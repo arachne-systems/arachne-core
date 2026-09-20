@@ -1,0 +1,6 @@
+# Scan tracked production and test code; replace Semgrep's default test exclusions.
+.git/
+.cache/
+dist/
+target/
+**/build/
