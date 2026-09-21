@@ -532,6 +532,12 @@ impl Client {
                     )
                 })
             })?;
+        if candidate_workspace != workspace {
+            return Err(error(
+                ErrorKind::Internal,
+                "publication candidate workspace mismatch",
+            ));
+        }
         Ok(PublicationCandidate {
             workspace: candidate_workspace,
             snapshot,
