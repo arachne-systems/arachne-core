@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 
 use crate::{
     WorkspacePhase, cancel, close, create, create_lan, create_nearby, create_relay, create_wan,
-    create_wan_only, describe, execute, wait_for_work,
+    create_wan_only, describe, execute, execute_stored, wait_for_work,
 };
 
 /// Address discovery and transport selection for a typed runtime client.
@@ -199,6 +199,12 @@ pub struct DeliveryReport {
     pub admitted: Vec<[u8; 32]>,
     pub queued: bool,
     pub failed: Vec<DeliveryFailure>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicationCandidate {
+    pub workspace: [u8; 32],
+    pub snapshot: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -489,6 +495,77 @@ impl Client {
             "revision": revision,
         }))?;
         Ok(())
+    }
+
+    pub fn stage_protected_publication(
+        &self,
+        workspace: [u8; 32],
+        revision: u64,
+        topic: &str,
+        id: [u8; 16],
+        payload: Vec<u8>,
+    ) -> Result<PublicationCandidate> {
+        let request = serde_json::to_vec(&json!({
+            "op": "stage_network_publication",
+            "workspace": workspace,
+            "revision": revision,
+            "topic": topic,
+            "id": id,
+            "payload": payload,
+        }))
+        .map_err(|parse_error| error(ErrorKind::Internal, parse_error.to_string()))?;
+        let [metadata, snapshot] =
+            execute_stored(self.handle()?, &request, &[]).map_err(|message| map_error(&message))?;
+        let value: Value = serde_json::from_slice(&metadata).map_err(|parse_error| {
+            error(
+                ErrorKind::Internal,
+                format!("invalid publication candidate: {parse_error}"),
+            )
+        })?;
+        let candidate_workspace = value
+            .get("workspace")
+            .ok_or_else(|| error(ErrorKind::Internal, "publication candidate has no workspace"))
+            .and_then(|value| {
+                serde_json::from_value(value.clone()).map_err(|parse_error| {
+                    error(
+                        ErrorKind::Internal,
+                        format!("invalid publication candidate workspace: {parse_error}"),
+                    )
+                })
+            })?;
+        Ok(PublicationCandidate {
+            workspace: candidate_workspace,
+            snapshot,
+        })
+    }
+
+    pub fn adopt_protected_publication(&self, snapshot: &[u8]) -> Result<DeliveryReport> {
+        let [metadata, _] = execute_stored(
+            self.handle()?,
+            br#"{"op":"adopt_publication"}"#,
+            snapshot,
+        )
+        .map_err(|message| map_error(&message))?;
+        let value: Value = serde_json::from_slice(&metadata).map_err(|parse_error| {
+            error(
+                ErrorKind::Internal,
+                format!("invalid publication result: {parse_error}"),
+            )
+        })?;
+        if let Some(message) = value.get("network_error").and_then(Value::as_str) {
+            return Err(error(ErrorKind::Transport, message));
+        }
+        let admission = value
+            .get("admission")
+            .ok_or_else(|| error(ErrorKind::Internal, "publication result has no admission"))?;
+        serde_json::from_value::<RawDeliveryReport>(admission.clone())
+            .map(Into::into)
+            .map_err(|parse_error| {
+                error(
+                    ErrorKind::Internal,
+                    format!("invalid publication admission: {parse_error}"),
+                )
+            })
     }
 
     pub fn set_interest(
