@@ -483,6 +483,14 @@ impl Client {
         Ok(())
     }
 
+    pub fn install_workspace_policy(&self, revision: u64) -> Result<()> {
+        self.request(json!({
+            "op": "install_workspace_policy",
+            "revision": revision,
+        }))?;
+        Ok(())
+    }
+
     pub fn set_interest(
         &self,
         workspace: [u8; 32],
