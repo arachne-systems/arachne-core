@@ -4,12 +4,14 @@ version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Typed Rust client API for Arachne secure peer-to-peer workspaces."
+keywords = ["api-bindings", "mls", "networking", "p2p"]
 documentation = "https://docs.rs/arachne-runtime"
 readme = "README.md"
-publish = false
+publish = ["crates-io"]
 
 [dependencies]
 arachne-delivery = { path = "../arachne-delivery", version = "0.1.0" }

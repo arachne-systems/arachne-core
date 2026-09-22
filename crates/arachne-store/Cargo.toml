@@ -4,12 +4,14 @@ version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Encrypted SQLite storage for Arachne workspace records."
+keywords = ["database", "encryption", "sqlite", "storage"]
 documentation = "https://docs.rs/arachne-store"
 readme = "README.md"
-publish = false
+publish = ["crates-io"]
 
 [dependencies]
 rusqlite = { version = "=0.32.1", features = ["bundled", "limits"] }
@@ -20,5 +22,5 @@ getrandom = "0.2"
 zeroize = "1"
 
 [dev-dependencies]
-arachne-security = { path = "../arachne-security" }
+arachne-security = { path = "../arachne-security", version = "0.1.0" }
 tempfile = "=3.27.0"

@@ -17,6 +17,8 @@ Small host-integration changes, with no Bao, wire, hashing or crypto changes:
 - Export the existing `gc_run_once` function. Arachne serializes calls so changing
   the single resumable partial reclaims obsolete bytes before another download.
 - Bound the file-store runtime to two workers per workspace instead of one per CPU.
+- Declare the Tokio runtime features the file-store crate uses, rather than
+  relying on feature unification from Arachne's host workspace.
 - The copied CLI example rejects non-UTF-8 arguments explicitly, rather than
   panicking during argument decoding. It is not included in Arachne binaries.
 

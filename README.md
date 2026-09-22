@@ -47,9 +47,9 @@ silently persist application state on the host’s behalf.
 ## Status
 
 Pre-release software under active development. APIs and persisted formats may
-change; the crates are not published to crates.io. Direct, local, and selected
-relay paths have Rust test coverage, but that is not a guarantee of reachability
-or capacity on every network or deployment.
+change; the crates are prepared for, but not yet published to, crates.io.
+Direct, local, and selected relay paths have Rust test coverage, but that is not
+a guarantee of reachability or capacity on every network or deployment.
 
 ## Build and test
 

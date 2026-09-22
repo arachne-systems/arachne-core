@@ -15,12 +15,11 @@ version = "0.1.0"
 authors = ["Arachne Systems"]
 edition = "2024"
 license = "MPL-2.0"
+rust-version = "1.91"
 repository = "https://github.com/arachne-systems/arachne-core"
 homepage = "https://github.com/arachne-systems"
 
 [patch.crates-io]
-iroh-gossip = { path = "vendor/iroh-gossip" }
-iroh-blobs = { path = "vendor/iroh-blobs" }
 bao-tree = { path = "vendor/bao-tree" }
 netlink-packet-core = { path = "vendor/netlink-packet-core" }
 hax-lib-macros = { path = "vendor/hax-lib-macros" }

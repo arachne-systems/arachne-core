@@ -1,5 +1,12 @@
 # iroh-blobs
 
+> This Arachne-maintained fork is published as `arachne-iroh-blobs`; its Rust
+> library keeps the `iroh_blobs` import name. It carries narrow host-integration
+> changes for bounded resource transfers. The exact changes and upstream
+> provenance are documented in [`ARACHNE-PATCH.md`](ARACHNE-PATCH.md). This is
+> not an official upstream Iroh release. The upstream MIT/Apache-2.0 license
+> terms remain in force.
+
 **NOTE: this version of iroh-blobs is not yet considered production quality. For now, if you need production quality, use iroh-blobs 0.35**
 
 This crate provides blob and blob sequence transfer support for iroh. It implements a simple request-response protocol based on BLAKE3 verified streaming.

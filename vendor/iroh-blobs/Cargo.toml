@@ -12,9 +12,10 @@
 [package]
 edition = "2021"
 rust-version = "1.91"
-name = "iroh-blobs"
+name = "arachne-iroh-blobs"
 version = "0.103.0"
 authors = [
+    "Arachne Systems",
     "dignifiedquire <me@dignifiedquire.com>",
     "n0 team",
 ]
@@ -24,16 +25,21 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "content-addressed blobs for iroh"
+description = "Arachne-maintained Iroh Blobs fork for bounded resource transfers"
 readme = "README.md"
 keywords = [
+    "arachne",
     "hashing",
     "quic",
     "blake3",
     "streaming",
 ]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/n0-computer/iroh-blobs"
+repository = "https://github.com/arachne-systems/arachne-core"
+homepage = "https://github.com/arachne-systems/arachne-core"
+documentation = "https://docs.rs/arachne-iroh-blobs"
+publish = ["crates-io"]
+exclude = ["Cargo.toml.orig"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -251,7 +257,7 @@ features = [
 
 [dependencies.tokio]
 version = "1.43.0"
-features = ["sync"]
+features = ["rt-multi-thread", "sync", "time"]
 default-features = false
 
 [dependencies.tracing]
