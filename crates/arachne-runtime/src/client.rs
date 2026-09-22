@@ -1,9 +1,13 @@
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
     WorkspacePhase, cancel, close, create, create_lan, create_nearby, create_relay, create_wan,
-    create_wan_only, describe, execute, execute_stored, wait_for_work,
+    create_wan_only, describe, enable_record_storage as enable_runtime_record_storage, execute,
+    execute_stored, restore_record_storage as restore_runtime_record_storage,
+    save_candidate as save_runtime_candidate, wait_for_work,
 };
 
 /// Address discovery and transport selection for a typed runtime client.
@@ -628,6 +632,30 @@ impl Client {
         )
         .map_err(|message| map_error(&message))?;
         parse_workspace_info(&metadata, "join adoption")
+    }
+
+    /// Enable encrypted native storage for this client's workspace.
+    pub fn enable_record_storage(&self, path: &Path, root: &[u8; 32]) -> Result<()> {
+        enable_runtime_record_storage(self.handle()?, path, root)
+            .map_err(|message| error(ErrorKind::Storage, message))
+    }
+
+    /// Restore a workspace from encrypted native storage.
+    pub fn restore_record_storage(
+        &self,
+        path: &Path,
+        root: &[u8; 32],
+        workspace: [u8; 32],
+    ) -> Result<()> {
+        restore_runtime_record_storage(self.handle()?, path, root, workspace)
+            .map(|_| ())
+            .map_err(|message| error(ErrorKind::Storage, message))
+    }
+
+    /// Save the exact staged snapshot before adopting it.
+    pub fn save_candidate(&self, snapshot: &[u8]) -> Result<()> {
+        save_runtime_candidate(self.handle()?, snapshot)
+            .map_err(|message| error(ErrorKind::Storage, message))
     }
 
     pub fn member_roster(&self) -> Result<MemberRoster> {
