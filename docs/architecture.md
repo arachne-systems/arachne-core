@@ -89,8 +89,10 @@ translate application objects, and choose what data to publish.
 
 ## Current release status
 
-The first-party crates are pre-release, versioned `0.1.0`, and configured for
-crates.io but not yet published. Wire formats, saved state, and APIs can change.
+Seven of the eight workspace crates have been published to crates.io. The
+initial `arachne-runtime` upload is still pending; it must be published
+manually before Trusted Publishing can be configured. The workspace remains
+pre-release: wire formats, saved state, and APIs can change.
 The typed `Client` is useful for Rust integration work, but it is not yet a
 complete, stable application SDK;
 see the specific gaps in [Integration](integration.md#known-integration-gaps).

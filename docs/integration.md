@@ -1,7 +1,8 @@
 # Integrating Arachne Core
 
-This repository is a pre-release Rust workspace, not a published SDK. Its
-crates are not yet published; APIs, wire formats, and saved state can change.
+This repository is a pre-release Rust workspace, not a stable SDK. Seven of
+its eight crates are published on crates.io; the initial `arachne-runtime`
+upload is still pending. APIs, wire formats, and saved state can change.
 The current typed entry point is `arachne_runtime::Client`. It is synchronous
 and owns a Tokio runtime internally, so call it from a blocking worker rather
 than from inside an application's async executor or UI thread.
