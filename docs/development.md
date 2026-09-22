@@ -18,8 +18,10 @@ Each crate has a short README. The root workspace pins direct dependency
 versions where interoperability or protocol behavior requires it and uses
 `Cargo.lock` to capture the resolved graph. Shared package metadata and
 registry-compatible versions for normal internal dependencies are configured.
-The six first-party packages are configured for crates.io but have not been
-published; do not treat a successful local build as a release artifact.
+The six first-party packages and two Arachne-maintained Iroh forks are
+publishable workspace members. Check crates.io for current publication status;
+new crate names require a one-time manual first publish before Trusted
+Publishing can be enabled.
 
 ## Toolchain and commands
 
@@ -103,43 +105,45 @@ separate packages with their own declared license terms. The vendor inventory is
 not an application-binary notice set: create target- and feature-specific
 notices when bundling Core into a binary distribution.
 
-## Crates.io release gate
+## Crates.io releases
 
 `arachne-node` depends on the two named Arachne Iroh forks so their required
 APIs are ordinary registry dependencies, not workspace-only patches. The
-other three vendor patches are deliberately not part of published package
-manifests. A clean consumer build outside this workspace is the release gate;
-it must resolve registry-compatible package names and dependencies without
-inheriting this root manifest's `[patch.crates-io]` entries.
+other three vendor patches are deliberately excluded from publishing. A clean
+consumer build outside this workspace must resolve registry-compatible
+package names and dependencies without inheriting this root manifest's
+`[patch.crates-io]` entries.
 
-Publish in dependency order: `arachne-routing`, `arachne-security`, and
-`arachne-store`; then `arachne-delivery`, `arachne-iroh-gossip`, and
-`arachne-iroh-blobs`; then `arachne-node`; finally `arachne-runtime`. Cargo
-cannot resolve an unpublished first-party dependency while verifying its
-dependent package. The release selectors are:
+The `.github/workflows/release-plz.yml` workflow prepares version and changelog
+updates through a release PR. Use Conventional Commit types `fix`, `feat`,
+`perf`, `refactor`, `security`, `deps`, or `docs`, optionally with a scope;
+append `!` for a breaking change (for example, `feat(api)!:`). Other commit
+types do not trigger a crate release. Review and merge the generated release PR
+to publish in dependency order and create per-crate GitHub tags/releases. Do
+not manually bump crate versions for normal releases.
 
-| Order | Package | Selector from repository root |
-| --- | --- | --- |
-| 1 | `arachne-routing` | `-p arachne-routing` |
-| 2 | `arachne-security` | `-p arachne-security` |
-| 3 | `arachne-store` | `-p arachne-store` |
-| 4 | `arachne-delivery` | `-p arachne-delivery` |
-| 5 | `arachne-iroh-gossip` | `--manifest-path vendor/iroh-gossip/Cargo.toml` |
-| 6 | `arachne-iroh-blobs` | `--manifest-path vendor/iroh-blobs/Cargo.toml` |
-| 7 | `arachne-node` | `-p arachne-node` |
-| 8 | `arachne-runtime` | `-p arachne-runtime` |
+Publishing uses crates.io Trusted Publishing through GitHub Actions OIDC; no
+crates.io API token is stored in GitHub. Configure each already-published
+crate's trusted publisher with owner `arachne-systems`, repository
+`arachne-core`, and workflow `.github/workflows/release-plz.yml`. A new crate
+must first be uploaded manually with Cargo; configure its trusted publisher
+after that initial upload. `arachne-runtime` is currently excluded from
+release-plz until its first upload and trusted publisher setup are complete.
 
-For each selector, run `cargo publish --dry-run <selector>`, then
-`cargo publish <selector>` only after the exact release commit and version are
-approved. Wait for the package to appear in the registry index before moving to
-the next dependent package; do not publish the workspace as one batch. Before
-the first upload, confirm crate-name availability and ownership and establish a
-crates.io publisher account. Store authentication in Cargo's user-level
-credentials, never in this repository. The names returned 404 from the sparse
-index on 2026-09-22; names are first-come and that observation does not reserve
-them. Each uploaded version is effectively permanent: it cannot be overwritten
-or deleted, and yanking does not remove its source archive. See the [Cargo
-publishing guide](https://doc.rust-lang.org/cargo/reference/publishing.html).
+The organization currently blocks `GITHUB_TOKEN` from creating pull requests.
+The workflow therefore uses a repository-scoped GitHub App token. Create an
+organization-owned app named `Arachne Systems Release Bot`, disable its webhook,
+grant only `Contents: read/write` and `Pull requests: read/write`, and install
+it only on `arachne-core`. Save its Client ID as the repository Actions
+variable `RELEASE_APP_CLIENT_ID` and its private key as the repository Actions
+secret `RELEASE_APP_PRIVATE_KEY`.
+
+For a local package-content check, run `cargo package --list -p <crate>` and
+`cargo publish --dry-run -p <crate>`. The initial upload is permanent: a
+published version cannot be overwritten or deleted, and yanking does not remove
+its source archive. See the [Cargo publishing
+guide](https://doc.rust-lang.org/cargo/reference/publishing.html) and
+[release-plz Trusted Publishing setup](https://release-plz.dev/docs/github/quickstart).
 
 ## Change discipline
 

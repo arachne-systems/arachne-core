@@ -6,9 +6,11 @@ members = [
     "crates/arachne-routing",
     "crates/arachne-node",
     "crates/arachne-runtime",
+    "vendor/iroh-gossip",
+    "vendor/iroh-blobs",
 ]
 resolver = "3"
-exclude = ["vendor/iroh-gossip", "vendor/iroh-blobs", "vendor/bao-tree", "vendor/netlink-packet-core", "vendor/hax-lib-macros"]
+exclude = ["vendor/bao-tree", "vendor/netlink-packet-core", "vendor/hax-lib-macros"]
 
 [workspace.package]
 version = "0.1.0"

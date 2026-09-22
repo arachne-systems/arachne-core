@@ -1,0 +1,9 @@
+[workspace]
+release_always = false
+release_commits = '^(feat|fix|perf|refactor|security|deps|docs)(\([^)]+\))?!?:'
+
+# crates.io requires a manual first upload before Trusted Publishing can be
+# configured. Remove this override after arachne-runtime 0.1.0 is published.
+[[package]]
+name = "arachne-runtime"
+release = false
