@@ -202,6 +202,7 @@ pub struct WorkspaceCandidate {
 pub enum RouteKind {
     Direct,
     Relay,
+    Tor,
     Custom(String),
 }
 
@@ -741,6 +742,7 @@ impl Client {
                     route: match path.route.as_str() {
                         "direct" => RouteKind::Direct,
                         "relay" => RouteKind::Relay,
+                        "tor" => RouteKind::Tor,
                         other => RouteKind::Custom(other.to_owned()),
                     },
                     rtt_ms: path.rtt_ms,

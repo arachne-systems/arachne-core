@@ -447,6 +447,9 @@ impl Actor {
                     Some(Err(err)) => {
                         warn!(peer = %peer_id.fmt_short(), "dial failed: {err}");
                         self.metrics.actor_tick_dialer_failure.inc();
+                        if let Some(PeerState::Pending { dialing, .. }) = self.peers.get_mut(&peer_id) {
+                            *dialing = false;
+                        }
                         let peer_state = self.peers.get(&peer_id);
                         let is_active = matches!(peer_state, Some(PeerState::Active { .. }));
                         if !is_active {
@@ -457,6 +460,9 @@ impl Actor {
                     None => {
                         warn!(peer = %peer_id.fmt_short(), "dial disconnected");
                         self.metrics.actor_tick_dialer_failure.inc();
+                        if let Some(PeerState::Pending { dialing, .. }) = self.peers.get_mut(&peer_id) {
+                            *dialing = false;
+                        }
                     }
                 }
             }
@@ -704,10 +710,11 @@ impl Actor {
                                 );
                             }
                         }
-                        PeerState::Pending { queue } => {
-                            if queue.is_empty() {
+                        PeerState::Pending { queue, dialing } => {
+                            if !*dialing {
                                 debug!(peer = %peer_id.fmt_short(), "start to dial");
                                 self.dialer.queue_dial(peer_id, self.alpn.clone());
+                                *dialing = true;
                             }
                             queue.push(message);
                         }
@@ -772,6 +779,7 @@ type ConnId = usize;
 enum PeerState {
     Pending {
         queue: Vec<ProtoMessage>,
+        dialing: bool,
     },
     Active {
         active_send_tx: mpsc::Sender<ProtoMessage>,
@@ -787,7 +795,7 @@ impl PeerState {
         conn_id: ConnId,
     ) -> Vec<ProtoMessage> {
         match self {
-            PeerState::Pending { queue } => {
+            PeerState::Pending { queue, .. } => {
                 let queue = std::mem::take(queue);
                 *self = PeerState::Active {
                     active_send_tx: send_tx,
@@ -817,7 +825,10 @@ impl PeerState {
 
 impl Default for PeerState {
     fn default() -> Self {
-        PeerState::Pending { queue: Vec::new() }
+        PeerState::Pending {
+            queue: Vec::new(),
+            dialing: false,
+        }
     }
 }
 
@@ -1183,8 +1194,14 @@ pub(crate) mod tests {
                 .expect("endpoint is not closed")
                 .add(address_lookup.clone());
 
-            let (actor, to_actor_tx, conn_tx) =
-                Actor::new(endpoint, config, metrics.clone(), None, address_lookup, None);
+            let (actor, to_actor_tx, conn_tx) = Actor::new(
+                endpoint,
+                config,
+                metrics.clone(),
+                None,
+                address_lookup,
+                None,
+            );
             let max_message_size = actor.state.max_message_size();
 
             let _actor_handle = AbortOnDropHandle::new(task::spawn(n0_future::future::pending()));

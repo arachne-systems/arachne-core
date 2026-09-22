@@ -48,6 +48,16 @@ impl EndpointHooks for ConnectionObserver {
         &'a self,
         connection: &'a iroh::endpoint::Connection,
     ) -> AfterHandshakeOutcome {
+        if connection
+            .alpn()
+            .starts_with(super::overlay::ALPN_PREFIX)
+        {
+            tracing::info!(
+                target: "data_fabric_transport",
+                peer = %connection.remote_id().fmt_short(),
+                "GOSSIP_HANDSHAKE_ACCEPTED"
+            );
+        }
         let mut observed = self.0.write().unwrap();
         observed
             .live
@@ -82,11 +92,16 @@ impl EndpointHooks for GossipAuthorization {
         remote: &'a EndpointAddr,
         alpn: &'a [u8],
     ) -> BeforeConnectOutcome {
-        if !alpn.starts_with(super::overlay::ALPN_PREFIX)
-            || self.allows(alpn, *remote.id.as_bytes())
-        {
+        let allowed = !alpn.starts_with(super::overlay::ALPN_PREFIX)
+            || self.allows(alpn, *remote.id.as_bytes());
+        if allowed {
             BeforeConnectOutcome::Accept
         } else {
+            tracing::warn!(
+                target: "data_fabric_transport",
+                peer = %remote.id.fmt_short(),
+                "GOSSIP_CONNECT_REJECTED"
+            );
             BeforeConnectOutcome::Reject
         }
     }
@@ -95,11 +110,18 @@ impl EndpointHooks for GossipAuthorization {
         &'a self,
         connection: &'a iroh::endpoint::Connection,
     ) -> AfterHandshakeOutcome {
-        if !connection.alpn().starts_with(super::overlay::ALPN_PREFIX)
-            || self.allows(connection.alpn(), *connection.remote_id().as_bytes())
-        {
+        let allowed = !connection
+            .alpn()
+            .starts_with(super::overlay::ALPN_PREFIX)
+            || self.allows(connection.alpn(), *connection.remote_id().as_bytes());
+        if allowed {
             AfterHandshakeOutcome::Accept
         } else {
+            tracing::warn!(
+                target: "data_fabric_transport",
+                peer = %connection.remote_id().fmt_short(),
+                "GOSSIP_HANDSHAKE_REJECTED"
+            );
             AfterHandshakeOutcome::Reject {
                 error_code: 403u32.into(),
                 reason: b"workspace endpoint denied".to_vec(),
@@ -342,6 +364,8 @@ impl Connections {
                         "direct"
                     } else if path.is_relay() {
                         "relay"
+                    } else if self.tor {
+                        "tor"
                     } else {
                         "custom"
                     },
@@ -391,13 +415,16 @@ impl Connections {
     }
 
     pub(super) async fn add_address_hint(&self, peer: PeerId, address: SocketAddr) -> Result<()> {
+        let key = PublicKey::from_bytes(&peer).map_err(transport)?;
+        if self.tor {
+            return Ok(());
+        }
         let mut addresses = self.addresses.lock().await;
         if addresses.len() >= MAX_ADDRESS_HINTS && !addresses.contains_key(&peer) {
             return Err(Error::TooLarge);
         }
         addresses.insert(peer, address);
         self.unreachable.lock().await.remove(&peer);
-        let key = PublicKey::from_bytes(&peer).map_err(transport)?;
         self.memory
             .add_endpoint_info(EndpointAddr::new(key).with_ip_addr(address));
         Ok(())
@@ -407,7 +434,14 @@ impl Connections {
         self.addresses.lock().await.get(&peer).copied()
     }
 
+    pub(super) fn can_dial_by_peer_id(&self) -> bool {
+        self.address_lookup
+    }
+
     pub(super) async fn remember_observed(&self, peer: PeerId, address: SocketAddr) {
+        if self.tor {
+            return;
+        }
         let mut addresses = self.addresses.lock().await;
         // The peer just reached us, so it is reachable again.
         self.unreachable.lock().await.remove(&peer);
@@ -489,7 +523,7 @@ impl Connections {
 
     async fn dial(&self, peer: PeerId, alpn: &[u8]) -> Result<iroh::endpoint::Connection> {
         let key = PublicKey::from_bytes(&peer).map_err(transport)?;
-        let hint = if self.use_ip_hints {
+        let hint = if self.use_ip_hints && !self.tor {
             self.address_hint(peer).await
         } else {
             None
@@ -606,6 +640,14 @@ impl Connections {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "tor")]
+    #[test]
+    fn tor_profile_uses_endpoint_id_resolution_without_ip_hints() {
+        let (mdns, wan_lookup, relay_only, use_ip_hints) = NetworkProfile::Tor.settings();
+        assert_eq!((mdns, wan_lookup, relay_only, use_ip_hints), (None, false, true, false));
+        assert!(NetworkProfile::Tor.uses_tor());
+    }
 
     #[tokio::test]
     async fn reuse_is_single_flight_protocol_scoped_and_never_evicts_busy_exchanges() {

@@ -27,6 +27,11 @@ use super::{
 pub(super) const ALPN_PREFIX: &[u8] = b"arachne/workspace-gossip/1/";
 const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_BOOTSTRAPS: usize = 3;
+const BOOTSTRAP_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(35),
+    Duration::from_secs(70),
+    Duration::from_secs(120),
+];
 /// The one overlay topic delivered across policy revisions (ADR 0008). Only
 /// self-authenticating membership steps may use it.
 pub(super) const MEMBERSHIP_TOPIC: &str = "arachne/membership/1";
@@ -99,6 +104,7 @@ pub(super) struct Overlay {
     neighbors: Arc<StdMutex<BTreeSet<PeerId>>>,
     changed: Arc<Notify>,
     receiver: JoinHandle<()>,
+    bootstrap_retry: Option<JoinHandle<()>>,
 }
 
 impl Overlay {
@@ -177,13 +183,13 @@ impl Overlay {
             .collect();
         let mut reachable = Vec::new();
         for peer in &ordered {
-            if connections.address_hint(*peer).await.is_some() {
+            if connections.can_dial_by_peer_id() || connections.address_hint(*peer).await.is_some() {
                 reachable.push(*peer);
             }
         }
         ordered.retain(|peer| !reachable.contains(peer));
         reachable.extend(ordered);
-        let bootstraps = reachable
+        let candidates = reachable
             .into_iter()
             .filter_map(|peer| match EndpointId::from_bytes(&peer) {
                 Ok(peer) => Some(peer),
@@ -192,7 +198,11 @@ impl Overlay {
                     None
                 }
             })
+            .collect::<Vec<_>>();
+        let bootstraps = candidates
+            .iter()
             .take(MAX_BOOTSTRAPS)
+            .copied()
             .collect::<Vec<_>>();
         tracing::info!(target: "data_fabric_transport", revision, members = peers.len(), bootstraps = ?bootstraps, "GOSSIP_OVERLAY_PREPARED");
         let topic = gossip
@@ -215,6 +225,7 @@ impl Overlay {
                     Ok(Event::NeighborDown(peer)) => {
                         tracing::info!(target: "data_fabric_transport", %peer, "GOSSIP_NEIGHBOR_DOWN");
                         observed.lock().unwrap().remove(peer.as_bytes());
+                        notify.notify_waiters();
                     }
                     Ok(Event::Received(message)) => {
                         let envelope = match wire::decode::<Envelope>(&message.content) {
@@ -266,6 +277,45 @@ impl Overlay {
                 }
             }
         });
+        // Gossip discards a bootstrap after its first failed dial. Tor has no
+        // address-hint update to trigger a rejoin, so an early hidden-service
+        // timeout otherwise leaves this overlay isolated forever.
+        let bootstrap_retry = (!candidates.is_empty()).then(|| {
+            let sender = sender.clone();
+            let retry_neighbors = neighbors.clone();
+            let retry_changed = changed.clone();
+            tokio::spawn(async move {
+                let mut failures = 0u32;
+                loop {
+                    let delay = BOOTSTRAP_RETRY_DELAYS[failures.min(2) as usize];
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {
+                            if !retry_neighbors.lock().unwrap().is_empty() {
+                                failures = 0;
+                                continue;
+                            }
+                        }
+                        _ = retry_changed.notified() => {
+                            failures = 0;
+                            continue;
+                        }
+                    }
+                    let start = failures as usize * MAX_BOOTSTRAPS % candidates.len();
+                    let batch = candidates
+                        .iter()
+                        .cycle()
+                        .skip(start)
+                        .take(candidates.len().min(MAX_BOOTSTRAPS))
+                        .copied()
+                        .collect();
+                    failures = failures.saturating_add(1);
+                    tracing::info!(target: "data_fabric_transport", attempt = failures, peers = candidates.len(), "GOSSIP_BOOTSTRAP_RETRY");
+                    if let Err(error) = sender.join_peers(batch).await {
+                        tracing::warn!(target: "data_fabric_transport", attempt = failures, %error, "GOSSIP_BOOTSTRAP_RETRY_FAILED");
+                    }
+                }
+            })
+        });
         Ok(Self {
             workspace,
             revision: std::sync::atomic::AtomicU64::new(revision),
@@ -276,6 +326,7 @@ impl Overlay {
             neighbors,
             changed,
             receiver,
+            bootstrap_retry,
         })
     }
 
@@ -342,6 +393,87 @@ impl Overlay {
 impl Drop for Overlay {
     fn drop(&mut self) {
         self.receiver.abort();
+        if let Some(retry) = &self.bootstrap_retry {
+            retry.abort();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{NetworkProfile, Node, Permissions};
+    use std::{collections::BTreeMap, net::SocketAddr};
+
+    #[tokio::test]
+    async fn isolated_gossip_overlay_retries_after_a_route_appears() {
+        tokio::time::timeout(Duration::from_secs(50), async {
+            let bind = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+            let (a, _) = Node::bind_with_profile(
+                bind(),
+                Some(&[81; 32]),
+                NetworkProfile::Direct,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+            let (b, _) = Node::bind_with_profile(
+                bind(),
+                Some(&[82; 32]),
+                NetworkProfile::Direct,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+            let workspace = [83; 32];
+            let policy = BTreeMap::from([
+                (a.id(), Permissions::AllTopics),
+                (b.id(), Permissions::AllTopics),
+            ]);
+            for node in [&a, &b] {
+                node.install_verified_policy(workspace, 1, policy.clone())
+                    .await
+                    .unwrap();
+                node.enable_gossip(workspace, 1).await.unwrap();
+            }
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(a.live_neighbors(workspace).await.is_empty());
+            assert!(b.live_neighbors(workspace).await.is_empty());
+
+            // Update discovery without triggering Node's immediate join path;
+            // the retry task must recover the failed initial bootstrap itself.
+            a.connections
+                .add_address_hint(b.id(), b.address())
+                .await
+                .unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(42);
+            loop {
+                if a.live_neighbors(workspace).await.contains(&b.id())
+                    && b.live_neighbors(workspace).await.contains(&a.id())
+                {
+                    break;
+                }
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            a.close().await;
+            b.close().await;
+        })
+        .await
+        .expect("isolated overlay did not recover after its bootstrap route appeared");
+    }
+
+    #[test]
+    fn bootstrap_retry_backoff_is_bounded() {
+        assert_eq!(
+            BOOTSTRAP_RETRY_DELAYS,
+            [
+                Duration::from_secs(35),
+                Duration::from_secs(70),
+                Duration::from_secs(120),
+            ]
+        );
     }
 }
 
