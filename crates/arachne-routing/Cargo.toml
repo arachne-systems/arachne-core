@@ -1,0 +1,12 @@
+[package]
+name = "arachne-routing"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Topic validation and workspace-scoped recipient selection for Arachne."
+documentation = "https://docs.rs/arachne-routing"
+readme = "README.md"
+publish = false

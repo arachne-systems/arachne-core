@@ -1,0 +1,8 @@
+.cache/
+/dist/
+**/__pycache__/
+graphify-out/
+**/target/
+
+# Claude Code agent worktrees
+.claude/

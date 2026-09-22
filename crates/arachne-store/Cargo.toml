@@ -1,0 +1,24 @@
+[package]
+name = "arachne-store"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Encrypted SQLite storage for Arachne workspace records."
+documentation = "https://docs.rs/arachne-store"
+readme = "README.md"
+publish = false
+
+[dependencies]
+rusqlite = { version = "=0.32.1", features = ["bundled", "limits"] }
+aes-gcm = "=0.10.3"
+hkdf = "=0.12.4"
+sha2 = "=0.10.9"
+getrandom = "0.2"
+zeroize = "1"
+
+[dev-dependencies]
+arachne-security = { path = "../arachne-security" }
+tempfile = "=3.27.0"
