@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::path::Path;
 
 use crate::{
     WorkspacePhase, cancel, close, create, create_lan, create_nearby, create_relay, create_wan,
@@ -207,6 +208,15 @@ pub struct PublicationCandidate {
     pub snapshot: Vec<u8>,
 }
 
+/// Current-value metadata for a protected publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct PublicationCurrent {
+    pub selector: [u8; 32],
+    pub replacement_key: [u8; 32],
+    pub expires_at: u64,
+    pub tombstone: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InterestObservation {
     pub workspace: [u8; 32],
@@ -394,6 +404,158 @@ impl Client {
         })
     }
 
+    /// Begin joining from an invitation. The returned projection is intentionally
+    /// left as JSON while the join protocol continues to evolve.
+    pub fn begin_join(
+        &self,
+        invitation: &[u8],
+        display_name: &str,
+        peers: &[[u8; 32]],
+    ) -> Result<Value> {
+        self.request(json!({
+            "op": "begin_join",
+            "invitation": invitation,
+            "display_name": display_name,
+            "peers": peers,
+        }))
+    }
+
+    pub fn drive_join(&self) -> Result<Value> {
+        self.request(json!({"op": "drive_join"}))
+    }
+
+    pub fn drive_workspace(&self) -> Result<Value> {
+        self.request(json!({"op": "drive_workspace"}))
+    }
+
+    /// Pull and durably adopt membership commits from an admitted peer until
+    /// this client agrees with a current member.
+    pub fn refresh_membership(&self) -> Result<MemberRoster> {
+        self.drive_workspace()?;
+        loop {
+            let next = self.request(json!({"op": "next_membership_peer"}))?;
+            let peer: Option<[u8; 32]> = serde_json::from_value(next["peer"].clone())
+                .map_err(|parse_error| error(ErrorKind::Internal, parse_error.to_string()))?;
+            let Some(peer) = peer else {
+                return self.member_roster();
+            };
+            self.request(json!({"op": "fetch_membership_update", "peer": peer}))?;
+            let update = loop {
+                let update = self.request(json!({"op": "poll_membership_update"}))?;
+                if !update.is_null() {
+                    break update;
+                }
+                let _ = self.wait_for_work()?;
+            };
+            match update["state"].as_str() {
+                Some("membership_current") => return self.member_roster(),
+                Some("membership_update_available") => {
+                    let request = serde_json::to_vec(&json!({
+                        "op": "stage_admission_update",
+                        "step": update["step"],
+                    }))
+                    .map_err(|parse_error| error(ErrorKind::Internal, parse_error.to_string()))?;
+                    let [metadata, snapshot] = execute_stored(self.handle()?, &request, &[])
+                        .map_err(|message| map_error(&message))?;
+                    let staged: Value =
+                        serde_json::from_slice(&metadata).map_err(|parse_error| {
+                            error(
+                                ErrorKind::Internal,
+                                format!("invalid membership candidate: {parse_error}"),
+                            )
+                        })?;
+                    if staged["state"] != "awaiting_save" || snapshot.is_empty() {
+                        return Err(error(
+                            ErrorKind::Internal,
+                            "membership update did not return a staged snapshot",
+                        ));
+                    }
+                    self.save_candidate(&snapshot)?;
+                    execute_stored(self.handle()?, br#"{"op":"adopt_admission"}"#, &snapshot)
+                        .map_err(|message| map_error(&message))?;
+                }
+                Some(state) => {
+                    return Err(error(
+                        ErrorKind::Transport,
+                        format!("membership refresh stopped in state {state}"),
+                    ));
+                }
+                None => {
+                    return Err(error(ErrorKind::Internal, "membership update has no state"));
+                }
+            }
+        }
+    }
+
+    pub fn use_service_profile(&self) -> Result<()> {
+        self.request(json!({"op": "use_service_profile"}))?;
+        Ok(())
+    }
+
+    pub fn enable_record_storage(&self, path: &Path, root: &[u8; 32]) -> Result<()> {
+        crate::enable_record_storage(self.handle()?, path, root)
+            .map_err(|message| map_error(&message))
+    }
+
+    pub fn restore_record_storage(
+        &self,
+        path: &Path,
+        root: &[u8; 32],
+        workspace: [u8; 32],
+    ) -> Result<Value> {
+        crate::restore_record_storage(self.handle()?, path, root, workspace)
+            .map_err(|message| map_error(&message))
+    }
+
+    pub fn save_candidate(&self, token: &[u8]) -> Result<()> {
+        crate::save_candidate(self.handle()?, token).map_err(|message| map_error(&message))
+    }
+
+    /// Enable durable group-object reception, committing its exact snapshot
+    /// before adoption when this client has record storage.
+    pub fn enable_object_delivery(&self) -> Result<()> {
+        let durable = self.workspace_state()?.durable;
+        let [metadata, snapshot] =
+            execute_stored(self.handle()?, br#"{"op":"enable_object_delivery"}"#, &[])
+                .map_err(|message| map_error(&message))?;
+        let staged: Value = serde_json::from_slice(&metadata).map_err(|parse_error| {
+            error(
+                ErrorKind::Internal,
+                format!("invalid object-delivery result: {parse_error}"),
+            )
+        })?;
+        if staged.get("state").and_then(Value::as_str) == Some("object_delivery_enabled") {
+            return Ok(());
+        }
+        if staged.get("state").and_then(Value::as_str) != Some("awaiting_reception_save")
+            || snapshot.is_empty()
+        {
+            return Err(error(
+                ErrorKind::Internal,
+                "object delivery did not return a staged workspace snapshot",
+            ));
+        }
+        if durable {
+            self.save_candidate(&snapshot)?;
+        }
+        let [metadata, _] =
+            execute_stored(self.handle()?, br#"{"op":"adopt_reception"}"#, &snapshot)
+                .map_err(|message| map_error(&message))?;
+        let adopted: Value = serde_json::from_slice(&metadata).map_err(|parse_error| {
+            error(
+                ErrorKind::Internal,
+                format!("invalid object-delivery adoption: {parse_error}"),
+            )
+        })?;
+        if adopted.get("state").and_then(Value::as_str) != Some("inbox_adopted") {
+            return Err(error(
+                ErrorKind::Internal,
+                "object delivery was not adopted",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn inspect_invitation(
         &self,
         invitation: &[u8],
@@ -505,12 +667,25 @@ impl Client {
         id: [u8; 16],
         payload: Vec<u8>,
     ) -> Result<PublicationCandidate> {
+        self.stage_protected_publication_with_current(workspace, revision, topic, id, payload, None)
+    }
+
+    pub fn stage_protected_publication_with_current(
+        &self,
+        workspace: [u8; 32],
+        revision: u64,
+        topic: &str,
+        id: [u8; 16],
+        payload: Vec<u8>,
+        current: Option<PublicationCurrent>,
+    ) -> Result<PublicationCandidate> {
         let request = serde_json::to_vec(&json!({
             "op": "stage_network_publication",
             "revision": revision,
             "topic": topic,
             "id": id,
             "payload": payload,
+            "current": current,
         }))
         .map_err(|parse_error| error(ErrorKind::Internal, parse_error.to_string()))?;
         let [metadata, snapshot] =
@@ -523,7 +698,12 @@ impl Client {
         })?;
         let candidate_workspace = value
             .get("workspace")
-            .ok_or_else(|| error(ErrorKind::Internal, "publication candidate has no workspace"))
+            .ok_or_else(|| {
+                error(
+                    ErrorKind::Internal,
+                    "publication candidate has no workspace",
+                )
+            })
             .and_then(|value| {
                 serde_json::from_value(value.clone()).map_err(|parse_error| {
                     error(
@@ -545,12 +725,9 @@ impl Client {
     }
 
     pub fn adopt_protected_publication(&self, snapshot: &[u8]) -> Result<DeliveryReport> {
-        let [metadata, _] = execute_stored(
-            self.handle()?,
-            br#"{"op":"adopt_publication"}"#,
-            snapshot,
-        )
-        .map_err(|message| map_error(&message))?;
+        let [metadata, _] =
+            execute_stored(self.handle()?, br#"{"op":"adopt_publication"}"#, snapshot)
+                .map_err(|message| map_error(&message))?;
         let value: Value = serde_json::from_slice(&metadata).map_err(|parse_error| {
             error(
                 ErrorKind::Internal,

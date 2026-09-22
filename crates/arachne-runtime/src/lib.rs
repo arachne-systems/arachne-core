@@ -43,11 +43,11 @@ mod resources;
 mod work_signal;
 mod workspace_activity;
 pub use client::{
-    Client, ClientConfig, ConnectivityReport, DeliveryFailure, DeliveryReport, EndpointInfo,
-    Error, ErrorKind, InterestObservation, InvitationDetails, InvitationInfo, MemberInfo,
-    MemberKind, MemberRoster,
-    Network, PeerPolicy, PeerRoute, Presence, Publication, PublicationCandidate, RecoveredPublication,
-    Result as ClientResult, RouteHint, RouteKind, WorkspaceInfo, WorkspaceState,
+    Client, ClientConfig, ConnectivityReport, DeliveryFailure, DeliveryReport, EndpointInfo, Error,
+    ErrorKind, InterestObservation, InvitationDetails, InvitationInfo, MemberInfo, MemberKind,
+    MemberRoster, Network, PeerPolicy, PeerRoute, Presence, Publication, PublicationCandidate,
+    PublicationCurrent, RecoveredPublication, Result as ClientResult, RouteHint, RouteKind,
+    WorkspaceInfo, WorkspaceState,
 };
 pub use persistence::{enable_record_storage, restore_record_storage, save_candidate};
 pub use workspace_activity::{Activity as WorkspaceActivity, Phase as WorkspacePhase};
