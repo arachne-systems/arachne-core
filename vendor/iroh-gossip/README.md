@@ -1,5 +1,11 @@
 # iroh-gossip
 
+> This Arachne-maintained fork is published as `arachne-iroh-gossip`; its Rust
+> library keeps the `iroh_gossip` import name. It adds shared, cancellation-safe
+> outgoing-dial admission. The change and upstream provenance are documented in
+> [`ARACHNE-PATCH.md`](ARACHNE-PATCH.md). This is not an official upstream Iroh
+> release. The upstream MIT/Apache-2.0 license terms remain in force.
+
 This crate implements the `iroh-gossip` protocol.
 It is based on *epidemic broadcast trees* to disseminate messages among a swarm of peers interested in a *topic*.
 The implementation is based on the papers [HyParView](https://asc.di.fct.unl.pt/~jleitao/pdf/dsn07-leitao.pdf) and [PlumTree](https://asc.di.fct.unl.pt/~jleitao/pdf/srds07-leitao.pdf).

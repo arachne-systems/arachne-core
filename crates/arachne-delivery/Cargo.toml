@@ -4,12 +4,14 @@ version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Bounded publication retention and authorized message-history recovery for Arachne."
+keywords = ["delivery", "messaging", "p2p", "recovery"]
 documentation = "https://docs.rs/arachne-delivery"
 readme = "README.md"
-publish = false
+publish = ["crates-io"]
 
 [dependencies]
 arachne-routing = { path = "../arachne-routing", version = "0.1.0" }

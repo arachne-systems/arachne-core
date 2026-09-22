@@ -17,9 +17,9 @@ docs/                 integration, architecture, and security guides
 Each crate has a short README. The root workspace pins direct dependency
 versions where interoperability or protocol behavior requires it and uses
 `Cargo.lock` to capture the resolved graph. Shared package metadata and
-registry-compatible versions for normal internal dependencies are configured,
-but all six Arachne crates remain `publish = false`; do not treat a successful
-local build as a release artifact.
+registry-compatible versions for normal internal dependencies are configured.
+The six first-party packages are configured for crates.io but have not been
+published; do not treat a successful local build as a release artifact.
 
 ## Toolchain and commands
 
@@ -72,10 +72,15 @@ certification.
 
 ## Vendored dependency patches
 
-The workspace overrides crates.io sources for `iroh-gossip`, `iroh-blobs`,
-`bao-tree`, `netlink-packet-core`, and `hax-lib-macros` under `vendor/`. Cargo's
-`[patch.crates-io]` entries in the root manifest select those local copies.
-They remain third-party code: keep their upstream copyright, license, and
+`vendor/` contains two Arachne-maintained, publishable forks of Iroh packages:
+`arachne-iroh-gossip` and `arachne-iroh-blobs`. Their Rust import names stay
+`iroh_gossip` and `iroh_blobs`; each retains upstream provenance, notices, and
+MIT/Apache-2.0 terms. They are not official Iroh releases.
+
+The root `[patch.crates-io]` still selects local copies of `bao-tree`,
+`netlink-packet-core`, and `hax-lib-macros` for this workspace. Those patches
+are not part of the Arachne crate dependencies; the clean-consumer check must
+therefore build without them. Keep their upstream copyright, license, and
 notice files intact, and do not imply that the Arachne MPL license replaces
 their terms.
 
@@ -94,23 +99,22 @@ separate release requirement; this guide is not that inventory.
 
 ## Crates.io release gate
 
-Do not enable publishing until a packaged consumer build works without this
-workspace's local patches. `arachne-node` uses `iroh-gossip`'s
-`Builder::dial_capacity` and `iroh-blobs`' `store::gc_run_once`, which are
-provided by our vendored patches. Cargo omits the root `[patch.crates-io]`
-overrides from published package manifests, so crates.io consumers would
-resolve upstream packages without those Arachne changes. The other vendor
-patches also do not transfer to downstream workspaces. Resolve this through
-compatible upstream releases or another registry-compatible dependency plan
-before removing `publish = false`.
+`arachne-node` depends on the two named Arachne Iroh forks so their required
+APIs are ordinary registry dependencies, not workspace-only patches. The
+other three vendor patches are deliberately not part of published package
+manifests. A clean consumer build outside this workspace is the release gate;
+it must resolve registry-compatible package names and dependencies without
+inheriting this root manifest's `[patch.crates-io]` entries.
 
-The first-party dependency order is `arachne-routing`, `arachne-security`, and
-`arachne-store`, followed by `arachne-delivery` and `arachne-node`, then
-`arachne-runtime`. Publish and verify each package in that order; Cargo cannot
-resolve a dependent package's registry version before the dependency has been
-published. Crates.io releases are effectively permanent, so run the full
-package checks and confirm names and ownership immediately before the first
-upload.
+Publish in dependency order: `arachne-routing`, `arachne-security`, and
+`arachne-store`; then `arachne-delivery`, `arachne-iroh-gossip`, and
+`arachne-iroh-blobs`; then `arachne-node`; finally `arachne-runtime`. Cargo
+cannot resolve an unpublished first-party dependency while verifying its
+dependent package. Package each release, run `cargo publish --dry-run` where
+all registry dependencies are available, and verify the published package
+before proceeding. Crates.io names are first-come and releases effectively
+permanent; reconfirm name availability and ownership immediately before the
+first upload.
 
 ## Change discipline
 
