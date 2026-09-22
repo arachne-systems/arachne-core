@@ -56,7 +56,7 @@ async fn tor_only_nodes_exchange_a_pubsub_message() {
 
         let paths = a.transport_metrics().paths;
         assert!(paths.iter().any(|path| path.endpoint == b.id()));
-        assert!(paths.iter().all(|path| path.route == "custom"), "{paths:?}");
+        assert!(paths.iter().all(|path| path.route == "tor"), "{paths:?}");
         a.close().await;
         b.close().await;
     })

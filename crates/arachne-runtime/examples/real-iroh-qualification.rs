@@ -522,6 +522,7 @@ fn compact_metrics(value: &Value) -> Value {
         if let Some(route) = path["route"].as_str().map(|route| match route {
             "direct" => "direct",
             "relay" => "relay",
+            "tor" => "tor",
             _ => "custom",
         }) {
             *routes.entry(route).or_default() += 1;

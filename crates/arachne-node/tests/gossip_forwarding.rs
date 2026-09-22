@@ -145,16 +145,18 @@ async fn workspace_publication_crosses_an_intermediate_without_a_direct_route() 
         // Losing the forwarding neighbor must repair to another authorized path.
         b.close().await;
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(matches!(
-            a.publish(
+        let disconnected = a
+            .publish(
                 workspace,
                 1,
                 topic.clone(),
-                b"before-route-refresh".to_vec()
+                b"before-route-refresh".to_vec(),
             )
-            .await,
-            Err(Error::MissingPeer)
-        ));
+            .await;
+        let disconnected = disconnected.unwrap();
+        assert!(disconnected.queued);
+        assert!(disconnected.failed.is_empty());
+        assert!(received.try_recv().is_err());
         a.add_address_hint(c.id(), c.address()).await.unwrap();
         c.add_address_hint(a.id(), a.address()).await.unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -170,10 +172,17 @@ async fn workspace_publication_crosses_an_intermediate_without_a_direct_route() 
                 result => panic!("overlay did not repair after neighbor loss: {result:?}"),
             }
         }
-        let repaired = tokio::time::timeout(Duration::from_secs(5), received.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let repaired = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message = received.recv().await.unwrap();
+                if message.payload == b"after-loss" {
+                    break message;
+                }
+                assert_eq!(message.payload, b"before-route-refresh");
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(repaired.sender, a.id());
         assert_eq!(repaired.received_from, a.id());
         assert_eq!(repaired.payload, b"after-loss");

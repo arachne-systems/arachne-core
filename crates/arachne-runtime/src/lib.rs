@@ -3662,10 +3662,11 @@ fn execute_in_session(
                 .map_err(str::to_owned)?[0];
             if author_endpoint != session.node.id()
                 && !candidates.contains(&author_endpoint)
-                && session
-                    .runtime
-                    .block_on(session.node.address_hint(author_endpoint))
-                    .is_some()
+                && (session.node.can_dial_by_peer_id()
+                    || session
+                        .runtime
+                        .block_on(session.node.address_hint(author_endpoint))
+                        .is_some())
             {
                 candidates.insert(0, author_endpoint);
             }
@@ -4099,10 +4100,11 @@ fn execute_in_session(
             candidates.truncate(MAX_WORKSPACE_OVERLAY_PATHS);
             if authority_endpoint != session.node.id()
                 && !candidates.contains(&authority_endpoint)
-                && session
-                    .runtime
-                    .block_on(session.node.address_hint(authority_endpoint))
-                    .is_some()
+                && (session.node.can_dial_by_peer_id()
+                    || session
+                        .runtime
+                        .block_on(session.node.address_hint(authority_endpoint))
+                        .is_some())
             {
                 candidates.insert(0, authority_endpoint);
             }

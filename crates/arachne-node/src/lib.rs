@@ -834,6 +834,12 @@ impl Node {
         self.connections.address_hint(peer).await
     }
 
+    /// Whether the configured Iroh transport can resolve a destination from
+    /// its authenticated endpoint ID without a socket address hint.
+    pub fn can_dial_by_peer_id(&self) -> bool {
+        self.connections.can_dial_by_peer_id()
+    }
+
     /// Endpoints passively observed on the application-named local mDNS service.
     /// These are route hints only and carry no workspace or human identity claim.
     pub async fn nearby_peers(&self) -> Vec<PeerId> {
