@@ -305,6 +305,28 @@ pub struct PublicationCandidate {
     pub snapshot: Vec<u8>,
 }
 
+/// A protected incoming publication staged for caller-owned save/adopt.
+/// The authenticated plaintext is withheld until `adopt_protected_reception`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtectedReceptionCandidate {
+    pub workspace: [u8; 32],
+    pub snapshot: Vec<u8>,
+}
+
+/// An authenticated protected publication released by candidate adoption.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceivedProtectedPublication {
+    pub workspace: [u8; 32],
+    pub revision: u64,
+    pub member: [u8; 32],
+    pub endpoint: [u8; 32],
+    pub topic: String,
+    pub id: [u8; 16],
+    pub sequence: Option<u64>,
+    pub payload: Vec<u8>,
+    pub recipients: Vec<[u8; 32]>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InterestObservation {
     pub workspace: [u8; 32],
@@ -870,6 +892,77 @@ impl Client {
             })
     }
 
+    /// Stage one protected incoming publication without exposing its plaintext.
+    /// Save the exact snapshot before adoption whenever record storage is enabled.
+    pub fn poll_protected(&self) -> Result<Option<ProtectedReceptionCandidate>> {
+        let [metadata, snapshot] =
+            execute_stored(self.handle()?, br#"{"op":"poll_protected"}"#, &[])
+                .map_err(|message| map_error(&message))?;
+        let value: Value = serde_json::from_slice(&metadata).map_err(|parse_error| {
+            error(
+                ErrorKind::Internal,
+                format!("invalid protected reception candidate: {parse_error}"),
+            )
+        })?;
+        if value.is_null() {
+            if snapshot.is_empty() {
+                return Ok(None);
+            }
+            return Err(error(
+                ErrorKind::Internal,
+                "empty protected reception returned a snapshot",
+            ));
+        }
+        let raw: RawProtectedReceptionCandidate =
+            serde_json::from_value(value).map_err(|parse_error| {
+                error(
+                    ErrorKind::Internal,
+                    format!("invalid protected reception candidate: {parse_error}"),
+                )
+            })?;
+        if raw.state != "awaiting_reception_save" || snapshot.is_empty() {
+            return Err(error(
+                ErrorKind::Internal,
+                "protected reception has no adoptable snapshot",
+            ));
+        }
+        Ok(Some(ProtectedReceptionCandidate {
+            workspace: raw.workspace,
+            snapshot,
+        }))
+    }
+
+    /// Adopt a staged protected reception and release its authenticated payload.
+    pub fn adopt_protected_reception(
+        &self,
+        snapshot: &[u8],
+    ) -> Result<ReceivedProtectedPublication> {
+        let [metadata, _] = execute_stored(
+            self.handle()?,
+            br#"{"op":"adopt_reception"}"#,
+            snapshot,
+        )
+        .map_err(|message| map_error(&message))?;
+        let raw: RawProtectedPublication =
+            serde_json::from_slice(&metadata).map_err(|parse_error| {
+                error(
+                    ErrorKind::Internal,
+                    format!("invalid adopted protected publication: {parse_error}"),
+                )
+            })?;
+        Ok(ReceivedProtectedPublication {
+            workspace: raw.workspace,
+            revision: raw.revision,
+            member: raw.member,
+            endpoint: raw.endpoint,
+            topic: raw.topic,
+            id: raw.id,
+            sequence: raw.sequence,
+            payload: raw.payload,
+            recipients: raw.recipients,
+        })
+    }
+
     pub fn set_interest(
         &self,
         workspace: [u8; 32],
@@ -1346,6 +1439,26 @@ struct RawPublication {
     sender: [u8; 32],
     topic: String,
     payload: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct RawProtectedReceptionCandidate {
+    workspace: [u8; 32],
+    state: String,
+}
+
+#[derive(Deserialize)]
+struct RawProtectedPublication {
+    workspace: [u8; 32],
+    revision: u64,
+    member: [u8; 32],
+    endpoint: [u8; 32],
+    topic: String,
+    id: [u8; 16],
+    sequence: Option<u64>,
+    payload: Vec<u8>,
+    #[serde(default)]
+    recipients: Vec<[u8; 32]>,
 }
 
 #[derive(Deserialize)]

@@ -49,10 +49,10 @@ pub use client::{
     DurationSummary, EndpointInfo, Error, ErrorKind, InterestObservation, InvitationDetails,
     InvitationInfo, JoinAdmissionStep, JoinRequest, MemberInfo, MemberKind,
     MembershipGossipMetrics, MemberRoster, Network, PeerPolicy, PeerRoute, Presence, Publication,
-    PublicationCandidate, RecoveredPublication, RecoveryAdoption, RecoveryCandidate,
-    RecoveryRangeReady, RecoveryRangeRequest, RecoveryRangeStatus, RecoveryStage,
-    Result as ClientResult, RouteHint, RouteKind, WorkspaceCandidate, WorkspaceInfo,
-    WorkspaceMetrics, WorkspaceState,
+    PublicationCandidate, ProtectedReceptionCandidate, ReceivedProtectedPublication,
+    RecoveredPublication, RecoveryAdoption, RecoveryCandidate, RecoveryRangeReady,
+    RecoveryRangeRequest, RecoveryRangeStatus, RecoveryStage, Result as ClientResult, RouteHint,
+    RouteKind, WorkspaceCandidate, WorkspaceInfo, WorkspaceMetrics, WorkspaceState,
 };
 pub use persistence::{enable_record_storage, restore_record_storage, save_candidate};
 pub use workspace_activity::{Activity as WorkspaceActivity, Phase as WorkspacePhase};
