@@ -1,9 +1,13 @@
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
     WorkspacePhase, cancel, close, create, create_lan, create_nearby, create_relay, create_wan,
-    create_wan_only, describe, execute, execute_stored, wait_for_work,
+    create_wan_only, describe, enable_record_storage as enable_runtime_record_storage, execute,
+    execute_stored, restore_record_storage as restore_runtime_record_storage,
+    save_candidate as save_runtime_candidate, wait_for_work,
 };
 
 /// Address discovery and transport selection for a typed runtime client.
@@ -305,6 +309,37 @@ pub struct PublicationCandidate {
     pub snapshot: Vec<u8>,
 }
 
+/// Current-value metadata for a protected publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct PublicationCurrent {
+    pub selector: [u8; 32],
+    pub replacement_key: [u8; 32],
+    pub expires_at: u64,
+    pub tombstone: bool,
+}
+
+/// A protected incoming publication staged for caller-owned save/adopt.
+/// The authenticated plaintext is withheld until `adopt_protected_reception`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtectedReceptionCandidate {
+    pub workspace: [u8; 32],
+    pub snapshot: Vec<u8>,
+}
+
+/// An authenticated protected publication released by candidate adoption.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceivedProtectedPublication {
+    pub workspace: [u8; 32],
+    pub revision: u64,
+    pub member: [u8; 32],
+    pub endpoint: [u8; 32],
+    pub topic: String,
+    pub id: [u8; 16],
+    pub sequence: Option<u64>,
+    pub payload: Vec<u8>,
+    pub recipients: Vec<[u8; 32]>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InterestObservation {
     pub workspace: [u8; 32],
@@ -517,11 +552,23 @@ impl Client {
         checkpoint: &[u8],
         display_name: &str,
     ) -> Result<JoinRequest> {
+        self.begin_join_with_peers(invitation, checkpoint, display_name, &[])
+    }
+
+    /// Begin joining with known peers for the admission exchange.
+    pub fn begin_join_with_peers(
+        &self,
+        invitation: &[u8],
+        checkpoint: &[u8],
+        display_name: &str,
+        peers: &[[u8; 32]],
+    ) -> Result<JoinRequest> {
         let response = self.request(json!({
             "op": "begin_join",
             "invitation": invitation,
             "checkpoint": checkpoint,
             "display_name": display_name,
+            "peers": peers,
         }))?;
         let raw: RawJoinRequest = serde_json::from_value(response).map_err(|parse_error| {
             error(
@@ -537,6 +584,11 @@ impl Client {
                 .admission_request
                 .ok_or_else(|| error(ErrorKind::InvalidInput, "invitation has no admission request"))?,
         })
+    }
+
+    /// Advance a join restored from native record storage.
+    pub fn drive_join(&self) -> Result<Value> {
+        self.request(json!({"op": "drive_join"}))
     }
 
     pub fn stage_admission(
@@ -608,6 +660,29 @@ impl Client {
         parse_workspace_info(&metadata, "join adoption")
     }
 
+    /// Enable encrypted native storage for this client's workspace.
+    pub fn enable_record_storage(&self, path: &Path, root: &[u8; 32]) -> Result<()> {
+        enable_runtime_record_storage(self.handle()?, path, root)
+            .map_err(|message| error(ErrorKind::Storage, message))
+    }
+
+    /// Restore a workspace from encrypted native storage.
+    pub fn restore_record_storage(
+        &self,
+        path: &Path,
+        root: &[u8; 32],
+        workspace: [u8; 32],
+    ) -> Result<Value> {
+        restore_runtime_record_storage(self.handle()?, path, root, workspace)
+            .map_err(|message| error(ErrorKind::Storage, message))
+    }
+
+    /// Save the exact staged snapshot before adopting it.
+    pub fn save_candidate(&self, snapshot: &[u8]) -> Result<()> {
+        save_runtime_candidate(self.handle()?, snapshot)
+            .map_err(|message| error(ErrorKind::Storage, message))
+    }
+
     pub fn member_roster(&self) -> Result<MemberRoster> {
         let response = self.request(json!({"op": "member_roster"}))?;
         let raw: RawMemberRoster = serde_json::from_value(response).map_err(|parse_error| {
@@ -631,6 +706,13 @@ impl Client {
             profile_count: raw.profiles.len(),
             profiles_retained: raw.profiles_retained.unwrap_or(true),
         })
+    }
+
+    /// Mark this session's signed workspace profile as a service.
+    /// This grants no membership or publication rights.
+    pub fn use_service_profile(&self) -> Result<()> {
+        self.request(json!({"op": "use_service_profile"}))?;
+        Ok(())
     }
 
     pub fn issue_invitation(&self) -> Result<InvitationInfo> {
@@ -794,6 +876,11 @@ impl Client {
         Ok(())
     }
 
+    pub fn enable_object_delivery(&self) -> Result<()> {
+        self.request(json!({"op": "enable_object_delivery"}))?;
+        Ok(())
+    }
+
     pub fn stage_protected_publication(
         &self,
         workspace: [u8; 32],
@@ -802,12 +889,25 @@ impl Client {
         id: [u8; 16],
         payload: Vec<u8>,
     ) -> Result<PublicationCandidate> {
+        self.stage_protected_publication_with_current(workspace, revision, topic, id, payload, None)
+    }
+
+    pub fn stage_protected_publication_with_current(
+        &self,
+        workspace: [u8; 32],
+        revision: u64,
+        topic: &str,
+        id: [u8; 16],
+        payload: Vec<u8>,
+        current: Option<PublicationCurrent>,
+    ) -> Result<PublicationCandidate> {
         let request = serde_json::to_vec(&json!({
             "op": "stage_network_publication",
             "revision": revision,
             "topic": topic,
             "id": id,
             "payload": payload,
+            "current": current,
         }))
         .map_err(|parse_error| error(ErrorKind::Internal, parse_error.to_string()))?;
         let [metadata, snapshot] =
@@ -868,6 +968,77 @@ impl Client {
                     format!("invalid publication admission: {parse_error}"),
                 )
             })
+    }
+
+    /// Stage one protected incoming publication without exposing its plaintext.
+    /// Save the exact snapshot before adoption whenever record storage is enabled.
+    pub fn poll_protected(&self) -> Result<Option<ProtectedReceptionCandidate>> {
+        let [metadata, snapshot] =
+            execute_stored(self.handle()?, br#"{"op":"poll_protected"}"#, &[])
+                .map_err(|message| map_error(&message))?;
+        let value: Value = serde_json::from_slice(&metadata).map_err(|parse_error| {
+            error(
+                ErrorKind::Internal,
+                format!("invalid protected reception candidate: {parse_error}"),
+            )
+        })?;
+        if value.is_null() {
+            if snapshot.is_empty() {
+                return Ok(None);
+            }
+            return Err(error(
+                ErrorKind::Internal,
+                "empty protected reception returned a snapshot",
+            ));
+        }
+        let raw: RawProtectedReceptionCandidate =
+            serde_json::from_value(value).map_err(|parse_error| {
+                error(
+                    ErrorKind::Internal,
+                    format!("invalid protected reception candidate: {parse_error}"),
+                )
+            })?;
+        if raw.state != "awaiting_reception_save" || snapshot.is_empty() {
+            return Err(error(
+                ErrorKind::Internal,
+                "protected reception has no adoptable snapshot",
+            ));
+        }
+        Ok(Some(ProtectedReceptionCandidate {
+            workspace: raw.workspace,
+            snapshot,
+        }))
+    }
+
+    /// Adopt a staged protected reception and release its authenticated payload.
+    pub fn adopt_protected_reception(
+        &self,
+        snapshot: &[u8],
+    ) -> Result<ReceivedProtectedPublication> {
+        let [metadata, _] = execute_stored(
+            self.handle()?,
+            br#"{"op":"adopt_reception"}"#,
+            snapshot,
+        )
+        .map_err(|message| map_error(&message))?;
+        let raw: RawProtectedPublication =
+            serde_json::from_slice(&metadata).map_err(|parse_error| {
+                error(
+                    ErrorKind::Internal,
+                    format!("invalid adopted protected publication: {parse_error}"),
+                )
+            })?;
+        Ok(ReceivedProtectedPublication {
+            workspace: raw.workspace,
+            revision: raw.revision,
+            member: raw.member,
+            endpoint: raw.endpoint,
+            topic: raw.topic,
+            id: raw.id,
+            sequence: raw.sequence,
+            payload: raw.payload,
+            recipients: raw.recipients,
+        })
     }
 
     pub fn set_interest(
@@ -1346,6 +1517,26 @@ struct RawPublication {
     sender: [u8; 32],
     topic: String,
     payload: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct RawProtectedReceptionCandidate {
+    workspace: [u8; 32],
+    state: String,
+}
+
+#[derive(Deserialize)]
+struct RawProtectedPublication {
+    workspace: [u8; 32],
+    revision: u64,
+    member: [u8; 32],
+    endpoint: [u8; 32],
+    topic: String,
+    id: [u8; 16],
+    sequence: Option<u64>,
+    payload: Vec<u8>,
+    #[serde(default)]
+    recipients: Vec<[u8; 32]>,
 }
 
 #[derive(Deserialize)]
