@@ -47,8 +47,7 @@ silently persist application state on the host’s behalf.
 ## Status
 
 Pre-release software under active development. APIs and persisted formats may
-change; seven of the eight crates are published on crates.io, with the initial
-`arachne-runtime` publication still pending.
+change. All eight crates have an initial release on crates.io.
 Direct, local, and selected relay paths have Rust test coverage, but that is not
 a guarantee of reachability or capacity on every network or deployment.
 

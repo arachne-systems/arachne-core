@@ -124,12 +124,13 @@ not manually bump crate versions for normal releases.
 
 Publishing uses crates.io Trusted Publishing through GitHub Actions OIDC; no
 crates.io API token is stored in GitHub. Configure each already-published
-crate's trusted publisher with owner `arachne-systems`, repository
-`arachne-core`, and workflow filename `release-plz.yml` (the workflow itself is
-located at `.github/workflows/release-plz.yml`). A new crate
+crate's trusted publisher, including `arachne-runtime`, with owner
+`arachne-systems`, repository `arachne-core`, and workflow filename
+`release-plz.yml` (the workflow itself is located at
+`.github/workflows/release-plz.yml`). A new crate
 must first be uploaded manually with Cargo; configure its trusted publisher
-after that initial upload. `arachne-runtime` is currently excluded from
-release-plz until its first upload and trusted publisher setup are complete.
+after that initial upload. `arachne-runtime` is temporarily excluded from
+release-plz until its Trusted Publisher is configured.
 
 The organization currently blocks `GITHUB_TOKEN` from creating pull requests.
 The workflow therefore uses a repository-scoped GitHub App token. Create an
