@@ -683,6 +683,13 @@ impl Client {
         })
     }
 
+    /// Mark this session's signed workspace profile as a service.
+    /// This grants no membership or publication rights.
+    pub fn use_service_profile(&self) -> Result<()> {
+        self.request(json!({"op": "use_service_profile"}))?;
+        Ok(())
+    }
+
     pub fn issue_invitation(&self) -> Result<InvitationInfo> {
         let response = self.request(json!({"op": "issue_invitation"}))?;
         let raw: RawInvitationInfo = serde_json::from_value(response).map_err(|parse_error| {
