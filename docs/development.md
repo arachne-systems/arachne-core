@@ -113,11 +113,30 @@ Publish in dependency order: `arachne-routing`, `arachne-security`, and
 `arachne-store`; then `arachne-delivery`, `arachne-iroh-gossip`, and
 `arachne-iroh-blobs`; then `arachne-node`; finally `arachne-runtime`. Cargo
 cannot resolve an unpublished first-party dependency while verifying its
-dependent package. Package each release, run `cargo publish --dry-run` where
-all registry dependencies are available, and verify the published package
-before proceeding. Crates.io names are first-come and releases effectively
-permanent; reconfirm name availability and ownership immediately before the
-first upload.
+dependent package. The release selectors are:
+
+| Order | Package | Selector from repository root |
+| --- | --- | --- |
+| 1 | `arachne-routing` | `-p arachne-routing` |
+| 2 | `arachne-security` | `-p arachne-security` |
+| 3 | `arachne-store` | `-p arachne-store` |
+| 4 | `arachne-delivery` | `-p arachne-delivery` |
+| 5 | `arachne-iroh-gossip` | `--manifest-path vendor/iroh-gossip/Cargo.toml` |
+| 6 | `arachne-iroh-blobs` | `--manifest-path vendor/iroh-blobs/Cargo.toml` |
+| 7 | `arachne-node` | `-p arachne-node` |
+| 8 | `arachne-runtime` | `-p arachne-runtime` |
+
+For each selector, run `cargo publish --dry-run <selector>`, then
+`cargo publish <selector>` only after the exact release commit and version are
+approved. Wait for the package to appear in the registry index before moving to
+the next dependent package; do not publish the workspace as one batch. Before
+the first upload, confirm crate-name availability and ownership and establish a
+crates.io publisher account. Store authentication in Cargo's user-level
+credentials, never in this repository. The names returned 404 from the sparse
+index on 2026-09-22; names are first-come and that observation does not reserve
+them. Each uploaded version is effectively permanent: it cannot be overwritten
+or deleted, and yanking does not remove its source archive. See the [Cargo
+publishing guide](https://doc.rust-lang.org/cargo/reference/publishing.html).
 
 ## Change discipline
 
