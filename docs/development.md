@@ -30,6 +30,9 @@ cargo +1.98.0 check --locked --workspace
 cargo +1.98.0 test --locked --workspace -- --test-threads=1
 ```
 
+Published manifests declare Rust 1.91 as the MSRV. Verify that claim with
+`cargo +1.91.0 check --locked --workspace` before changing the dependency lock.
+
 Run from the repository root. Tests are serialized within each test binary
 because runtime tests share process-wide session state and capacity. The
 workspace build and tests are Rust checks; they do not build the Android plugin,
