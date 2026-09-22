@@ -93,9 +93,12 @@ When updating a patched dependency:
 4. Update `Cargo.lock`, run the relevant crate tests, and include the patch
    rationale in the change.
 
-The per-directory upstream README/license files are retained as provenance
-material. A source-provenance and dependency-notice inventory is still a
-separate release requirement; this guide is not that inventory.
+The complete inventory of source checked into `vendor/` is in
+[`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md); each entry links to its
+upstream license and patch/provenance record. Cargo registry dependencies remain
+separate packages with their own declared license terms. The vendor inventory is
+not an application-binary notice set: create target- and feature-specific
+notices when bundling Core into a binary distribution.
 
 ## Crates.io release gate
 

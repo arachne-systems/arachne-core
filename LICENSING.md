@@ -1,8 +1,9 @@
 # Licensing
 
 The Mozilla Public License 2.0 in [`LICENSE`](LICENSE) applies to Arachne-authored
-source in this repository; workspace package manifests identify Arachne crates
-as `MPL-2.0`. It does not relicense third-party code.
+source in this repository. Each Arachne package inherits this license text via
+`license-file.workspace`; Cargo includes the canonical file in each package
+archive. This license does not relicense third-party code.
 
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) inventories source checked in
 under `vendor/`, whose original license texts and Arachne patch notes remain in
