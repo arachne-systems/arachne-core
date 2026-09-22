@@ -316,10 +316,12 @@ impl ResourceTransfers {
         progress.send_replace(local.local_bytes());
         if !local.is_complete() {
             let mut changes = self.0.changed.subscribe();
-            let connection =
-                tokio::time::timeout(IDLE_TIMEOUT, self.0.connections.connect(peer, ALPN))
-                    .await
-                    .map_err(|_| Error::Timeout("resource connect"))??;
+            let connection = tokio::time::timeout(
+                self.0.connections.operation_timeout(),
+                self.0.connections.connect(peer, ALPN),
+            )
+            .await
+            .map_err(|_| Error::Timeout("resource connect"))??;
             self.authorize(workspace, revision, peer).await?;
             let (mut send, recv) = connection.open_bi().await.map_err(transport)?;
             send.write_all(&[STREAM_KIND]).await.map_err(transport)?;

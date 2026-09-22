@@ -315,8 +315,9 @@ impl ControlClient {
             let payload = payload.ok_or(Error::TooLarge)?;
             let mut stage = "connect";
             let mut observed = None;
-            let outcome = tokio::time::timeout(CONTROL_TIMEOUT, async {
-            let connection = tokio::time::timeout(TIMEOUT, connections.connect(peer, ALPN))
+            let operation_timeout = connections.operation_timeout();
+            let outcome = tokio::time::timeout(CONTROL_TIMEOUT.max(operation_timeout), async {
+            let connection = tokio::time::timeout(operation_timeout, connections.connect(peer, ALPN))
                 .await.map_err(|_| Error::Timeout("control connect"))?
                 ?;
             observed = Some(connection.clone());

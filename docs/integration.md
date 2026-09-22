@@ -30,9 +30,26 @@ other typed profiles require one.
 | `Wan` | Public lookup and relay-assisted connectivity. | Does not guarantee a usable route. |
 | `RelayOnly` | Prefer relay-only transport behavior. | A custom operator relay is not configurable through `ClientConfig` today. |
 | `WanOnly` | WAN lookup without LAN discovery or saved address hints. | Intended for diagnostics; direct paths remain enabled. |
+| `Tor` | Tor hidden-service transport only. | Requires the `tor` feature, a stable endpoint secret, and a local Tor daemon; IP and Iroh relay transports are disabled. |
 
 The lower-level node/runtime surface has additional relay configuration. The
 typed `ClientConfig` does not currently expose it as an adopter-ready option.
+
+`Tor` is experimental because it uses Iroh's unstable custom-transport API.
+The Tor transport creates an ephemeral onion service from the endpoint identity,
+so peers can dial by endpoint key without an IP address hint. It expects the
+Tor SOCKS5 and control ports at `127.0.0.1:9050` and `127.0.0.1:9051`. Keep the
+endpoint secret stable to keep the same endpoint identity and derived onion
+address across restarts. The profile does not fall back to direct IP or Iroh
+relay paths.
+
+The Docker-backed Core integration check is ignored in ordinary test runs and
+can be run with a local Tor daemon available on those ports:
+
+```sh
+cargo test -p arachne-node --features tor --test tor_transport -- --ignored --nocapture
+cargo test -p arachne-runtime --features tor --test tor_client -- --ignored --nocapture
+```
 
 ## Workspace lifecycle
 
