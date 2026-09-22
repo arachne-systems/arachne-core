@@ -5,6 +5,8 @@ use crate::{
     WorkspacePhase, cancel, close, create, create_lan, create_nearby, create_relay, create_wan,
     create_wan_only, describe, execute, execute_stored, wait_for_work,
 };
+#[cfg(feature = "tor")]
+use crate::create_tor;
 
 /// Address discovery and transport selection for a typed runtime client.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,6 +17,8 @@ pub enum Network {
     Wan,
     RelayOnly,
     WanOnly,
+    #[cfg(feature = "tor")]
+    Tor,
 }
 
 /// Configuration for one workspace-facing runtime client.
@@ -430,6 +434,8 @@ impl Client {
             Network::WanOnly => {
                 create_required_secret(config.secret.as_ref(), "WAN-only", create_wan_only)
             }
+            #[cfg(feature = "tor")]
+            Network::Tor => create_required_secret(config.secret.as_ref(), "Tor", create_tor),
         };
         Ok(Self {
             handle: Some(handle?),

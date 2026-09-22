@@ -53,6 +53,8 @@ pub enum NetworkProfile {
     Wan,
     RelayOnly,
     WanOnly,
+    #[cfg(feature = "tor")]
+    Tor,
 }
 
 impl NetworkProfile {
@@ -64,7 +66,17 @@ impl NetworkProfile {
             Self::Wan => (Some("data-fabric"), true, false, false),
             Self::RelayOnly => (None, true, true, false),
             Self::WanOnly => (None, true, false, false),
+            #[cfg(feature = "tor")]
+            Self::Tor => (None, false, true, false),
         }
+    }
+
+    fn uses_tor(self) -> bool {
+        #[cfg(feature = "tor")]
+        return matches!(self, Self::Tor);
+
+        #[cfg(not(feature = "tor"))]
+        false
     }
 }
 
@@ -451,6 +463,19 @@ impl Node {
             address,
             Some(secret),
             NetworkProfile::WanOnly,
+            ConnectionBudget::default(),
+        )
+        .await
+    }
+
+    /// Bind using Tor's custom transport and an endpoint identity that derives
+    /// the onion address. Requires a local Tor daemon on ports 9050 and 9051.
+    #[cfg(feature = "tor")]
+    pub async fn bind_tor_with_identity(secret: &[u8; 32]) -> Result<(Self, MessageReceiver)> {
+        Self::bind_with_profile(
+            SocketAddr::from(([0, 0, 0, 0], 0)),
+            Some(secret),
+            NetworkProfile::Tor,
             ConnectionBudget::default(),
         )
         .await
@@ -1273,7 +1298,7 @@ async fn send_frame(
     let mut stage = "connect";
     let mut observed_connection = None;
     tracing::info!(target: "data_fabric_transport", remote = %key, bytes = bytes.len(), "TRANSPORT_SEND_BEGIN");
-    let result = tokio::time::timeout(TIMEOUT, async {
+    let result = tokio::time::timeout(connections.operation_timeout(), async {
         let connection = connections.connect(peer, ALPN).await?;
         observed_connection = Some(connection.clone());
         tracing::info!(target: "data_fabric_transport", remote = %key, connection_id = connection.stable_id(), paths = ?connection.paths(), "TRANSPORT_SEND_CONNECTED");

@@ -13,6 +13,9 @@ documentation = "https://docs.rs/arachne-runtime"
 readme = "README.md"
 publish = ["crates-io"]
 
+[features]
+tor = ["arachne-node/tor"]
+
 [dependencies]
 arachne-delivery = { path = "../arachne-delivery", version = "0.1.0" }
 arachne-routing = { path = "../arachne-routing", version = "0.1.0" }

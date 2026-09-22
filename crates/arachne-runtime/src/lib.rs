@@ -501,50 +501,53 @@ fn nearby_workspace_payloads(reply: &[u8]) -> Vec<&[u8]> {
 /// Create an endpoint session. Credentials must be unique to this workspace-facing endpoint.
 /// Blocking: invoke outside an async runtime. Call `close` to release its resources.
 pub fn create(secret: Option<&[u8; 32]>) -> Result<i64, String> {
-    create_endpoint(secret, false, false, false, false, None)
+    create_endpoint(secret, NetworkProfile::Direct, None)
 }
 
 /// Opt in to local endpoint advertisement and lookup. No public discovery or relay.
 /// Uses the supplied workspace-scoped identity; discovery does not grant membership.
 pub fn create_lan(secret: &[u8; 32]) -> Result<i64, String> {
-    create_endpoint(Some(secret), true, false, false, false, None)
+    create_endpoint(Some(secret), NetworkProfile::Lan, None)
 }
 
 /// Advertise a device-level nearby-invitation endpoint on the local network.
 pub fn create_nearby(secret: &[u8; 32]) -> Result<i64, String> {
-    create_endpoint(Some(secret), true, false, false, true, None)
+    create_endpoint(Some(secret), NetworkProfile::Nearby, None)
 }
 
 /// Opt in to Iroh's public Pkarr lookup and relay network, with LAN discovery
 /// retained as a local fallback. External services provide routes, not authority.
 pub fn create_wan(secret: &[u8; 32]) -> Result<i64, String> {
-    create_endpoint(Some(secret), true, true, false, false, None)
+    create_endpoint(Some(secret), NetworkProfile::Wan, None)
 }
 
 /// Force Iroh relay paths for a diagnostic WAN check while preserving the
 /// caller's network connection and workspace-scoped endpoint identity.
 pub fn create_relay(secret: &[u8; 32]) -> Result<i64, String> {
-    create_endpoint(Some(secret), false, true, true, false, None)
+    create_endpoint(Some(secret), NetworkProfile::RelayOnly, None)
 }
 
 /// Use a caller-supplied relay map for controlled qualification or an
 /// operator-managed relay deployment.
 pub fn create_relay_with_options(secret: &[u8; 32], relay: RelayOptions) -> Result<i64, String> {
-    create_endpoint(Some(secret), false, true, true, false, Some(relay))
+    create_endpoint(Some(secret), NetworkProfile::RelayOnly, Some(relay))
 }
 
 /// Use public endpoint lookup without LAN discovery or saved address hints.
 /// Direct Iroh paths remain enabled for a diagnostic WAN check.
 pub fn create_wan_only(secret: &[u8; 32]) -> Result<i64, String> {
-    create_endpoint(Some(secret), false, true, false, false, None)
+    create_endpoint(Some(secret), NetworkProfile::WanOnly, None)
+}
+
+/// Create a Tor-only endpoint using the supplied stable endpoint identity.
+#[cfg(feature = "tor")]
+pub fn create_tor(secret: &[u8; 32]) -> Result<i64, String> {
+    create_endpoint(Some(secret), NetworkProfile::Tor, None)
 }
 
 fn create_endpoint(
     secret: Option<&[u8; 32]>,
-    lan_lookup: bool,
-    wan_lookup: bool,
-    relay_only: bool,
-    nearby: bool,
+    profile: NetworkProfile,
     relay: Option<RelayOptions>,
 ) -> Result<i64, String> {
     let mut registry = REGISTRY.lock().map_err(|_| "node registry unavailable")?;
@@ -561,14 +564,6 @@ fn create_endpoint(
         .block_on(async {
             tokio::time::timeout(Duration::from_secs(10), async {
                 let address = ([0, 0, 0, 0], 0).into();
-                let profile = match (secret, lan_lookup, wan_lookup, relay_only, nearby) {
-                    (Some(_), _, _, _, true) => NetworkProfile::Nearby,
-                    (Some(_), _, _, true, false) => NetworkProfile::RelayOnly,
-                    (Some(_), false, true, false, false) => NetworkProfile::WanOnly,
-                    (Some(_), _, true, false, false) => NetworkProfile::Wan,
-                    (Some(_), true, false, false, false) => NetworkProfile::Lan,
-                    _ => NetworkProfile::Direct,
-                };
                 let bound = match relay {
                     Some(relay) => {
                         Node::bind_with_profile_and_relay(
@@ -584,7 +579,7 @@ fn create_endpoint(
                         Node::bind_with_profile(address, secret, profile, connection_budget).await?
                     }
                 };
-                if relay_only {
+                if matches!(profile, NetworkProfile::RelayOnly) {
                     bound.0.wait_online().await;
                 }
                 Ok::<_, arachne_node::Error>(bound)

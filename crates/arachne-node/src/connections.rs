@@ -22,6 +22,8 @@ const MAX_CONTROL_CONNECTIONS: usize = 32;
 /// First wait after a failed dial; doubles per consecutive failure.
 const UNREACHABLE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_UNREACHABLE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(120);
+const TOR_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+const TOR_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 // The owning Connections instance supplies the local endpoint identity.
 // A peer path/address is deliberately absent from this key.
@@ -134,6 +136,9 @@ pub(super) struct Connections {
     unreachable: Arc<Mutex<BTreeMap<PeerId, (Instant, u32)>>>,
     address_lookup: bool,
     use_ip_hints: bool,
+    tor: bool,
+    #[cfg(feature = "tor")]
+    _tor_transport: Option<Arc<iroh_tor_transport::TorCustomTransport>>,
 }
 
 impl Connections {
@@ -146,8 +151,38 @@ impl Connections {
         relay: Option<RelayOptions>,
     ) -> Result<Self> {
         let (mdns_service, wan_lookup, relay_only, use_ip_hints) = profile.settings();
+        #[cfg(feature = "tor")]
+        let tor_transport = if profile.uses_tor() {
+            if relay.is_some() {
+                return Err(Error::Transport(
+                    "Tor profile cannot be combined with an Iroh relay".into(),
+                ));
+            }
+            let secret = secret.clone().ok_or_else(|| {
+                Error::Transport("Tor profile requires a stable endpoint identity".into())
+            })?;
+            Some(
+                iroh_tor_transport::TorCustomTransport::builder()
+                    .build(secret)
+                    .await
+                    .map_err(transport)?,
+            )
+        } else {
+            None
+        };
         let gossip_authorization = GossipAuthorization::default();
         let observer = ConnectionObserver::default();
+        #[cfg(feature = "tor")]
+        let builder = if let Some(tor_transport) = tor_transport.as_ref() {
+            Endpoint::builder(tor_transport.preset())
+        } else if wan_lookup {
+            Endpoint::builder(presets::N0)
+        } else {
+            Endpoint::builder(presets::Minimal)
+                .clear_relay_transports()
+                .clear_ip_transports()
+        };
+        #[cfg(not(feature = "tor"))]
         let builder = if wan_lookup {
             Endpoint::builder(presets::N0)
         } else {
@@ -162,10 +197,12 @@ impl Connections {
             builder.bind_addr(address).map_err(transport)?
         }
         .alpns(alpns.clone())
-        .address_lookup(memory.clone())
         .hooks(gossip_authorization.clone())
         .hooks(budget.clone())
         .hooks(observer.clone());
+        if !profile.uses_tor() {
+            builder = builder.address_lookup(memory.clone());
+        }
         // Disable GSO on Android x86_64: multi-packet replies fail on the tested
         // emulator path.
         #[cfg(all(target_os = "android", target_arch = "x86_64"))]
@@ -238,8 +275,11 @@ impl Connections {
             nearby,
             nearby_listener: Arc::new(Mutex::new(nearby_listener)),
             unreachable: Arc::new(Mutex::new(BTreeMap::new())),
-            address_lookup: mdns_service.is_some() || wan_lookup,
+            address_lookup: mdns_service.is_some() || wan_lookup || profile.uses_tor(),
             use_ip_hints,
+            tor: profile.uses_tor(),
+            #[cfg(feature = "tor")]
+            _tor_transport: tor_transport,
         })
     }
 
@@ -253,6 +293,14 @@ impl Connections {
 
     pub(super) fn address(&self) -> SocketAddr {
         self.bound_address
+    }
+
+    pub(super) fn operation_timeout(&self) -> std::time::Duration {
+        if self.tor {
+            TOR_OPERATION_TIMEOUT
+        } else {
+            super::TIMEOUT
+        }
     }
 
     pub(super) fn endpoint(&self) -> Endpoint {
@@ -465,7 +513,38 @@ impl Connections {
         // supplied direct address is unreachable, so racing a second connect
         // with a timer only creates duplicate dials and can strand a reply on
         // a path the peer has not settled yet.
-        let outcome = attempt(destination, super::TIMEOUT).await;
+        let outcome = if self.tor {
+            // Tor hidden-service descriptors can take up to two minutes to
+            // propagate. Retry failed SOCKS connects within a bounded window.
+            let deadline = Instant::now() + TOR_DIAL_TIMEOUT;
+            let mut delay = std::time::Duration::from_secs(3);
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break Err(Error::Timeout("Tor connect"));
+                }
+                match attempt(
+                    destination.clone(),
+                    remaining.min(std::time::Duration::from_secs(30)),
+                )
+                .await
+                {
+                    Ok(connection) => break Ok(connection),
+                    Err(_) if Instant::now() < deadline => {
+                        tokio::time::sleep(
+                            delay.min(deadline.saturating_duration_since(Instant::now())),
+                        )
+                        .await;
+                        delay = delay
+                            .saturating_mul(2)
+                            .min(std::time::Duration::from_secs(15));
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+        } else {
+            attempt(destination, super::TIMEOUT).await
+        };
         let mut unreachable = self.unreachable.lock().await;
         match &outcome {
             Ok(_) => {
@@ -474,6 +553,16 @@ impl Connections {
             // Only silence marks a peer unreachable. A peer that answers, even
             // with a refusal such as a full connection budget, is reachable.
             Err(Error::Timeout(_)) => {
+                let failures = unreachable
+                    .get(&peer)
+                    .map_or(0, |(_, failures)| *failures)
+                    .saturating_add(1);
+                unreachable.insert(
+                    peer,
+                    (Instant::now() + unreachable_backoff(failures), failures),
+                );
+            }
+            Err(Error::Transport(_)) if self.tor => {
                 let failures = unreachable
                     .get(&peer)
                     .map_or(0, |(_, failures)| *failures)
