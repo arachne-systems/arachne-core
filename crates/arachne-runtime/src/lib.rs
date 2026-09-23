@@ -190,6 +190,24 @@ impl<Q> Drop for PendingControl<Q> {
     }
 }
 
+async fn request_control_retry_once(
+    control: ControlClient,
+    peer: [u8; 32],
+    payload: &[u8],
+) -> Result<Vec<u8>, arachne_node::Error> {
+    match control.clone().request_control(peer, payload).await {
+        Err(arachne_node::Error::ControlNotSent(_)) => {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            control.retry_control(peer, payload).await
+        }
+        Err(arachne_node::Error::Transport(_) | arachne_node::Error::Timeout(_)) => {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            control.request_control(peer, payload).await
+        }
+        result => result,
+    }
+}
+
 enum JoinAttemptOutcome {
     NotSent,
     Waiting,
@@ -3714,7 +3732,15 @@ fn execute_in_session(
         .map_err(str::to_owned)?;
         let requests = candidates
             .iter()
-            .map(|peer| (*peer, session.node.request_control(*peer, &wire)))
+            .map(|peer| {
+                let peer = *peer;
+                let control = session.node.control_client();
+                let payload = wire.clone();
+                (
+                    peer,
+                    async move { request_control_retry_once(control, peer, &payload).await },
+                )
+            })
             .collect::<Vec<_>>();
         let candidate_count = requests.len();
         let (reply_tx, replies) = mpsc::channel(candidate_count);
