@@ -530,6 +530,7 @@ impl Node {
         let routing = Arc::new(Mutex::new(RoutingTable::default()));
         let resources = resources::ResourceTransfers::new(connections.clone(), routing.clone());
         let (control_inbox, controls, control_signal) = control::ControlInbox::new(512);
+        // This shared signal wakes host polling for control and queued delivery work.
         let events = DeliveryQueue {
             work: Some(control_signal.clone()),
             ..DeliveryQueue::default()
