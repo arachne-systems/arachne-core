@@ -925,6 +925,10 @@ enum Request {
     },
     PollRecoveryRange {},
     NextDirectGap {},
+    NextGroupGap {
+        author: [u8; 32],
+        topics: Vec<String>,
+    },
     FetchDirectRecovery {
         author: [u8; 32],
         revision: u64,
@@ -3875,6 +3879,35 @@ fn execute_in_session(
                 "recipients":gap.recipients, "after":gap.after, "through":gap.through}),
             None => Value::Null,
         }
+    } else if let Request::NextGroupGap { author, topics } = request {
+        if topics.is_empty() || topics.len() > arachne_delivery::MAX_TOPICS {
+            return Err("invalid group recovery topic selection".into());
+        }
+        let topic_count = topics.len();
+        let topics = topics
+            .into_iter()
+            .map(Topic::new)
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        if topics.len() != topic_count {
+            return Err("duplicate group recovery topic".into());
+        }
+        let owner = session
+            .workspace
+            .as_ref()
+            .ok_or("session has no workspace")?;
+        match session
+            .inbox
+            .as_ref()
+            .ok_or("object delivery not enabled")?
+            .next_group_gap(owner, author, &topics)
+            .map_err(str::to_owned)?
+        {
+            Some(gap) => json!({"state":"group_recovery_needed", "author":gap.author,
+                "topics":topics.iter().map(|topic| topic.as_str()).collect::<Vec<_>>(),
+                "after":gap.after, "through":gap.through}),
+            None => Value::Null,
+        }
     } else if let Request::FetchDirectRecovery {
         author,
         revision,
@@ -5933,6 +5966,7 @@ fn execute_in_session(
                     | Request::PollRecoveryRange {}
                     | Request::StageRecoveryRange { .. }
                     | Request::NextDirectGap {}
+                    | Request::NextGroupGap { .. }
                     | Request::FetchDirectRecovery { .. }
                     | Request::PollDirectRecovery {}
                     | Request::StageDirectRecovery {}
@@ -6265,6 +6299,12 @@ mod tests {
             .unwrap();
         call(json!({"op":"restore_workspace","workspace":reader.id(),"snapshot":snapshot}))
             .unwrap();
+        let gap = call(json!({"op":"next_group_gap",
+            "author":sender.member().unwrap().id(),"topics":["chat/messages"]}))
+            .unwrap();
+        assert_eq!(gap["state"], "group_recovery_needed");
+        assert_eq!(gap["after"], 0);
+        assert_eq!(gap["through"], 1);
         let pending = call(json!({"op":"poll_pending_object"})).unwrap();
         assert_eq!(pending["id"], json!(vec![2; 16]));
         assert_eq!(
