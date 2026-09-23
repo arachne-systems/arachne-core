@@ -297,6 +297,22 @@ pub struct ControlClient {
 }
 
 impl ControlClient {
+    /// Retry a request only after the caller confirmed no bytes were sent.
+    /// Clear the failed-dial cooldown for this peer before consuming that retry.
+    pub fn retry_control(
+        &self,
+        peer: PeerId,
+        payload: &[u8],
+    ) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send + 'static {
+        let connections = self.connections.clone();
+        let client = self.clone();
+        let payload = payload.to_vec();
+        async move {
+            connections.clear_unreachable(peer).await;
+            client.request_control(peer, &payload).await
+        }
+    }
+
     pub fn request_control(
         self,
         peer: PeerId,

@@ -434,6 +434,11 @@ impl Connections {
         self.addresses.lock().await.get(&peer).copied()
     }
 
+    /// Clear one peer's failed-dial cooldown for a confirmed-unsent retry.
+    pub(super) async fn clear_unreachable(&self, peer: PeerId) {
+        self.unreachable.lock().await.remove(&peer);
+    }
+
     pub(super) fn can_dial_by_peer_id(&self) -> bool {
         self.address_lookup
     }
@@ -784,13 +789,16 @@ mod tests {
                 "{refused}"
             );
             assert_eq!(cache.budget.control_dials_available(), 16);
-            // New address information ends the backoff: the next call dials again.
-            cache.add_address_hint(dead, nowhere).await.unwrap();
+            // A caller-authorized retry bypasses the peer cooldown without
+            // changing its route information.
+            cache.clear_unreachable(dead).await;
             let redialed = cache.connect(dead, &alpn).await.unwrap_err();
             assert!(
                 !redialed.to_string().contains("recently unreachable"),
                 "{redialed}"
             );
+            cache.add_address_hint(dead, nowhere).await.unwrap();
+            assert!(!cache.unreachable.lock().await.contains_key(&dead));
             cache.close().await;
         })
         .await
