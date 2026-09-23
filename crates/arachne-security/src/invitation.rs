@@ -623,10 +623,26 @@ impl Workspace {
             for step in &history.steps {
                 place_accepted(&mut slots, start, AcceptedStep::History(step))?;
             }
-            // The retained history is authoritative. Once it covers the whole
-            // requested range, scanning the retry index only reparses the same
-            // commits and adds duplicate work to every admission.
+            // History supplies the result, but overlapping retry entries must
+            // agree. Their reply epoch is one past the commit's epoch, so this
+            // check avoids parsing each retained commit again.
             if slots.iter().all(Option::is_some) {
+                for admission in &self.admissions {
+                    let Some(index) = admission
+                        .reply
+                        .epoch
+                        .checked_sub(1)
+                        .and_then(|epoch| epoch.checked_sub(start))
+                        .and_then(|index| usize::try_from(index).ok())
+                    else {
+                        continue;
+                    };
+                    if let Some(Some(existing)) = slots.get(index)
+                        && existing.commit() != admission.reply.commit.as_ref()
+                    {
+                        return None;
+                    }
+                }
                 return slots.into_iter().collect();
             }
         }
@@ -1739,6 +1755,33 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
             .is_err()
     );
     assert_eq!(helper_updated.member_count(), 4);
+}
+
+#[test]
+fn retained_checkpoint_rejects_conflicting_admission_index() {
+    use super::PendingJoin;
+
+    let admin = Workspace::create([1; 32], "Organizer").unwrap();
+    let (created, invitation, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let base = created.workspace;
+    let first = PendingJoin::from_invitation(&invitation, &checkpoint, [2; 32], "First").unwrap();
+    let accepted = base
+        .prepare_admission([2; 32], first.admission_request().unwrap())
+        .unwrap();
+    let competing =
+        PendingJoin::from_invitation(&invitation, &checkpoint, [3; 32], "Competing").unwrap();
+    let competing = base
+        .prepare_admission([3; 32], competing.admission_request().unwrap())
+        .unwrap();
+    assert_ne!(accepted.commit, competing.commit);
+
+    let mut inconsistent = accepted.workspace;
+    let start = checkpoint_epoch(&checkpoint).unwrap();
+    assert!(inconsistent.accepted_range(start).is_some());
+    inconsistent.admissions[0].reply.commit = competing.commit.into();
+    inconsistent.admissions[0].reply.authorization = competing.authorization;
+
+    assert!(inconsistent.accepted_range(start).is_none());
 }
 
 /// FUT-35: the owner must not re-verify its own already-accepted branch for
