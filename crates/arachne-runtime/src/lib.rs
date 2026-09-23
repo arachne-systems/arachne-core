@@ -2750,6 +2750,13 @@ fn execute_in_session(
         if guard.as_ref().ok_or("node is closed")?.records.is_none() {
             return Err("workspace lifecycle requires native record storage".into());
         }
+        // Gossip is ephemeral. Run authenticated presence as part of the
+        // durable pump so an active member can discover and pull a missed epoch.
+        let _ = execute_in_session(
+            guard,
+            Request::PollWorkspacePresence { announce: false },
+            ended,
+        )?;
         let mut staged =
             execute_in_session(guard, Request::PollAdmission { profile: false }, ended)?;
         let staged_state = staged

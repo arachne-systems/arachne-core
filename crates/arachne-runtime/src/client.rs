@@ -607,7 +607,10 @@ impl Client {
         self.request(json!({"op": "drive_join"}))
     }
 
-    /// Process one peer-control event for a durable workspace owner.
+    /// Advance one durable workspace step on every active member.
+    ///
+    /// This processes peer control, verified membership updates, and the
+    /// authenticated presence exchange used to catch up after missed gossip.
     pub fn drive_workspace(&self) -> Result<Value> {
         self.request(json!({"op": "drive_workspace"}))
     }
