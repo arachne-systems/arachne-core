@@ -20,16 +20,38 @@ async fn dialer_reconnects_after_the_listener_restarts_on_the_same_port() {
         let listener_secret = [72; 32];
         let dialer_address = unused_address();
         let listener_address = unused_address();
-        let (node_a, _) = Node::bind_with_identity(dialer_address, &dialer_secret)
+        let (node_a, node_a_messages) = Node::bind_with_identity(dialer_address, &dialer_secret)
             .await
             .unwrap();
-        let (node_b, _) = Node::bind_with_identity(listener_address, &listener_secret)
-            .await
-            .unwrap();
-        let (dialer, listener, listener_secret, listener_address) = if node_a.id() < node_b.id() {
-            (node_a, node_b, listener_secret, listener_address)
+        let (node_b, node_b_messages) =
+            Node::bind_with_identity(listener_address, &listener_secret)
+                .await
+                .unwrap();
+        let (
+            dialer,
+            mut dialer_messages,
+            listener,
+            _listener_messages,
+            listener_secret,
+            listener_address,
+        ) = if node_a.id() < node_b.id() {
+            (
+                node_a,
+                node_a_messages,
+                node_b,
+                node_b_messages,
+                listener_secret,
+                listener_address,
+            )
         } else {
-            (node_b, node_a, dialer_secret, dialer_address)
+            (
+                node_b,
+                node_b_messages,
+                node_a,
+                node_a_messages,
+                dialer_secret,
+                dialer_address,
+            )
         };
         let topic = Topic::new("ptt/audio").unwrap();
         let workspace = [45; 32];
@@ -100,15 +122,15 @@ async fn dialer_reconnects_after_the_listener_restarts_on_the_same_port() {
             .publish_protected_with_class(
                 workspace,
                 1,
-                topic,
+                topic.clone(),
                 1,
                 DeliveryClass::Critical,
                 frame.clone(),
             )
             .await
             .unwrap();
-        assert!(report.queued);
-        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert!(report.queued, "{report:?}");
+        assert!(report.failed.is_empty(), "{report:?}");
         let received = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(message) = listener_messages.try_recv()
@@ -122,6 +144,34 @@ async fn dialer_reconnects_after_the_listener_restarts_on_the_same_port() {
         .await
         .unwrap();
         assert_eq!(received.received_from, dialer.id());
+
+        let reverse_frame = b"packet in reverse after listener restart".to_vec();
+        let report = listener
+            .publish_protected_with_class(
+                workspace,
+                1,
+                topic,
+                1,
+                DeliveryClass::Critical,
+                reverse_frame.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(report.queued, "{report:?}");
+        assert!(report.failed.is_empty(), "{report:?}");
+        let reverse_received = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(message) = dialer_messages.try_recv()
+                    && message.payload == reverse_frame
+                {
+                    break message;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(reverse_received.received_from, listener.id());
 
         dialer.close().await;
         listener.close().await;

@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use tokio::{sync::Mutex, task::JoinHandle};
 
 use crate::{
-    AdmissionReport, DeliveryQueue, Error, Frame, Operation, PeerId, Result, Topic, WorkspaceId,
-    connections::Connections, wire,
+    AdmissionReport, DeliveryClass, DeliveryQueue, Error, Frame, Operation, PeerId, Result, Topic,
+    WorkspaceId, connections::Connections, wire,
 };
 
 const SESSION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -167,6 +167,7 @@ impl Streams {
         }
         let worker = tokio::spawn(run_peer(
             incoming,
+            self.0.connections.clone(),
             self.0.local,
             peer,
             scope,
@@ -475,6 +476,7 @@ async fn authorize(
 
 async fn run_peer(
     mut incoming: iroh_moq::IncomingSessionStream,
+    connections: Connections,
     local: PeerId,
     peer: PeerId,
     scope: Scope,
@@ -496,6 +498,19 @@ async fn run_peer(
             session.close(moq_net::Error::Cancel);
             continue;
         }
+        if let Err(error) =
+            announce_interest(&connections, &routing, local, peer, scope, &topic).await
+        {
+            tracing::warn!(
+                target: "data_fabric_transport",
+                peer = %session.remote_id(),
+                route = "moq",
+                ?error,
+                "PTT_MOQ_INTEREST_SYNC_FAILED",
+            );
+            session.close(moq_net::Error::Cancel);
+            continue;
+        }
         if let Some(counters) = counters.upgrade() {
             counters.sessions_total.fetch_add(1, Ordering::Relaxed);
             counters.sessions_active.fetch_add(1, Ordering::Relaxed);
@@ -511,6 +526,33 @@ async fn run_peer(
             session.close(moq_net::Error::Cancel);
         }
     }
+}
+
+async fn announce_interest(
+    connections: &Connections,
+    routing: &Mutex<RoutingTable>,
+    local: PeerId,
+    peer: PeerId,
+    scope: Scope,
+    topic: &Topic,
+) -> Result<()> {
+    if !routing
+        .lock()
+        .await
+        .subscribed(scope.workspace, scope.revision, local, topic)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let frame = Frame {
+        workspace: scope.workspace,
+        revision: scope.revision,
+        topic: topic.as_str().into(),
+        delivery: DeliveryClass::Critical,
+        operation: Operation::Subscribe,
+    };
+    let bytes = wire::encode(&frame)?;
+    super::send_frame(connections, routing, peer, &frame, &bytes).await
 }
 
 struct ActiveSession(Option<Arc<Counters>>);
@@ -540,8 +582,14 @@ async fn receive_session(
         .map_err(transport)?;
     let track = broadcast.track(topic.as_str()).map_err(transport)?;
     let mut subscriber = track.subscribe(None).await.map_err(transport)?;
+    let closed = session.closed();
+    tokio::pin!(closed);
     loop {
-        let Some(mut group) = subscriber.recv_group().await.map_err(transport)? else {
+        let next_group = tokio::select! {
+            group = subscriber.recv_group() => group.map_err(transport)?,
+            reason = &mut closed => return Err(transport(reason)),
+        };
+        let Some(mut group) = next_group else {
             return Ok(());
         };
         let sequence = group.sequence;
