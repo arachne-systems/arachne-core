@@ -13,10 +13,15 @@ documentation = "https://docs.rs/arachne-node"
 readme = "README.md"
 publish = ["crates-io"]
 
+[features]
+default = []
+moq = ["dep:iroh-moq"]
+
 [dependencies]
 bytes = "1"
 getrandom = "=0.4.3"
 futures-util = "=0.3.34"
+iroh-moq = { git = "https://github.com/n0-computer/iroh-live", rev = "bd5afc40822eca7e6b1db2432556460ddc345a6d", optional = true }
 arachne-routing = { path = "../arachne-routing", version = "0.1.0" }
 iroh = { version = "=1.2.0", default-features = false, features = ["tls-ring", "metrics"] }
 iroh-blobs = { package = "arachne-iroh-blobs", path = "../../vendor/iroh-blobs", version = "=0.103.0", default-features = false, features = ["fs-store"] }
