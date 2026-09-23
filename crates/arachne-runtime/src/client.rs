@@ -401,6 +401,35 @@ pub struct RecoveryRangeRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryCutoffRequest {
+    pub peer: [u8; 32],
+    pub revision: u64,
+    pub topics: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryCutoff {
+    pub workspace: [u8; 32],
+    pub author: [u8; 32],
+    pub peer: [u8; 32],
+    pub epoch: u64,
+    pub revision: u64,
+    pub topics: Vec<String>,
+    pub head: u64,
+    pub retained_after: u64,
+    pub accepted_through: u64,
+    /// None when the bounded inbox cannot prove the cursor prefix.
+    pub received_through: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RecoveryCutoffStatus {
+    Pending,
+    Observed(RecoveryCutoff),
+    Denied,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryRangeReady {
     pub workspace: [u8; 32],
     pub author: [u8; 32],
@@ -1340,6 +1369,26 @@ impl Client {
         parse_recovery_range_status(response).map(Some)
     }
 
+    pub fn discover_recovery_cutoff(
+        &self,
+        request: RecoveryCutoffRequest,
+    ) -> Result<RecoveryCutoffStatus> {
+        parse_recovery_cutoff_status(self.request(json!({
+            "op": "discover_recovery_cutoff",
+            "peer": request.peer,
+            "revision": request.revision,
+            "topics": request.topics,
+        }))?)
+    }
+
+    pub fn poll_recovery_cutoff(&self) -> Result<Option<RecoveryCutoffStatus>> {
+        let response = self.request(json!({"op": "poll_recovery_cutoff"}))?;
+        if response.is_null() {
+            return Ok(None);
+        }
+        parse_recovery_cutoff_status(response).map(Some)
+    }
+
     pub fn cancel_recovery_range(&self) -> Result<()> {
         match parse_recovery_range_status(self.request(json!({
             "op": "cancel_recovery_range"
@@ -1741,6 +1790,21 @@ struct RawRecoveryRangePending {
 }
 
 #[derive(Deserialize)]
+struct RawRecoveryCutoffObserved {
+    workspace: [u8; 32],
+    author: [u8; 32],
+    peer: [u8; 32],
+    epoch: u64,
+    revision: u64,
+    topics: Vec<String>,
+    head: u64,
+    retained_after: u64,
+    accepted_through: u64,
+    #[serde(default)]
+    received_through: Option<u64>,
+}
+
+#[derive(Deserialize)]
 struct RawRecoveryRangeReady {
     workspace: [u8; 32],
     author: [u8; 32],
@@ -1859,6 +1923,35 @@ fn parse_recovery_range_status(value: Value) -> Result<RecoveryRangeStatus> {
             ErrorKind::Internal,
             format!("unknown recovery range state: {other}"),
         )),
+    }
+}
+
+fn parse_recovery_cutoff_status(value: Value) -> Result<RecoveryCutoffStatus> {
+    match value.get("state").and_then(Value::as_str) {
+        Some("recovery_cutoff_pending") => Ok(RecoveryCutoffStatus::Pending),
+        Some("recovery_cutoff_observed") => {
+            let raw: RawRecoveryCutoffObserved =
+                serde_json::from_value(value).map_err(|parse_error| {
+                    error(
+                        ErrorKind::Internal,
+                        format!("invalid recovery cutoff: {parse_error}"),
+                    )
+                })?;
+            Ok(RecoveryCutoffStatus::Observed(RecoveryCutoff {
+                workspace: raw.workspace,
+                author: raw.author,
+                peer: raw.peer,
+                epoch: raw.epoch,
+                revision: raw.revision,
+                topics: raw.topics,
+                head: raw.head,
+                retained_after: raw.retained_after,
+                accepted_through: raw.accepted_through,
+                received_through: raw.received_through,
+            }))
+        }
+        Some("recovery_cutoff_denied") => Ok(RecoveryCutoffStatus::Denied),
+        _ => Err(error(ErrorKind::Internal, "unknown recovery cutoff status")),
     }
 }
 

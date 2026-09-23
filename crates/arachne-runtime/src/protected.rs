@@ -375,11 +375,15 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
     if let Some(inbox) = session.inbox.as_ref() {
         if ready.automatic {
             let progress = inbox.recovery_progress(ready.query.author, &ready.query.topics);
-            if ready.query.through <= progress {
+            let received_through = inbox
+                .group_received_through(owner, ready.query.author, &ready.query.topics)
+                .map_err(str::to_owned)?
+                .unwrap_or(progress);
+            if ready.query.through <= received_through {
                 session.ready_range = None;
                 return Ok(json!({"state":"recovery_already_covered"}));
             }
-            if ready.query.after != progress {
+            if ready.query.after < progress || ready.query.after > received_through {
                 return Err("recovery range does not continue accepted progress".into());
             }
         }
