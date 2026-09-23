@@ -2752,7 +2752,7 @@ fn execute_in_session(
         }
         // Gossip is ephemeral. Run authenticated presence as part of the
         // durable pump so an active member can discover and pull a missed epoch.
-        let _ = execute_in_session(
+        let presence = execute_in_session(
             guard,
             Request::PollWorkspacePresence { announce: false },
             ended,
@@ -2782,6 +2782,7 @@ fn execute_in_session(
             // deadline and must not hide it.
             if staged_state.is_some() {
                 staged["activity"] = activity_value(guard.as_ref().ok_or("node is closed")?);
+                staged["presence"] = presence.clone();
                 return Ok(staged);
             }
             let membership = execute_in_session(guard, Request::PollMembershipUpdate {}, ended)?;
@@ -2818,6 +2819,7 @@ fn execute_in_session(
                         execute_in_session(guard, Request::AdoptAdmission { snapshot }, ended)?;
                     committed["state"] = json!("workspace_name_committed");
                     committed["activity"] = activity_value(guard.as_ref().ok_or("node is closed")?);
+                    committed["presence"] = presence.clone();
                     return Ok(committed);
                 }
                 let mut membership = membership;
@@ -2836,9 +2838,11 @@ fn execute_in_session(
                     membership["state"] = json!("membership_replied");
                 }
                 membership["activity"] = activity_value(guard.as_ref().ok_or("node is closed")?);
+                membership["presence"] = presence.clone();
                 return Ok(membership);
             }
             staged["activity"] = activity_value(guard.as_ref().ok_or("node is closed")?);
+            staged["presence"] = presence;
             return Ok(staged);
         }
         let snapshot: Vec<u8> = serde_json::from_value(staged["snapshot"].clone())
@@ -2859,6 +2863,7 @@ fn execute_in_session(
         }
         committed["state"] = json!("workspace_committed");
         committed["activity"] = activity_value(guard.as_ref().ok_or("node is closed")?);
+        committed["presence"] = presence;
         return Ok(committed);
     }
     if matches!(request, Request::DriveJoin {}) {
