@@ -623,6 +623,12 @@ impl Workspace {
             for step in &history.steps {
                 place_accepted(&mut slots, start, AcceptedStep::History(step))?;
             }
+            // The retained history is authoritative. Once it covers the whole
+            // requested range, scanning the retry index only reparses the same
+            // commits and adds duplicate work to every admission.
+            if slots.iter().all(Option::is_some) {
+                return slots.into_iter().collect();
+            }
         }
         for admission in &self.admissions {
             place_accepted(&mut slots, start, AcceptedStep::Admission(admission))?;
