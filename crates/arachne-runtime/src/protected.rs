@@ -240,6 +240,14 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
                     .direct_authenticated_bytes(&message.recipients)
                     .map_err(str::to_owned)?
             };
+            let now = if current.is_some() {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| "system clock is before Unix epoch")?
+                    .as_secs()
+            } else {
+                0
+            };
             if let Some(active_inbox) = inbox.as_ref() {
                 let authenticated = owner
                     .unprotect_object(&aad, ciphertext)
@@ -249,7 +257,7 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
                 }
                 let stage = match current {
                     Some(metadata) => {
-                        active_inbox.stage_live_current(owner, &context, metadata, ciphertext)
+                        active_inbox.stage_live_current(owner, &context, metadata, now, ciphertext)
                     }
                     None => active_inbox.stage_with_recipients(
                         owner,
@@ -382,11 +390,11 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
             arachne_delivery::wire::RangeReply::Rejected(e) => return Err(e.to_string()),
         };
         let mut next = inbox.clone();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "system clock is before Unix epoch")?
+            .as_secs();
         if retain_until != 0 {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|_| "system clock is before Unix epoch")?
-                .as_secs();
             next = next
                 .retain_range(owner, &ready.query, &ready.reply, retain_until, now)
                 .map_err(str::to_owned)?;
@@ -426,7 +434,7 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
                 .map_err(str::to_owned)?;
             let staged = match live {
                 Some(ref live) => {
-                    next.stage_live_current(owner, &packet.context, live.metadata, ciphertext)
+                    next.stage_live_current(owner, &packet.context, live.metadata, now, ciphertext)
                 }
                 None => next.stage(owner, &packet.context, ciphertext),
             }
@@ -638,11 +646,15 @@ pub(super) fn inbox_operation(session: &mut Session, request: Request) -> Result
         .as_ref()
         .ok_or("session has no protected root key")?;
     if let Request::PollPendingObject { deferred } = request {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "system clock is before Unix epoch")?
+            .as_secs();
         return match session
             .inbox
             .as_ref()
             .ok_or("object delivery not enabled")?
-            .pending_excluding(owner, &deferred)
+            .pending_excluding_at(owner, &deferred, now)
             .map_err(str::to_owned)?
         {
             None => Ok(Value::Null),

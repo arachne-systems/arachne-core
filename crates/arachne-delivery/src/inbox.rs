@@ -517,7 +517,7 @@ impl ObjectInbox {
             {
                 return Err("current-view value has wrong author");
             }
-            match next.stage_live_current(owner, &context, metadata, ciphertext)? {
+            match next.stage_live_current(owner, &context, metadata, now, ciphertext)? {
                 InboxStage::Prepared(candidate) => {
                     next = *candidate;
                     pending += 1;
@@ -640,17 +640,30 @@ impl ObjectInbox {
         recipients: &[[u8; 32]],
         object: &[u8],
     ) -> Result<InboxStage, &'static str> {
-        self.stage_scoped(owner, context, recipients, None, object)
+        self.stage_scoped(owner, context, recipients, None, true, object)
     }
 
+    /// Preserve the publisher cursor, but queue only the newest unexpired value
+    /// for a selector and replacement key.
     pub fn stage_live_current(
         &self,
         owner: &arachne_security::Workspace,
         context: &PublicationContext,
         metadata: current::CurrentMetadata,
+        now: u64,
         object: &[u8],
     ) -> Result<InboxStage, &'static str> {
-        self.stage_scoped(owner, context, &[], Some(metadata.into()), object)
+        if context.sequence.is_none() {
+            return Err("current value lacks publisher sequence");
+        }
+        self.stage_scoped(
+            owner,
+            context,
+            &[],
+            Some(metadata.into()),
+            metadata.expires_at > now,
+            object,
+        )
     }
 
     fn stage_scoped(
@@ -659,6 +672,7 @@ impl ObjectInbox {
         context: &PublicationContext,
         recipients: &[[u8; 32]],
         current: Option<CurrentReceipt>,
+        pending: bool,
         object: &[u8],
     ) -> Result<InboxStage, &'static str> {
         self.validate_owner(owner)?;
@@ -710,6 +724,31 @@ impl ObjectInbox {
             next.streams.len() - 1
         });
         let stream = &mut next.streams[index];
+        let has_newer_current = current.as_ref().is_some_and(|current| {
+            context.sequence.is_some_and(|sequence| {
+                stream.receipts.iter().any(|receipt| {
+                    receipt.revision == context.revision
+                        && receipt.sequence > sequence.get()
+                        && receipt.current.as_ref().is_some_and(|known| {
+                            known.selector == current.selector
+                                && known.replacement_key == current.replacement_key
+                        })
+                })
+            })
+        });
+        if let (Some(current), Some(sequence)) = (current.as_ref(), context.sequence) {
+            for receipt in &mut stream.receipts {
+                if receipt.revision == context.revision
+                    && receipt.sequence < sequence.get()
+                    && receipt.current.as_ref().is_some_and(|known| {
+                        known.selector == current.selector
+                            && known.replacement_key == current.replacement_key
+                    })
+                {
+                    receipt.pending = None;
+                }
+            }
+        }
         stream.receipts.push(Receipt {
             counter,
             revision: context.revision,
@@ -718,7 +757,7 @@ impl ObjectInbox {
             recipients: recipients.to_vec(),
             current,
             digest,
-            pending: Some(object.to_vec()),
+            pending: (pending && !has_newer_current).then(|| object.to_vec()),
             rejected: false,
         });
         stream.receipts.sort_by_key(|r| r.counter);
@@ -1168,12 +1207,33 @@ impl ObjectInbox {
         self.pending_excluding(owner, &[])
     }
 
+    /// Poll pending work as of the supplied Unix time, skipping expired current
+    /// values without changing the durable receipt or publisher cursor.
+    pub fn pending_at(
+        &self,
+        owner: &arachne_security::Workspace,
+        now: u64,
+    ) -> Result<Option<PendingObject>, &'static str> {
+        self.pending_excluding_at(owner, &[], now)
+    }
+
     /// Poll without consuming work, skipping only the supplied delivery scopes.
     /// Hints apply to this call only; durable receipts and epoch guards are unchanged.
     pub fn pending_excluding(
         &self,
         owner: &arachne_security::Workspace,
         deferred: &[DeferredDeliveryStream],
+    ) -> Result<Option<PendingObject>, &'static str> {
+        self.pending_excluding_at(owner, deferred, 0)
+    }
+
+    /// Poll without consuming work, skipping deferred scopes and expired
+    /// current values.
+    pub fn pending_excluding_at(
+        &self,
+        owner: &arachne_security::Workspace,
+        deferred: &[DeferredDeliveryStream],
+        now: u64,
     ) -> Result<Option<PendingObject>, &'static str> {
         self.validate_owner(owner)?;
         if deferred.len() > 64 {
@@ -1191,6 +1251,13 @@ impl ObjectInbox {
         for stream in &self.streams {
             for receipt in &stream.receipts {
                 if let Some(object) = &receipt.pending {
+                    if receipt
+                        .current
+                        .as_ref()
+                        .is_some_and(|current| current.expires_at <= now)
+                    {
+                        continue;
+                    }
                     if deferred.iter().any(|scope| {
                         scope.member == stream.author
                             && scope.revision == receipt.revision
@@ -1986,11 +2053,11 @@ fn current_value_survives_authenticated_delivery_bundle() {
     altered.expires_at += 1;
     assert!(
         ObjectInbox::new(reader.id(), reader.epoch())
-            .stage_live_current(&reader, &received_context, altered, ciphertext)
+            .stage_live_current(&reader, &received_context, altered, 50, ciphertext)
             .is_err()
     );
     let InboxStage::Prepared(received) = ObjectInbox::new(reader.id(), reader.epoch())
-        .stage_live_current(&reader, &received_context, metadata, ciphertext)
+        .stage_live_current(&reader, &received_context, metadata, 50, ciphertext)
         .unwrap()
     else {
         panic!("current value was not staged")
@@ -1998,6 +2065,72 @@ fn current_value_survives_authenticated_delivery_bundle() {
     let pending = received.pending(&reader).unwrap().unwrap();
     assert_eq!(pending.message.payload, b"latest");
     assert_eq!(pending.current, Some(metadata));
+}
+
+#[test]
+fn current_pending_coalesces_to_newest_replacement_and_expires() {
+    use arachne_security::{PendingJoin, Workspace};
+
+    let admin = Workspace::create([1; 32], "Publisher").unwrap();
+    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let join = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let prepared = admin
+        .prepare_admission([2; 32], join.admission_request().unwrap())
+        .unwrap();
+    let mut proof = join.join_proof().unwrap();
+    proof
+        .apply_add(&prepared.authorization, &prepared.commit)
+        .unwrap();
+    let reader = join.prepare_workspace(&proof, &prepared.welcome).unwrap();
+    let mut sender = prepared.workspace;
+    let topic = Topic::new("feeds/pli").unwrap();
+    let metadata = current::CurrentMetadata {
+        selector: [4; 32],
+        replacement_key: [5; 32],
+        expires_at: 100,
+        tombstone: false,
+    };
+    let mut publications = Vec::new();
+    for sequence in 1..=2 {
+        let context = PublicationContext {
+            workspace: reader.id(),
+            revision: 7,
+            topic: topic.clone(),
+            id: [sequence as u8; 16],
+            sequence: std::num::NonZeroU64::new(sequence),
+        };
+        let object = sender
+            .protect_object(&metadata.authenticated_context(&context), &[sequence as u8])
+            .unwrap();
+        publications.push((context, object));
+    }
+    let mut inbox = ObjectInbox::new(reader.id(), reader.epoch());
+    for (context, object) in publications.into_iter().rev() {
+        let InboxStage::Prepared(next) = inbox
+            .stage_live_current(&reader, &context, metadata, 0, &object)
+            .unwrap()
+        else {
+            panic!("current value was not staged")
+        };
+        inbox = *next;
+    }
+
+    assert_eq!(inbox.pending_count(), 1);
+    let pending = inbox.pending(&reader).unwrap().unwrap();
+    assert_eq!(pending.context.sequence.unwrap().get(), 2);
+    assert_eq!(pending.message.payload, [2]);
+    assert_eq!(
+        inbox
+            .pending_at(&reader, 99)
+            .unwrap()
+            .unwrap()
+            .context
+            .sequence
+            .unwrap()
+            .get(),
+        2
+    );
+    assert!(inbox.pending_at(&reader, 100).unwrap().is_none());
 }
 
 #[test]
@@ -2302,7 +2435,7 @@ fn group_pending_orders_chat_and_counts_other_topic_cursor_slots() {
             .is_some()
     );
     let InboxStage::Prepared(inbox) = inbox
-        .stage_live_current(&reader, &other_topic, metadata, &other_object)
+        .stage_live_current(&reader, &other_topic, metadata, 0, &other_object)
         .unwrap()
     else {
         panic!("other-topic object was not staged")

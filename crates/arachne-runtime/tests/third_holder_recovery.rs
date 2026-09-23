@@ -199,6 +199,190 @@ fn retained_replay_delivers_events_current_values_and_deletions() {
 }
 
 #[test]
+fn expired_current_in_group_recovery_is_not_pending() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let author = create(Some(&[91; 32])).unwrap();
+    let reader = create(Some(&[92; 32])).unwrap();
+    let created = call(
+        author,
+        json!({"op":"create_workspace","display_name":"Author"}),
+    );
+    let invite = call(author, json!({"op":"issue_invitation"}));
+    add(author, reader, &invite, vec![], "Reader");
+    for handle in [author, reader] {
+        let staged = call(handle, json!({"op":"enable_object_delivery"}));
+        call(
+            handle,
+            json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
+        );
+        call(
+            handle,
+            json!({"op":"install_workspace_policy","revision":2}),
+        );
+    }
+    for (id, topic) in [(1, EVENT), (2, CURRENT), (3, EVENT)] {
+        let mut request = json!({"op":"stage_network_publication","revision":2,
+            "topic":topic,"id":vec![id;16],"payload":[id]});
+        if topic == CURRENT {
+            request["current"] = json!({"selector":vec![8;32],
+                "replacement_key":vec![9;32],"expires_at":1});
+        }
+        let staged = call(author, request);
+        call(
+            author,
+            json!({"op":"adopt_publication","snapshot":staged["snapshot"]}),
+        );
+    }
+    connect(reader, author);
+    for topic in [EVENT, CURRENT] {
+        call(
+            reader,
+            json!({"op":"subscribe","workspace":created["workspace"],
+                "revision":2,"topic":topic}),
+        );
+    }
+    let info: Value = serde_json::from_str(&describe(author).unwrap()).unwrap();
+    let member = call(author, json!({"op":"member_roster"}))["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|member| member["self"] == true)
+        .unwrap()["id"]
+        .clone();
+    call(
+        reader,
+        json!({"op":"fetch_recovery_range","peer":info["endpoint_key"],
+            "author":member,"revision":2,"topics":[EVENT,CURRENT],"after":0,"through":3}),
+    );
+    assert_eq!(finish_range(&[author], reader)["packet_count"], 3);
+    let staged = call(reader, json!({"op":"stage_recovery_range"}));
+    call(
+        reader,
+        json!({"op":"adopt_recovery","snapshot":staged["snapshot"]}),
+    );
+    assert!(
+        call(
+            reader,
+            json!({"op":"next_group_gap","author":member,"topics":[EVENT]}),
+        )
+        .is_null()
+    );
+    for id in [1, 3] {
+        let pending = call(reader, json!({"op":"poll_pending_object"}));
+        assert_eq!(pending["id"], json!(vec![id; 16]));
+        assert_eq!(pending["payload"], json!([id]));
+        let ack = call(
+            reader,
+            json!({"op":"stage_object_acknowledgement",
+            "member":pending["member"],"topic":pending["topic"],
+            "counter":pending["counter"],"id":pending["id"]}),
+        );
+        call(
+            reader,
+            json!({"op":"adopt_reception","snapshot":ack["snapshot"]}),
+        );
+    }
+    assert!(
+        call(reader, json!({"op":"poll_pending_object"})).is_null(),
+        "expired current state was delivered to the application"
+    );
+    close(author).unwrap();
+    close(reader).unwrap();
+}
+
+#[test]
+fn expired_live_current_is_not_pending_and_queued_values_expire() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let author = create(Some(&[93; 32])).unwrap();
+    let reader = create(Some(&[94; 32])).unwrap();
+    let created = call(
+        author,
+        json!({"op":"create_workspace","display_name":"Author"}),
+    );
+    let invite = call(author, json!({"op":"issue_invitation"}));
+    add(author, reader, &invite, vec![], "Reader");
+    for handle in [author, reader] {
+        let staged = call(handle, json!({"op":"enable_object_delivery"}));
+        call(
+            handle,
+            json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
+        );
+        call(
+            handle,
+            json!({"op":"install_workspace_policy","revision":2}),
+        );
+    }
+    connect(reader, author);
+    connect(author, reader);
+    let report = call(
+        reader,
+        json!({"op":"subscribe","workspace":created["workspace"],
+            "revision":2,"topic":CURRENT}),
+    );
+    assert!(
+        report["admitted"]
+            .as_array()
+            .is_some_and(|peers| !peers.is_empty())
+    );
+    let staged = call(
+        author,
+        json!({"op":"stage_network_publication","revision":2,
+            "topic":CURRENT,"id":vec![93;16],"payload":[93],
+            "current":{"selector":vec![8;32],"replacement_key":vec![9;32],
+                "expires_at":1}}),
+    );
+    call(
+        author,
+        json!({"op":"adopt_publication","snapshot":staged["snapshot"]}),
+    );
+    assert_eq!(receive_one(reader)["state"], "awaiting_reception_save");
+    assert!(
+        call(reader, json!({"op":"poll_pending_object"})).is_null(),
+        "expired live current state was delivered to the application"
+    );
+    let expires_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3;
+    let staged = call(
+        author,
+        json!({"op":"stage_network_publication","revision":2,
+            "topic":CURRENT,"id":vec![95;16],"payload":[95],
+            "current":{"selector":vec![8;32],"replacement_key":vec![9;32],
+                "expires_at":expires_at}}),
+    );
+    call(
+        author,
+        json!({"op":"adopt_publication","snapshot":staged["snapshot"]}),
+    );
+    assert_eq!(receive_one(reader)["state"], "awaiting_reception_save");
+    assert_eq!(
+        call(reader, json!({"op":"poll_pending_object"}))["payload"],
+        json!([95])
+    );
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        < expires_at
+    {
+        assert!(
+            Instant::now() < deadline,
+            "current value did not expire in time"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        call(reader, json!({"op":"poll_pending_object"})).is_null(),
+        "current state expired while queued but was still delivered"
+    );
+    close(reader).unwrap();
+    close(author).unwrap();
+}
+
+#[test]
 fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let author = create(Some(&[111; 32])).unwrap();
