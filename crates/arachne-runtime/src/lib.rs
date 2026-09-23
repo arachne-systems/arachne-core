@@ -1180,6 +1180,12 @@ enum Request {
         topic: String,
         subscribed: bool,
     },
+    EnableMoqDelivery {
+        workspace: [u8; 32],
+        revision: u64,
+        peer_endpoint: [u8; 32],
+        topic: String,
+    },
     PollInterest {},
     Subscribe {
         workspace: [u8; 32],
@@ -5348,30 +5354,49 @@ fn execute_in_session(
                 // Adoption is final even if network admission fails or times out.
                 let sent = session.runtime.block_on(async {
                     tokio::time::timeout(Duration::from_secs(10), async {
+                        let topic = context.topic.clone();
                         if recipients.is_empty() {
-                            session
-                                .node
-                                .publish_with_class(
+                            #[cfg(feature = "moq")]
+                            if let Some(sequence) = context.sequence {
+                                return session.node.publish_protected_with_class(
                                     context.workspace,
                                     context.revision,
-                                    context.topic,
+                                    topic,
+                                    sequence.get(),
                                     delivery,
                                     packet,
-                                )
-                                .await
+                                ).await;
+                            }
+                            session.node.publish_with_class(
+                                context.workspace,
+                                context.revision,
+                                topic,
+                                delivery,
+                                packet,
+                            ).await
                         } else {
-                            session
-                                .node
-                                .publish_to_with_class(
+                            #[cfg(feature = "moq")]
+                            if let Some(sequence) = context.sequence {
+                                return session.node.publish_protected_to_with_class(
                                     context.workspace,
                                     context.revision,
-                                    context.topic,
+                                    topic,
+                                    sequence.get(),
                                     endpoints,
                                     recipients.clone(),
                                     delivery,
                                     packet,
-                                )
-                                .await
+                                ).await;
+                            }
+                            session.node.publish_to_with_class(
+                                context.workspace,
+                                context.revision,
+                                topic,
+                                endpoints,
+                                recipients.clone(),
+                                delivery,
+                                packet,
+                            ).await
                         }
                     })
                     .await
@@ -5794,6 +5819,21 @@ fn execute_in_session(
                         .await?;
                         session.interests.replace_revision(owner.id(), revision);
                         json!({"workspace":owner.id(), "revision":revision, "members":owner.member_count()})
+                    }
+                    Request::EnableMoqDelivery { workspace, revision, peer_endpoint, topic } => {
+                        let topic = Topic::new(topic).map_err(|error| error.to_string())?;
+                        #[cfg(feature = "moq")]
+                        {
+                            node.enable_moq_delivery(workspace, revision, peer_endpoint, topic)
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            json!({"enabled":true})
+                        }
+                        #[cfg(not(feature = "moq"))]
+                        {
+                            let _ = (workspace, revision, peer_endpoint, topic);
+                            return Err("MoQ transport feature is not enabled".into());
+                        }
                     }
                     Request::InstallMemberPolicy { revision, topics } => {
                         let workspace = session

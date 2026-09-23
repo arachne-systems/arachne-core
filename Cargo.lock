@@ -261,6 +261,7 @@ dependencies = [
  "iroh",
  "iroh-mdns-address-lookup 0.5.0",
  "iroh-moq",
+ "moq-net",
  "postcard",
  "serde",
  "serde_json",

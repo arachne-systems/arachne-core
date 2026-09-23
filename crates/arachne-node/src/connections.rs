@@ -259,6 +259,11 @@ impl Connections {
         self.endpoint.clone()
     }
 
+    #[cfg(feature = "moq")]
+    pub(super) fn dial_capacity(&self, alpn: &[u8]) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        self.budget.dial(alpn)
+    }
+
     pub(super) async fn wait_online(&self) {
         self.endpoint.online().await;
     }

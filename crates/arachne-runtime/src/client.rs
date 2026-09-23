@@ -1173,6 +1173,26 @@ impl Client {
         Ok(())
     }
 
+    /// Opt one authenticated endpoint and topic into protected MoQ delivery.
+    /// The `moq` Cargo feature must be enabled on the runtime/SDK.
+    #[cfg(feature = "moq")]
+    pub fn enable_moq_delivery(
+        &self,
+        workspace: [u8; 32],
+        revision: u64,
+        peer_endpoint: [u8; 32],
+        topic: &str,
+    ) -> Result<()> {
+        self.request(json!({
+            "op": "enable_moq_delivery",
+            "workspace": workspace,
+            "revision": revision,
+            "peer_endpoint": peer_endpoint,
+            "topic": topic,
+        }))?;
+        Ok(())
+    }
+
     pub fn poll_interest(&self) -> Result<Option<InterestObservation>> {
         let response = self.request(json!({"op": "poll_interest"}))?;
         if response.is_null()

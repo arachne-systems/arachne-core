@@ -509,6 +509,40 @@ fn typed_clients_persist_authenticated_inbox_objects_before_acknowledging() {
         .unwrap();
     assert_eq!(ordinary.payload, ordinary_payload);
 
+    #[cfg(feature = "moq")]
+    {
+        owner
+            .set_interest(workspace.workspace, revision, topic, true)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            reader.poll_control().unwrap();
+            if let Some(interest) = owner.poll_interest().unwrap() {
+                assert!(interest.admission.failed.is_empty(), "{interest:?}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "owner topic interest did not settle");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let owner_endpoint = owner.endpoint().unwrap().endpoint_key;
+        let reader_endpoint = reader.endpoint().unwrap().endpoint_key;
+        if owner_endpoint < reader_endpoint {
+            reader
+                .enable_moq_delivery(workspace.workspace, revision, owner_endpoint, topic)
+                .unwrap();
+            owner
+                .enable_moq_delivery(workspace.workspace, revision, reader_endpoint, topic)
+                .unwrap();
+        } else {
+            owner
+                .enable_moq_delivery(workspace.workspace, revision, reader_endpoint, topic)
+                .unwrap();
+            reader
+                .enable_moq_delivery(workspace.workspace, revision, owner_endpoint, topic)
+                .unwrap();
+        }
+    }
+
     // Use explicit stage -> save -> adopt operations for durable inbox changes.
     for client in [&owner, &reader] {
         let candidate = client.stage_object_delivery().unwrap().unwrap();
