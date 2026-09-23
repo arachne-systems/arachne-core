@@ -5,6 +5,48 @@ use std::{
 };
 
 #[tokio::test]
+async fn accepted_data_raises_work_signal_for_host_polling() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (sender, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let (receiver, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let workspace = [91; 32];
+        let topic = Topic::new("streams/work-signal").unwrap();
+        let policy = BTreeMap::from([
+            (sender.id(), Permissions::AllTopics),
+            (receiver.id(), Permissions::AllTopics),
+        ]);
+        sender
+            .install_verified_policy(workspace, 1, policy.clone())
+            .await
+            .unwrap();
+        receiver
+            .install_verified_policy(workspace, 1, policy)
+            .await
+            .unwrap();
+        sender
+            .add_address_hint(receiver.id(), receiver.address())
+            .await
+            .unwrap();
+        receiver
+            .add_address_hint(sender.id(), sender.address())
+            .await
+            .unwrap();
+        receiver.subscribe(workspace, 1, topic.clone()).await.unwrap();
+        let signal = receiver.control_signal();
+        let notified = signal.notified();
+        let report = sender.publish(workspace, 1, topic, vec![1]).await.unwrap();
+        assert_eq!(report.admitted, vec![receiver.id()]);
+        tokio::time::timeout(Duration::from_secs(1), notified)
+            .await
+            .expect("accepted data must wake the host work loop");
+        receiver.close().await;
+        sender.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn transport_metrics_observe_reused_paths_without_retaining_closed_connections() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let (sender, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();

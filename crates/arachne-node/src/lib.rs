@@ -172,6 +172,7 @@ struct DeliveryQueue {
     state: Arc<StdMutex<DeliveryState>>,
     changed: Arc<tokio::sync::Notify>,
     closed: Arc<AtomicBool>,
+    work: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl DeliveryQueue {
@@ -203,6 +204,9 @@ impl DeliveryQueue {
         }
         drop(state);
         self.changed.notify_one();
+        if let Some(work) = &self.work {
+            work.notify_one();
+        }
         Ok(())
     }
 
@@ -523,11 +527,15 @@ impl Node {
         .await?;
         let routing = Arc::new(Mutex::new(RoutingTable::default()));
         let resources = resources::ResourceTransfers::new(connections.clone(), routing.clone());
-        let events = DeliveryQueue::default();
+        let (control_inbox, controls, control_signal) = control::ControlInbox::new(512);
+        // This shared signal wakes host polling for control and queued delivery work.
+        let events = DeliveryQueue {
+            work: Some(control_signal.clone()),
+            ..DeliveryQueue::default()
+        };
         let receiver = MessageReceiver {
             queue: events.clone(),
         };
-        let (control_inbox, controls, control_signal) = control::ControlInbox::new(512);
         let (control_cancel, _) = watch::channel(false);
         let node_control_inbox = control_inbox.clone();
         let overlays: Arc<Mutex<BTreeMap<WorkspaceId, Arc<overlay::Overlay>>>> =
