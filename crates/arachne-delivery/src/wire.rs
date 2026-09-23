@@ -17,6 +17,10 @@ const DIRECT_REPLY: &[u8] = b"DFDP\x01";
 const DIRECT_HEAD: &[u8] = b"DFDH\x01";
 const GROUP_HEADS_QUERY: &[u8] = b"DFGQ\x01";
 const GROUP_HEADS_REPLY: &[u8] = b"DFGP\x01";
+const GROUP_HEADS_QUERY_V2: &[u8] = b"DFGQ\x02";
+const GROUP_HEADS_REPLY_V2: &[u8] = b"DFGP\x02";
+const GROUP_OBJECTS_QUERY: &[u8] = b"DFOQ\x01";
+const GROUP_OBJECTS_REPLY: &[u8] = b"DFOP\x01";
 pub const MAX_GROUP_HEADS: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,7 +39,8 @@ impl GroupHeadsQuery {
 
     pub fn from_wire(bytes: &[u8]) -> Result<Self, &'static str> {
         let mut input = bytes;
-        if take(&mut input, 5)? != GROUP_HEADS_QUERY {
+        let format = take(&mut input, 5)?;
+        if format != GROUP_HEADS_QUERY && format != GROUP_HEADS_QUERY_V2 {
             return Err("wrong group-head query format");
         }
         let query = Self {
@@ -46,6 +51,21 @@ impl GroupHeadsQuery {
             return Err("trailing group-head query");
         }
         Ok(query)
+    }
+
+    pub fn to_wire_v2(&self) -> Vec<u8> {
+        let mut bytes = GROUP_HEADS_QUERY_V2.to_vec();
+        bytes.extend(self.workspace);
+        bytes.extend(self.epoch.to_be_bytes());
+        bytes
+    }
+
+    pub fn version(bytes: &[u8]) -> Result<u8, &'static str> {
+        match bytes.get(..5) {
+            Some(value) if value == GROUP_HEADS_QUERY => Ok(1),
+            Some(value) if value == GROUP_HEADS_QUERY_V2 => Ok(2),
+            _ => Err("wrong group-head query format"),
+        }
     }
 }
 
@@ -58,6 +78,25 @@ pub struct GroupHead {
     pub selection: [u8; 32],
     pub after: u64,
     pub through: u64,
+}
+
+/// Untrusted hint that a peer has received a group object. Unlike GroupHead,
+/// this does not assert complete range coverage or carry publisher proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupObjectHead {
+    pub author: [u8; 32],
+    pub policy_revision: u64,
+    pub topic: Topic,
+    pub through: u64,
+}
+
+impl GroupObjectHead {
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.through == 0 {
+            return Err("invalid group object head");
+        }
+        Ok(())
+    }
 }
 
 impl GroupHead {
@@ -105,15 +144,61 @@ pub fn parse_group_heads_reply(
     query: &GroupHeadsQuery,
     bytes: &[u8],
 ) -> Result<Vec<GroupHead>, &'static str> {
+    parse_group_heads_reply_full(query, bytes).map(|(heads, _)| heads)
+}
+
+pub fn group_heads_reply_v2(
+    query: &GroupHeadsQuery,
+    heads: &[GroupHead],
+    objects: &[GroupObjectHead],
+) -> Result<Vec<u8>, &'static str> {
+    if heads.len() > MAX_GROUP_HEADS || objects.len() > MAX_GROUP_HEADS {
+        return Err("too many group heads");
+    }
+    let mut bytes = GROUP_HEADS_REPLY_V2.to_vec();
+    bytes.extend(query.workspace);
+    bytes.extend(query.epoch.to_be_bytes());
+    bytes.push(heads.len() as u8);
+    for head in heads {
+        head.validate()?;
+        bytes.extend(head.author);
+        bytes.extend(head.policy_revision.to_be_bytes());
+        bytes.extend(head.selection);
+        bytes.extend(head.after.to_be_bytes());
+        bytes.extend(head.through.to_be_bytes());
+    }
+    bytes.push(objects.len() as u8);
+    for head in objects {
+        head.validate()?;
+        bytes.extend(head.author);
+        bytes.extend(head.policy_revision.to_be_bytes());
+        write_topic(&mut bytes, &head.topic);
+        bytes.extend(head.through.to_be_bytes());
+    }
+    if bytes.len() > arachne_security::MAX_APPLICATION_CIPHERTEXT {
+        return Err("group-head reply exceeds bound");
+    }
+    Ok(bytes)
+}
+
+pub fn parse_group_heads_reply_full(
+    query: &GroupHeadsQuery,
+    bytes: &[u8],
+) -> Result<(Vec<GroupHead>, Vec<GroupObjectHead>), &'static str> {
     let mut input = bytes;
-    if take(&mut input, 5)? != GROUP_HEADS_REPLY
-        || take(&mut input, 32)? != query.workspace
-        || number64(&mut input)? != query.epoch
-    {
+    let format = take(&mut input, 5)?;
+    if format != GROUP_HEADS_REPLY && format != GROUP_HEADS_REPLY_V2 {
+        return Err("wrong group-head reply format");
+    }
+    if take(&mut input, 32)? != query.workspace || number64(&mut input)? != query.epoch {
         return Err("group-head reply scope mismatch");
     }
     let count = take(&mut input, 1)?[0] as usize;
-    if count > MAX_GROUP_HEADS || input.len() != count * 88 {
+    let signed_head_bytes = count * 88;
+    if count > MAX_GROUP_HEADS
+        || input.len() < signed_head_bytes
+        || (format == GROUP_HEADS_REPLY && input.len() != signed_head_bytes)
+    {
         return Err("invalid group-head count");
     }
     let mut heads = Vec::with_capacity(count);
@@ -128,10 +213,213 @@ pub fn parse_group_heads_reply(
         head.validate()?;
         heads.push(head);
     }
+    let mut objects = Vec::new();
+    if format == GROUP_HEADS_REPLY_V2 {
+        let count = take(&mut input, 1)?[0] as usize;
+        if count > MAX_GROUP_HEADS {
+            return Err("invalid group object head count");
+        }
+        for _ in 0..count {
+            let head = GroupObjectHead {
+                author: take(&mut input, 32)?.try_into().unwrap(),
+                policy_revision: number64(&mut input)?,
+                topic: read_topic(&mut input)?,
+                through: number64(&mut input)?,
+            };
+            head.validate()?;
+            objects.push(head);
+        }
+    }
     if !input.is_empty() {
         return Err("trailing group-head reply");
     }
-    Ok(heads)
+    Ok((heads, objects))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupObjectsQuery {
+    pub workspace: [u8; 32],
+    pub author: [u8; 32],
+    pub epoch: u64,
+    pub policy_revision: u64,
+    pub topics: BTreeSet<Topic>,
+    pub after: u64,
+    pub through: u64,
+}
+
+impl GroupObjectsQuery {
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.topics.is_empty()
+            || self.topics.len() > MAX_TOPICS
+            || self.after >= self.through
+            || self.through - self.after > MAX_RECOVERY_PACKETS as u64
+        {
+            return Err("invalid group object query");
+        }
+        Ok(())
+    }
+
+    pub fn to_wire(&self) -> Result<Vec<u8>, &'static str> {
+        self.validate()?;
+        let mut bytes = GROUP_OBJECTS_QUERY.to_vec();
+        bytes.extend(self.workspace);
+        bytes.extend(self.author);
+        for value in [self.epoch, self.policy_revision, self.after, self.through] {
+            bytes.extend(value.to_be_bytes());
+        }
+        write_topics(&mut bytes, &self.topics)?;
+        if bytes.len() > MAX_QUERY_BYTES {
+            return Err("group object query exceeds bound");
+        }
+        Ok(bytes)
+    }
+
+    pub fn from_wire(bytes: &[u8]) -> Result<Self, &'static str> {
+        if bytes.len() > MAX_QUERY_BYTES {
+            return Err("group object query exceeds bound");
+        }
+        let mut input = bytes;
+        if take(&mut input, 5)? != GROUP_OBJECTS_QUERY {
+            return Err("wrong group object query format");
+        }
+        let query = Self {
+            workspace: take(&mut input, 32)?.try_into().unwrap(),
+            author: take(&mut input, 32)?.try_into().unwrap(),
+            epoch: number64(&mut input)?,
+            policy_revision: number64(&mut input)?,
+            after: number64(&mut input)?,
+            through: number64(&mut input)?,
+            topics: read_topics(&mut input)?,
+        };
+        if !input.is_empty() {
+            return Err("trailing group object query");
+        }
+        query.validate()?;
+        Ok(query)
+    }
+}
+
+pub struct GroupObjectsReply {
+    pub packets: Vec<RecoveredPacket>,
+}
+
+pub fn group_objects_reply(
+    query: &GroupObjectsQuery,
+    records: impl IntoIterator<Item = RetainedPublication>,
+) -> Result<Vec<u8>, &'static str> {
+    query.validate()?;
+    let mut records = records.into_iter().collect::<Vec<_>>();
+    records.sort_by_key(|record| record.sequence);
+    if records.len() > MAX_RECOVERY_PACKETS {
+        return Err("too many group object records");
+    }
+    let mut bytes = GROUP_OBJECTS_REPLY.to_vec();
+    bytes.extend(query.workspace);
+    bytes.extend(query.author);
+    bytes.extend(query.epoch.to_be_bytes());
+    bytes.extend(query.policy_revision.to_be_bytes());
+    bytes.extend(query.after.to_be_bytes());
+    bytes.extend(query.through.to_be_bytes());
+    bytes.push(records.len() as u8);
+    let mut previous = query.after;
+    for record in records {
+        if record.context.workspace != query.workspace
+            || record.context.revision != query.policy_revision
+            || !query.topics.contains(&record.context.topic)
+            || record.context.sequence.map(|sequence| sequence.get()) != Some(record.sequence)
+            || record.sequence <= previous
+            || record.sequence > query.through
+            || record.ciphertext.is_empty()
+            || record.ciphertext.len() > MAX_APPLICATION_CIPHERTEXT
+        {
+            return Err("invalid group object record");
+        }
+        previous = record.sequence;
+        bytes.extend(record.sequence.to_be_bytes());
+        write_topic(&mut bytes, &record.context.topic);
+        bytes.extend(record.context.id);
+        bytes.extend((record.ciphertext.len() as u32).to_be_bytes());
+        bytes.extend(record.ciphertext);
+    }
+    if bytes.len() > MAX_REPLY_BYTES {
+        return Err("group object reply exceeds bound");
+    }
+    Ok(bytes)
+}
+
+pub fn parse_group_objects_reply(
+    query: &GroupObjectsQuery,
+    bytes: &[u8],
+) -> Result<GroupObjectsReply, &'static str> {
+    query.validate()?;
+    if bytes.len() > MAX_REPLY_BYTES {
+        return Err("group object reply exceeds bound");
+    }
+    let mut input = bytes;
+    if take(&mut input, 5)? != GROUP_OBJECTS_REPLY
+        || take(&mut input, 32)? != query.workspace
+        || take(&mut input, 32)? != query.author
+        || number64(&mut input)? != query.epoch
+        || number64(&mut input)? != query.policy_revision
+        || number64(&mut input)? != query.after
+        || number64(&mut input)? != query.through
+    {
+        return Err("group object reply scope mismatch");
+    }
+    let count = take(&mut input, 1)?[0] as usize;
+    if count > MAX_RECOVERY_PACKETS {
+        return Err("invalid group object count");
+    }
+    let mut packets = Vec::with_capacity(count);
+    let mut previous = query.after;
+    for _ in 0..count {
+        let sequence = number64(&mut input)?;
+        let topic = read_topic(&mut input)?;
+        let id = take(&mut input, 16)?.try_into().unwrap();
+        let length = number32(&mut input)?;
+        if sequence <= previous || sequence > query.through || !query.topics.contains(&topic) {
+            return Err("invalid group object sequence or topic");
+        }
+        previous = sequence;
+        if length == 0 || length > MAX_APPLICATION_CIPHERTEXT {
+            return Err("invalid group object ciphertext length");
+        }
+        let context = PublicationContext {
+            workspace: query.workspace,
+            revision: query.policy_revision,
+            topic,
+            id,
+            sequence: std::num::NonZeroU64::new(sequence),
+        };
+        let ciphertext = take(&mut input, length)?.to_vec();
+        packets.push(RecoveredPacket {
+            context,
+            ciphertext,
+        });
+    }
+    if !input.is_empty() {
+        return Err("trailing group object reply");
+    }
+    Ok(GroupObjectsReply { packets })
+}
+
+pub fn verify_group_objects_reply(
+    owner: &Workspace,
+    query: &GroupObjectsQuery,
+    bytes: &[u8],
+) -> Result<GroupObjectsReply, &'static str> {
+    let reply = parse_group_objects_reply(query, bytes)?;
+    let endpoint = owner.endpoints_for_members(&[query.author])?[0];
+    for packet in &reply.packets {
+        let authenticated =
+            owner.unprotect_object(&packet.context.authenticated_bytes(), &packet.ciphertext)?;
+        if authenticated.message.member != query.author
+            || authenticated.message.endpoint != endpoint
+        {
+            return Err("group object author mismatch");
+        }
+    }
+    Ok(reply)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -914,6 +1202,17 @@ fn read_topics(input: &mut &[u8]) -> Result<BTreeSet<Topic>, &'static str> {
     Ok(topics)
 }
 
+fn write_topics(bytes: &mut Vec<u8>, topics: &BTreeSet<Topic>) -> Result<(), &'static str> {
+    if topics.is_empty() || topics.len() > MAX_TOPICS {
+        return Err("invalid query topic count");
+    }
+    bytes.push(topics.len() as u8);
+    for topic in topics {
+        write_topic(bytes, topic);
+    }
+    Ok(())
+}
+
 fn write_topic(bytes: &mut Vec<u8>, topic: &Topic) {
     bytes.push(topic.as_str().len() as u8);
     bytes.extend(topic.as_str().as_bytes());
@@ -950,6 +1249,70 @@ fn group_head_wire_is_scoped_and_bounded() {
     *malformed.last_mut().unwrap() = 0;
     assert!(parse_group_heads_reply(&query, &malformed).is_err());
     assert!(group_heads_reply(&query, &[heads[0]; MAX_GROUP_HEADS + 1]).is_err());
+
+    let object_heads = vec![GroupObjectHead {
+        author: [3; 32],
+        policy_revision: 4,
+        topic: Topic::new("chat/main").unwrap(),
+        through: 7,
+    }];
+    let query_v2 = query.to_wire_v2();
+    assert_eq!(GroupHeadsQuery::version(&query_v2).unwrap(), 2);
+    let reply_v2 = group_heads_reply_v2(&query, &heads, &object_heads).unwrap();
+    assert_eq!(
+        parse_group_heads_reply_full(&query, &reply_v2).unwrap(),
+        (heads, object_heads)
+    );
+}
+
+#[test]
+fn group_object_wire_is_sparse_scoped_and_bounded() {
+    let topic = Topic::new("chat/main").unwrap();
+    let query = GroupObjectsQuery {
+        workspace: [1; 32],
+        author: [2; 32],
+        epoch: 3,
+        policy_revision: 4,
+        topics: BTreeSet::from([topic.clone()]),
+        after: 1,
+        through: 3,
+    };
+    let encoded = query.to_wire().unwrap();
+    assert_eq!(GroupObjectsQuery::from_wire(&encoded).unwrap(), query);
+    let record = RetainedPublication {
+        sequence: 3,
+        context: PublicationContext {
+            workspace: query.workspace,
+            revision: query.policy_revision,
+            topic: topic.clone(),
+            id: [5; 16],
+            sequence: std::num::NonZeroU64::new(3),
+        },
+        ciphertext: vec![6, 7, 8],
+    };
+    let reply = group_objects_reply(&query, [record]).unwrap();
+    let parsed = parse_group_objects_reply(&query, &reply).unwrap();
+    assert_eq!(parsed.packets.len(), 1);
+    assert_eq!(parsed.packets[0].context.sequence.unwrap().get(), 3);
+    assert_eq!(parsed.packets[0].ciphertext, [6, 7, 8]);
+    assert!(
+        parse_group_objects_reply(
+            &GroupObjectsQuery {
+                author: [9; 32],
+                ..query.clone()
+            },
+            &reply
+        )
+        .is_err()
+    );
+    assert!(
+        GroupObjectsQuery {
+            through: query.after + MAX_RECOVERY_PACKETS as u64 + 1,
+            ..query
+        }
+        .to_wire()
+        .is_err()
+    );
 }
 
 fn read_topic(bytes: &mut &[u8]) -> Result<Topic, &'static str> {

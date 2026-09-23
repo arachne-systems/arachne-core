@@ -1426,3 +1426,277 @@ fn group_tail_recovers_from_a_retained_three_client_holder() {
     close_for_impairment(holder);
     close_for_impairment(reader);
 }
+
+#[test]
+fn group_tail_recovers_from_an_acknowledged_live_three_client_holder() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let author = create(Some(&[134; 32])).unwrap();
+    let holder = create(Some(&[135; 32])).unwrap();
+    let reader = create(Some(&[136; 32])).unwrap();
+    let created = call(
+        author,
+        json!({"op":"create_workspace","display_name":"Author"}),
+    );
+    let invite = call(author, json!({"op":"issue_invitation"}));
+    let holder_join = add(author, holder, &invite, vec![], "Holder");
+    let reader_join = add(author, reader, &invite, vec![step(&holder_join)], "Reader");
+    let staged = call(
+        holder,
+        json!({"op":"stage_admission_update","step":step(&reader_join)}),
+    );
+    call(
+        holder,
+        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+    );
+    let revision = 3;
+    for handle in [author, holder, reader] {
+        let staged = call(handle, json!({"op":"enable_object_delivery"}));
+        call(
+            handle,
+            json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
+        );
+        call(
+            handle,
+            json!({"op":"install_workspace_policy","revision":revision}),
+        );
+    }
+    for handle in [holder, reader] {
+        call(
+            handle,
+            json!({"op":"set_interest","workspace":created["workspace"],
+                "revision":revision,"topic":EVENT,"subscribed":true}),
+        );
+    }
+    for (from, to) in [
+        (author, holder),
+        (holder, author),
+        (author, reader),
+        (reader, author),
+    ] {
+        connect(from, to);
+    }
+    for handle in [holder, reader] {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if call(handle, json!({"op":"poll_interest"})).is_null() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "topic subscription did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    let first = call(
+        author,
+        json!({"op":"stage_network_publication","revision":revision,
+            "topic":EVENT,"id":vec![1;16],"payload":[1]}),
+    );
+    let first = call(
+        author,
+        json!({"op":"adopt_publication","snapshot":first["snapshot"]}),
+    );
+    assert_eq!(first["sequence"], 1);
+    let first_held = receive_one(holder);
+    let pending = call(holder, json!({"op":"poll_pending_object"}));
+    assert_eq!(pending["payload"], json!([1]));
+    let ack = call(
+        holder,
+        json!({"op":"stage_object_acknowledgement","member":pending["member"],
+            "topic":pending["topic"],"counter":pending["counter"],"id":pending["id"]}),
+    );
+    call(
+        holder,
+        json!({"op":"adopt_reception","snapshot":ack["snapshot"]}),
+    );
+    assert_eq!(first_held["state"], "awaiting_reception_save");
+
+    let author_info: Value = serde_json::from_str(&describe(author).unwrap()).unwrap();
+    call(
+        reader,
+        json!({"op":"fetch_recovery_range","peer":author_info["endpoint_key"],
+            "revision":revision,"topics":[EVENT],"after":0,"through":1}),
+    );
+    assert_eq!(
+        finish_range(&[author], reader)["state"],
+        "recovery_range_ready"
+    );
+    let first_recovered = call(reader, json!({"op":"stage_recovery_range"}));
+    call(
+        reader,
+        json!({"op":"adopt_recovery","snapshot":first_recovered["snapshot"]}),
+    );
+    let pending = call(reader, json!({"op":"poll_pending_object"}));
+    let ack = call(
+        reader,
+        json!({"op":"stage_object_acknowledgement","member":pending["member"],
+            "topic":pending["topic"],"counter":pending["counter"],"id":pending["id"]}),
+    );
+    call(
+        reader,
+        json!({"op":"adopt_reception","snapshot":ack["snapshot"]}),
+    );
+    let saved_reader = call(reader, json!({"op":"seal_workspace"}));
+    close(reader).unwrap();
+
+    let tail = call(
+        author,
+        json!({"op":"stage_network_publication","revision":revision,
+            "topic":EVENT,"id":vec![2;16],"payload":[2]}),
+    );
+    let tail = call(
+        author,
+        json!({"op":"adopt_publication","snapshot":tail["snapshot"]}),
+    );
+    assert_eq!(tail["sequence"], 2);
+    receive_one(holder);
+    let pending = call(holder, json!({"op":"poll_pending_object"}));
+    assert_eq!(pending["payload"], json!([2]));
+    let ack = call(
+        holder,
+        json!({"op":"stage_object_acknowledgement","member":pending["member"],
+            "topic":pending["topic"],"counter":pending["counter"],"id":pending["id"]}),
+    );
+    call(
+        holder,
+        json!({"op":"adopt_reception","snapshot":ack["snapshot"]}),
+    );
+    let saved_holder = call(holder, json!({"op":"seal_workspace"}));
+    close(holder).unwrap();
+    close(author).unwrap();
+
+    let holder = create(Some(&[135; 32])).unwrap();
+    call(
+        holder,
+        json!({"op":"restore_workspace","workspace":created["workspace"],
+            "snapshot":saved_holder["snapshot"]}),
+    );
+    call(
+        holder,
+        json!({"op":"install_workspace_policy","revision":revision}),
+    );
+    let reader = create(Some(&[136; 32])).unwrap();
+    call(
+        reader,
+        json!({"op":"restore_workspace","workspace":created["workspace"],
+            "snapshot":saved_reader["snapshot"]}),
+    );
+    call(
+        reader,
+        json!({"op":"install_workspace_policy","revision":revision}),
+    );
+    let neighbors_before_holder =
+        call(reader, json!({"op":"workspace_metrics"}))["gossip_neighbors"]
+            .as_u64()
+            .unwrap();
+    connect(reader, holder);
+    connect(holder, reader);
+    let neighbor_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let neighbors = call(reader, json!({"op":"workspace_metrics"}))["gossip_neighbors"]
+            .as_u64()
+            .unwrap();
+        if neighbors > neighbors_before_holder {
+            break;
+        }
+        assert!(
+            Instant::now() < neighbor_deadline,
+            "restored holder did not connect"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let discovery_started = Instant::now();
+    let presence_deadline = Instant::now() + Duration::from_secs(10);
+    let gap = loop {
+        let served = call(holder, json!({"op":"poll_admission"}));
+        if !served.is_null() {
+            assert!(matches!(
+                served["state"].as_str(),
+                Some("presence_replied" | "group_heads_replied")
+            ));
+        }
+        call(reader, json!({"op":"poll_workspace_presence"}));
+        let gap = call(
+            reader,
+            json!({"op":"next_group_gap", "author":
+            created["member"]["id"], "topics":[EVENT]}),
+        );
+        if !gap.is_null() {
+            break gap;
+        }
+        assert!(
+            Instant::now() < presence_deadline,
+            "live group tail was not announced"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let discovered = Instant::now();
+    assert_eq!(gap["after"], 1);
+    assert_eq!(gap["through"], 2);
+    assert_eq!(
+        gap["relay_peer"],
+        describe(holder).unwrap().parse::<Value>().unwrap()["endpoint_key"]
+    );
+
+    call(
+        reader,
+        json!({"op":"fetch_group_objects","peer":gap["relay_peer"],
+            "author":gap["author"],"revision":revision,"topics":[EVENT],
+            "after":gap["after"],"through":gap["through"]}),
+    );
+    let fetch_started = Instant::now();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let ready = loop {
+        let served = call(holder, json!({"op":"poll_admission"}));
+        if !served.is_null() {
+            assert_eq!(served["state"], "group_objects_replied");
+        }
+        let status = call(reader, json!({"op":"poll_group_objects"}));
+        if !status.is_null() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "group object recovery did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(ready["state"], "group_object_recovery_ready");
+    assert_eq!(ready["packet_count"], 1);
+    assert_eq!(ready["accepted_progress"], false);
+    let recovery_ready = Instant::now();
+    let staged = call(reader, json!({"op":"stage_group_objects"}));
+    assert_eq!(staged["publication_count"], 1);
+    assert_eq!(staged["accepted_progress"], false);
+    call(
+        reader,
+        json!({"op":"adopt_recovery","snapshot":staged["snapshot"]}),
+    );
+    let pending = call(reader, json!({"op":"poll_pending_object"}));
+    assert_eq!(pending["sequence"], 2);
+    assert_eq!(pending["payload"], json!([2]));
+    assert!(
+        call(
+            reader,
+            json!({"op":"next_group_gap", "author":
+        created["member"]["id"], "topics":[EVENT]})
+        )
+        .is_null()
+    );
+    eprintln!(
+        "live_group_discovery_ms={} object_fetch_ms={} offline_to_ready_ms={}",
+        discovered
+            .saturating_duration_since(discovery_started)
+            .as_millis(),
+        recovery_ready
+            .saturating_duration_since(fetch_started)
+            .as_millis(),
+        recovery_ready
+            .saturating_duration_since(discovery_started)
+            .as_millis(),
+    );
+    close(holder).unwrap();
+    close(reader).unwrap();
+}

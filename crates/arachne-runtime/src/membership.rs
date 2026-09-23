@@ -1303,6 +1303,8 @@ pub(super) fn bare_test_session(workspace: impl Into<Arc<arachne_security::Works
         direct_range: None,
         ready_direct_range: None,
         direct_miss: None,
+        group_objects: None,
+        ready_group_objects: None,
         recovered: VecDeque::new(),
         publisher: None,
         received: None,

@@ -259,6 +259,12 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
                     Some(metadata) => {
                         active_inbox.stage_live_current(owner, &context, metadata, now, ciphertext)
                     }
+                    None if message.recipients.is_empty() => active_inbox.stage_group_object(
+                        owner,
+                        &context,
+                        ciphertext,
+                        message.delivery == arachne_node::DeliveryClass::Critical,
+                    ),
                     None => active_inbox.stage_with_recipients(
                         owner,
                         &context,
@@ -585,6 +591,71 @@ pub(super) fn stage_direct_recovery(session: &mut Session) -> Result<Value, Stri
         transition: WorkspaceTransition::InboxRecovery { count },
     });
     session.ready_direct_range = None;
+    Ok(value)
+}
+
+pub(super) fn stage_group_objects(session: &mut Session) -> Result<Value, String> {
+    let ready = session
+        .ready_group_objects
+        .as_ref()
+        .ok_or("no group object recovery ready")?;
+    check_recovery_policy(
+        session,
+        ready.peer,
+        ready.query.author,
+        ready.query.workspace,
+        ready.query.epoch,
+        ready.query.policy_revision,
+        &ready.query.topics,
+    )?;
+    let owner = session
+        .workspace
+        .as_ref()
+        .ok_or("session has no workspace")?;
+    let key = session
+        .storage_key
+        .as_ref()
+        .ok_or("session has no protected root key")?;
+    let (next, count) = session
+        .inbox
+        .as_ref()
+        .ok_or("object delivery not enabled")?
+        .stage_group_objects(owner, &ready.query, &ready.reply)
+        .map_err(str::to_owned)?;
+    if count == 0 {
+        session.ready_group_objects = None;
+        return Ok(json!({"state":"group_object_recovery_already_covered",
+            "accepted_progress":false}));
+    }
+    let publisher = session
+        .publisher
+        .clone()
+        .unwrap_or(arachne_delivery::PublisherLog::new(
+            owner.id(),
+            owner.member().ok_or("member required")?.id(),
+            owner.epoch(),
+        ));
+    let snapshot = seal_state(
+        session.records.is_some(),
+        owner,
+        key,
+        Some(&publisher),
+        session.received.as_ref(),
+        Some(&next),
+    )?;
+    let candidate = owner.provisional_copy().map_err(str::to_owned)?;
+    let value = json!({"workspace":owner.id(), "snapshot":snapshot,
+        "state":"awaiting_recovery_save", "publication_count":count,
+        "durable":false, "accepted_progress":false});
+    session.staged_workspace = Some(StagedWorkspace {
+        workspace: candidate,
+        publisher: Some(publisher),
+        received: session.received.clone(),
+        inbox: Some(next),
+        snapshot,
+        transition: WorkspaceTransition::InboxRecovery { count },
+    });
+    session.ready_group_objects = None;
     Ok(value)
 }
 
