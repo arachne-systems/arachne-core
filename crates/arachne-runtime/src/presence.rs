@@ -22,14 +22,24 @@ struct ObservedGroupHead {
     at: Instant,
 }
 
+struct ObservedGroupObjectHead {
+    peer: [u8; 32],
+    head: arachne_delivery::wire::GroupObjectHead,
+    at: Instant,
+}
+
 pub(super) struct Presence {
     seen: BTreeMap<[u8; 32], Seen>,
     pending: Vec<PendingControl<()>>,
-    group_pending: Vec<PendingControl<()>>,
+    group_pending: Vec<PendingControl<u8>>,
     queued: VecDeque<[u8; 32]>,
     group_queued: VecDeque<[u8; 32]>,
     group_unsupported: BTreeSet<[u8; 32]>,
     group_heads: Vec<ObservedGroupHead>,
+    group_object_heads: Vec<ObservedGroupObjectHead>,
+    group_version: BTreeMap<[u8; 32], u8>,
+    group_retries: BTreeMap<[u8; 32], u8>,
+    group_retry_at: BTreeMap<[u8; 32], Instant>,
     head_cursor: BTreeMap<[u8; 32], usize>,
     next: Option<Instant>,
     epoch: Option<u64>,
@@ -49,6 +59,10 @@ impl Presence {
             group_queued: VecDeque::new(),
             group_unsupported: BTreeSet::new(),
             group_heads: Vec::new(),
+            group_object_heads: Vec::new(),
+            group_version: BTreeMap::new(),
+            group_retries: BTreeMap::new(),
+            group_retry_at: BTreeMap::new(),
             head_cursor: BTreeMap::new(),
             next: None,
             epoch: None,
@@ -62,7 +76,10 @@ impl Presence {
         self.group_pending.clear();
         self.queued.clear();
         self.group_queued.clear();
+        self.group_retries.clear();
+        self.group_retry_at.clear();
         self.group_heads.clear();
+        self.group_object_heads.clear();
     }
 
     pub(super) fn announce_next(&mut self) {
@@ -90,10 +107,33 @@ impl Presence {
             .max()
             .filter(|through| *through > after)
     }
+
+    pub(super) fn group_object_tail(
+        &self,
+        author: [u8; 32],
+        topics: &BTreeSet<Topic>,
+        after: u64,
+        now: Instant,
+    ) -> Option<([u8; 32], u64)> {
+        self.group_object_heads
+            .iter()
+            .filter(|observed| {
+                observed.head.author == author
+                    && topics.contains(&observed.head.topic)
+                    && observed.head.through > after
+                    && now.saturating_duration_since(observed.at) < FRESH
+            })
+            .max_by_key(|observed| observed.head.through)
+            .map(|observed| (observed.peer, observed.head.through))
+    }
 }
 
 fn queue_group_heads(presence: &mut Presence, peer: [u8; 32]) {
     if !presence.group_unsupported.contains(&peer)
+        && presence
+            .group_retry_at
+            .get(&peer)
+            .is_none_or(|retry_at| Instant::now() >= *retry_at)
         && !presence.group_queued.contains(&peer)
         && !presence
             .group_pending
@@ -101,6 +141,38 @@ fn queue_group_heads(presence: &mut Presence, peer: [u8; 32]) {
             .any(|pending| pending.peer == peer)
     {
         presence.group_queued.push_back(peer);
+    }
+}
+
+fn schedule_group_retry(presence: &mut Presence, peer: [u8; 32], now: Instant) {
+    let retries = presence.group_retries.entry(peer).or_default();
+    let delay = match *retries {
+        0 => {
+            *retries = 1;
+            Duration::from_millis(300)
+        }
+        1 => {
+            *retries = 2;
+            REFRESH_INTERVAL
+        }
+        _ => {
+            *retries = 0;
+            REFRESH_INTERVAL
+        }
+    };
+    presence.group_retry_at.insert(peer, now + delay);
+}
+
+fn queue_due_group_retries(presence: &mut Presence, now: Instant) {
+    let due: Vec<_> = presence
+        .group_retry_at
+        .iter()
+        .filter(|(_, retry_at)| now >= **retry_at)
+        .map(|(peer, _)| *peer)
+        .collect();
+    for peer in due {
+        presence.group_retry_at.remove(&peer);
+        queue_group_heads(presence, peer);
     }
 }
 
@@ -266,7 +338,14 @@ fn observe(session: &mut Session, peer: [u8; 32], bytes: &[u8]) -> Result<bool, 
             .presence
             .group_heads
             .retain(|observed| observed.peer != peer);
+        session
+            .presence
+            .group_object_heads
+            .retain(|observed| observed.peer != peer);
         session.presence.group_unsupported.remove(&peer);
+        session.presence.group_version.remove(&peer);
+        session.presence.group_retries.remove(&peer);
+        session.presence.group_retry_at.remove(&peer);
         session
             .presence
             .group_queued
@@ -289,24 +368,47 @@ fn observe(session: &mut Session, peer: [u8; 32], bytes: &[u8]) -> Result<bool, 
     Ok(restarted)
 }
 
-fn observe_group_heads(session: &mut Session, peer: [u8; 32], bytes: &[u8]) -> Result<(), String> {
+fn observe_group_heads(
+    session: &mut Session,
+    peer: [u8; 32],
+    requested_version: u8,
+    bytes: &[u8],
+) -> Result<(), String> {
     let owner = session.workspace.as_ref().ok_or("no workspace")?;
     let query = arachne_delivery::wire::GroupHeadsQuery {
         workspace: owner.id(),
         epoch: owner.epoch(),
     };
-    let heads = match arachne_delivery::wire::parse_group_heads_reply(&query, bytes) {
-        Ok(heads) => heads,
+    let (heads, object_heads) =
+        match arachne_delivery::wire::parse_group_heads_reply_full(&query, bytes) {
+            Ok(heads) => heads,
         Err(_) if !bytes.starts_with(b"DFGP") => {
+            if requested_version == 2 {
+                session.presence.group_version.insert(peer, 1);
+                session.presence.group_retries.remove(&peer);
+                session.presence.group_retry_at.remove(&peer);
+                queue_group_heads(&mut session.presence, peer);
+                return Ok(());
+            }
             session
                 .presence
                 .group_heads
                 .retain(|observed| observed.peer != peer);
+            session
+                .presence
+                .group_object_heads
+                .retain(|observed| observed.peer != peer);
             session.presence.group_unsupported.insert(peer);
+            session.presence.group_retries.remove(&peer);
+            session.presence.group_retry_at.remove(&peer);
             return Ok(());
         }
-        Err(error) => return Err(error.to_owned()),
-    };
+            Err(error) => return Err(error.to_owned()),
+        };
+    let response_version = if bytes.starts_with(b"DFGP\x02") { 2 } else { 1 };
+    session.presence.group_version.insert(peer, response_version);
+    session.presence.group_retries.remove(&peer);
+    session.presence.group_retry_at.remove(&peer);
     owner.member_id_for_endpoint(peer).map_err(str::to_owned)?;
     session
         .presence
@@ -320,6 +422,22 @@ fn observe_group_heads(session: &mut Session, peer: [u8; 32], bytes: &[u8]) -> R
                 head,
                 at: now,
             });
+        }
+    }
+    session
+        .presence
+        .group_object_heads
+        .retain(|observed| observed.peer != peer);
+    for head in object_heads {
+        if owner.endpoints_for_members(&[head.author]).is_ok() {
+            session
+                .presence
+                .group_object_heads
+                .push(ObservedGroupObjectHead {
+                    peer,
+                    head,
+                    at: now,
+                });
         }
     }
     session.presence.group_unsupported.remove(&peer);
@@ -430,10 +548,25 @@ pub(super) fn poll(session: &mut Session, announce: bool) -> Result<Value, Strin
     session.presence.group_heads.retain(|observed| {
         peers.contains(&observed.peer) && now.saturating_duration_since(observed.at) < FRESH
     });
+    session.presence.group_object_heads.retain(|observed| {
+        peers.contains(&observed.peer) && now.saturating_duration_since(observed.at) < FRESH
+    });
     session
         .presence
         .group_unsupported
         .retain(|peer| peers.contains(peer));
+    session
+        .presence
+        .group_version
+        .retain(|peer, _| peers.contains(peer));
+    session
+        .presence
+        .group_retries
+        .retain(|peer, _| peers.contains(peer));
+    session
+        .presence
+        .group_retry_at
+        .retain(|peer, _| peers.contains(peer));
     session
         .presence
         .group_queued
@@ -451,7 +584,10 @@ pub(super) fn poll(session: &mut Session, announce: bool) -> Result<Value, Strin
         session.presence.queued.clear();
         session.presence.group_queued.clear();
         session.presence.group_heads.clear();
-        session.presence.group_unsupported.clear();
+        session.presence.group_object_heads.clear();
+        session.presence.group_version.clear();
+        session.presence.group_retries.clear();
+        session.presence.group_retry_at.clear();
         session.presence.head_cursor.clear();
         session.presence.next = None;
         session.presence.epoch = Some(epoch);
@@ -499,21 +635,25 @@ pub(super) fn poll(session: &mut Session, announce: bool) -> Result<Value, Strin
         let mut done = session.presence.group_pending.swap_remove(i);
         match session.runtime.block_on(&mut done.task) {
             Ok(Ok(bytes)) => {
-                if let Err(error) = observe_group_heads(session, done.peer, &bytes) {
+                if let Err(error) = observe_group_heads(session, done.peer, done.query, &bytes) {
                     response_errors = response_errors.saturating_add(1);
                     response_error.get_or_insert(error);
+                    schedule_group_retry(&mut session.presence, done.peer, now);
                 }
             }
             Ok(Err(error)) => {
                 response_errors = response_errors.saturating_add(1);
                 response_error.get_or_insert(error.to_string());
+                schedule_group_retry(&mut session.presence, done.peer, now);
             }
             Err(error) => {
                 response_errors = response_errors.saturating_add(1);
                 response_error.get_or_insert(error.to_string());
+                schedule_group_retry(&mut session.presence, done.peer, now);
             }
         }
     }
+    queue_due_group_retries(&mut session.presence, now);
     if session.presence.pending.is_empty()
         && session.presence.queued.is_empty()
         && session.presence.next.is_none_or(|next| now >= next)
@@ -544,7 +684,18 @@ pub(super) fn poll(session: &mut Session, announce: bool) -> Result<Value, Strin
         let Some(peer) = session.presence.group_queued.pop_front() else {
             break;
         };
-        let query = arachne_delivery::wire::GroupHeadsQuery { workspace, epoch }.to_wire();
+        let query = arachne_delivery::wire::GroupHeadsQuery { workspace, epoch };
+        let version = session
+            .presence
+            .group_version
+            .get(&peer)
+            .copied()
+            .unwrap_or(2);
+        let query = if version == 2 {
+            query.to_wire_v2()
+        } else {
+            query.to_wire()
+        };
         let control = session.node.control_client();
         let task = session.runtime.spawn(async move {
             tokio::time::timeout(
@@ -555,7 +706,7 @@ pub(super) fn poll(session: &mut Session, announce: bool) -> Result<Value, Strin
             .map_err(|_| arachne_node::Error::Timeout("group-head response"))?
         });
         session.presence.group_pending.push(PendingControl {
-            query: (),
+            query: version,
             peer,
             task,
         });
@@ -612,5 +763,26 @@ mod tests {
         receive(&mut session, peer, &packet).unwrap();
 
         assert!(session.membership_update.is_some());
+    }
+
+    #[test]
+    fn group_head_timeout_retries_once_then_waits_for_refresh() {
+        let mut presence = Presence::new().unwrap();
+        let peer = [93; 32];
+        let now = Instant::now();
+
+        schedule_group_retry(&mut presence, peer, now);
+        queue_group_heads(&mut presence, peer);
+        assert!(presence.group_queued.is_empty());
+        queue_due_group_retries(&mut presence, now + Duration::from_millis(299));
+        assert!(presence.group_queued.is_empty());
+        queue_due_group_retries(&mut presence, now + Duration::from_millis(300));
+        assert_eq!(presence.group_queued.pop_front(), Some(peer));
+
+        schedule_group_retry(&mut presence, peer, now + Duration::from_millis(300));
+        queue_due_group_retries(&mut presence, now + Duration::from_secs(30));
+        assert!(presence.group_queued.is_empty());
+        queue_due_group_retries(&mut presence, now + Duration::from_millis(30_300));
+        assert_eq!(presence.group_queued.pop_front(), Some(peer));
     }
 }

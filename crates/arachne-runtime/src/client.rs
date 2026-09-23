@@ -137,6 +137,13 @@ pub struct MemberRoster {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspacePresenceStatus {
+    pub sync_peer: Option<[u8; 32]>,
+    pub response_errors: u32,
+    pub response_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteHint {
     pub peer: [u8; 32],
     pub address: String,
@@ -330,6 +337,7 @@ pub struct PendingObject {
     pub revision: u64,
     pub topic: String,
     pub id: [u8; 16],
+    pub sequence: Option<u64>,
     pub member: [u8; 32],
     pub endpoint: [u8; 32],
     pub payload: Vec<u8>,
@@ -401,6 +409,16 @@ pub struct RecoveryRangeRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupObjectRecoveryRequest {
+    pub peer: [u8; 32],
+    pub author: [u8; 32],
+    pub revision: u64,
+    pub topics: Vec<String>,
+    pub after: u64,
+    pub through: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryCutoffRequest {
     pub peer: [u8; 32],
     pub revision: u64,
@@ -427,6 +445,39 @@ pub enum RecoveryCutoffStatus {
     Pending,
     Observed(RecoveryCutoff),
     Denied,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupRecoveryGap {
+    pub author: [u8; 32],
+    pub topics: Vec<String>,
+    pub after: u64,
+    pub through: u64,
+    /// Present when an authorized peer advertised live group objects.
+    pub relay_peer: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupObjectRecoveryReady {
+    pub peer: [u8; 32],
+    pub author: [u8; 32],
+    pub revision: u64,
+    pub topics: Vec<String>,
+    pub after: u64,
+    pub through: u64,
+    pub packet_count: usize,
+    pub retained_bytes: usize,
+    pub attempted: usize,
+    pub accepted_progress: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GroupObjectRecoveryStatus {
+    Pending { candidate_count: usize },
+    Ready(GroupObjectRecoveryReady),
+    Empty { peer: [u8; 32], attempted: usize },
+    SourceUnavailable { attempted: usize, reason: Option<String> },
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -896,6 +947,30 @@ impl Client {
         Ok(!self.request(json!({"op": "poll_admission"}))?.is_null())
     }
 
+    pub fn poll_workspace_presence(&self, announce: bool) -> Result<WorkspacePresenceStatus> {
+        let raw: RawWorkspacePresenceStatus = serde_json::from_value(self.request(json!({
+            "op": "poll_workspace_presence",
+            "announce": announce,
+        }))?)
+        .map_err(|parse_error| {
+            error(
+                ErrorKind::Internal,
+                format!("invalid workspace presence status: {parse_error}"),
+            )
+        })?;
+        if raw.state != "workspace_presence" {
+            return Err(error(
+                ErrorKind::Internal,
+                format!("unknown workspace presence state: {}", raw.state),
+            ));
+        }
+        Ok(WorkspacePresenceStatus {
+            sync_peer: raw.sync_peer,
+            response_errors: raw.response_errors,
+            response_error: raw.response_error,
+        })
+    }
+
     pub fn add_address_hint(&self, peer: [u8; 32], address: &str) -> Result<()> {
         self.request(json!({
             "op": "add_address_hint",
@@ -969,6 +1044,7 @@ impl Client {
             revision: raw.revision,
             topic: raw.topic,
             id: raw.id,
+            sequence: raw.sequence,
             member: raw.member,
             endpoint: raw.endpoint,
             payload: raw.payload,
@@ -1369,6 +1445,114 @@ impl Client {
         parse_recovery_range_status(response).map(Some)
     }
 
+    pub fn next_group_gap(
+        &self,
+        author: [u8; 32],
+        topics: Vec<String>,
+    ) -> Result<Option<GroupRecoveryGap>> {
+        let response = self.request(json!({
+            "op": "next_group_gap",
+            "author": author,
+            "topics": topics,
+        }))?;
+        if response.is_null() {
+            return Ok(None);
+        }
+        let raw: RawGroupRecoveryGap = serde_json::from_value(response).map_err(|parse_error| {
+            error(
+                ErrorKind::Internal,
+                format!("invalid group recovery gap: {parse_error}"),
+            )
+        })?;
+        if raw.state != "group_recovery_needed" {
+            return Err(error(
+                ErrorKind::Internal,
+                format!("unknown group recovery gap state: {}", raw.state),
+            ));
+        }
+        Ok(Some(GroupRecoveryGap {
+            author: raw.author,
+            topics: raw.topics,
+            after: raw.after,
+            through: raw.through,
+            relay_peer: raw.relay_peer,
+        }))
+    }
+
+    pub fn fetch_group_objects(
+        &self,
+        request: GroupObjectRecoveryRequest,
+    ) -> Result<GroupObjectRecoveryStatus> {
+        parse_group_object_recovery_status(self.request(json!({
+            "op": "fetch_group_objects",
+            "peer": request.peer,
+            "author": request.author,
+            "revision": request.revision,
+            "topics": request.topics,
+            "after": request.after,
+            "through": request.through,
+        }))?)
+    }
+
+    pub fn poll_group_objects(&self) -> Result<Option<GroupObjectRecoveryStatus>> {
+        let response = self.request(json!({"op": "poll_group_objects"}))?;
+        if response.is_null() {
+            return Ok(None);
+        }
+        parse_group_object_recovery_status(response).map(Some)
+    }
+
+    pub fn cancel_group_objects(&self) -> Result<()> {
+        match parse_group_object_recovery_status(
+            self.request(json!({"op": "cancel_group_objects"}))?,
+        )? {
+            GroupObjectRecoveryStatus::Cancelled => Ok(()),
+            _ => Err(error(
+                ErrorKind::Internal,
+                "invalid group-object recovery cancellation response",
+            )),
+        }
+    }
+
+    pub fn stage_group_objects(&self) -> Result<RecoveryStage> {
+        let [metadata, snapshot] =
+            execute_stored(self.handle()?, br#"{"op":"stage_group_objects"}"#, &[])
+                .map_err(|message| map_error(&message))?;
+        let value: Value = serde_json::from_slice(&metadata).map_err(|parse_error| {
+            error(
+                ErrorKind::Internal,
+                format!("invalid group-object recovery stage: {parse_error}"),
+            )
+        })?;
+        match value.get("state").and_then(Value::as_str) {
+            Some("awaiting_recovery_save") => {
+                let raw: RawRecoveryCandidate =
+                    serde_json::from_value(value).map_err(|parse_error| {
+                        error(
+                            ErrorKind::Internal,
+                            format!("invalid group-object recovery candidate: {parse_error}"),
+                        )
+                    })?;
+                Ok(RecoveryStage::Candidate(RecoveryCandidate {
+                    workspace: raw.workspace,
+                    snapshot,
+                    publication_count: raw.publication_count,
+                    already_received: raw.already_received,
+                    durable: raw.durable,
+                }))
+            }
+            Some("group_object_recovery_already_covered") => Ok(RecoveryStage::AlreadyCovered),
+            Some(state) => Err(error(
+                ErrorKind::Internal,
+                format!("unknown group-object recovery stage: {state}"),
+            )),
+            None => Err(error(
+                ErrorKind::Internal,
+                "group-object recovery stage has no state",
+            )),
+        }
+    }
+
     pub fn discover_recovery_cutoff(
         &self,
         request: RecoveryCutoffRequest,
@@ -1747,6 +1931,8 @@ struct RawPendingObject {
     revision: u64,
     topic: String,
     id: [u8; 16],
+    #[serde(default)]
+    sequence: Option<u64>,
     member: [u8; 32],
     endpoint: [u8; 32],
     payload: Vec<u8>,
@@ -1828,6 +2014,54 @@ struct RawRecoverySourceUnavailable {
 }
 
 #[derive(Deserialize)]
+struct RawGroupRecoveryGap {
+    state: String,
+    author: [u8; 32],
+    topics: Vec<String>,
+    after: u64,
+    through: u64,
+    #[serde(default)]
+    relay_peer: Option<[u8; 32]>,
+}
+
+#[derive(Deserialize)]
+struct RawWorkspacePresenceStatus {
+    state: String,
+    sync_peer: Option<[u8; 32]>,
+    response_errors: u32,
+    response_error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawGroupObjectRecoveryStatus {
+    state: String,
+    #[serde(default)]
+    candidate_count: Option<usize>,
+    #[serde(default)]
+    peer: Option<[u8; 32]>,
+    #[serde(default)]
+    author: Option<[u8; 32]>,
+    #[serde(default)]
+    revision: Option<u64>,
+    #[serde(default)]
+    topics: Vec<String>,
+    #[serde(default)]
+    after: Option<u64>,
+    #[serde(default)]
+    through: Option<u64>,
+    #[serde(default)]
+    packet_count: Option<usize>,
+    #[serde(default)]
+    retained_bytes: Option<usize>,
+    #[serde(default)]
+    attempted: Option<usize>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    accepted_progress: bool,
+}
+
+#[derive(Deserialize)]
 struct RawRecoveryCandidate {
     workspace: [u8; 32],
     #[serde(default)]
@@ -1848,6 +2082,64 @@ struct RawRecoveryAdoption {
     publication_count: usize,
     #[serde(default)]
     missing_count: usize,
+}
+
+fn parse_group_object_recovery_status(value: Value) -> Result<GroupObjectRecoveryStatus> {
+    let raw: RawGroupObjectRecoveryStatus =
+        serde_json::from_value(value).map_err(|parse_error| {
+            error(
+                ErrorKind::Internal,
+                format!("invalid group-object recovery status: {parse_error}"),
+            )
+        })?;
+    if raw.accepted_progress {
+        return Err(error(
+            ErrorKind::Internal,
+            "group-object recovery changed signed range progress",
+        ));
+    }
+    let missing = |field: &str| {
+        error(
+            ErrorKind::Internal,
+            format!("group-object recovery status is missing {field}"),
+        )
+    };
+    match raw.state.as_str() {
+        "group_object_recovery_pending" => Ok(GroupObjectRecoveryStatus::Pending {
+            candidate_count: raw
+                .candidate_count
+                .ok_or_else(|| missing("candidate count"))?,
+        }),
+        "group_object_recovery_ready" => {
+            Ok(GroupObjectRecoveryStatus::Ready(GroupObjectRecoveryReady {
+                peer: raw.peer.ok_or_else(|| missing("peer"))?,
+                author: raw.author.ok_or_else(|| missing("author"))?,
+                revision: raw.revision.ok_or_else(|| missing("revision"))?,
+                topics: raw.topics,
+                after: raw.after.ok_or_else(|| missing("after cursor"))?,
+                through: raw.through.ok_or_else(|| missing("through cursor"))?,
+                packet_count: raw.packet_count.ok_or_else(|| missing("packet count"))?,
+                retained_bytes: raw
+                    .retained_bytes
+                    .ok_or_else(|| missing("retained bytes"))?,
+                attempted: raw.attempted.ok_or_else(|| missing("attempt count"))?,
+                accepted_progress: raw.accepted_progress,
+            }))
+        }
+        "group_object_recovery_empty" => Ok(GroupObjectRecoveryStatus::Empty {
+            peer: raw.peer.ok_or_else(|| missing("peer"))?,
+            attempted: raw.attempted.ok_or_else(|| missing("attempt count"))?,
+        }),
+        "group_object_source_unavailable" => Ok(GroupObjectRecoveryStatus::SourceUnavailable {
+            attempted: raw.attempted.ok_or_else(|| missing("attempt count"))?,
+            reason: raw.reason,
+        }),
+        "group_object_recovery_cancelled" => Ok(GroupObjectRecoveryStatus::Cancelled),
+        other => Err(error(
+            ErrorKind::Internal,
+            format!("unknown group-object recovery state: {other}"),
+        )),
+    }
 }
 
 fn parse_recovery_range_status(value: Value) -> Result<RecoveryRangeStatus> {
@@ -2044,4 +2336,58 @@ fn create_required_secret(
     let secret = secret
         .ok_or_else(|| error(ErrorKind::InvalidInput, format!("{name} requires a secret")))?;
     create(secret).map_err(|message| map_error(&message))
+}
+
+#[cfg(test)]
+mod group_object_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn ready_status_preserves_advisory_only_coverage() {
+        let ready = parse_group_object_recovery_status(json!({
+            "state": "group_object_recovery_ready",
+            "peer": vec![1; 32],
+            "author": vec![2; 32],
+            "revision": 3,
+            "topics": ["chat/main"],
+            "after": 4,
+            "through": 5,
+            "packet_count": 1,
+            "retained_bytes": 120,
+            "attempted": 1,
+            "accepted_progress": false,
+        }))
+        .unwrap();
+        assert_eq!(
+            ready,
+            GroupObjectRecoveryStatus::Ready(GroupObjectRecoveryReady {
+                peer: [1; 32],
+                author: [2; 32],
+                revision: 3,
+                topics: vec!["chat/main".into()],
+                after: 4,
+                through: 5,
+                packet_count: 1,
+                retained_bytes: 120,
+                attempted: 1,
+                accepted_progress: false,
+            })
+        );
+        assert!(
+            parse_group_object_recovery_status(json!({
+                "state": "group_object_recovery_ready",
+                "peer": vec![1; 32],
+                "author": vec![2; 32],
+                "revision": 3,
+                "topics": ["chat/main"],
+                "after": 4,
+                "through": 5,
+                "packet_count": 1,
+                "retained_bytes": 120,
+                "attempted": 1,
+                "accepted_progress": true,
+            }))
+            .is_err()
+        );
+    }
 }

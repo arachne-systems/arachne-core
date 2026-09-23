@@ -46,15 +46,16 @@ mod workspace_activity;
 pub use client::{
     AdmissionAuthorization, AdmissionReply, Client, ClientConfig, ConnectivityReport,
     ConnectionCapacityMetrics, ControlTimingMetrics, DeliveryFailure, DeliveryReport,
-    DurationSummary, EndpointInfo, Error, ErrorKind, InterestObservation, InvitationDetails,
-    InvitationInfo, JoinAdmissionStep, JoinRequest, MemberInfo, MemberKind,
+    DurationSummary, EndpointInfo, Error, ErrorKind, GroupObjectRecoveryReady,
+    GroupObjectRecoveryRequest, GroupObjectRecoveryStatus, GroupRecoveryGap,
+    InterestObservation, InvitationDetails, InvitationInfo, JoinAdmissionStep, JoinRequest, MemberInfo, MemberKind,
     MembershipGossipMetrics, MemberRoster, Network, PeerPolicy, PeerRoute, PendingObject, Presence,
     Publication, PublicationCandidate, PublicationCurrent, ProtectedReceptionCandidate,
     ReceivedProtectedPublication,
     RecoveredPublication, RecoveryAdoption, RecoveryCandidate, RecoveryCutoff,
     RecoveryCutoffRequest, RecoveryCutoffStatus, RecoveryRangeReady, RecoveryRangeRequest,
     RecoveryRangeStatus, RecoveryStage, Result as ClientResult, RouteHint, RouteKind,
-    WorkspaceCandidate, WorkspaceInfo, WorkspaceMetrics, WorkspaceState,
+    WorkspaceCandidate, WorkspaceInfo, WorkspaceMetrics, WorkspacePresenceStatus, WorkspaceState,
 };
 pub use persistence::{enable_record_storage, restore_record_storage, save_candidate};
 pub use workspace_activity::{Activity as WorkspaceActivity, Phase as WorkspacePhase};
@@ -253,6 +254,13 @@ struct ReadyDirectRange {
     packet_count: usize,
 }
 
+struct ReadyGroupObjects {
+    query: arachne_delivery::wire::GroupObjectsQuery,
+    peer: [u8; 32],
+    reply: Vec<u8>,
+    packet_count: usize,
+}
+
 struct ReadyCurrentView {
     query: arachne_delivery::current::CurrentViewQuery,
     peer: [u8; 32],
@@ -284,6 +292,19 @@ struct PendingDirectRange {
     task: tokio::task::JoinHandle<()>,
     attempted: usize,
     reason: Option<String>,
+}
+
+struct PendingGroupObjects {
+    query: arachne_delivery::wire::GroupObjectsQuery,
+    replies: mpsc::Receiver<RecoveryReply>,
+    task: tokio::task::JoinHandle<()>,
+    attempted: usize,
+    reason: Option<String>,
+}
+impl Drop for PendingGroupObjects {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 impl Drop for PendingDirectRange {
     fn drop(&mut self) {
@@ -342,6 +363,8 @@ struct Session {
     direct_range: Option<PendingDirectRange>,
     ready_direct_range: Option<ReadyDirectRange>,
     direct_miss: Option<arachne_delivery::wire::DirectRangeQuery>,
+    group_objects: Option<PendingGroupObjects>,
+    ready_group_objects: Option<ReadyGroupObjects>,
     recovered: VecDeque<(
         arachne_routing::PublicationContext,
         arachne_security::ApplicationMessage,
@@ -654,6 +677,8 @@ fn create_endpoint(
             direct_range: None,
             ready_direct_range: None,
             direct_miss: None,
+            group_objects: None,
+            ready_group_objects: None,
             recovered: VecDeque::new(),
             publisher: None,
             received: None,
@@ -956,6 +981,17 @@ enum Request {
         after: u64,
         through: u64,
     },
+    FetchGroupObjects {
+        peer: [u8; 32],
+        author: [u8; 32],
+        revision: u64,
+        topics: Vec<String>,
+        after: u64,
+        through: u64,
+    },
+    PollGroupObjects {},
+    StageGroupObjects {},
+    CancelGroupObjects {},
     PollDirectRecovery {},
     StageDirectRecovery {},
     StageDirectMiss {},
@@ -1432,6 +1468,8 @@ fn check_epoch_transition(session: &mut Session) -> Result<(), String> {
     drop(session.direct_range.take());
     session.ready_direct_range = None;
     session.direct_miss = None;
+    drop(session.group_objects.take());
+    session.ready_group_objects = None;
     drop(session.current_view.take());
     session.ready_current_view = None;
     Ok(())
@@ -2693,6 +2731,8 @@ fn reset_workspace(session: &mut Session) -> Result<Value, String> {
     session.direct_range = None;
     session.ready_direct_range = None;
     session.direct_miss = None;
+    session.group_objects = None;
+    session.ready_group_objects = None;
     session.recovered.clear();
     session.publisher = None;
     session.received = None;
@@ -3933,6 +3973,7 @@ fn execute_in_session(
             .inbox
             .as_ref()
             .ok_or("object delivery not enabled")?;
+        let mut relay_peer = None;
         let gap = match inbox
             .next_group_gap(owner, author, &topics)
             .map_err(str::to_owned)?
@@ -3950,12 +3991,34 @@ fn execute_in_session(
                             after,
                             through,
                         })
+                        .or_else(|| {
+                            session
+                                .presence
+                                .group_object_tail(
+                                    author,
+                                    &topics,
+                                    after,
+                                    std::time::Instant::now(),
+                                )
+                                .map(|(peer, through)| {
+                                    relay_peer = Some(peer);
+                                    arachne_delivery::inbox::GroupGap {
+                                        author,
+                                        after,
+                                        through: through.min(
+                                            after.saturating_add(
+                                                arachne_security::MAX_RECOVERY_PACKETS as u64,
+                                            ),
+                                        ),
+                                    }
+                                })
+                        })
                 }),
         };
         match gap {
             Some(gap) => json!({"state":"group_recovery_needed", "author":gap.author,
                 "topics":topics.iter().map(|topic| topic.as_str()).collect::<Vec<_>>(),
-                "after":gap.after, "through":gap.through}),
+                "after":gap.after, "through":gap.through, "relay_peer":relay_peer}),
             None => Value::Null,
         }
     } else if let Request::FetchDirectRecovery {
@@ -4057,6 +4120,147 @@ fn execute_in_session(
         });
         json!({"state":"direct_recovery_pending", "candidate_count":candidate_count,
             "accepted_progress":false})
+    } else if let Request::FetchGroupObjects {
+        peer,
+        author,
+        revision,
+        topics,
+        after,
+        through,
+    } = request
+    {
+        if session.cutoff.is_some()
+            || session.range.is_some()
+            || session.ready_range.is_some()
+            || session.direct_range.is_some()
+            || session.ready_direct_range.is_some()
+            || session.group_objects.is_some()
+            || session.ready_group_objects.is_some()
+            || session.current_view.is_some()
+            || session.ready_current_view.is_some()
+        {
+            return Err("continuity operation already pending".into());
+        }
+        let owner = session
+            .workspace
+            .as_ref()
+            .ok_or("session has no workspace")?;
+        if session.inbox.is_none() || peer == session.node.id() {
+            return Err("invalid group object recovery peer".into());
+        }
+        let topic_count = topics.len();
+        let topics = topics
+            .into_iter()
+            .map(Topic::new)
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        if topics.len() != topic_count {
+            return Err("duplicate group recovery topic".into());
+        }
+        let query = arachne_delivery::wire::GroupObjectsQuery {
+            workspace: owner.id(),
+            author,
+            epoch: owner.epoch(),
+            policy_revision: revision,
+            topics,
+            after,
+            through,
+        };
+        let wire = query.to_wire().map_err(str::to_owned)?;
+        check_recovery_policy(
+            session,
+            peer,
+            query.author,
+            query.workspace,
+            query.epoch,
+            query.policy_revision,
+            &query.topics,
+        )?;
+        let control = session.node.control_client();
+        let (reply_tx, replies) = mpsc::channel(1);
+        let task = session.runtime.spawn(async move {
+            let result = request_control_retry_once(control, peer, &wire)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = reply_tx.send((peer, result)).await;
+        });
+        session.group_objects = Some(PendingGroupObjects {
+            query,
+            replies,
+            task,
+            attempted: 0,
+            reason: None,
+        });
+        json!({"state":"group_object_recovery_pending", "candidate_count":1,
+            "accepted_progress":false})
+    } else if matches!(request, Request::CancelGroupObjects {}) {
+        drop(session.group_objects.take());
+        session.ready_group_objects = None;
+        json!({"state":"group_object_recovery_cancelled", "accepted_progress":false})
+    } else if matches!(request, Request::PollGroupObjects {}) {
+        let Some(active) = session.group_objects.as_mut() else {
+            return Ok(Value::Null);
+        };
+        let (peer, reply) = match active.replies.try_recv() {
+            Ok(reply) => reply,
+            Err(mpsc::error::TryRecvError::Empty) if !active.task.is_finished() => {
+                return Ok(Value::Null);
+            }
+            Err(_) => {
+                let pending = session.group_objects.take().unwrap();
+                return Ok(json!({"state":"group_object_source_unavailable",
+                    "attempted":pending.attempted, "reason":pending.reason,
+                    "accepted_progress":false}));
+            }
+        };
+        active.attempted += 1;
+        let query = active.query.clone();
+        let attempted = active.attempted;
+        let result = reply.and_then(|reply| {
+            check_recovery_policy(
+                session,
+                peer,
+                query.author,
+                query.workspace,
+                query.epoch,
+                query.policy_revision,
+                &query.topics,
+            )?;
+            let count = arachne_delivery::wire::parse_group_objects_reply(&query, &reply)
+                .map_err(str::to_owned)?
+                .packets
+                .len();
+            Ok((reply, count))
+        });
+        match result {
+            Ok((_reply, 0)) => {
+                drop(session.group_objects.take());
+                json!({"state":"group_object_recovery_empty", "peer":peer,
+                    "attempted":attempted, "accepted_progress":false})
+            }
+            Ok((reply, packet_count)) => {
+                drop(session.group_objects.take());
+                session.ready_group_objects = Some(ReadyGroupObjects {
+                    query,
+                    peer,
+                    reply,
+                    packet_count,
+                });
+                let ready = session.ready_group_objects.as_ref().unwrap();
+                json!({"state":"group_object_recovery_ready", "peer":ready.peer,
+                    "author":ready.query.author, "revision":ready.query.policy_revision,
+                    "topics":ready.query.topics.iter().map(|topic| topic.as_str()).collect::<Vec<_>>(),
+                    "after":ready.query.after, "through":ready.query.through,
+                    "packet_count":ready.packet_count, "retained_bytes":ready.reply.len(),
+                    "attempted":attempted, "accepted_progress":false})
+            }
+            Err(error) => {
+                session.group_objects.as_mut().unwrap().reason = Some(error);
+                Value::Null
+            }
+        }
+    } else if matches!(request, Request::StageGroupObjects {}) {
+        protected::stage_group_objects(session)?
     } else if matches!(request, Request::CancelDirectRecovery {}) {
         drop(session.direct_range.take());
         session.ready_direct_range = None;
@@ -4899,6 +5103,8 @@ fn execute_in_session(
             return Ok(event);
         }
         if incoming.payload().starts_with(b"DFGQ") {
+            let version =
+                arachne_delivery::wire::GroupHeadsQuery::version(incoming.payload()).unwrap_or(1);
             let reply = match arachne_delivery::wire::GroupHeadsQuery::from_wire(
                 incoming.payload(),
             ) {
@@ -4910,19 +5116,40 @@ fn execute_in_session(
                             .duration_since(std::time::UNIX_EPOCH)
                             .map_err(|_| "system clock is before Unix epoch")?
                             .as_secs();
-                        let heads = session.runtime.block_on(
+                        let (heads, object_heads) = session.runtime.block_on(
                             session.node.with_routing_policy(|policy| {
-                                inbox
-                                    .retained_group_heads_for(
-                                        owner,
-                                        policy,
-                                        incoming.peer(),
-                                        now,
-                                    )
-                                    .unwrap_or_default()
+                                (
+                                    inbox
+                                        .retained_group_heads_for(
+                                            owner,
+                                            policy,
+                                            incoming.peer(),
+                                            now,
+                                        )
+                                        .unwrap_or_default(),
+                                    inbox
+                                        .retained_group_object_heads_for(
+                                            owner,
+                                            policy,
+                                            incoming.peer(),
+                                        )
+                                        .unwrap_or_default(),
+                                )
                             }),
                         );
-                        arachne_delivery::wire::group_heads_reply(&query, &heads)
+                        if version == 2 {
+                            arachne_delivery::wire::group_heads_reply_v2(
+                                &query,
+                                &heads,
+                                &object_heads,
+                            )
+                        } else {
+                            arachne_delivery::wire::group_heads_reply(&query, &heads)
+                        }
+                        .unwrap_or_else(|_| vec![0])
+                    }
+                    _ if version == 2 => {
+                        arachne_delivery::wire::group_heads_reply_v2(&query, &[], &[])
                             .unwrap_or_else(|_| vec![0])
                     }
                     _ => arachne_delivery::wire::group_heads_reply(&query, &[])
@@ -4932,6 +5159,26 @@ fn execute_in_session(
             };
             incoming.respond(reply).map_err(|error| error.to_string())?;
             return Ok(json!({"state":"group_heads_replied", "remote_receipt":false}));
+        }
+        if incoming.payload().starts_with(b"DFOQ") {
+            let reply = match (
+                session.workspace.as_ref(),
+                session.inbox.as_ref(),
+                arachne_delivery::wire::GroupObjectsQuery::from_wire(incoming.payload()),
+            ) {
+                (Some(owner), Some(inbox), Ok(query)) => session
+                    .runtime
+                    .block_on(session.node.with_routing_policy(|policy| {
+                        inbox.serve_group_objects(owner, policy, incoming.peer(), &query)
+                    }))
+                    .unwrap_or_else(|_| {
+                        arachne_delivery::wire::group_objects_reply(&query, [])
+                            .unwrap_or_else(|_| vec![0])
+                    }),
+                _ => vec![0],
+            };
+            incoming.respond(reply).map_err(|error| error.to_string())?;
+            return Ok(json!({"state":"group_objects_replied", "remote_receipt":false}));
         }
         // One control queue: route continuity before admission parsing. Never serve
         // staged state (the dispatcher rejects polls while adoption is pending).
@@ -6064,6 +6311,10 @@ fn execute_in_session(
                     | Request::NextDirectGap {}
                     | Request::NextGroupGap { .. }
                     | Request::FetchDirectRecovery { .. }
+                    | Request::FetchGroupObjects { .. }
+                    | Request::PollGroupObjects {}
+                    | Request::StageGroupObjects {}
+                    | Request::CancelGroupObjects {}
                     | Request::PollDirectRecovery {}
                     | Request::StageDirectRecovery {}
                     | Request::StageDirectMiss {}

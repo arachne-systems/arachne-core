@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 const MAGIC: &[u8] = b"DFOI\x01";
 const LEGACY_CACHE_MAGIC: &[u8] = b"DFIC\x01";
 const CURRENT_CACHE_MAGIC: &[u8] = b"DFIC\x02";
-const CACHE_MAGIC: &[u8] = b"DFIC\x03";
+const RETAINED_CURRENT_CACHE_MAGIC: &[u8] = b"DFIC\x03";
+const CACHE_MAGIC: &[u8] = b"DFIC\x04";
 const MAX_STREAMS: usize = 4096;
 const WINDOW: usize = MAX_PACKETS_PER_TOPIC;
 const MAX_RETAINED_RANGES: usize = 4;
@@ -16,6 +17,7 @@ const MAX_DIRECT_STREAMS: usize = 256;
 // Recovery copies are optional; pending application objects and replay floors
 // are not. Bound encoded copies across all audiences, not just packet counts.
 const MAX_DIRECT_RETAINED_BYTES: usize = 128 * 1024;
+const MAX_GROUP_RELAY_RECORDS: usize = 128;
 
 fn is_false(value: &bool) -> bool {
     !*value
@@ -38,6 +40,9 @@ struct Receipt {
     /// The application permanently rejected this authenticated object.
     #[serde(default, skip_serializing_if = "is_false")]
     rejected: bool,
+    /// Keep this pending critical group ciphertext replayable for other peers.
+    #[serde(default, skip_serializing_if = "is_false")]
+    retain_for_recovery: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +144,17 @@ struct DirectStream {
     records: Vec<DirectRecord>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GroupRelayRecord {
+    author: [u8; 32],
+    revision: u64,
+    topic: String,
+    id: [u8; 16],
+    sequence: u64,
+    object: Vec<u8>,
+}
+
 impl DirectStream {
     fn effective_head(&self) -> u64 {
         self.known_head.max(
@@ -171,6 +187,8 @@ pub struct ObjectInbox {
     legacy_receive_snapshot: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     direct: Vec<DirectStream>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    group_relay: Vec<GroupRelayRecord>,
 }
 
 #[derive(Deserialize)]
@@ -187,6 +205,8 @@ struct Snapshot {
     legacy_receive_snapshot: Option<Vec<u8>>,
     #[serde(default)]
     direct: Vec<DirectStream>,
+    #[serde(default)]
+    group_relay: Vec<GroupRelayRecord>,
 }
 
 pub enum InboxStage {
@@ -292,6 +312,7 @@ impl ObjectInbox {
             current_progress: Vec::new(),
             legacy_receive_snapshot: None,
             direct: Vec::new(),
+            group_relay: Vec::new(),
         }
     }
 
@@ -683,7 +704,19 @@ impl ObjectInbox {
         recipients: &[[u8; 32]],
         object: &[u8],
     ) -> Result<InboxStage, &'static str> {
-        self.stage_scoped(owner, context, recipients, None, true, object)
+        self.stage_scoped(owner, context, recipients, None, true, false, object)
+    }
+
+    /// Stage a live or relayed group object. Only callers handling Critical
+    /// delivery set the replay marker; optional replay storage stays bounded.
+    pub fn stage_group_object(
+        &self,
+        owner: &arachne_security::Workspace,
+        context: &PublicationContext,
+        object: &[u8],
+        retain_for_recovery: bool,
+    ) -> Result<InboxStage, &'static str> {
+        self.stage_scoped(owner, context, &[], None, true, retain_for_recovery, object)
     }
 
     /// Preserve the publisher cursor, but queue only the newest unexpired value
@@ -705,6 +738,7 @@ impl ObjectInbox {
             &[],
             Some(metadata.into()),
             metadata.expires_at > now,
+            false,
             object,
         )
     }
@@ -716,6 +750,7 @@ impl ObjectInbox {
         recipients: &[[u8; 32]],
         current: Option<CurrentReceipt>,
         pending: bool,
+        retain_group_for_recovery: bool,
         object: &[u8],
     ) -> Result<InboxStage, &'static str> {
         self.validate_owner(owner)?;
@@ -723,6 +758,10 @@ impl ObjectInbox {
             return Err("wrong inbox workspace");
         }
         let sequence = context.sequence.map_or(0, |n| n.get());
+        let retain_for_recovery = retain_group_for_recovery
+            && recipients.is_empty()
+            && current.is_none()
+            && context.sequence.is_some();
         let aad = receipt_aad(owner, context, recipients, current.as_ref())?;
         let authenticated = owner.unprotect_object(&aad, object)?;
         let author = authenticated.message.member;
@@ -802,6 +841,7 @@ impl ObjectInbox {
             digest,
             pending: (pending && !has_newer_current).then(|| object.to_vec()),
             rejected: false,
+            retain_for_recovery,
         });
         stream.receipts.sort_by_key(|r| r.counter);
         if stream.receipts.len() > WINDOW {
@@ -815,7 +855,12 @@ impl ObjectInbox {
         if !recipients.is_empty() && context.sequence.is_some() {
             next.retain_direct(author, context, recipients, object)?;
         }
-        next.snapshot()?; // Enforce encoded-byte bound before returning a candidate.
+        while let Err(error) = next.snapshot() {
+            if next.group_relay.is_empty() {
+                return Err(error);
+            }
+            next.group_relay.remove(0);
+        }
         Ok(InboxStage::Prepared(Box::new(next)))
     }
 
@@ -1096,6 +1141,49 @@ impl ObjectInbox {
         Ok(())
     }
 
+    fn retain_group_object(
+        &mut self,
+        author: [u8; 32],
+        context: &PublicationContext,
+        object: &[u8],
+    ) -> Result<(), &'static str> {
+        let sequence = context
+            .sequence
+            .ok_or("group recovery requires sequence")?
+            .get();
+        if let Some(known) = self
+            .group_relay
+            .iter()
+            .find(|record| record.author == author && record.sequence == sequence)
+        {
+            if known.revision == context.revision
+                && known.topic == context.topic.as_str()
+                && known.id == context.id
+                && known.object == object
+            {
+                return Ok(());
+            }
+            return Err("conflicting group recovery sequence");
+        }
+        self.group_relay.push(GroupRelayRecord {
+            author,
+            revision: context.revision,
+            topic: context.topic.as_str().to_owned(),
+            id: context.id,
+            sequence,
+            object: object.to_vec(),
+        });
+        while self.group_relay.len() > MAX_GROUP_RELAY_RECORDS
+            || serde_json::to_vec(&self.group_relay)
+                .map_err(|_| "group recovery encoding failed")?
+                .len()
+                > MAX_DIRECT_RETAINED_BYTES
+        {
+            self.group_relay.remove(0);
+        }
+        Ok(())
+    }
+
     pub fn serve_direct_range(
         &self,
         owner: &arachne_security::Workspace,
@@ -1361,40 +1449,36 @@ impl ObjectInbox {
         Ok(None)
     }
 
-    /// Stage acknowledgement; save this inbox with the owner/publisher before
-    /// forgetting pending work. Duplicate application attempts need the same ID.
-    pub fn acknowledge(
+    fn resolve_group_object(
         &self,
         author: [u8; 32],
         topic: &Topic,
         counter: u64,
         id: [u8; 16],
+        rejected: bool,
     ) -> Result<Self, &'static str> {
         let mut next = self.clone();
-        let stream = next
-            .streams
-            .iter_mut()
-            .find(|s| s.author == author && s.topic == topic.as_str())
-            .ok_or("unknown pending stream")?;
-        let receipt = stream
-            .receipts
-            .iter_mut()
-            .find(|r| r.counter == counter && r.id == id)
-            .ok_or("unknown pending object")?;
-        receipt.pending = None;
-        receipt.rejected = false;
-        Ok(next)
-    }
-
-    /// Persist permanent application rejection while retaining replay identity.
-    pub fn reject(
-        &self,
-        author: [u8; 32],
-        topic: &Topic,
-        counter: u64,
-        id: [u8; 16],
-    ) -> Result<Self, &'static str> {
-        let mut next = self.clone();
+        let (context, object, retain_for_recovery) = {
+            let stream = next
+                .streams
+                .iter()
+                .find(|stream| stream.author == author && stream.topic == topic.as_str())
+                .ok_or("unknown pending stream")?;
+            let receipt = stream
+                .receipts
+                .iter()
+                .find(|receipt| receipt.counter == counter && receipt.id == id)
+                .ok_or("unknown pending object")?;
+            (
+                next.context(stream, receipt)?,
+                receipt.pending.clone(),
+                receipt.retain_for_recovery,
+            )
+        };
+        if retain_for_recovery {
+            let object = object.ok_or("recoverable group object is not pending")?;
+            next.retain_group_object(author, &context, &object)?;
+        }
         let receipt = next
             .streams
             .iter_mut()
@@ -1406,12 +1490,36 @@ impl ObjectInbox {
                     .find(|receipt| receipt.counter == counter && receipt.id == id)
             })
             .ok_or("unknown pending object")?;
-        if receipt.pending.is_none() {
+        if rejected && receipt.pending.is_none() {
             return Err("object is not pending");
         }
         receipt.pending = None;
-        receipt.rejected = true;
+        receipt.rejected = rejected;
+        receipt.retain_for_recovery = false;
         Ok(next)
+    }
+
+    /// Stage acknowledgement; save this inbox with the owner/publisher before
+    /// forgetting pending work. Duplicate application attempts need the same ID.
+    pub fn acknowledge(
+        &self,
+        author: [u8; 32],
+        topic: &Topic,
+        counter: u64,
+        id: [u8; 16],
+    ) -> Result<Self, &'static str> {
+        self.resolve_group_object(author, topic, counter, id, false)
+    }
+
+    /// Persist permanent application rejection while retaining replay identity.
+    pub fn reject(
+        &self,
+        author: [u8; 32],
+        topic: &Topic,
+        counter: u64,
+        id: [u8; 16],
+    ) -> Result<Self, &'static str> {
+        self.resolve_group_object(author, topic, counter, id, true)
     }
 
     /// Retain an exact publisher-signed range after local verification. A holder
@@ -1657,6 +1765,175 @@ impl ObjectInbox {
         Ok(heads)
     }
 
+    /// Advertise received group objects only to current, authorized members.
+    /// These heads are hints; the requester authenticates each object itself.
+    pub fn retained_group_object_heads_for(
+        &self,
+        owner: &arachne_security::Workspace,
+        policy: &arachne_routing::RoutingTable,
+        requester: [u8; 32],
+    ) -> Result<Vec<wire::GroupObjectHead>, &'static str> {
+        self.validate_owner(owner)?;
+        let mut heads = BTreeMap::new();
+        let mut add = |author: [u8; 32], revision: u64, topic: &str, sequence: u64| {
+            let topic = Topic::new(topic.to_owned()).map_err(|_| "invalid relay topic")?;
+            let topics = BTreeSet::from([topic.clone()]);
+            if super::authorize_history(owner, policy, requester, author, revision, &topics).is_ok()
+            {
+                heads
+                    .entry((author, revision, topic))
+                    .and_modify(|through: &mut u64| *through = (*through).max(sequence))
+                    .or_insert(sequence);
+            }
+            Ok::<(), &'static str>(())
+        };
+        for record in &self.group_relay {
+            add(record.author, record.revision, &record.topic, record.sequence)?;
+        }
+        for stream in &self.streams {
+            for receipt in &stream.receipts {
+                if receipt.retain_for_recovery
+                    && receipt.pending.is_some()
+                    && receipt.recipients.is_empty()
+                    && receipt.current.is_none()
+                    && receipt.sequence > 0
+                {
+                    add(
+                        stream.author,
+                        receipt.revision,
+                        &stream.topic,
+                        receipt.sequence,
+                    )?;
+                }
+            }
+        }
+        let mut heads = heads
+            .into_iter()
+            .map(
+                |((author, policy_revision, topic), through)| wire::GroupObjectHead {
+                    author,
+                    policy_revision,
+                    topic,
+                    through,
+                },
+            )
+            .collect::<Vec<_>>();
+        heads.sort_by(|left, right| {
+            (left.author, left.policy_revision, &left.topic).cmp(&(
+                right.author,
+                right.policy_revision,
+                &right.topic,
+            ))
+        });
+        heads.truncate(wire::MAX_GROUP_HEADS);
+        Ok(heads)
+    }
+
+    /// Return authenticated ciphertext candidates for an exact authorized
+    /// selection. The response is intentionally sparse and grants no coverage.
+    pub fn serve_group_objects(
+        &self,
+        owner: &arachne_security::Workspace,
+        policy: &arachne_routing::RoutingTable,
+        requester: [u8; 32],
+        query: &wire::GroupObjectsQuery,
+    ) -> Result<Vec<u8>, &'static str> {
+        self.validate_owner(owner)?;
+        if query.workspace != self.workspace
+            || query.epoch != self.epoch
+            || super::authorize_history(
+                owner,
+                policy,
+                requester,
+                query.author,
+                query.policy_revision,
+                &query.topics,
+            )
+            .is_err()
+        {
+            return wire::group_objects_reply(query, []);
+        }
+        let mut records = self
+            .group_relay
+            .iter()
+            .filter(|record| {
+                record.author == query.author
+                    && record.revision == query.policy_revision
+                    && record.sequence > query.after
+                    && record.sequence <= query.through
+                    && query
+                        .topics
+                        .iter()
+                        .any(|topic| topic.as_str() == record.topic)
+            })
+            .map(|record| RetainedPublication {
+                sequence: record.sequence,
+                context: PublicationContext {
+                    workspace: self.workspace,
+                    revision: record.revision,
+                    topic: Topic::new(record.topic.clone()).expect("retained topic validated"),
+                    id: record.id,
+                    sequence: std::num::NonZeroU64::new(record.sequence),
+                },
+                ciphertext: record.object.clone(),
+            })
+            .collect::<Vec<_>>();
+        for stream in &self.streams {
+            for receipt in &stream.receipts {
+                if receipt.retain_for_recovery
+                    && receipt.pending.is_some()
+                    && receipt.recipients.is_empty()
+                    && receipt.current.is_none()
+                    && stream.author == query.author
+                    && receipt.revision == query.policy_revision
+                    && receipt.sequence > query.after
+                    && receipt.sequence <= query.through
+                    && query
+                        .topics
+                        .iter()
+                        .any(|topic| topic.as_str() == stream.topic)
+                {
+                    records.push(RetainedPublication {
+                        sequence: receipt.sequence,
+                        context: self.context(stream, receipt)?,
+                        ciphertext: receipt
+                            .pending
+                            .clone()
+                            .ok_or("recoverable group object is not pending")?,
+                    });
+                }
+            }
+        }
+        wire::group_objects_reply(query, records)
+    }
+
+    /// Authenticate each relayed object and queue it through the normal inbox.
+    /// This does not change signed range progress or claim complete delivery.
+    pub fn stage_group_objects(
+        &self,
+        owner: &arachne_security::Workspace,
+        query: &wire::GroupObjectsQuery,
+        reply: &[u8],
+    ) -> Result<(Self, usize), &'static str> {
+        self.validate_owner(owner)?;
+        let packets = wire::verify_group_objects_reply(owner, query, reply)?.packets;
+        let mut next = self.clone();
+        let mut count = 0;
+        for packet in packets {
+            match next.stage_group_object(owner, &packet.context, &packet.ciphertext, true)? {
+                InboxStage::Prepared(candidate) => {
+                    next = *candidate;
+                    count += 1;
+                }
+                InboxStage::Duplicate => (),
+                InboxStage::OutsideWindow => {
+                    return Err("group object recovery outside receive window");
+                }
+            }
+        }
+        Ok((next, count))
+    }
+
     fn snapshot(&self) -> Result<Vec<u8>, &'static str> {
         let json = serde_json::to_vec(self).map_err(|_| "inbox encoding failed")?;
         let mut bytes = CACHE_MAGIC.to_vec();
@@ -1765,12 +2042,15 @@ impl ObjectInbox {
             take(&mut bytes, length)?,
         )?;
         let (json, ranges, retained_current_views, current) = if bytes.starts_with(CACHE_MAGIC)
+            || bytes.starts_with(RETAINED_CURRENT_CACHE_MAGIC)
             || bytes.starts_with(CURRENT_CACHE_MAGIC)
             || bytes.starts_with(LEGACY_CACHE_MAGIC)
         {
-            let has_current =
-                bytes.starts_with(CACHE_MAGIC) || bytes.starts_with(CURRENT_CACHE_MAGIC);
-            let has_retained_current = bytes.starts_with(CACHE_MAGIC);
+            let has_current = bytes.starts_with(CACHE_MAGIC)
+                || bytes.starts_with(RETAINED_CURRENT_CACHE_MAGIC)
+                || bytes.starts_with(CURRENT_CACHE_MAGIC);
+            let has_retained_current = bytes.starts_with(CACHE_MAGIC)
+                || bytes.starts_with(RETAINED_CURRENT_CACHE_MAGIC);
             let mut input = &bytes[5..];
             let length = u32::from_be_bytes(take(&mut input, 4)?.try_into().unwrap()) as usize;
             let json = take(&mut input, length)?;
@@ -1872,6 +2152,7 @@ impl ObjectInbox {
             current_progress: parsed.current_progress,
             legacy_receive_snapshot: parsed.legacy_receive_snapshot,
             direct: parsed.direct,
+            group_relay: parsed.group_relay,
         };
         inbox.validate_owner(owner)?;
         inbox.legacy_receipts()?;
@@ -1933,6 +2214,41 @@ impl ObjectInbox {
         }
         if inbox.direct.len() > MAX_DIRECT_STREAMS {
             return Err("direct recovery stream capacity exceeded");
+        }
+        if inbox.group_relay.len() > MAX_GROUP_RELAY_RECORDS
+            || serde_json::to_vec(&inbox.group_relay)
+                .map_err(|_| "group recovery encoding failed")?
+                .len()
+                > MAX_DIRECT_RETAINED_BYTES
+        {
+            return Err("group recovery cache exceeds bound");
+        }
+        let mut group_sequences = BTreeSet::new();
+        for record in &inbox.group_relay {
+            let topic = Topic::new(record.topic.clone()).map_err(|_| "invalid relay topic")?;
+            let sequence = std::num::NonZeroU64::new(record.sequence)
+                .ok_or("invalid group recovery sequence")?;
+            if record.object.is_empty()
+                || record.object.len() > MAX_APPLICATION_CIPHERTEXT
+                || !group_sequences.insert((record.author, record.sequence))
+            {
+                return Err("invalid group recovery record");
+            }
+            let context = PublicationContext {
+                workspace: owner.id(),
+                revision: record.revision,
+                topic,
+                id: record.id,
+                sequence: Some(sequence),
+            };
+            let authenticated =
+                owner.unprotect_object(&context.authenticated_bytes(), &record.object)?;
+            if authenticated.message.member != record.author
+                || authenticated.message.endpoint
+                    != owner.endpoints_for_members(&[record.author])?[0]
+            {
+                return Err("invalid group recovery author");
+            }
         }
         let local = owner.member().ok_or("member required")?.id();
         let mut direct_streams = BTreeSet::new();
@@ -2011,6 +2327,14 @@ impl ObjectInbox {
                 previous = receipt.counter;
                 if receipt.rejected && receipt.pending.is_some() {
                     return Err("rejected inbox object is still pending");
+                }
+                if receipt.retain_for_recovery
+                    && (receipt.pending.is_none()
+                        || !receipt.recipients.is_empty()
+                        || receipt.current.is_some()
+                        || receipt.sequence == 0)
+                {
+                    return Err("invalid recoverable inbox object");
                 }
                 if let Some(object) = &receipt.pending {
                     let message = owner.unprotect_object(&aad, object)?;
@@ -2541,6 +2865,176 @@ fn group_pending_orders_chat_and_counts_other_topic_cursor_slots() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn acknowledged_live_group_objects_remain_bounded_and_replayable() {
+    use arachne_routing::{Permissions, RoutingTable};
+    use arachne_security::{PendingJoin, StorageKey, Workspace};
+
+    let admin = Workspace::create([1; 32], "Publisher").unwrap();
+    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let holder_join =
+        PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Holder").unwrap();
+    let prepared = admin
+        .prepare_admission([2; 32], holder_join.admission_request().unwrap())
+        .unwrap();
+    let mut holder_proof = holder_join.join_proof().unwrap();
+    holder_proof
+        .apply_add(&prepared.authorization, &prepared.commit)
+        .unwrap();
+    let holder = holder_join
+        .prepare_workspace(&holder_proof, &prepared.welcome)
+        .unwrap();
+    let admin = prepared.workspace;
+
+    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let reader_join =
+        PendingJoin::from_invitation(&invite, &checkpoint, [3; 32], "Reader").unwrap();
+    let prepared = admin
+        .prepare_admission([3; 32], reader_join.admission_request().unwrap())
+        .unwrap();
+    let mut reader_proof = reader_join.join_proof().unwrap();
+    reader_proof
+        .apply_add(&prepared.authorization, &prepared.commit)
+        .unwrap();
+    let reader = reader_join
+        .prepare_workspace(&reader_proof, &prepared.welcome)
+        .unwrap();
+    let holder = holder
+        .prepare_admission_update(&prepared.authorization, &prepared.commit)
+        .unwrap();
+    let mut author = prepared.workspace;
+
+    let topic = Topic::new("chat/main").unwrap();
+    let context = PublicationContext {
+        workspace: author.id(),
+        revision: 7,
+        topic: topic.clone(),
+        id: [8; 16],
+        sequence: std::num::NonZeroU64::new(1),
+    };
+    let ciphertext = author
+        .protect_object(&context.authenticated_bytes(), b"live chat")
+        .unwrap();
+    let InboxStage::Prepared(inbox) = ObjectInbox::new(holder.id(), holder.epoch())
+        .stage_group_object(&holder, &context, &ciphertext, true)
+        .unwrap()
+    else {
+        panic!("live group object was not staged")
+    };
+    assert!(inbox.group_relay.is_empty());
+    let staged_inbox = *inbox;
+    let pending = staged_inbox.pending(&holder).unwrap().unwrap();
+    let inbox = staged_inbox
+        .acknowledge(pending.message.member, &topic, pending.counter, context.id)
+        .unwrap();
+    assert_eq!(inbox.pending_count(), 0);
+    assert_eq!(inbox.group_relay.len(), 1);
+
+    let endpoint = |owner: &Workspace| owner.endpoint();
+    let members = [
+        (endpoint(&author), true),
+        (endpoint(&holder), false),
+        (endpoint(&reader), false),
+    ];
+    let permissions = |publisher: bool| Permissions::Selected {
+        publish: if publisher {
+            BTreeSet::from([topic.clone()])
+        } else {
+            BTreeSet::new()
+        },
+        subscribe: if publisher {
+            BTreeSet::new()
+        } else {
+            BTreeSet::from([topic.clone()])
+        },
+    };
+    let mut policy = RoutingTable::default();
+    policy
+        .install_verified_policy(
+            holder.id(),
+            7,
+            BTreeMap::from([
+                (members[0].0, permissions(members[0].1)),
+                (members[1].0, permissions(members[1].1)),
+                (members[2].0, permissions(members[2].1)),
+            ]),
+        )
+        .unwrap();
+    let heads = inbox
+        .retained_group_object_heads_for(&holder, &policy, members[2].0)
+        .unwrap();
+    assert_eq!(heads.len(), 1);
+    assert_eq!(heads[0].through, 1);
+
+    let key = StorageKey::derive(&[4; 32]).unwrap();
+    let publisher = PublisherLog::new(holder.id(), holder.member().unwrap().id(), holder.epoch());
+    let saved = inbox.seal(&holder, &key, &publisher).unwrap();
+    let (holder, _, restored) = ObjectInbox::restore(&key, [2; 32], holder.id(), &saved).unwrap();
+    let query = wire::GroupObjectsQuery {
+        workspace: holder.id(),
+        author: author.member().unwrap().id(),
+        epoch: holder.epoch(),
+        policy_revision: 7,
+        topics: BTreeSet::from([topic]),
+        after: 0,
+        through: 1,
+    };
+    let pending_heads = staged_inbox
+        .retained_group_object_heads_for(&holder, &policy, members[2].0)
+        .unwrap();
+    assert_eq!(pending_heads.len(), 1);
+    let pending_reply = staged_inbox
+        .serve_group_objects(&holder, &policy, members[2].0, &query)
+        .unwrap();
+    assert_eq!(
+        wire::verify_group_objects_reply(&holder, &query, &pending_reply)
+            .unwrap()
+            .packets
+            .len(),
+        1
+    );
+    let reply = restored
+        .serve_group_objects(&holder, &policy, members[2].0, &query)
+        .unwrap();
+    let (reader_inbox, count) = ObjectInbox::new(reader.id(), reader.epoch())
+        .stage_group_objects(&reader, &query, &reply)
+        .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(
+        reader_inbox
+            .pending(&reader)
+            .unwrap()
+            .unwrap()
+            .message
+            .payload,
+        b"live chat"
+    );
+    assert_eq!(
+        reader_inbox.recovery_progress(query.author, &query.topics),
+        0
+    );
+
+    let mut bounded = restored.clone();
+    for sequence in 2..=(MAX_GROUP_RELAY_RECORDS as u64 + 2) {
+        let context = PublicationContext {
+            workspace: holder.id(),
+            revision: 7,
+            topic: Topic::new("chat/main").unwrap(),
+            id: u128::from(sequence).to_be_bytes(),
+            sequence: std::num::NonZeroU64::new(sequence),
+        };
+        bounded
+            .retain_group_object(
+                author.member().unwrap().id(),
+                &context,
+                b"bounded replay record",
+            )
+            .unwrap();
+    }
+    assert_eq!(bounded.group_relay.len(), MAX_GROUP_RELAY_RECORDS);
+    assert_eq!(bounded.group_relay.first().unwrap().sequence, 3);
 }
 
 #[test]
