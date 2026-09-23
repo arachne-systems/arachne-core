@@ -44,13 +44,12 @@ mod resources;
 mod work_signal;
 mod workspace_activity;
 pub use client::{
-    AdmissionAuthorization, AdmissionReply, Client, ClientConfig, ConnectivityReport,
-    ConnectionCapacityMetrics, ControlTimingMetrics, DeliveryFailure, DeliveryReport,
-    DurationSummary, EndpointInfo, Error, ErrorKind, InterestObservation, InvitationDetails,
-    InvitationInfo, JoinAdmissionStep, JoinRequest, MemberInfo, MemberKind,
-    MembershipGossipMetrics, MemberRoster, Network, PeerPolicy, PeerRoute, Presence, Publication,
-    PublicationCandidate, PublicationCurrent, ProtectedReceptionCandidate,
-    ReceivedProtectedPublication,
+    AdmissionAuthorization, AdmissionReply, Client, ClientConfig, ConnectionCapacityMetrics,
+    ConnectivityReport, ControlTimingMetrics, DeliveryFailure, DeliveryReport, DurationSummary,
+    EndpointInfo, Error, ErrorKind, InterestObservation, InvitationDetails, InvitationInfo,
+    JoinAdmissionStep, JoinRequest, MemberInfo, MemberKind, MemberRoster, MembershipGossipMetrics,
+    Network, PeerPolicy, PeerRoute, PendingObject, Presence, ProtectedReceptionCandidate,
+    Publication, PublicationCandidate, PublicationCurrent, ReceivedProtectedPublication,
     RecoveredPublication, RecoveryAdoption, RecoveryCandidate, RecoveryRangeReady,
     RecoveryRangeRequest, RecoveryRangeStatus, RecoveryStage, Result as ClientResult, RouteHint,
     RouteKind, WorkspaceCandidate, WorkspaceInfo, WorkspaceMetrics, WorkspaceState,

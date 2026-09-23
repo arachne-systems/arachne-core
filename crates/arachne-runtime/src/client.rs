@@ -310,7 +310,7 @@ pub struct PublicationCandidate {
 }
 
 /// Current-value metadata for a protected publication.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PublicationCurrent {
     pub selector: [u8; 32],
     pub replacement_key: [u8; 32],
@@ -338,6 +338,22 @@ pub struct ReceivedProtectedPublication {
     pub sequence: Option<u64>,
     pub payload: Vec<u8>,
     pub recipients: Vec<[u8; 32]>,
+}
+
+/// Authenticated application content waiting for its caller to record or handle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingObject {
+    pub workspace: [u8; 32],
+    pub revision: u64,
+    pub member: [u8; 32],
+    pub endpoint: [u8; 32],
+    pub topic: String,
+    pub id: [u8; 16],
+    pub sequence: Option<u64>,
+    pub payload: Vec<u8>,
+    pub counter: u64,
+    pub recipients: Vec<[u8; 32]>,
+    pub current: Option<PublicationCurrent>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -876,9 +892,106 @@ impl Client {
         Ok(())
     }
 
+    /// Enable durable object delivery. Ephemeral clients adopt the same staged
+    /// transition without a save because they have no native record store.
     pub fn enable_object_delivery(&self) -> Result<()> {
-        self.request(json!({"op": "enable_object_delivery"}))?;
+        let durable = self.workspace_state()?.durable;
+        if let Some(candidate) = self.stage_object_delivery()? {
+            if durable {
+                self.save_candidate(&candidate.snapshot)?;
+            }
+            self.adopt_inbox_transition(&candidate.snapshot)?;
+        }
         Ok(())
+    }
+
+    /// Stage enabling the protected-object inbox. Save the returned snapshot
+    /// before calling `adopt_inbox_transition` when record storage is enabled.
+    pub fn stage_object_delivery(&self) -> Result<Option<WorkspaceCandidate>> {
+        let [metadata, snapshot] =
+            execute_stored(self.handle()?, br#"{"op":"enable_object_delivery"}"#, &[])
+                .map_err(|message| map_error(&message))?;
+        parse_inbox_candidate(&metadata, snapshot, "object delivery")
+    }
+
+    /// Adopt an object-inbox change after saving its exact candidate snapshot.
+    /// Use this for object-delivery enablement, inbox reception, and acknowledgement.
+    pub fn adopt_inbox_transition(&self, snapshot: &[u8]) -> Result<()> {
+        let [metadata, _] =
+            execute_stored(self.handle()?, br#"{"op":"adopt_reception"}"#, snapshot)
+                .map_err(|message| map_error(&message))?;
+        let raw: RawInboxAdoption = serde_json::from_slice(&metadata).map_err(|parse_error| {
+            error(
+                ErrorKind::Internal,
+                format!("invalid inbox adoption: {parse_error}"),
+            )
+        })?;
+        if raw.state != "inbox_adopted" {
+            return Err(error(
+                ErrorKind::Internal,
+                format!("unexpected inbox adoption state: {}", raw.state),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Return the next authenticated object held by the protected inbox.
+    pub fn poll_pending_object(&self) -> Result<Option<PendingObject>> {
+        let value = self.request(json!({"op": "poll_pending_object"}))?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        let raw: RawPendingObject = serde_json::from_value(value).map_err(|parse_error| {
+            error(
+                ErrorKind::Internal,
+                format!("invalid pending object: {parse_error}"),
+            )
+        })?;
+        Ok(Some(PendingObject {
+            workspace: raw.workspace,
+            revision: raw.revision,
+            member: raw.member,
+            endpoint: raw.endpoint,
+            topic: raw.topic,
+            id: raw.id,
+            sequence: raw.sequence,
+            payload: raw.payload,
+            counter: raw.counter,
+            recipients: raw.recipients,
+            current: raw.current,
+        }))
+    }
+
+    /// Stage acknowledgement of a pending object. Persist its snapshot before
+    /// adopting it so restart cannot redeliver already-recorded content.
+    pub fn stage_object_acknowledgement(
+        &self,
+        pending: &PendingObject,
+    ) -> Result<WorkspaceCandidate> {
+        let request = serde_json::to_vec(&json!({
+            "op": "stage_object_acknowledgement",
+            "member": pending.member,
+            "topic": pending.topic,
+            "counter": pending.counter,
+            "id": pending.id,
+        }))
+        .map_err(|parse_error| error(ErrorKind::Internal, parse_error.to_string()))?;
+        let [metadata, snapshot] =
+            execute_stored(self.handle()?, &request, &[]).map_err(|message| map_error(&message))?;
+        let candidate = parse_inbox_candidate(&metadata, snapshot, "object acknowledgement")?
+            .ok_or_else(|| {
+                error(
+                    ErrorKind::Internal,
+                    "object acknowledgement has no candidate",
+                )
+            })?;
+        if candidate.workspace != pending.workspace {
+            return Err(error(
+                ErrorKind::Internal,
+                "object acknowledgement workspace mismatch",
+            ));
+        }
+        Ok(candidate)
     }
 
     pub fn stage_protected_publication(
@@ -1010,7 +1123,9 @@ impl Client {
         }))
     }
 
-    /// Adopt a staged protected reception and release its authenticated payload.
+    /// Adopt an ordinary MLS publication and release its authenticated payload.
+    /// For object-inbox receptions, use `adopt_inbox_transition` and then
+    /// `poll_pending_object` so recording happens before acknowledgement.
     pub fn adopt_protected_reception(
         &self,
         snapshot: &[u8],
@@ -1458,6 +1573,39 @@ fn parse_workspace_candidate(
     })
 }
 
+fn parse_inbox_candidate(
+    metadata: &[u8],
+    snapshot: Vec<u8>,
+    context: &str,
+) -> Result<Option<WorkspaceCandidate>> {
+    let raw: RawInboxCandidate = serde_json::from_slice(metadata).map_err(|parse_error| {
+        error(
+            ErrorKind::Internal,
+            format!("invalid {context} candidate: {parse_error}"),
+        )
+    })?;
+    match raw.state.as_str() {
+        "object_delivery_enabled" if snapshot.is_empty() => Ok(None),
+        "awaiting_reception_save" if !snapshot.is_empty() => Ok(Some(WorkspaceCandidate {
+            workspace: raw.workspace.ok_or_else(|| {
+                error(
+                    ErrorKind::Internal,
+                    format!("{context} candidate has no workspace"),
+                )
+            })?,
+            snapshot,
+        })),
+        "object_delivery_enabled" | "awaiting_reception_save" => Err(error(
+            ErrorKind::Internal,
+            format!("{context} returned an invalid inbox snapshot"),
+        )),
+        other => Err(error(
+            ErrorKind::Internal,
+            format!("unexpected {context} candidate state: {other}"),
+        )),
+    }
+}
+
 impl TryFrom<RawMemberInfo> for MemberInfo {
     type Error = Error;
 
@@ -1523,6 +1671,33 @@ struct RawPublication {
 struct RawProtectedReceptionCandidate {
     workspace: [u8; 32],
     state: String,
+}
+
+#[derive(Deserialize)]
+struct RawInboxCandidate {
+    state: String,
+    workspace: Option<[u8; 32]>,
+}
+
+#[derive(Deserialize)]
+struct RawInboxAdoption {
+    state: String,
+}
+
+#[derive(Deserialize)]
+struct RawPendingObject {
+    workspace: [u8; 32],
+    revision: u64,
+    member: [u8; 32],
+    endpoint: [u8; 32],
+    topic: String,
+    id: [u8; 16],
+    sequence: Option<u64>,
+    payload: Vec<u8>,
+    counter: u64,
+    #[serde(default)]
+    recipients: Vec<[u8; 32]>,
+    current: Option<PublicationCurrent>,
 }
 
 #[derive(Deserialize)]
