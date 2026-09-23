@@ -154,7 +154,6 @@ type CurrentKey = (
     u64,
     String,
     PeerId,
-    PeerId,
     [u8; 32],
     Vec<[u8; 32]>,
 );
@@ -191,7 +190,6 @@ impl DeliveryQueue {
                     message.revision,
                     message.topic.as_str().into(),
                     message.sender,
-                    message.received_from,
                     replacement_key,
                     message.recipients.clone(),
                 );
@@ -1500,4 +1498,54 @@ async fn receiver_checks_local_interest_even_if_sender_routes_a_direct_frame() {
         "stale sender interest defeated local unsubscribe"
     );
     assert!(received.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn current_state_replay_across_mesh_paths_does_not_fill_the_queue() {
+    let queue = DeliveryQueue::default();
+    let topic = Topic::new("atak/pli").unwrap();
+    for path in 0..65u8 {
+        let mut received_from = [0; 32];
+        received_from[0] = path;
+        queue
+            .push(Message {
+                workspace: [1; 32],
+                revision: 1,
+                sender: [2; 32],
+                received_from,
+                topic: topic.clone(),
+                payload: vec![path],
+                recipients: Vec::new(),
+                delivery: DeliveryClass::Current {
+                    replacement_key: [9; 32],
+                },
+            })
+            .expect("one current value should replace its mesh duplicates");
+    }
+    assert_eq!(queue.state.lock().unwrap().current.len(), 1);
+}
+
+#[test]
+fn current_queue_preserves_distinct_replacement_keys() {
+    let queue = DeliveryQueue::default();
+    let topic = Topic::new("atak/pli").unwrap();
+    for key in [1, 2] {
+        queue
+            .push(Message {
+                workspace: [1; 32],
+                revision: 1,
+                sender: [2; 32],
+                received_from: [2; 32],
+                topic: topic.clone(),
+                payload: vec![key],
+                recipients: Vec::new(),
+                delivery: DeliveryClass::Current {
+                    replacement_key: [key; 32],
+                },
+            })
+            .unwrap();
+    }
+    assert_eq!(queue.state.lock().unwrap().current.len(), 2);
+    assert_eq!(queue.pop().unwrap().payload, vec![1]);
+    assert_eq!(queue.pop().unwrap().payload, vec![2]);
 }
