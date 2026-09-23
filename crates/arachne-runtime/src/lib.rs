@@ -872,6 +872,7 @@ enum Request {
         request: resources::Request,
     },
     WorkspaceMetrics {},
+    MoqMetrics {},
     WorkspaceState {},
     ResetWorkspace {},
     DiscardWorkspaceCandidate {},
@@ -3233,6 +3234,14 @@ fn execute_in_session(
                 + usize::from(session.current_view.is_some() || session.ready_current_view.is_some()),
             "paths":paths, "paths_limited":metrics.paths_limited
         }));
+    }
+    if matches!(request, Request::MoqMetrics {}) {
+        #[cfg(feature = "moq")]
+        {
+            return serde_json::to_value(session.node.moq_metrics()).map_err(|e| e.to_string());
+        }
+        #[cfg(not(feature = "moq"))]
+        return Err("runtime was built without MoQ support".into());
     }
     if matches!(request, Request::NetworkChange {}) {
         session.runtime.block_on(session.node.network_change());
@@ -5949,6 +5958,7 @@ fn execute_in_session(
                     ),
                     Request::Resource { .. }
                     | Request::WorkspaceMetrics {}
+                    | Request::MoqMetrics {}
                     | Request::WorkspaceState {}
                     | Request::ResetWorkspace {}
                     | Request::NetworkChange {}

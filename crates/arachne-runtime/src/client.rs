@@ -607,6 +607,11 @@ impl Client {
         self.request(json!({"op": "drive_join"}))
     }
 
+    /// Process one peer-control event for a durable workspace owner.
+    pub fn drive_workspace(&self) -> Result<Value> {
+        self.request(json!({"op": "drive_workspace"}))
+    }
+
     pub fn stage_admission(
         &self,
         authenticated_endpoint: [u8; 32],
@@ -840,6 +845,11 @@ impl Client {
                 .collect(),
             paths_limited: raw.paths_limited,
         })
+    }
+
+    #[cfg(feature = "moq")]
+    pub fn moq_metrics(&self) -> Result<Value> {
+        self.request(json!({"op": "moq_metrics"}))
     }
 
     pub fn network_change(&self) -> Result<()> {
