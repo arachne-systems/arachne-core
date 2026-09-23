@@ -318,14 +318,12 @@ impl ObjectInbox {
             .map_or(0, |progress| progress.through)
     }
 
-    /// Find the first observed hole. Publisher sequence numbers span topics,
-    /// so any retained group receipt from the author accounts for that slot.
-    pub fn next_group_gap(
+    fn group_progress_and_gap(
         &self,
         owner: &arachne_security::Workspace,
         author: [u8; 32],
         topics: &BTreeSet<Topic>,
-    ) -> Result<Option<GroupGap>, &'static str> {
+    ) -> Result<(u64, Option<GroupGap>, bool), &'static str> {
         self.validate_owner(owner)?;
         if topics.is_empty() || topics.len() > MAX_TOPICS {
             return Err("invalid group recovery topic selection");
@@ -348,6 +346,7 @@ impl ObjectInbox {
             );
         }
         let mut previous = progress;
+        let mut prefix_unknown = false;
         for sequence in sequences {
             if sequence <= previous {
                 continue;
@@ -355,18 +354,56 @@ impl ObjectInbox {
             if sequence > previous.saturating_add(1) {
                 if previous == progress && may_have_evicted {
                     previous = sequence;
+                    prefix_unknown = true;
                     continue;
                 }
-                return Ok(Some(GroupGap {
-                    author,
-                    after: previous,
-                    through: (sequence - 1)
-                        .min(previous.saturating_add(MAX_RECOVERY_PACKETS as u64)),
-                }));
+                return Ok((
+                    previous,
+                    Some(GroupGap {
+                        author,
+                        after: previous,
+                        through: (sequence - 1)
+                            .min(previous.saturating_add(MAX_RECOVERY_PACKETS as u64)),
+                    }),
+                    !prefix_unknown,
+                ));
             }
             previous = sequence;
         }
-        Ok(None)
+        if previous == progress && may_have_evicted {
+            prefix_unknown = true;
+        }
+        Ok((previous, None, !prefix_unknown))
+    }
+
+    /// Highest contiguous group sequence proved by retained receipts or a
+    /// previously accepted range. Receipts from every topic prove publisher
+    /// cursor slots; a gap remains before the cursor until recovery.
+    pub fn group_received_through(
+        &self,
+        owner: &arachne_security::Workspace,
+        author: [u8; 32],
+        topics: &BTreeSet<Topic>,
+    ) -> Result<Option<u64>, &'static str> {
+        self.group_progress_and_gap(owner, author, topics)
+            .map(|(through, _, known)| known.then_some(through))
+    }
+
+    /// Return the first observed gap in the author's group sequence. Publisher
+    /// sequence numbers span topics, so any retained group receipt from this
+    /// author proves that global cursor slot arrived, even when its topic is not
+    /// selected for recovery. An unreceived publication on an unknown topic
+    /// remains indistinguishable from a miss. Once the bounded receipt window
+    /// has evicted its first record, an initial gap is suppressed because that
+    /// delivery status is unknowable.
+    pub fn next_group_gap(
+        &self,
+        owner: &arachne_security::Workspace,
+        author: [u8; 32],
+        topics: &BTreeSet<Topic>,
+    ) -> Result<Option<GroupGap>, &'static str> {
+        self.group_progress_and_gap(owner, author, topics)
+            .map(|(_, gap, _)| gap)
     }
 
     /// Add or replace one publisher-owned latest value. The returned inbox must
@@ -578,7 +615,13 @@ impl ObjectInbox {
             return Ok(self.clone());
         }
         if query.after != current {
-            return Err("recovery range does not continue accepted progress");
+            let received_through =
+                self.group_received_through(owner, query.author, &query.topics)?;
+            if query.after < current
+                || received_through.is_none_or(|received_through| received_through < query.after)
+            {
+                return Err("recovery range does not continue accepted progress");
+            }
         }
         if position.is_none() && self.progress.len() == MAX_RECOVERY_SELECTIONS {
             return Err("recovery selection capacity exhausted");
@@ -2806,6 +2849,105 @@ fn durable_pending_objects_and_bounded_topic_replay() {
         "OBJECT_INBOX skipped=10000 subsequent=1024 pending_survives_save_restore=true duplicate_and_expired_replay_rejected=true receipt_window=32 pending_eviction=backpressure adapter_exactly_once=not_proven"
     );
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn signed_recovery_skips_only_a_durable_group_receipt_prefix() {
+    use arachne_routing::{Permissions, RoutingTable};
+    use arachne_security::{PendingJoin, Workspace};
+
+    let admin = Workspace::create([1; 32], "Publisher").unwrap();
+    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let join = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let prepared = admin
+        .prepare_admission([2; 32], join.admission_request().unwrap())
+        .unwrap();
+    let mut proof = join.join_proof().unwrap();
+    proof
+        .apply_add(&prepared.authorization, &prepared.commit)
+        .unwrap();
+    let reader = join.prepare_workspace(&proof, &prepared.welcome).unwrap();
+    let mut author = prepared.workspace;
+    let topic = Topic::new("chat/messages").unwrap();
+    let mut policy = RoutingTable::default();
+    policy
+        .install_verified_policy(
+            author.id(),
+            1,
+            BTreeMap::from([
+                (
+                    [1; 32],
+                    Permissions::Selected {
+                        publish: BTreeSet::from([topic.clone()]),
+                        subscribe: BTreeSet::new(),
+                    },
+                ),
+                (
+                    [2; 32],
+                    Permissions::Selected {
+                        publish: BTreeSet::new(),
+                        subscribe: BTreeSet::from([topic.clone()]),
+                    },
+                ),
+            ]),
+        )
+        .unwrap();
+    let first = PublicationContext {
+        workspace: author.id(),
+        revision: 1,
+        topic: topic.clone(),
+        id: [1; 16],
+        sequence: std::num::NonZeroU64::new(1),
+    };
+    let second = PublicationContext {
+        id: [2; 16],
+        sequence: std::num::NonZeroU64::new(2),
+        ..first.clone()
+    };
+    let first_object = author
+        .protect_object(&first.authenticated_bytes(), b"already received")
+        .unwrap();
+    let second_object = author
+        .protect_object(&second.authenticated_bytes(), b"recovery tail")
+        .unwrap();
+    let mut log = PublisherLog::new(author.id(), author.member().unwrap().id(), author.epoch());
+    log.append(first.clone(), first_object.clone()).unwrap();
+    log.append(second, second_object).unwrap();
+    let query = RangeQuery {
+        workspace: reader.id(),
+        author: author.member().unwrap().id(),
+        epoch: reader.epoch(),
+        policy_revision: 1,
+        after: 1,
+        through: 2,
+        topics: BTreeSet::from([topic.clone()]),
+    };
+    let reply = wire::serve_range(&log, &author, &policy, reader.endpoint(), &query).unwrap();
+    let InboxStage::Prepared(received) =
+        ObjectInbox::new(reader.id(), reader.epoch())
+            .stage(&reader, &first, &first_object)
+            .unwrap()
+    else {
+        panic!("received prefix was not staged")
+    };
+    assert_eq!(
+        received
+            .group_received_through(&reader, query.author, &query.topics)
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        received
+            .accept_recovery_coverage(&reader, &query, &reply)
+            .unwrap()
+            .recovery_progress(query.author, &query.topics),
+        2
+    );
+    assert!(matches!(
+        ObjectInbox::new(reader.id(), reader.epoch())
+            .accept_recovery_coverage(&reader, &query, &reply),
+        Err("recovery range does not continue accepted progress")
+    ));
 }
 
 #[test]

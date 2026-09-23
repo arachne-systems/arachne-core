@@ -1,7 +1,7 @@
 use arachne_runtime::{
     Client, ClientConfig, ErrorKind, JoinAdmissionStep, MemberKind, Network, PeerPolicy,
-    PendingObject, Presence, RecoveredPublication, RecoveryRangeRequest, RecoveryRangeStatus,
-    WorkspacePhase,
+    PendingObject, Presence, RecoveredPublication, RecoveryCutoffRequest, RecoveryCutoffStatus,
+    RecoveryRangeRequest, RecoveryRangeStatus, WorkspacePhase,
 };
 use std::time::{Duration, Instant};
 
@@ -225,20 +225,47 @@ fn typed_client_recovers_and_acknowledges_a_pending_object() {
         )
         .unwrap();
     owner.adopt_protected_publication(&staged.snapshot).unwrap();
+    assert_eq!(
+        reader
+            .discover_recovery_cutoff(RecoveryCutoffRequest {
+                peer: owner_endpoint.endpoint_key,
+                revision,
+                topics: vec!["streams/example".into()],
+            })
+            .unwrap(),
+        RecoveryCutoffStatus::Pending
+    );
+    let rejection_deadline = Instant::now() + Duration::from_secs(10);
+    let cutoff = loop {
+        owner.poll_control().unwrap();
+        if let Some(status) = reader.poll_recovery_cutoff().unwrap() {
+            break match status {
+                RecoveryCutoffStatus::Observed(cutoff) => cutoff,
+                other => panic!("unexpected cutoff status: {other:?}"),
+            };
+        }
+        assert!(
+            Instant::now() < rejection_deadline,
+            "recovery cutoff did not complete"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(cutoff.head, 2);
+    assert_eq!(cutoff.accepted_through, 0);
+    assert_eq!(cutoff.received_through, Some(1));
     assert!(matches!(
         reader
             .fetch_recovery_range(RecoveryRangeRequest {
-                peer: Some(owner_endpoint.endpoint_key),
+                peer: None,
                 author: Some(owner_member),
                 revision,
                 topics: vec!["streams/example".into()],
-                after: Some(1),
-                through: Some(2),
+                after: None,
+                through: None,
             })
             .unwrap(),
         RecoveryRangeStatus::Pending { .. } | RecoveryRangeStatus::Ready(_)
     ));
-    let rejection_deadline = Instant::now() + Duration::from_secs(10);
     let ready = loop {
         owner.poll_control().unwrap();
         if let Some(status) = reader.poll_recovery_range().unwrap() {
@@ -253,6 +280,9 @@ fn typed_client_recovers_and_acknowledges_a_pending_object() {
         );
         std::thread::sleep(Duration::from_millis(5));
     };
+    assert_eq!(ready.after, 1);
+    assert_eq!(ready.through, 2);
+    assert!(ready.automatic_source);
     assert_eq!(ready.packet_count, 1);
     let staged = match reader.stage_recovery_range(0).unwrap() {
         arachne_runtime::RecoveryStage::Candidate(candidate) => candidate,

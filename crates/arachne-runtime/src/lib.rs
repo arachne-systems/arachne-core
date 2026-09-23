@@ -51,9 +51,10 @@ pub use client::{
     MembershipGossipMetrics, MemberRoster, Network, PeerPolicy, PeerRoute, PendingObject, Presence,
     Publication, PublicationCandidate, PublicationCurrent, ProtectedReceptionCandidate,
     ReceivedProtectedPublication,
-    RecoveredPublication, RecoveryAdoption, RecoveryCandidate, RecoveryRangeReady,
-    RecoveryRangeRequest, RecoveryRangeStatus, RecoveryStage, Result as ClientResult, RouteHint,
-    RouteKind, WorkspaceCandidate, WorkspaceInfo, WorkspaceMetrics, WorkspaceState,
+    RecoveredPublication, RecoveryAdoption, RecoveryCandidate, RecoveryCutoff,
+    RecoveryCutoffRequest, RecoveryCutoffStatus, RecoveryRangeReady, RecoveryRangeRequest,
+    RecoveryRangeStatus, RecoveryStage, Result as ClientResult, RouteHint, RouteKind,
+    WorkspaceCandidate, WorkspaceInfo, WorkspaceMetrics, WorkspaceState,
 };
 pub use persistence::{enable_record_storage, restore_record_storage, save_candidate};
 pub use workspace_activity::{Activity as WorkspaceActivity, Phase as WorkspacePhase};
@@ -3621,11 +3622,17 @@ fn execute_in_session(
         }?;
         let after = match after {
             Some(after) => after,
-            None => session
-                .inbox
-                .as_ref()
-                .ok_or("automatic recovery requires object delivery")?
-                .recovery_progress(author, &topics),
+            None => {
+                let inbox = session
+                    .inbox
+                    .as_ref()
+                    .ok_or("automatic recovery requires object delivery")?;
+                let progress = inbox.recovery_progress(author, &topics);
+                inbox
+                    .group_received_through(owner, author, &topics)
+                    .map_err(str::to_owned)?
+                    .unwrap_or(progress)
+            }
         };
         let available = through
             .is_none()
@@ -4482,10 +4489,21 @@ fn execute_in_session(
                         |inbox| Some(inbox.recovery_progress(query.author, &query.topics)),
                     )
                     .unwrap_or(0);
+                let received_through = if let Some(inbox) = session.inbox.as_ref() {
+                    inbox
+                        .group_received_through(owner, query.author, &query.topics)
+                        .map_err(str::to_owned)?
+                } else {
+                    session
+                        .received
+                        .as_ref()
+                        .and_then(|received| received.progress(query.author, &query.topics))
+                };
                 json!({"state":"recovery_cutoff_observed", "workspace":owner.id(),
                 "author":query.author, "peer":pending.peer, "epoch":owner.epoch(), "revision":query.policy_revision,
                 "topics":query.topics.iter().map(|t|t.as_str()).collect::<Vec<_>>(),
                 "head":head, "retained_after":after, "accepted_through":accepted_through,
+                "received_through":received_through,
                 "accepted_progress":false})
             }
             None => json!({"state":"recovery_cutoff_denied", "accepted_progress":false}),
