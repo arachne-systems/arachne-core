@@ -15,6 +15,124 @@ const AVAILABLE_REPLY: &[u8] = b"DFHP\x01";
 const DIRECT_QUERY: &[u8] = b"DFDQ\x01";
 const DIRECT_REPLY: &[u8] = b"DFDP\x01";
 const DIRECT_HEAD: &[u8] = b"DFDH\x01";
+const GROUP_HEADS_QUERY: &[u8] = b"DFGQ\x01";
+const GROUP_HEADS_REPLY: &[u8] = b"DFGP\x01";
+pub const MAX_GROUP_HEADS: usize = 4;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupHeadsQuery {
+    pub workspace: [u8; 32],
+    pub epoch: u64,
+}
+
+impl GroupHeadsQuery {
+    pub fn to_wire(&self) -> Vec<u8> {
+        let mut bytes = GROUP_HEADS_QUERY.to_vec();
+        bytes.extend(self.workspace);
+        bytes.extend(self.epoch.to_be_bytes());
+        bytes
+    }
+
+    pub fn from_wire(bytes: &[u8]) -> Result<Self, &'static str> {
+        let mut input = bytes;
+        if take(&mut input, 5)? != GROUP_HEADS_QUERY {
+            return Err("wrong group-head query format");
+        }
+        let query = Self {
+            workspace: take(&mut input, 32)?.try_into().unwrap(),
+            epoch: number64(&mut input)?,
+        };
+        if !input.is_empty() {
+            return Err("trailing group-head query");
+        }
+        Ok(query)
+    }
+}
+
+/// Advisory cursor from a holder's retained publisher-signed group range.
+/// It can trigger recovery, but never advances the reader's durable cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupHead {
+    pub author: [u8; 32],
+    pub policy_revision: u64,
+    pub selection: [u8; 32],
+    pub after: u64,
+    pub through: u64,
+}
+
+impl GroupHead {
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.after >= self.through || self.through - self.after > MAX_RECOVERY_PACKETS as u64 {
+            return Err("invalid group head range");
+        }
+        Ok(())
+    }
+
+    pub fn from_query(query: &RangeQuery) -> Self {
+        Self {
+            author: query.author,
+            policy_revision: query.policy_revision,
+            selection: selection_digest(&query.topics),
+            after: query.after,
+            through: query.through,
+        }
+    }
+}
+
+pub fn group_heads_reply(
+    query: &GroupHeadsQuery,
+    heads: &[GroupHead],
+) -> Result<Vec<u8>, &'static str> {
+    if heads.len() > MAX_GROUP_HEADS {
+        return Err("too many group heads");
+    }
+    let mut bytes = GROUP_HEADS_REPLY.to_vec();
+    bytes.extend(query.workspace);
+    bytes.extend(query.epoch.to_be_bytes());
+    bytes.push(heads.len() as u8);
+    for head in heads {
+        head.validate()?;
+        bytes.extend(head.author);
+        bytes.extend(head.policy_revision.to_be_bytes());
+        bytes.extend(head.selection);
+        bytes.extend(head.after.to_be_bytes());
+        bytes.extend(head.through.to_be_bytes());
+    }
+    Ok(bytes)
+}
+
+pub fn parse_group_heads_reply(
+    query: &GroupHeadsQuery,
+    bytes: &[u8],
+) -> Result<Vec<GroupHead>, &'static str> {
+    let mut input = bytes;
+    if take(&mut input, 5)? != GROUP_HEADS_REPLY
+        || take(&mut input, 32)? != query.workspace
+        || number64(&mut input)? != query.epoch
+    {
+        return Err("group-head reply scope mismatch");
+    }
+    let count = take(&mut input, 1)?[0] as usize;
+    if count > MAX_GROUP_HEADS || input.len() != count * 88 {
+        return Err("invalid group-head count");
+    }
+    let mut heads = Vec::with_capacity(count);
+    for _ in 0..count {
+        let head = GroupHead {
+            author: take(&mut input, 32)?.try_into().unwrap(),
+            policy_revision: number64(&mut input)?,
+            selection: take(&mut input, 32)?.try_into().unwrap(),
+            after: number64(&mut input)?,
+            through: number64(&mut input)?,
+        };
+        head.validate()?;
+        heads.push(head);
+    }
+    if !input.is_empty() {
+        return Err("trailing group-head reply");
+    }
+    Ok(heads)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirectHead {
@@ -800,6 +918,40 @@ fn write_topic(bytes: &mut Vec<u8>, topic: &Topic) {
     bytes.push(topic.as_str().len() as u8);
     bytes.extend(topic.as_str().as_bytes());
 }
+
+#[test]
+fn group_head_wire_is_scoped_and_bounded() {
+    let query = GroupHeadsQuery {
+        workspace: [1; 32],
+        epoch: 2,
+    };
+    let heads = vec![GroupHead {
+        author: [3; 32],
+        policy_revision: 4,
+        selection: [5; 32],
+        after: 6,
+        through: 7,
+    }];
+    let encoded_query = query.to_wire();
+    assert_eq!(GroupHeadsQuery::from_wire(&encoded_query).unwrap(), query);
+    let reply = group_heads_reply(&query, &heads).unwrap();
+    assert_eq!(parse_group_heads_reply(&query, &reply).unwrap(), heads);
+    assert!(
+        parse_group_heads_reply(
+            &GroupHeadsQuery {
+                epoch: 3,
+                ..query.clone()
+            },
+            &reply,
+        )
+        .is_err()
+    );
+    let mut malformed = reply;
+    *malformed.last_mut().unwrap() = 0;
+    assert!(parse_group_heads_reply(&query, &malformed).is_err());
+    assert!(group_heads_reply(&query, &[heads[0]; MAX_GROUP_HEADS + 1]).is_err());
+}
+
 fn read_topic(bytes: &mut &[u8]) -> Result<Topic, &'static str> {
     let length = take(bytes, 1)?[0] as usize;
     Topic::new(std::str::from_utf8(take(bytes, length)?).map_err(|_| "invalid topic encoding")?)

@@ -13,6 +13,13 @@ fn call(handle: i64, request: Value) -> Value {
         .unwrap()
 }
 
+fn close_for_impairment(handle: i64) {
+    if let Err(error) = close(handle) {
+        assert_eq!(error, "node shutdown timed out");
+    }
+    assert!(describe(handle).is_err());
+}
+
 fn step(reply: &Value) -> Value {
     json!({"commit":reply["commit"],"authorization":reply["authorization"]})
 }
@@ -1189,4 +1196,233 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     close(author).unwrap();
     close(holder).unwrap();
     close(reader).unwrap();
+}
+
+#[test]
+fn group_tail_recovers_from_a_retained_three_client_holder() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let author = create(Some(&[131; 32])).unwrap();
+    let holder = create(Some(&[132; 32])).unwrap();
+    let reader = create(Some(&[133; 32])).unwrap();
+    let created = call(
+        author,
+        json!({"op":"create_workspace","display_name":"Author"}),
+    );
+    let invite = call(author, json!({"op":"issue_invitation"}));
+    let holder_join = add(author, holder, &invite, vec![], "Holder");
+    let reader_join = add(author, reader, &invite, vec![step(&holder_join)], "Reader");
+    let staged = call(
+        holder,
+        json!({"op":"stage_admission_update","step":step(&reader_join)}),
+    );
+    call(
+        holder,
+        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+    );
+    let revision = 3;
+    for handle in [author, holder, reader] {
+        let staged = call(handle, json!({"op":"enable_object_delivery"}));
+        call(
+            handle,
+            json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
+        );
+        call(
+            handle,
+            json!({"op":"install_workspace_policy","revision":revision}),
+        );
+    }
+    for (from, to) in [
+        (author, holder),
+        (holder, author),
+        (author, reader),
+        (reader, author),
+    ] {
+        connect(from, to);
+    }
+    let first = call(
+        author,
+        json!({"op":"stage_network_publication","revision":revision,
+            "topic":EVENT,"id":vec![1;16],"payload":[1]}),
+    );
+    let first = call(
+        author,
+        json!({"op":"adopt_publication","snapshot":first["snapshot"]}),
+    );
+    assert_eq!(first["sequence"], 1);
+    let author_info: Value = serde_json::from_str(&describe(author).unwrap()).unwrap();
+    call(
+        reader,
+        json!({"op":"fetch_recovery_range","peer":author_info["endpoint_key"],
+            "revision":revision,"topics":[EVENT],"after":0,"through":1}),
+    );
+    assert_eq!(finish_range(&[author], reader)["packet_count"], 1);
+    let recovered = call(reader, json!({"op":"stage_recovery_range"}));
+    call(
+        reader,
+        json!({"op":"adopt_recovery","snapshot":recovered["snapshot"]}),
+    );
+    let pending = call(reader, json!({"op":"poll_pending_object"}));
+    assert_eq!(pending["sequence"], 1);
+    assert_eq!(pending["payload"], json!([1]));
+    let acknowledged = call(
+        reader,
+        json!({"op":"stage_object_acknowledgement","member":pending["member"],
+            "topic":pending["topic"],"counter":pending["counter"],"id":pending["id"]}),
+    );
+    call(
+        reader,
+        json!({"op":"adopt_reception","snapshot":acknowledged["snapshot"]}),
+    );
+    let saved_reader = call(reader, json!({"op":"seal_workspace"}));
+    close(reader).unwrap();
+
+    let tail = call(
+        author,
+        json!({"op":"stage_network_publication","revision":revision,
+            "topic":EVENT,"id":vec![2;16],"payload":[2]}),
+    );
+    let tail = call(
+        author,
+        json!({"op":"adopt_publication","snapshot":tail["snapshot"]}),
+    );
+    assert_eq!(tail["sequence"], 2);
+    call(
+        holder,
+        json!({"op":"fetch_recovery_range","peer":author_info["endpoint_key"],
+            "revision":revision,"topics":[EVENT],"after":1,"through":2}),
+    );
+    assert_eq!(finish_range(&[author], holder)["packet_count"], 1);
+    let retain_until = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let retained = call(
+        holder,
+        json!({"op":"stage_recovery_range","retain_until":retain_until}),
+    );
+    call(
+        holder,
+        json!({"op":"adopt_recovery","snapshot":retained["snapshot"]}),
+    );
+
+    let reader = create(Some(&[133; 32])).unwrap();
+    call(
+        reader,
+        json!({"op":"restore_workspace","workspace":created["workspace"],
+            "snapshot":saved_reader["snapshot"]}),
+    );
+    call(
+        reader,
+        json!({"op":"install_workspace_policy","revision":revision}),
+    );
+    let neighbors_before_holder =
+        call(reader, json!({"op":"workspace_metrics"}))["gossip_neighbors"]
+            .as_u64()
+            .unwrap();
+    connect(reader, holder);
+    connect(holder, reader);
+    let neighbor_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let neighbors = call(reader, json!({"op":"workspace_metrics"}))["gossip_neighbors"]
+            .as_u64()
+            .unwrap();
+        if neighbors > neighbors_before_holder {
+            break;
+        }
+        assert!(
+            Instant::now() < neighbor_deadline,
+            "retained holder did not join the reader's workspace overlay"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    close_for_impairment(author);
+
+    let discovery_started = Instant::now();
+    let presence_deadline = Instant::now() + Duration::from_secs(10);
+    let gap = loop {
+        let served = call(holder, json!({"op":"poll_admission"}));
+        if !served.is_null() {
+            assert!(matches!(
+                served["state"].as_str(),
+                Some("presence_replied" | "group_heads_replied")
+            ));
+        }
+        call(reader, json!({"op":"poll_workspace_presence"}));
+        let gap = call(
+            reader,
+            json!({"op":"next_group_gap", "author":
+            created["member"]["id"], "topics":[EVENT]}),
+        );
+        if !gap.is_null() {
+            break gap;
+        }
+        assert!(
+            Instant::now() < presence_deadline,
+            "retained group tail was not announced by the live holder"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let gap_detected = Instant::now();
+    assert_eq!(gap["after"], 1);
+    assert_eq!(gap["through"], 2);
+    assert!(
+        call(
+            reader,
+            json!({"op":"next_group_gap", "author":
+        created["member"]["id"], "topics":[CURRENT]})
+        )
+        .is_null()
+    );
+
+    let request = json!({"op":"fetch_recovery_range","author":created["member"]["id"],
+        "revision":revision,"topics":[EVENT]});
+    let recovery_started = Instant::now();
+    let recovery_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let started = call(reader, request.clone());
+        if started["state"] == "recovery_range_pending" {
+            break;
+        }
+        assert_eq!(started["state"], "recovery_source_waiting");
+        assert!(
+            Instant::now() < recovery_deadline,
+            "holder did not become reachable"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let ready = finish_range(&[holder], reader);
+    let ready_at = Instant::now();
+    eprintln!(
+        "group_tail_discovery_ms={} group_tail_range_ms={} group_tail_offline_to_ready_ms={}",
+        gap_detected
+            .saturating_duration_since(discovery_started)
+            .as_millis(),
+        ready_at
+            .saturating_duration_since(recovery_started)
+            .as_millis(),
+        ready_at
+            .saturating_duration_since(discovery_started)
+            .as_millis(),
+    );
+    assert_eq!(ready["state"], "recovery_range_ready", "{ready}");
+    let holder_info: Value = serde_json::from_str(&describe(holder).unwrap()).unwrap();
+    assert_eq!(ready["peer"], holder_info["endpoint_key"]);
+    assert_eq!(ready["after"], 1);
+    assert_eq!(ready["through"], gap["through"]);
+    assert_eq!(
+        ready["packet_count"], 1,
+        "replayed an already received prefix"
+    );
+    let recovered = call(reader, json!({"op":"stage_recovery_range"}));
+    assert_eq!(recovered["publication_count"], 1);
+    call(
+        reader,
+        json!({"op":"adopt_recovery","snapshot":recovered["snapshot"]}),
+    );
+    let pending = call(reader, json!({"op":"poll_pending_object"}));
+    assert_eq!(pending["sequence"], 2);
+    assert_eq!(pending["payload"], json!([2]));
+    close_for_impairment(holder);
+    close_for_impairment(reader);
 }

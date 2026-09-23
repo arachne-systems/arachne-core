@@ -16,10 +16,20 @@ struct Seen {
     instance: [u8; 16],
 }
 
+struct ObservedGroupHead {
+    peer: [u8; 32],
+    head: arachne_delivery::wire::GroupHead,
+    at: Instant,
+}
+
 pub(super) struct Presence {
     seen: BTreeMap<[u8; 32], Seen>,
     pending: Vec<PendingControl<()>>,
+    group_pending: Vec<PendingControl<()>>,
     queued: VecDeque<[u8; 32]>,
+    group_queued: VecDeque<[u8; 32]>,
+    group_unsupported: BTreeSet<[u8; 32]>,
+    group_heads: Vec<ObservedGroupHead>,
     head_cursor: BTreeMap<[u8; 32], usize>,
     next: Option<Instant>,
     epoch: Option<u64>,
@@ -34,7 +44,11 @@ impl Presence {
         Ok(Self {
             seen: BTreeMap::new(),
             pending: Vec::new(),
+            group_pending: Vec::new(),
             queued: VecDeque::new(),
+            group_queued: VecDeque::new(),
+            group_unsupported: BTreeSet::new(),
+            group_heads: Vec::new(),
             head_cursor: BTreeMap::new(),
             next: None,
             epoch: None,
@@ -45,12 +59,48 @@ impl Presence {
 
     pub fn cancel(&mut self) {
         self.pending.clear();
+        self.group_pending.clear();
         self.queued.clear();
+        self.group_queued.clear();
+        self.group_heads.clear();
     }
 
     pub(super) fn announce_next(&mut self) {
         self.announce = true;
         self.next = None;
+    }
+
+    pub(super) fn group_tail_through(
+        &self,
+        author: [u8; 32],
+        topics: &BTreeSet<Topic>,
+        after: u64,
+        now: Instant,
+    ) -> Option<u64> {
+        let selection = arachne_delivery::selection_digest(topics);
+        self.group_heads
+            .iter()
+            .filter(|observed| {
+                observed.head.author == author
+                    && observed.head.selection == selection
+                    && observed.head.after == after
+                    && now.saturating_duration_since(observed.at) < FRESH
+            })
+            .map(|observed| observed.head.through)
+            .max()
+            .filter(|through| *through > after)
+    }
+}
+
+fn queue_group_heads(presence: &mut Presence, peer: [u8; 32]) {
+    if !presence.group_unsupported.contains(&peer)
+        && !presence.group_queued.contains(&peer)
+        && !presence
+            .group_pending
+            .iter()
+            .any(|pending| pending.peer == peer)
+    {
+        presence.group_queued.push_back(peer);
     }
 }
 
@@ -211,6 +261,21 @@ fn observe(session: &mut Session, peer: [u8; 32], bytes: &[u8]) -> Result<bool, 
             .seen
             .get(&peer)
             .is_some_and(|seen| seen.instance != instance);
+    if restarted {
+        session
+            .presence
+            .group_heads
+            .retain(|observed| observed.peer != peer);
+        session.presence.group_unsupported.remove(&peer);
+        session
+            .presence
+            .group_queued
+            .retain(|queued| *queued != peer);
+        session
+            .presence
+            .group_pending
+            .retain(|pending| pending.peer != peer);
+    }
     session.presence.seen.insert(
         peer,
         Seen {
@@ -222,6 +287,43 @@ fn observe(session: &mut Session, peer: [u8; 32], bytes: &[u8]) -> Result<bool, 
         },
     );
     Ok(restarted)
+}
+
+fn observe_group_heads(session: &mut Session, peer: [u8; 32], bytes: &[u8]) -> Result<(), String> {
+    let owner = session.workspace.as_ref().ok_or("no workspace")?;
+    let query = arachne_delivery::wire::GroupHeadsQuery {
+        workspace: owner.id(),
+        epoch: owner.epoch(),
+    };
+    let heads = match arachne_delivery::wire::parse_group_heads_reply(&query, bytes) {
+        Ok(heads) => heads,
+        Err(_) if !bytes.starts_with(b"DFGP") => {
+            session
+                .presence
+                .group_heads
+                .retain(|observed| observed.peer != peer);
+            session.presence.group_unsupported.insert(peer);
+            return Ok(());
+        }
+        Err(error) => return Err(error.to_owned()),
+    };
+    owner.member_id_for_endpoint(peer).map_err(str::to_owned)?;
+    session
+        .presence
+        .group_heads
+        .retain(|observed| observed.peer != peer);
+    let now = Instant::now();
+    for head in heads {
+        if owner.endpoints_for_members(&[head.author]).is_ok() {
+            session.presence.group_heads.push(ObservedGroupHead {
+                peer,
+                head,
+                at: now,
+            });
+        }
+    }
+    session.presence.group_unsupported.remove(&peer);
+    Ok(())
 }
 
 pub(super) fn receive(
@@ -236,6 +338,9 @@ pub(super) fn receive(
         // epoch/name heads can stay identical after a join, so waiting for a
         // head difference leaves the joiner's display name unknown forever.
         let _ = super::membership::start_query_if_needed(session, peer);
+    }
+    if session.inbox.is_some() {
+        queue_group_heads(&mut session.presence, peer);
     }
     // The authenticated presence response must not fail because an optional
     // native reconciliation query could not be started. The sender needs our
@@ -306,26 +411,47 @@ fn reconcile_seen(session: &mut Session) -> Result<Option<[u8; 32]>, String> {
 }
 
 pub(super) fn poll(session: &mut Session, announce: bool) -> Result<Value, String> {
-    let owner = session.workspace.as_ref().ok_or("no workspace")?;
-    let epoch = owner.epoch();
-    let peers: BTreeSet<_> = owner
-        .member_endpoints()
-        .map_err(str::to_owned)?
-        .into_iter()
-        .filter(|peer| *peer != session.node.id())
-        .collect();
+    let (workspace, epoch, peers) = {
+        let owner = session.workspace.as_ref().ok_or("no workspace")?;
+        let peers: BTreeSet<_> = owner
+            .member_endpoints()
+            .map_err(str::to_owned)?
+            .into_iter()
+            .filter(|peer| *peer != session.node.id())
+            .collect();
+        (owner.id(), owner.epoch(), peers)
+    };
     session.presence.seen.retain(|peer, _| peers.contains(peer));
     session
         .presence
         .head_cursor
         .retain(|peer, _| peers.contains(peer));
     let now = Instant::now();
+    session.presence.group_heads.retain(|observed| {
+        peers.contains(&observed.peer) && now.saturating_duration_since(observed.at) < FRESH
+    });
+    session
+        .presence
+        .group_unsupported
+        .retain(|peer| peers.contains(peer));
+    session
+        .presence
+        .group_queued
+        .retain(|peer| peers.contains(peer));
+    session
+        .presence
+        .group_pending
+        .retain(|pending| peers.contains(&pending.peer));
     let mut response_errors = 0_u32;
     let mut response_error = None;
     if announce || session.presence.epoch != Some(epoch) {
         // A newly accepted epoch or reconnect supersedes in-flight old observations.
         session.presence.pending.clear();
+        session.presence.group_pending.clear();
         session.presence.queued.clear();
+        session.presence.group_queued.clear();
+        session.presence.group_heads.clear();
+        session.presence.group_unsupported.clear();
         session.presence.head_cursor.clear();
         session.presence.next = None;
         session.presence.epoch = Some(epoch);
@@ -341,13 +467,43 @@ pub(super) fn poll(session: &mut Session, announce: bool) -> Result<Value, Strin
         let mut done = session.presence.pending.swap_remove(i);
         match session.runtime.block_on(&mut done.task) {
             Ok(Ok(bytes)) => match observe(session, done.peer, &bytes) {
-                Ok(true) => session.interests.repair(),
-                Ok(false) => (),
+                Ok(restarted) => {
+                    if restarted {
+                        session.interests.repair();
+                    }
+                    if session.inbox.is_some() {
+                        queue_group_heads(&mut session.presence, done.peer);
+                    }
+                }
                 Err(error) => {
                     response_errors = response_errors.saturating_add(1);
                     response_error.get_or_insert(error);
                 }
             },
+            Ok(Err(error)) => {
+                response_errors = response_errors.saturating_add(1);
+                response_error.get_or_insert(error.to_string());
+            }
+            Err(error) => {
+                response_errors = response_errors.saturating_add(1);
+                response_error.get_or_insert(error.to_string());
+            }
+        }
+    }
+    let mut i = 0;
+    while i < session.presence.group_pending.len() {
+        if !session.presence.group_pending[i].task.is_finished() {
+            i += 1;
+            continue;
+        }
+        let mut done = session.presence.group_pending.swap_remove(i);
+        match session.runtime.block_on(&mut done.task) {
+            Ok(Ok(bytes)) => {
+                if let Err(error) = observe_group_heads(session, done.peer, &bytes) {
+                    response_errors = response_errors.saturating_add(1);
+                    response_error.get_or_insert(error);
+                }
+            }
             Ok(Err(error)) => {
                 response_errors = response_errors.saturating_add(1);
                 response_error.get_or_insert(error.to_string());
@@ -379,6 +535,26 @@ pub(super) fn poll(session: &mut Session, announce: bool) -> Result<Value, Strin
                 .map_err(|_| arachne_node::Error::Timeout("presence response"))?
         });
         session.presence.pending.push(PendingControl {
+            query: (),
+            peer,
+            task,
+        });
+    }
+    while session.presence.group_pending.len() < 16 && session.inbox.is_some() {
+        let Some(peer) = session.presence.group_queued.pop_front() else {
+            break;
+        };
+        let query = arachne_delivery::wire::GroupHeadsQuery { workspace, epoch }.to_wire();
+        let control = session.node.control_client();
+        let task = session.runtime.spawn(async move {
+            tokio::time::timeout(
+                REQUEST_TIMEOUT,
+                super::request_control_retry_once(control, peer, &query),
+            )
+            .await
+            .map_err(|_| arachne_node::Error::Timeout("group-head response"))?
+        });
+        session.presence.group_pending.push(PendingControl {
             query: (),
             peer,
             task,
