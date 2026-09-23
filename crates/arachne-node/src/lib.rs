@@ -1504,9 +1504,10 @@ async fn receiver_checks_local_interest_even_if_sender_routes_a_direct_frame() {
 async fn current_state_replay_across_mesh_paths_does_not_fill_the_queue() {
     let queue = DeliveryQueue::default();
     let topic = Topic::new("atak/pli").unwrap();
-    for path in 0..65u8 {
+    for path in 0..=CURRENT_QUEUE {
+        let route = (path as u64).to_be_bytes();
         let mut received_from = [0; 32];
-        received_from[0] = path;
+        received_from[..route.len()].copy_from_slice(&route);
         queue
             .push(Message {
                 workspace: [1; 32],
@@ -1514,7 +1515,7 @@ async fn current_state_replay_across_mesh_paths_does_not_fill_the_queue() {
                 sender: [2; 32],
                 received_from,
                 topic: topic.clone(),
-                payload: vec![path],
+                payload: route.to_vec(),
                 recipients: Vec::new(),
                 delivery: DeliveryClass::Current {
                     replacement_key: [9; 32],
