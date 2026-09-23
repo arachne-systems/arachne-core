@@ -1,6 +1,7 @@
 use arachne_runtime::{
-    Client, ClientConfig, ErrorKind, JoinAdmissionStep, MemberKind, Network, PeerPolicy, Presence,
-    RecoveredPublication, RecoveryRangeRequest, RecoveryRangeStatus, WorkspacePhase,
+    Client, ClientConfig, ErrorKind, JoinAdmissionStep, MemberKind, Network, PeerPolicy,
+    PendingObject, Presence, RecoveredPublication, RecoveryRangeRequest, RecoveryRangeStatus,
+    WorkspacePhase,
 };
 use std::time::{Duration, Instant};
 
@@ -98,7 +99,7 @@ fn typed_client_exposes_recovery_request_lifecycle() {
 }
 
 #[test]
-fn typed_clients_recover_an_opaque_publication() {
+fn typed_client_recovers_and_acknowledges_a_pending_object() {
     let mut owner = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([16; 32]),
@@ -142,6 +143,10 @@ fn typed_clients_recover_an_opaque_publication() {
     let revision = joined_owner.epoch + 1;
     owner.install_workspace_policy(revision).unwrap();
     reader.install_workspace_policy(revision).unwrap();
+    for client in [&owner, &reader] {
+        let candidate = client.enable_object_delivery().unwrap();
+        client.adopt_object_delivery(&candidate).unwrap();
+    }
 
     let payload = vec![0, 255, 42, 7];
     let staged = owner
@@ -201,19 +206,65 @@ fn typed_clients_recover_an_opaque_publication() {
     let adoption = reader.adopt_recovery(&staged.snapshot).unwrap();
     assert_eq!(adoption.recovered_publications, 1);
 
-    let recovered = loop {
-        if let Some(publication) = reader.poll_recovered_publication().unwrap() {
-            break publication;
+    let pending: PendingObject = reader.poll_pending_object().unwrap().unwrap();
+    assert_eq!(pending.workspace, workspace.workspace);
+    assert_eq!(pending.topic, "streams/example");
+    assert_eq!(pending.payload, payload);
+    let receipt = reader.stage_object_acknowledgement(&pending).unwrap();
+    reader.adopt_object_receipt(&receipt).unwrap();
+    assert!(reader.poll_pending_object().unwrap().is_none());
+
+    let rejected_payload = vec![9, 8, 7];
+    let staged = owner
+        .stage_protected_publication(
+            workspace.workspace,
+            revision,
+            "streams/example",
+            [8; 16],
+            rejected_payload.clone(),
+        )
+        .unwrap();
+    owner.adopt_protected_publication(&staged.snapshot).unwrap();
+    assert!(matches!(
+        reader
+            .fetch_recovery_range(RecoveryRangeRequest {
+                peer: Some(owner_endpoint.endpoint_key),
+                author: Some(owner_member),
+                revision,
+                topics: vec!["streams/example".into()],
+                after: Some(1),
+                through: Some(2),
+            })
+            .unwrap(),
+        RecoveryRangeStatus::Pending { .. } | RecoveryRangeStatus::Ready(_)
+    ));
+    let rejection_deadline = Instant::now() + Duration::from_secs(10);
+    let ready = loop {
+        owner.poll_control().unwrap();
+        if let Some(status) = reader.poll_recovery_range().unwrap() {
+            break match status {
+                RecoveryRangeStatus::Ready(ready) => ready,
+                other => panic!("unexpected rejection recovery status: {other:?}"),
+            };
         }
         assert!(
-            Instant::now() < deadline,
-            "typed recovery publication did not arrive"
+            Instant::now() < rejection_deadline,
+            "rejection recovery did not complete"
         );
         std::thread::sleep(Duration::from_millis(5));
     };
-    assert_eq!(recovered.workspace, workspace.workspace);
-    assert_eq!(recovered.topic, "streams/example");
-    assert_eq!(recovered.payload, payload);
+    assert_eq!(ready.packet_count, 1);
+    let staged = match reader.stage_recovery_range(0).unwrap() {
+        arachne_runtime::RecoveryStage::Candidate(candidate) => candidate,
+        other => panic!("unexpected rejection recovery stage: {other:?}"),
+    };
+    assert_eq!(staged.publication_count, 1);
+    reader.adopt_recovery(&staged.snapshot).unwrap();
+    let pending = reader.poll_pending_object().unwrap().unwrap();
+    assert_eq!(pending.payload, rejected_payload);
+    let receipt = reader.stage_object_rejection(&pending).unwrap();
+    reader.adopt_object_receipt(&receipt).unwrap();
+    assert!(reader.poll_pending_object().unwrap().is_none());
 
     reader.close().unwrap();
     owner.close().unwrap();

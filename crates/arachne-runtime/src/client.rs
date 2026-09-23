@@ -315,12 +315,27 @@ pub struct PublicationCandidate {
 }
 
 /// Current-value metadata for a protected publication.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PublicationCurrent {
     pub selector: [u8; 32],
     pub replacement_key: [u8; 32],
     pub expires_at: u64,
     pub tombstone: bool,
+}
+
+/// An authenticated object retained by the inbox pending application handling.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingObject {
+    pub workspace: [u8; 32],
+    pub revision: u64,
+    pub topic: String,
+    pub id: [u8; 16],
+    pub member: [u8; 32],
+    pub endpoint: [u8; 32],
+    pub payload: Vec<u8>,
+    pub counter: u64,
+    pub recipients: Vec<[u8; 32]>,
+    pub current: Option<PublicationCurrent>,
 }
 
 /// A protected incoming publication staged for caller-owned save/adopt.
@@ -884,8 +899,152 @@ impl Client {
         Ok(())
     }
 
-    pub fn enable_object_delivery(&self) -> Result<()> {
-        self.request(json!({"op": "enable_object_delivery"}))?;
+    /// Stage object-delivery state. Save the candidate snapshot before adoption
+    /// when record storage is enabled.
+    pub fn enable_object_delivery(&self) -> Result<WorkspaceCandidate> {
+        let [metadata, snapshot] =
+            execute_stored(self.handle()?, br#"{"op":"enable_object_delivery"}"#, &[])
+                .map_err(|message| map_error(&message))?;
+        parse_workspace_candidate(&metadata, snapshot, "object delivery")
+    }
+
+    pub fn adopt_object_delivery(&self, candidate: &WorkspaceCandidate) -> Result<()> {
+        self.adopt_object_candidate(candidate, false)
+    }
+
+    /// Poll one durable inbox object. Acknowledgement or rejection must be
+    /// staged and adopted only after the application has durably handled it.
+    pub fn poll_pending_object(&self) -> Result<Option<PendingObject>> {
+        self.poll_pending_object_excluding(&[])
+    }
+
+    pub fn poll_pending_object_excluding(
+        &self,
+        deferred: &[arachne_delivery::inbox::DeferredDeliveryStream],
+    ) -> Result<Option<PendingObject>> {
+        let response = self.request(json!({
+            "op": "poll_pending_object",
+            "deferred": deferred,
+        }))?;
+        if response.is_null() {
+            return Ok(None);
+        }
+        let raw: RawPendingObject = serde_json::from_value(response).map_err(|parse_error| {
+            error(
+                ErrorKind::Internal,
+                format!("invalid pending object: {parse_error}"),
+            )
+        })?;
+        Ok(Some(PendingObject {
+            workspace: raw.workspace,
+            revision: raw.revision,
+            topic: raw.topic,
+            id: raw.id,
+            member: raw.member,
+            endpoint: raw.endpoint,
+            payload: raw.payload,
+            counter: raw.counter,
+            recipients: raw.recipients,
+            current: raw.current,
+        }))
+    }
+
+    pub fn stage_object_acknowledgement(
+        &self,
+        pending: &PendingObject,
+    ) -> Result<WorkspaceCandidate> {
+        self.stage_object_receipt(pending, false)
+    }
+
+    pub fn stage_object_rejection(&self, pending: &PendingObject) -> Result<WorkspaceCandidate> {
+        self.stage_object_receipt(pending, true)
+    }
+
+    /// Adopt an acknowledgement or rejection after saving its exact snapshot.
+    pub fn adopt_object_receipt(&self, candidate: &WorkspaceCandidate) -> Result<()> {
+        self.adopt_object_candidate(candidate, true)
+    }
+
+    fn stage_object_receipt(
+        &self,
+        pending: &PendingObject,
+        rejected: bool,
+    ) -> Result<WorkspaceCandidate> {
+        let request = serde_json::to_vec(&json!({
+            "op": if rejected {
+                "stage_object_rejection"
+            } else {
+                "stage_object_acknowledgement"
+            },
+            "member": pending.member,
+            "topic": pending.topic,
+            "counter": pending.counter,
+            "id": pending.id,
+        }))
+        .map_err(|parse_error| error(ErrorKind::Internal, parse_error.to_string()))?;
+        let [metadata, snapshot] =
+            execute_stored(self.handle()?, &request, &[]).map_err(|message| map_error(&message))?;
+        let value: Value = serde_json::from_slice(&metadata).map_err(|parse_error| {
+            error(
+                ErrorKind::Internal,
+                format!("invalid object receipt candidate: {parse_error}"),
+            )
+        })?;
+        if value.get("state").and_then(Value::as_str) != Some("awaiting_reception_save") {
+            return Err(error(
+                ErrorKind::Internal,
+                "object receipt has no adoptable snapshot",
+            ));
+        }
+        let candidate = parse_workspace_candidate(&metadata, snapshot, "object receipt")?;
+        if candidate.workspace != pending.workspace || candidate.snapshot.is_empty() {
+            return Err(error(
+                ErrorKind::Internal,
+                "object receipt candidate does not match pending object",
+            ));
+        }
+        Ok(candidate)
+    }
+
+    fn adopt_object_candidate(
+        &self,
+        candidate: &WorkspaceCandidate,
+        allow_rejection: bool,
+    ) -> Result<()> {
+        let [metadata, _] = execute_stored(
+            self.handle()?,
+            br#"{"op":"adopt_reception"}"#,
+            &candidate.snapshot,
+        )
+        .map_err(|message| map_error(&message))?;
+        let response: Value = serde_json::from_slice(&metadata).map_err(|parse_error| {
+            error(
+                ErrorKind::Internal,
+                format!("invalid object-delivery adoption: {parse_error}"),
+            )
+        })?;
+        let state = response.get("state").and_then(Value::as_str);
+        if state != Some("inbox_adopted")
+            && !(allow_rejection && state == Some("inbox_rejection_adopted"))
+        {
+            return Err(error(
+                ErrorKind::Internal,
+                "object inbox candidate was not adopted",
+            ));
+        }
+        let workspace: [u8; 32] =
+            serde_json::from_value(response["workspace"].clone()).map_err(|parse_error| {
+                error(
+                    ErrorKind::Internal,
+                    format!("invalid adopted object-inbox workspace: {parse_error}"),
+                )
+            })?;
+        if workspace != candidate.workspace {
+            return Err(error(
+                ErrorKind::Internal,
+                "object inbox candidate workspace mismatch",
+            ));
+        }
         Ok(())
     }
 
@@ -1531,6 +1690,22 @@ struct RawPublication {
 struct RawProtectedReceptionCandidate {
     workspace: [u8; 32],
     state: String,
+}
+
+#[derive(Deserialize)]
+struct RawPendingObject {
+    workspace: [u8; 32],
+    revision: u64,
+    topic: String,
+    id: [u8; 16],
+    member: [u8; 32],
+    endpoint: [u8; 32],
+    payload: Vec<u8>,
+    counter: u64,
+    #[serde(default)]
+    recipients: Vec<[u8; 32]>,
+    #[serde(default)]
+    current: Option<PublicationCurrent>,
 }
 
 #[derive(Deserialize)]
