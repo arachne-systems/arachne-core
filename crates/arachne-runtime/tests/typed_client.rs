@@ -38,6 +38,25 @@ fn typed_client_reports_endpoint_and_workspace_state_then_closes() {
 }
 
 #[test]
+fn lan_client_binds_to_a_reusable_port() {
+    let port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut client = Client::open(ClientConfig {
+        network: Network::LanAtPort(port),
+        secret: Some([70; 32]),
+    })
+    .unwrap();
+    assert_eq!(
+        client.endpoint().unwrap().bound_address,
+        format!("0.0.0.0:{port}")
+    );
+    client.close().unwrap();
+}
+
+#[test]
 fn typed_client_creates_named_workspace_with_typed_state() {
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,

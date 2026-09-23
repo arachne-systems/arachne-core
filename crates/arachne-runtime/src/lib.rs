@@ -510,6 +510,15 @@ pub fn create_lan(secret: &[u8; 32]) -> Result<i64, String> {
     create_endpoint(Some(secret), true, false, false, false, None)
 }
 
+/// Bind a LAN endpoint to a caller-selected UDP port so saved peer routes
+/// remain valid when the process restarts.
+pub fn create_lan_at_port(secret: &[u8; 32], port: u16) -> Result<i64, String> {
+    if port == 0 {
+        return Err("LAN port must be non-zero".into());
+    }
+    create_endpoint_at_port(Some(secret), true, false, false, false, port, None)
+}
+
 /// Advertise a device-level nearby-invitation endpoint on the local network.
 pub fn create_nearby(secret: &[u8; 32]) -> Result<i64, String> {
     create_endpoint(Some(secret), true, false, false, true, None)
@@ -547,6 +556,18 @@ fn create_endpoint(
     nearby: bool,
     relay: Option<RelayOptions>,
 ) -> Result<i64, String> {
+    create_endpoint_at_port(secret, lan_lookup, wan_lookup, relay_only, nearby, 0, relay)
+}
+
+fn create_endpoint_at_port(
+    secret: Option<&[u8; 32]>,
+    lan_lookup: bool,
+    wan_lookup: bool,
+    relay_only: bool,
+    nearby: bool,
+    port: u16,
+    relay: Option<RelayOptions>,
+) -> Result<i64, String> {
     let mut registry = REGISTRY.lock().map_err(|_| "node registry unavailable")?;
     if registry.sessions.len() >= 8 || registry.next == i64::MAX {
         return Err("node limit reached".into());
@@ -560,7 +581,7 @@ fn create_endpoint(
     let (node, receiver) = runtime
         .block_on(async {
             tokio::time::timeout(Duration::from_secs(10), async {
-                let address = ([0, 0, 0, 0], 0).into();
+                let address = ([0, 0, 0, 0], port).into();
                 let profile = match (secret, lan_lookup, wan_lookup, relay_only, nearby) {
                     (Some(_), _, _, _, true) => NetworkProfile::Nearby,
                     (Some(_), _, _, true, false) => NetworkProfile::RelayOnly,

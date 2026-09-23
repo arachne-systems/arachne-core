@@ -65,7 +65,7 @@ struct Route {
     moq: Moq,
     broadcast: broadcast::Producer,
     track: track::Producer,
-    worker: StdMutex<Option<JoinHandle<()>>>,
+    workers: StdMutex<Vec<JoinHandle<()>>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -136,6 +136,9 @@ impl Streams {
         }
 
         let moq = Moq::new(self.0.connections.endpoint());
+        // Subscribe before publishing the route. An outbound dial can complete
+        // immediately after the peer installs the matching route.
+        let incoming = moq.incoming_sessions();
         let path = path(workspace, self.0.local, revision);
         let broadcast = moq.publish(path.as_str()).map_err(transport)?;
         let track = broadcast
@@ -147,7 +150,7 @@ impl Streams {
             moq: moq.clone(),
             broadcast,
             track,
-            worker: StdMutex::new(None),
+            workers: StdMutex::new(Vec::new()),
         });
         let inserted = {
             let mut routes = self.0.routes.lock().await;
@@ -163,7 +166,7 @@ impl Streams {
             return Err(Error::Rejected);
         }
         let worker = tokio::spawn(run_peer(
-            moq.clone(),
+            incoming,
             self.0.local,
             peer,
             scope,
@@ -172,9 +175,10 @@ impl Streams {
             self.0.events.clone(),
             Arc::downgrade(&self.0.counters),
         ));
-        *route.worker.lock().unwrap() = Some(worker);
+        route.workers.lock().unwrap().push(worker);
 
         // A deterministic dialer avoids duplicate sessions when both peers opt in.
+        let mut dialed_session = None;
         if self.0.local < peer {
             let _permit = match self.0.connections.dial_capacity(iroh_moq::ALPN) {
                 Ok(permit) => permit,
@@ -187,7 +191,7 @@ impl Streams {
                 tokio::time::timeout(SESSION_TIMEOUT, moq.connect(EndpointAddr::new(key))).await;
             drop(_permit);
             match result {
-                Ok(Ok(_session)) => {}
+                Ok(Ok(session)) => dialed_session = Some(session),
                 Ok(Err(error)) => {
                     self.remove_route(peer).await;
                     return Err(transport(error));
@@ -197,6 +201,15 @@ impl Streams {
                     return Err(Error::Timeout("dial MoQ"));
                 }
             }
+        }
+        if let Some(session) = dialed_session {
+            let worker = tokio::spawn(reconnect_peer(
+                moq,
+                EndpointAddr::new(key),
+                self.0.connections.clone(),
+                session,
+            ));
+            route.workers.lock().unwrap().push(worker);
         }
         Ok(())
     }
@@ -392,8 +405,8 @@ impl Route {
     }
 
     async fn stop(&self) {
-        let worker = self.worker.lock().unwrap().take();
-        if let Some(worker) = worker {
+        let workers = std::mem::take(&mut *self.workers.lock().unwrap());
+        for worker in workers {
             worker.abort();
             let _ = worker.await;
         }
@@ -403,11 +416,40 @@ impl Route {
     }
 
     fn abort(&self) {
-        if let Some(worker) = self.worker.lock().unwrap().take() {
+        for worker in std::mem::take(&mut *self.workers.lock().unwrap()) {
             worker.abort();
         }
         let _ = self.track.finish();
         self.broadcast.finish();
+    }
+}
+
+async fn reconnect_peer(
+    moq: Moq,
+    address: EndpointAddr,
+    connections: Connections,
+    mut session: MoqSession,
+) {
+    let mut delay = Duration::from_millis(250);
+    loop {
+        session.closed().await;
+        tokio::time::sleep(delay).await;
+        let permit = match connections.dial_capacity(iroh_moq::ALPN) {
+            Ok(permit) => permit,
+            Err(_) => {
+                delay = (delay * 2).min(Duration::from_secs(5));
+                continue;
+            }
+        };
+        let result = tokio::time::timeout(SESSION_TIMEOUT, moq.connect(address.clone())).await;
+        drop(permit);
+        match result {
+            Ok(Ok(reconnected)) => {
+                session = reconnected;
+                delay = Duration::from_millis(250);
+            }
+            Ok(Err(_)) | Err(_) => delay = (delay * 2).min(Duration::from_secs(5)),
+        }
     }
 }
 
@@ -432,7 +474,7 @@ async fn authorize(
 }
 
 async fn run_peer(
-    moq: Moq,
+    mut incoming: iroh_moq::IncomingSessionStream,
     local: PeerId,
     peer: PeerId,
     scope: Scope,
@@ -441,7 +483,6 @@ async fn run_peer(
     events: DeliveryQueue,
     counters: Weak<Counters>,
 ) {
-    let mut incoming = moq.incoming_sessions();
     while let Some(session) = incoming.next().await {
         if *session.remote_id().as_bytes() != peer
             || session.dialed() != (local < peer)

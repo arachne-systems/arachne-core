@@ -14,6 +14,141 @@ fn access(topic: &Topic) -> Permissions {
 }
 
 #[tokio::test]
+async fn dialer_reconnects_after_the_listener_restarts_on_the_same_port() {
+    tokio::time::timeout(Duration::from_secs(45), async {
+        let dialer_secret = [71; 32];
+        let listener_secret = [72; 32];
+        let dialer_address = unused_address();
+        let listener_address = unused_address();
+        let (node_a, _) = Node::bind_with_identity(dialer_address, &dialer_secret)
+            .await
+            .unwrap();
+        let (node_b, _) = Node::bind_with_identity(listener_address, &listener_secret)
+            .await
+            .unwrap();
+        let (dialer, listener, listener_secret, listener_address) = if node_a.id() < node_b.id() {
+            (node_a, node_b, listener_secret, listener_address)
+        } else {
+            (node_b, node_a, dialer_secret, dialer_address)
+        };
+        let topic = Topic::new("ptt/audio").unwrap();
+        let workspace = [45; 32];
+        let policy = BTreeMap::from([
+            (dialer.id(), access(&topic)),
+            (listener.id(), access(&topic)),
+        ]);
+        dialer
+            .add_address_hint(listener.id(), listener.address())
+            .await
+            .unwrap();
+        listener
+            .add_address_hint(dialer.id(), dialer.address())
+            .await
+            .unwrap();
+        dialer
+            .install_verified_policy(workspace, 1, policy.clone())
+            .await
+            .unwrap();
+        listener
+            .install_verified_policy(workspace, 1, policy.clone())
+            .await
+            .unwrap();
+        dialer.subscribe(workspace, 1, topic.clone()).await.unwrap();
+        listener
+            .subscribe(workspace, 1, topic.clone())
+            .await
+            .unwrap();
+        listener
+            .enable_moq_delivery(workspace, 1, dialer.id(), topic.clone())
+            .await
+            .unwrap();
+        dialer
+            .enable_moq_delivery(workspace, 1, listener.id(), topic.clone())
+            .await
+            .unwrap();
+        wait_for_sessions(&dialer, &listener, 1).await;
+
+        listener.close().await;
+        let (listener, mut listener_messages) =
+            Node::bind_with_identity(listener_address, &listener_secret)
+                .await
+                .unwrap();
+        dialer
+            .add_address_hint(listener.id(), listener.address())
+            .await
+            .unwrap();
+        listener
+            .add_address_hint(dialer.id(), dialer.address())
+            .await
+            .unwrap();
+        listener
+            .install_verified_policy(workspace, 1, policy)
+            .await
+            .unwrap();
+        listener
+            .subscribe(workspace, 1, topic.clone())
+            .await
+            .unwrap();
+        listener
+            .enable_moq_delivery(workspace, 1, dialer.id(), topic.clone())
+            .await
+            .unwrap();
+
+        wait_for_sessions(&dialer, &listener, 1).await;
+        let frame = b"packet after listener restart".to_vec();
+        let report = dialer
+            .publish_protected_with_class(
+                workspace,
+                1,
+                topic,
+                1,
+                DeliveryClass::Critical,
+                frame.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(report.queued);
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        let received = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(message) = listener_messages.try_recv()
+                    && message.payload == frame
+                {
+                    break message;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(received.received_from, dialer.id());
+
+        dialer.close().await;
+        listener.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+fn unused_address() -> std::net::SocketAddr {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.local_addr().unwrap()
+}
+
+async fn wait_for_sessions(left: &Node, right: &Node, expected: usize) {
+    for _ in 0..500 {
+        if left.moq_metrics().sessions_active == expected
+            && right.moq_metrics().sessions_active == expected
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(left.moq_metrics().sessions_active, expected);
+    assert_eq!(right.moq_metrics().sessions_active, expected);
+}
+
+#[tokio::test]
 async fn opted_in_peers_exchange_packets_over_moq_and_reject_an_outsider() {
     tokio::time::timeout(Duration::from_secs(35), async {
         let (left, mut left_messages) = Node::bind("127.0.0.1:0".parse().unwrap())

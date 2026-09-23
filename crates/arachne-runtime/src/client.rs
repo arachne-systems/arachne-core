@@ -4,9 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    WorkspacePhase, cancel, close, create, create_lan, create_nearby, create_relay, create_wan,
-    create_wan_only, describe, enable_record_storage as enable_runtime_record_storage, execute,
-    execute_stored, restore_record_storage as restore_runtime_record_storage,
+    WorkspacePhase, cancel, close, create, create_lan, create_lan_at_port, create_nearby,
+    create_relay, create_wan, create_wan_only, describe,
+    enable_record_storage as enable_runtime_record_storage, execute, execute_stored,
+    restore_record_storage as restore_runtime_record_storage,
     save_candidate as save_runtime_candidate, wait_for_work,
 };
 
@@ -15,6 +16,7 @@ use crate::{
 pub enum Network {
     Direct,
     Lan,
+    LanAtPort(u16),
     Nearby,
     Wan,
     RelayOnly,
@@ -471,6 +473,11 @@ impl Client {
                 create(config.secret.as_ref()).map_err(|message| map_error(&message))
             }
             Network::Lan => create_required_secret(config.secret.as_ref(), "LAN", create_lan),
+            Network::LanAtPort(port) => create_required_secret(
+                config.secret.as_ref(),
+                "LAN",
+                |secret| create_lan_at_port(secret, port),
+            ),
             Network::Nearby => {
                 create_required_secret(config.secret.as_ref(), "nearby", create_nearby)
             }
@@ -1971,7 +1978,7 @@ fn map_error(message: &str) -> Error {
 fn create_required_secret(
     secret: Option<&[u8; 32]>,
     name: &str,
-    create: fn(&[u8; 32]) -> std::result::Result<i64, String>,
+    create: impl FnOnce(&[u8; 32]) -> std::result::Result<i64, String>,
 ) -> Result<i64> {
     let secret = secret
         .ok_or_else(|| error(ErrorKind::InvalidInput, format!("{name} requires a secret")))?;

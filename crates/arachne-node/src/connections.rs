@@ -356,7 +356,7 @@ impl Connections {
         self.unreachable.lock().await.remove(&peer);
         let key = PublicKey::from_bytes(&peer).map_err(transport)?;
         self.memory
-            .add_endpoint_info(EndpointAddr::new(key).with_ip_addr(address));
+            .set_endpoint_info(EndpointAddr::new(key).with_ip_addr(address));
         Ok(())
     }
 
@@ -372,7 +372,7 @@ impl Connections {
             addresses.insert(peer, address);
             if let Ok(key) = PublicKey::from_bytes(&peer) {
                 self.memory
-                    .add_endpoint_info(EndpointAddr::new(key).with_ip_addr(address));
+                    .set_endpoint_info(EndpointAddr::new(key).with_ip_addr(address));
             }
         }
     }
@@ -522,6 +522,52 @@ impl Connections {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn refreshing_an_address_hint_replaces_the_stale_port() {
+        let peer = Endpoint::builder(presets::Minimal)
+            .clear_relay_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let cache = Connections::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            NetworkProfile::Direct,
+            None,
+            ConnectionBudget::default(),
+            vec![],
+            None,
+        )
+        .await
+        .unwrap();
+        let stale = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let current = peer.bound_sockets()[0];
+        cache
+            .add_address_hint(*peer.id().as_bytes(), stale)
+            .await
+            .unwrap();
+        cache
+            .add_address_hint(*peer.id().as_bytes(), current)
+            .await
+            .unwrap();
+
+        let known = cache
+            .memory
+            .get_endpoint_info(peer.id())
+            .unwrap()
+            .ip_addrs()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(known, [current]);
+
+        cache.close().await;
+        peer.close().await;
+    }
 
     #[tokio::test]
     async fn reuse_is_single_flight_protocol_scoped_and_never_evicts_busy_exchanges() {
