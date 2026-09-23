@@ -3929,13 +3929,30 @@ fn execute_in_session(
             .workspace
             .as_ref()
             .ok_or("session has no workspace")?;
-        match session
+        let inbox = session
             .inbox
             .as_ref()
-            .ok_or("object delivery not enabled")?
+            .ok_or("object delivery not enabled")?;
+        let gap = match inbox
             .next_group_gap(owner, author, &topics)
             .map_err(str::to_owned)?
         {
+            Some(gap) => Some(gap),
+            None => inbox
+                .group_received_through(owner, author, &topics)
+                .map_err(str::to_owned)?
+                .and_then(|after| {
+                    session
+                        .presence
+                        .group_tail_through(author, &topics, after, std::time::Instant::now())
+                        .map(|through| arachne_delivery::inbox::GroupGap {
+                            author,
+                            after,
+                            through,
+                        })
+                }),
+        };
+        match gap {
             Some(gap) => json!({"state":"group_recovery_needed", "author":gap.author,
                 "topics":topics.iter().map(|topic| topic.as_str()).collect::<Vec<_>>(),
                 "after":gap.after, "through":gap.through}),
@@ -4880,6 +4897,41 @@ fn execute_in_session(
                 event["peer"] = json!(peer);
             }
             return Ok(event);
+        }
+        if incoming.payload().starts_with(b"DFGQ") {
+            let reply = match arachne_delivery::wire::GroupHeadsQuery::from_wire(
+                incoming.payload(),
+            ) {
+                Ok(query) => match (session.workspace.as_ref(), session.inbox.as_ref()) {
+                    (Some(owner), Some(inbox))
+                        if owner.id() == query.workspace && owner.epoch() == query.epoch =>
+                    {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_err(|_| "system clock is before Unix epoch")?
+                            .as_secs();
+                        let heads = session.runtime.block_on(
+                            session.node.with_routing_policy(|policy| {
+                                inbox
+                                    .retained_group_heads_for(
+                                        owner,
+                                        policy,
+                                        incoming.peer(),
+                                        now,
+                                    )
+                                    .unwrap_or_default()
+                            }),
+                        );
+                        arachne_delivery::wire::group_heads_reply(&query, &heads)
+                            .unwrap_or_else(|_| vec![0])
+                    }
+                    _ => arachne_delivery::wire::group_heads_reply(&query, &[])
+                        .unwrap_or_else(|_| vec![0]),
+                },
+                Err(_) => vec![0],
+            };
+            incoming.respond(reply).map_err(|error| error.to_string())?;
+            return Ok(json!({"state":"group_heads_replied", "remote_receipt":false}));
         }
         // One control queue: route continuity before admission parsing. Never serve
         // staged state (the dispatcher rejects polls while adoption is pending).

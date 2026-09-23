@@ -1605,6 +1605,58 @@ impl ObjectInbox {
         wire::available_offer(&query, &range.reply)
     }
 
+    /// Advertise only retained group ranges that still verify and that this
+    /// requester may fetch. The head is advisory; recovery verifies the proof
+    /// again before adopting any publication.
+    pub fn retained_group_heads_for(
+        &self,
+        owner: &arachne_security::Workspace,
+        policy: &arachne_routing::RoutingTable,
+        requester: [u8; 32],
+        now: u64,
+    ) -> Result<Vec<wire::GroupHead>, &'static str> {
+        self.validate_owner(owner)?;
+        let mut heads = self
+            .retained_ranges
+            .iter()
+            .filter(|range| range.expires_at > now)
+            .filter_map(|range| {
+                let query = RangeQuery::from_wire(&range.query).ok()?;
+                if query.workspace != self.workspace
+                    || query.epoch != self.epoch
+                    || super::authorize_history(
+                        owner,
+                        policy,
+                        requester,
+                        query.author,
+                        query.policy_revision,
+                        &query.topics,
+                    )
+                    .is_err()
+                    || !matches!(
+                        wire::verify_reply(owner, &query, &range.reply),
+                        Ok(wire::RangeReply::Offered(_))
+                    )
+                {
+                    return None;
+                }
+                Some(wire::GroupHead::from_query(&query))
+            })
+            .collect::<Vec<_>>();
+        heads.sort_by_key(|head| {
+            (
+                head.author,
+                head.policy_revision,
+                head.selection,
+                head.after,
+                head.through,
+            )
+        });
+        heads.dedup();
+        heads.truncate(wire::MAX_GROUP_HEADS);
+        Ok(heads)
+    }
+
     fn snapshot(&self) -> Result<Vec<u8>, &'static str> {
         let json = serde_json::to_vec(self).map_err(|_| "inbox encoding failed")?;
         let mut bytes = CACHE_MAGIC.to_vec();
@@ -3045,6 +3097,24 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
     let saved = inbox.seal(&holder, &key, &holder_log).unwrap();
     let (holder, _, inbox) =
         ObjectInbox::restore(&key, holder.endpoint(), holder.id(), &saved).unwrap();
+    assert_eq!(
+        inbox
+            .retained_group_heads_for(&holder, &policy, reader.endpoint(), 150)
+            .unwrap(),
+        vec![wire::GroupHead::from_query(&query)]
+    );
+    assert!(
+        inbox
+            .retained_group_heads_for(&holder, &policy, [99; 32], 150)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        inbox
+            .retained_group_heads_for(&holder, &policy, reader.endpoint(), 200)
+            .unwrap()
+            .is_empty()
+    );
 
     let relayed = inbox
         .serve_range(&holder, &policy, [3; 32], &query, 150)
