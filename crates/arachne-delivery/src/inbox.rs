@@ -235,6 +235,16 @@ pub struct DirectGap {
     pub through: u64,
 }
 
+/// An observed hole in a publisher's selected group sequence. A missing tail
+/// without a later packet remains unknown, while an initial hole behind an
+/// evicted receipt window is ambiguous.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupGap {
+    pub author: [u8; 32],
+    pub after: u64,
+    pub through: u64,
+}
+
 fn audience_aad(
     owner: &arachne_security::Workspace,
     context: &PublicationContext,
@@ -306,6 +316,57 @@ impl ObjectInbox {
             .iter()
             .find(|progress| progress.author == author && progress.selection == selection)
             .map_or(0, |progress| progress.through)
+    }
+
+    /// Find the first observed hole. Publisher sequence numbers span topics,
+    /// so any retained group receipt from the author accounts for that slot.
+    pub fn next_group_gap(
+        &self,
+        owner: &arachne_security::Workspace,
+        author: [u8; 32],
+        topics: &BTreeSet<Topic>,
+    ) -> Result<Option<GroupGap>, &'static str> {
+        self.validate_owner(owner)?;
+        if topics.is_empty() || topics.len() > MAX_TOPICS {
+            return Err("invalid group recovery topic selection");
+        }
+        owner.endpoints_for_members(&[author])?;
+        let progress = self.recovery_progress(author, topics);
+        let mut sequences = BTreeSet::new();
+        let mut may_have_evicted = false;
+        for stream in &self.streams {
+            if stream.author != author {
+                continue;
+            }
+            may_have_evicted |= stream.floor > 0;
+            sequences.extend(
+                stream
+                    .receipts
+                    .iter()
+                    .filter(|receipt| receipt.recipients.is_empty() && receipt.sequence > progress)
+                    .map(|receipt| receipt.sequence),
+            );
+        }
+        let mut previous = progress;
+        for sequence in sequences {
+            if sequence <= previous {
+                continue;
+            }
+            if sequence > previous.saturating_add(1) {
+                if previous == progress && may_have_evicted {
+                    previous = sequence;
+                    continue;
+                }
+                return Ok(Some(GroupGap {
+                    author,
+                    after: previous,
+                    through: (sequence - 1)
+                        .min(previous.saturating_add(MAX_RECOVERY_PACKETS as u64)),
+                }));
+            }
+            previous = sequence;
+        }
+        Ok(None)
     }
 
     /// Add or replace one publisher-owned latest value. The returned inbox must
@@ -2173,6 +2234,84 @@ fn deferred_streams_preserve_order_identity_and_restart() {
         ObjectInbox::new([0; 32], reader.epoch())
             .pending_excluding(&reader, &deferred)
             .is_err()
+    );
+}
+
+#[test]
+fn group_pending_orders_chat_and_counts_other_topic_cursor_slots() {
+    use arachne_security::{PendingJoin, Workspace};
+
+    let admin = Workspace::create([1; 32], "Publisher").unwrap();
+    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let join = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let prepared = admin
+        .prepare_admission([2; 32], join.admission_request().unwrap())
+        .unwrap();
+    let mut proof = join.join_proof().unwrap();
+    proof
+        .apply_add(&prepared.authorization, &prepared.commit)
+        .unwrap();
+    let reader = join.prepare_workspace(&proof, &prepared.welcome).unwrap();
+    let mut sender = prepared.workspace;
+    let chat = Topic::new("chat/messages").unwrap();
+    let other = Topic::new("feeds/pli").unwrap();
+    let context = |sequence: u64, topic: Topic| PublicationContext {
+        workspace: reader.id(),
+        revision: 7,
+        topic,
+        id: [sequence as u8; 16],
+        sequence: std::num::NonZeroU64::new(sequence),
+    };
+    let first = context(1, chat.clone());
+    let other_topic = context(2, other);
+    let second = context(3, chat.clone());
+    let metadata = current::CurrentMetadata {
+        selector: [4; 32],
+        replacement_key: [5; 32],
+        expires_at: 100,
+        tombstone: false,
+    };
+    let first_object = sender
+        .protect_object(&first.authenticated_bytes(), b"first")
+        .unwrap();
+    let other_object = sender
+        .protect_object(
+            &metadata.authenticated_context(&other_topic),
+            b"current state",
+        )
+        .unwrap();
+    let second_object = sender
+        .protect_object(&second.authenticated_bytes(), b"second")
+        .unwrap();
+    let InboxStage::Prepared(inbox) = ObjectInbox::new(reader.id(), reader.epoch())
+        .stage(&reader, &second, &second_object)
+        .unwrap()
+    else {
+        panic!("second object was not staged")
+    };
+    let InboxStage::Prepared(inbox) = inbox.stage(&reader, &first, &first_object).unwrap() else {
+        panic!("first object was not staged")
+    };
+    let pending = inbox.pending(&reader).unwrap().unwrap();
+    assert_eq!(pending.message.payload, b"first");
+    let chat_topics = BTreeSet::from([chat]);
+    assert!(
+        inbox
+            .next_group_gap(&reader, pending.message.member, &chat_topics)
+            .unwrap()
+            .is_some()
+    );
+    let InboxStage::Prepared(inbox) = inbox
+        .stage_live_current(&reader, &other_topic, metadata, &other_object)
+        .unwrap()
+    else {
+        panic!("other-topic object was not staged")
+    };
+    assert!(
+        inbox
+            .next_group_gap(&reader, pending.message.member, &chat_topics)
+            .unwrap()
+            .is_none()
     );
 }
 
