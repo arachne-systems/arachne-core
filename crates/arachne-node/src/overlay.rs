@@ -20,8 +20,8 @@ use tokio::{
 };
 
 use super::{
-    DeliveryClass, DeliveryQueue, Error, PeerId, Result, RoutingTable, Topic, WorkspaceId, apply,
-    wire,
+    DeliveryClass, DeliveryQueue, Error, PeerId, Result, RoutingTable, Topic, WorkspaceId,
+    apply_gossip, wire,
 };
 
 pub(super) const ALPN_PREFIX: &[u8] = b"arachne/workspace-gossip/1/";
@@ -254,7 +254,7 @@ impl Overlay {
                             delivery: envelope.delivery,
                             operation: super::Operation::Publish(envelope.payload),
                         };
-                        if let Err(error) = apply(
+                        if let Err(error) = apply_gossip(
                             &routing,
                             &events,
                             local,

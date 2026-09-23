@@ -239,3 +239,77 @@ async fn workspace_publication_crosses_an_intermediate_without_a_direct_route() 
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn gossip_replays_critical_delivery_after_receiver_queue_backpressure() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (a, _) = Node::bind_with_identity("127.0.0.1:0".parse().unwrap(), &[81; 32])
+            .await
+            .unwrap();
+        let (b, _) = Node::bind_with_identity("127.0.0.1:0".parse().unwrap(), &[82; 32])
+            .await
+            .unwrap();
+        let (c, mut received) = Node::bind_with_identity("127.0.0.1:0".parse().unwrap(), &[83; 32])
+            .await
+            .unwrap();
+        let workspace = [84; 32];
+        let slow = Topic::new("streams/slow-replay").unwrap();
+        let target = Topic::new("streams/replay-target").unwrap();
+        let policy = BTreeMap::from([
+            (a.id(), Permissions::AllTopics),
+            (b.id(), Permissions::AllTopics),
+            (c.id(), Permissions::AllTopics),
+        ]);
+        for node in [&a, &b, &c] {
+            node.install_verified_policy(workspace, 1, policy.clone())
+                .await
+                .unwrap();
+        }
+        c.subscribe(workspace, 1, slow.clone()).await.unwrap();
+        c.subscribe(workspace, 1, target.clone()).await.unwrap();
+        for sequence in 0_u16..256 {
+            c.publish(workspace, 1, slow.clone(), sequence.to_be_bytes().to_vec())
+                .await
+                .unwrap();
+        }
+        assert_eq!(c.transport_metrics().receive_queue, 256);
+
+        a.add_address_hint(b.id(), b.address()).await.unwrap();
+        b.add_address_hint(a.id(), a.address()).await.unwrap();
+        b.add_address_hint(c.id(), c.address()).await.unwrap();
+        c.add_address_hint(b.id(), b.address()).await.unwrap();
+        a.enable_gossip(workspace, 1).await.unwrap();
+        b.enable_gossip(workspace, 1).await.unwrap();
+        c.enable_gossip(workspace, 1).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let neighbors = c.live_neighbors(workspace).await;
+            if neighbors.contains(&b.id()) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let report = a
+            .publish(workspace, 1, target.clone(), b"after-drain".to_vec())
+            .await
+            .unwrap();
+        assert!(report.queued);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        for _ in 0..256 {
+            assert_eq!(received.recv().await.unwrap().topic, slow);
+        }
+        let target_message = tokio::time::timeout(Duration::from_secs(2), received.recv())
+            .await
+            .expect("gossip target should survive receiver queue backpressure")
+            .unwrap();
+        assert_eq!(target_message.topic, target);
+        assert_eq!(target_message.payload, b"after-drain");
+        c.close().await;
+        b.close().await;
+        a.close().await;
+    })
+    .await
+    .unwrap();
+}
