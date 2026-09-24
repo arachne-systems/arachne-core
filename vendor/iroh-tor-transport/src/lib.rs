@@ -457,11 +457,7 @@ impl TorCustomTransportBuilder {
             Err(err) => return Err(e!(BuildError::CreateOnion, err)),
         }
 
-        tracing::info!(
-            "Hidden service created: {}:{}",
-            onion_addr,
-            self.onion_port
-        );
+        tracing::info!("Hidden service created: {}:{}", onion_addr, self.onion_port);
 
         let socks_addr: std::net::SocketAddr =
             format!("127.0.0.1:{}", self.socks_port).parse().unwrap();

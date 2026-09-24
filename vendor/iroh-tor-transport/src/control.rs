@@ -257,12 +257,16 @@ fn parse_protocol_info(lines: &[String]) -> Result<ProtocolInfo, ControlError> {
         return Err(ControlError::Protocol("PROTOCOLINFO version is not 1"));
     }
     if lines.last().map(String::as_str) != Some("OK") {
-        return Err(ControlError::Protocol("PROTOCOLINFO reply does not end with OK"));
+        return Err(ControlError::Protocol(
+            "PROTOCOLINFO reply does not end with OK",
+        ));
     }
     let auth = lines
         .iter()
         .find_map(|line| line.strip_prefix("AUTH METHODS="))
-        .ok_or(ControlError::Protocol("PROTOCOLINFO reply has no AUTH line"))?;
+        .ok_or(ControlError::Protocol(
+            "PROTOCOLINFO reply has no AUTH line",
+        ))?;
     let (methods, rest) = auth.split_once(' ').unwrap_or((auth, ""));
     let mut info = ProtocolInfo::default();
     for method in methods.split(',') {
@@ -399,7 +403,10 @@ mod tests {
             b"250 \xff\r\n",
         ] {
             let err = read_one(bytes).await.unwrap_err();
-            assert!(matches!(err, ControlError::Protocol(_)), "{bytes:?}: {err:?}");
+            assert!(
+                matches!(err, ControlError::Protocol(_)),
+                "{bytes:?}: {err:?}"
+            );
         }
     }
 
@@ -415,7 +422,10 @@ mod tests {
             }
         });
         let err = TorControl::new(client).read_reply().await.unwrap_err();
-        assert!(matches!(err, ControlError::Protocol("reply too large")), "{err:?}");
+        assert!(
+            matches!(err, ControlError::Protocol("reply too large")),
+            "{err:?}"
+        );
         writer.abort();
     }
 
@@ -455,9 +465,17 @@ mod tests {
             ProtocolInfo::default()
         );
         for bad in [
-            vec!["PROTOCOLINFO 2".into(), "AUTH METHODS=NULL".into(), "OK".into()],
+            vec![
+                "PROTOCOLINFO 2".into(),
+                "AUTH METHODS=NULL".into(),
+                "OK".into(),
+            ],
             vec!["PROTOCOLINFO 1".into(), "AUTH METHODS=NULL".into()],
-            vec!["PROTOCOLINFO 1".into(), "VERSION Tor=\"x\"".into(), "OK".into()],
+            vec![
+                "PROTOCOLINFO 1".into(),
+                "VERSION Tor=\"x\"".into(),
+                "OK".into(),
+            ],
             lines("AUTH METHODS=COOKIE OTHER=1"),
             lines("AUTH METHODS=COOKIE COOKIEFILE=/unquoted"),
             lines("AUTH METHODS=COOKIE COOKIEFILE=\"/a\" trailing"),
@@ -475,7 +493,15 @@ mod tests {
         assert_eq!(unquote(r#""\101\60x\7""#).as_deref(), Some("A0x\u{7}"));
         assert_eq!(unquote(r#""\q""#).as_deref(), Some("q"));
         assert_eq!(unquote(r#""\303\251""#).as_deref(), Some("é"));
-        for bad in ["", "abc", "\"abc", "\"a\"b", r#""\"#, r#""\400""#, r#""\377""#] {
+        for bad in [
+            "",
+            "abc",
+            "\"abc",
+            "\"a\"b",
+            r#""\"#,
+            r#""\400""#,
+            r#""\377""#,
+        ] {
             assert_eq!(unquote(bad), None, "{bad:?}");
         }
     }
@@ -527,12 +553,22 @@ mod tests {
 
         // 552: the service already exists on this Tor instance.
         let (client, server) = duplex(4096);
-        let server = tokio::spawn(fake_tor(server, vec!["552 Onion address collision\r\n".into()]));
+        let server = tokio::spawn(fake_tor(
+            server,
+            vec!["552 Onion address collision\r\n".into()],
+        ));
         let err = TorControl::new(client)
-            .add_onion_v3(&ExpandedSecretKey::from_seed(&seed), 9999, "127.0.0.1:1".parse().unwrap())
+            .add_onion_v3(
+                &ExpandedSecretKey::from_seed(&seed),
+                9999,
+                "127.0.0.1:1".parse().unwrap(),
+            )
             .await
             .unwrap_err();
-        assert!(matches!(err, ControlError::Status { code: 552, .. }), "{err:?}");
+        assert!(
+            matches!(err, ControlError::Status { code: 552, .. }),
+            "{err:?}"
+        );
         server.await.unwrap();
     }
 
@@ -542,20 +578,30 @@ mod tests {
         let cookie_path = temp_cookie("handshake", 32);
         let quoted = format!("\"{}\"", cookie_path.display());
         let info = |auth: &str| {
-            format!("250-PROTOCOLINFO 1\r\n250-{auth}\r\n250-VERSION Tor=\"0.4.8.10\"\r\n250 OK\r\n")
+            format!(
+                "250-PROTOCOLINFO 1\r\n250-{auth}\r\n250-VERSION Tor=\"0.4.8.10\"\r\n250 OK\r\n"
+            )
         };
         let cookie_hex = "A5".repeat(32);
         let cases = [
-            (vec![info("AUTH METHODS=NULL"), "250 OK\r\n".into()], "AUTHENTICATE\r\n".to_string()),
+            (
+                vec![info("AUTH METHODS=NULL"), "250 OK\r\n".into()],
+                "AUTHENTICATE\r\n".to_string(),
+            ),
             (
                 vec![
-                    info(&format!("AUTH METHODS=COOKIE,SAFECOOKIE COOKIEFILE={quoted}")),
+                    info(&format!(
+                        "AUTH METHODS=COOKIE,SAFECOOKIE COOKIEFILE={quoted}"
+                    )),
                     "250 OK\r\n".into(),
                 ],
                 format!("AUTHENTICATE {cookie_hex}\r\n"),
             ),
             (
-                vec![info(&format!("AUTH METHODS=SAFECOOKIE COOKIEFILE={quoted}")), "250 OK\r\n".into()],
+                vec![
+                    info(&format!("AUTH METHODS=SAFECOOKIE COOKIEFILE={quoted}")),
+                    "250 OK\r\n".into(),
+                ],
                 format!("AUTHENTICATE {cookie_hex}\r\n"),
             ),
             (vec![info("AUTH METHODS=HASHEDPASSWORD")], String::new()),
@@ -576,12 +622,18 @@ mod tests {
 
         // A rejected AUTHENTICATE is an error.
         let (client, server) = duplex(4096);
-        let server = tokio::spawn(fake_tor(server, vec!["515 Authentication failed\r\n".into()]));
+        let server = tokio::spawn(fake_tor(
+            server,
+            vec!["515 Authentication failed\r\n".into()],
+        ));
         let err = TorControl::new(client)
             .authenticate(&AuthData::Null)
             .await
             .unwrap_err();
-        assert!(matches!(err, ControlError::Status { code: 515, .. }), "{err:?}");
+        assert!(
+            matches!(err, ControlError::Status { code: 515, .. }),
+            "{err:?}"
+        );
         server.await.unwrap();
     }
 
@@ -604,18 +656,47 @@ mod tests {
             cookie_file: cookie_file.clone(),
         };
         assert_eq!(
-            info(true, true, true, &cookie_file).auth_data().await.unwrap(),
+            info(true, true, true, &cookie_file)
+                .auth_data()
+                .await
+                .unwrap(),
             Some(AuthData::Null)
         );
-        assert_eq!(info(false, false, true, &cookie_file).auth_data().await.unwrap(), cookie);
-        assert_eq!(info(false, true, false, &cookie_file).auth_data().await.unwrap(), cookie);
-        assert_eq!(info(false, true, true, &None).auth_data().await.unwrap(), None);
-        assert_eq!(info(false, false, false, &cookie_file).auth_data().await.unwrap(), None);
+        assert_eq!(
+            info(false, false, true, &cookie_file)
+                .auth_data()
+                .await
+                .unwrap(),
+            cookie
+        );
+        assert_eq!(
+            info(false, true, false, &cookie_file)
+                .auth_data()
+                .await
+                .unwrap(),
+            cookie
+        );
+        assert_eq!(
+            info(false, true, true, &None).auth_data().await.unwrap(),
+            None
+        );
+        assert_eq!(
+            info(false, false, false, &cookie_file)
+                .auth_data()
+                .await
+                .unwrap(),
+            None
+        );
 
         let short = Some(temp_cookie("short", 31));
         assert!(info(false, true, false, &short).auth_data().await.is_err());
         let missing = Some(PathBuf::from("/nonexistent/arachne/cookie"));
-        assert!(info(false, true, false, &missing).auth_data().await.is_err());
+        assert!(
+            info(false, true, false, &missing)
+                .auth_data()
+                .await
+                .is_err()
+        );
     }
 
     /// Against a real Tor: `tor --ControlPort 9051 --CookieAuthentication 0`
@@ -624,10 +705,16 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a local Tor daemon with ControlPort 9051"]
     async fn live_tor_accepts_key_and_reports_same_service_id() {
-        let stream = tokio::net::TcpStream::connect("127.0.0.1:9051").await.unwrap();
+        let stream = tokio::net::TcpStream::connect("127.0.0.1:9051")
+            .await
+            .unwrap();
         let mut conn = TorControl::new(stream);
         let info = conn.protocol_info().await.unwrap();
-        let auth = info.auth_data().await.unwrap().expect("usable Tor auth method");
+        let auth = info
+            .auth_data()
+            .await
+            .unwrap()
+            .expect("usable Tor auth method");
         conn.authenticate(&auth).await.unwrap();
         let secret = iroh::SecretKey::generate();
         let key = ExpandedSecretKey::from_seed(&secret.to_bytes());
