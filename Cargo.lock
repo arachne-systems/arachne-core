@@ -145,6 +145,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "arachne-bao-tree"
+version = "0.16.1-arachne.1"
+dependencies = [
+ "blake3",
+ "bytes",
+ "futures-lite",
+ "genawaiter",
+ "iroh-io",
+ "positioned-io",
+ "range-collections",
+ "self_cell",
+ "serde",
+ "smallvec",
+ "tokio",
+]
+
+[[package]]
 name = "arachne-delivery"
 version = "0.1.0"
 dependencies = [
@@ -160,10 +177,10 @@ name = "arachne-iroh-blobs"
 version = "0.103.0"
 dependencies = [
  "anyhow",
+ "arachne-bao-tree",
  "arrayvec",
  "async-compression",
  "atomic_refcell",
- "bao-tree",
  "bytes",
  "cfg_aliases",
  "chrono",
@@ -537,23 +554,6 @@ checksum = "cffb0e931875b666fc4fcb20fee52e9bbd1ef836fd9e9e04ec21555f9f85f7ef"
 dependencies = [
  "fastrand",
  "gloo-timers",
- "tokio",
-]
-
-[[package]]
-name = "bao-tree"
-version = "0.16.1"
-dependencies = [
- "blake3",
- "bytes",
- "futures-lite",
- "genawaiter",
- "iroh-io",
- "positioned-io",
- "range-collections",
- "self_cell",
- "serde",
- "smallvec",
  "tokio",
 ]
 

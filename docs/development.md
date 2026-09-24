@@ -77,17 +77,33 @@ certification.
 
 ## Vendored dependency patches
 
-`vendor/` contains two Arachne-maintained, publishable forks of Iroh packages:
-`arachne-iroh-gossip` and `arachne-iroh-blobs`. Their Rust import names stay
-`iroh_gossip` and `iroh_blobs`; each retains upstream provenance, notices, and
-MIT/Apache-2.0 terms. They are not official Iroh releases.
+`vendor/` contains three Arachne-maintained, publishable renamed forks:
+`arachne-iroh-gossip`, `arachne-iroh-blobs` and `arachne-bao-tree`. Their Rust
+import names stay `iroh_gossip`, `iroh_blobs` and `bao_tree`; each retains
+upstream provenance, notices, and MIT/Apache-2.0 terms. They are not official
+upstream releases. Because Arachne crates depend on them directly (with
+`package = "arachne-..."`), their fixes reach every downstream consumer.
 
-The root `[patch.crates-io]` still selects local copies of `bao-tree`,
-`netlink-packet-core`, and `hax-lib-macros` for this workspace. Those patches
-are not part of the Arachne crate dependencies; the clean-consumer check must
-therefore build without them. Keep their upstream copyright, license, and
-notice files intact, and do not imply that the Arachne MPL license replaces
-their terms.
+Fork versions use `<upstream version>-arachne.<N>` (for example
+`0.103.0-arachne.1`). Dependents pin them with `=`, because the patched source
+must match. Note: `arachne-iroh-blobs` 0.103.0 and `arachne-iroh-gossip` 0.101.0
+were published earlier with the plain upstream numbers. Under semver, a
+pre-release such as `0.103.0-arachne.1` sorts *below* `0.103.0`. Thus a caret
+requirement or `cargo add` picks the old release. Always use the exact `=` pin.
+
+The root `[patch.crates-io]` still selects local copies of
+`netlink-packet-core` and `hax-lib-macros` for this workspace only. Cargo
+ignores `[patch]` in dependencies. Both come in through third-party parents that
+Arachne does not fork (`iroh` -> `netwatch`/`netdev`, and
+`openmls_rust_crypto` -> `hpke-rs` -> `libcrux` -> `hax-lib`), so a renamed
+fork cannot replace them. Downstream consumers (for example the SDK) that want
+the same lockfile must copy these two entries. The patches are not needed for
+correctness: they only remove "unmaintained" advisories (`paste`
+RUSTSEC-2024-0436, `proc-macro-error2` RUSTSEC-2026-0173). `proc-macro-error2`
+is only a `cfg(hax)` dependency and is never compiled in normal builds. The
+clean-consumer check must therefore build without them. Keep their upstream
+copyright, license, and notice files intact, and do not imply that the Arachne
+MPL license replaces their terms.
 
 When updating a patched dependency:
 
@@ -107,9 +123,20 @@ notices when bundling Core into a binary distribution.
 
 ## Crates.io releases
 
-`arachne-node` depends on the two named Arachne Iroh forks so their required
-APIs are ordinary registry dependencies, not workspace-only patches. The
-other three vendor patches are deliberately excluded from publishing. A clean
+`arachne-node` depends on the two named Arachne Iroh forks, and
+`arachne-iroh-blobs` depends on `arachne-bao-tree`, so their required APIs and
+fixes are ordinary registry dependencies, not workspace-only patches. The
+other two vendor patches (`netlink-packet-core`, `hax-lib-macros`) are
+deliberately excluded from publishing.
+
+`arachne-bao-tree` is in the workspace `exclude` list (to keep its upstream
+dev-dependencies out of `Cargo.lock`), so release-plz does not publish it.
+Publish order for a fork change: `arachne-bao-tree` (by hand, `cargo publish
+--manifest-path vendor/bao-tree/Cargo.toml`), then `arachne-iroh-blobs`,
+`arachne-iroh-gossip`, `arachne-node`, `arachne-runtime`. Until
+`arachne-bao-tree` is on crates.io, `cargo package`/`cargo publish --dry-run`
+verification of `arachne-iroh-blobs`, `arachne-node` and `arachne-runtime`
+fails; use `cargo package --list` or `--no-verify` for a local check. A clean
 consumer build outside this workspace must resolve registry-compatible
 package names and dependencies without inheriting this root manifest's
 `[patch.crates-io]` entries.

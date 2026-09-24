@@ -25,6 +25,22 @@ that deletion would break the locked `netlink-packet-route` 0.31.0 consumers.
 This substitution keeps the 0.8 API; it does not relabel `paste` or suppress its
 advisory. Remove the patch when the transport parents support the upstream API.
 
+## Reach: workspace only
+
+This package is applied through the root `[patch.crates-io]`. Cargo ignores
+`[patch]` in dependencies, so downstream consumers of the Arachne crates get the
+unpatched registry `netlink-packet-core` 0.8.2 unless they copy the patch entry.
+A renamed fork cannot help: the parents are third-party crates that Arachne does
+not fork (`iroh` -> `netwatch`/`portmapper` -> `netdev`, `netlink-packet-route`
+0.31.0 and `netlink-proto`).
+
+The patch is not needed for correctness. `paste` is a compile-time proc macro,
+and its advisory (RUSTSEC-2024-0436) is "unmaintained", not a vulnerability.
+Without the patch, `cargo deny check advisories` reports only that
+informational advisory. The graph also contains `netlink-packet-core` 0.9.0
+(via `netdev` 0.46); that version does not use `paste`. Thus with the patch,
+`paste` is not in the graph.
+
 Run the existing packet tests plus the regression with
 `cargo +1.98.0 test --manifest-path vendor/netlink-packet-core/Cargo.toml --lib`
 from the root. This standalone test uses upstream's unchanged old example dev

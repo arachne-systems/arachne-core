@@ -23,7 +23,13 @@ rust-version = "1.91"
 repository = "https://github.com/arachne-systems/arachne-core"
 homepage = "https://github.com/arachne-systems"
 
+# These two patches only apply inside this workspace; Cargo ignores [patch] in
+# dependencies. Both packages come in through third-party parents (iroh ->
+# netwatch/netdev, openmls_rust_crypto -> hpke-rs -> libcrux -> hax-lib), so a
+# renamed fork cannot replace them. They are advisory hygiene, not correctness
+# fixes: see docs/development.md ("Vendored dependency patches").
+# bao-tree is no longer patched here: arachne-iroh-blobs depends on the renamed
+# `arachne-bao-tree` fork directly.
 [patch.crates-io]
-bao-tree = { path = "vendor/bao-tree" }
 netlink-packet-core = { path = "vendor/netlink-packet-core" }
 hax-lib-macros = { path = "vendor/hax-lib-macros" }

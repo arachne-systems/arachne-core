@@ -32,6 +32,20 @@ No cfg branch is removed or disabled. Upgrading this package alone to 0.4 would
 not satisfy the parent's exact 0.3.7 dependency; retire this backport with a
 compatible upstream parent upgrade.
 
+## Reach: workspace only
+
+This package is applied through the root `[patch.crates-io]`. Cargo ignores
+`[patch]` in dependencies, so downstream consumers get the unpatched registry
+package unless they copy the patch entry. A renamed fork cannot help: the parent
+chain is third-party (`openmls_rust_crypto` -> `hpke-rs` -> `libcrux-*` ->
+`hax-lib` -> `hax-lib-macros`, with an exact `=0.3.7` requirement).
+
+The patch is not needed for correctness. Upstream declares `proc-macro-error2`
+only under `[target."cfg(hax)".dependencies]`. Normal builds do not set
+`cfg(hax)`, so that crate is never compiled; it only appears in `Cargo.lock`.
+Without the patch, `cargo deny check advisories` reports only its
+"unmaintained" advisory (RUSTSEC-2026-0173), not a vulnerability.
+
 Build the macro with its existing nightly requirement and `RUSTFLAGS='--cfg hax'`,
 then run `python3 tests/check-diagnostics.py PATH_TO_LIBHAX_LIB_MACROS.so RUSTC`.
 The check covers all explicit abort sites, syn parsing, and valid expression
