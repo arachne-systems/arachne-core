@@ -56,7 +56,7 @@ and a different Core pin. Core work that each plan step depends on:
 - [x] **A8** (`1b481ca`; per-namespace object key + namespace in AAD; true isolation still needs separate groups, documented)
   Original: Per-app or per-topic isolation.
 - [x] **A9** Version ranges; renamed forks with own versions; SPDX license field. (`fix/a9-supply-chain`, merged into `integrate/wave1`)
-  - [ ] A9a: ~40 `.rs` comments cite ADR 0008/0009/0010 that live only in `arachne-development`. Replace with inline rationale.
+  - [x] A9a (`fd189aa`; 40 comments rewritten, `docs/architecture.md` gossip section): ~40 `.rs` comments cite ADR 0008/0009/0010 that live only in `arachne-development`. Replace with inline rationale.
   - [x] A9b (`fix/a9b-tor`; torut replaced, deny clean): `tor` feature pulls `torut` → `ed25519-dalek 1.0.1` / `curve25519-dalek 3.2.0` (RUSTSEC-2022-0093, RUSTSEC-2024-0344).
   - [~] A9c: rusqlite 0.40.2 (SQLite 3.53.2) and getrandom 0.4 done (`a227d9a`). **Next** (after A3/B3a merge): our crates to sha2 0.11 + hkdf/hmac 0.13 (same as iroh 1.2 and openmls_rust_crypto 0.6; sha2 0.10 stays only via ed25519-dalek 2 / p256 / p384). **Keep** aes-gcm 0.10 (openmls_rust_crypto uses 0.10). Check sframe 2.0 separately.
   - [x] A9d (`334ab7f`): in-file change notices in fork sources; stale `release = false` in `release-plz.toml`.
