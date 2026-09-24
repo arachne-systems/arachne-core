@@ -2,6 +2,7 @@
 //! Legacy hosts persist encrypted snapshots; trusted native adapters can persist
 //! separate secret-bearing records in an authenticated encrypted store.
 mod bootstrap;
+mod gossip_key;
 mod history;
 mod records;
 pub use records::SecurityRecords;
@@ -241,6 +242,7 @@ impl Workspace {
             credential,
         )
         .map_err(|_| "workspace creation failed")?;
+        gossip_key::generate(&provider)?;
         Ok(Self {
             provider,
             _signer: signer,

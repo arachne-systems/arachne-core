@@ -35,6 +35,21 @@ pub mod harness {
     pub use crate::membership::StateBasis;
     pub use crate::membership::wire::{Query, decode_reply, encode_query};
     pub use crate::presence::harness_presence_packet;
+
+    /// The session workspace's gossip tag key, so a qualification harness can
+    /// join raw nodes to the same overlay. The host already holds this state.
+    pub fn gossip_tag_key(handle: i64) -> Result<[u8; 32], String> {
+        let shared = crate::session(handle)?;
+        let guard = shared.lock().map_err(|_| "node session unavailable")?;
+        guard
+            .as_ref()
+            .ok_or("node is closed")?
+            .workspace
+            .as_ref()
+            .ok_or("session has no workspace")?
+            .gossip_tag_key()
+            .map_err(str::to_owned)
+    }
 }
 mod admission_waiters;
 mod persistence;
@@ -892,6 +907,7 @@ async fn install_gossip_policy(
     workspace: [u8; 32],
     revision: u64,
     policy: BTreeMap<[u8; 32], Permissions>,
+    tag_key: [u8; 32],
 ) -> Result<(), String> {
     let desired = policy
         .keys()
@@ -906,9 +922,9 @@ async fn install_gossip_policy(
         node.install_verified_policy(workspace, revision, policy)
             .await
             .map_err(|error| error.to_string())?;
-        // ponytail: the workspace ID stands in for a stable members-only
-        // secret until the security layer exports one for the gossip tag.
-        node.enable_gossip(workspace, revision, &workspace)
+        // A stable members-only key: the overlay tag does not reveal the
+        // workspace to a party that knows only its ID.
+        node.enable_gossip(workspace, revision, &tag_key)
             .await
             .map_err(|error| error.to_string())
     }
@@ -5871,6 +5887,7 @@ fn execute_in_session(
                             owner.id(),
                             revision,
                             policy,
+                            owner.gossip_tag_key().map_err(str::to_owned)?,
                         )
                         .await?;
                         session.interests.replace_revision(owner.id(), revision);
@@ -5910,6 +5927,7 @@ fn execute_in_session(
                             workspace.id(),
                             revision,
                             policy,
+                            workspace.gossip_tag_key().map_err(str::to_owned)?,
                         )
                         .await?;
                         session.interests.replace_revision(workspace.id(), revision);

@@ -366,15 +366,16 @@ impl PendingJoin {
             .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
             .use_ratchet_tree_extension(false)
             .build();
-        let group = StagedWelcome::new_from_welcome(
-            &provider,
-            &config,
-            welcome,
-            Some(proof.export_ratchet_tree().into()),
-        )
+        let processed = ProcessedWelcome::new_from_welcome(&provider, &config, welcome)
+            .map_err(|_| "Welcome validation failed")?;
+        let group_info = processed.unverified_group_info().extensions().clone();
+        let group = processed
+            .into_staged_welcome(&provider, Some(proof.export_ratchet_tree().into()))
             .map_err(|_| "Welcome validation failed")?
             .into_group(&provider)
             .map_err(|_| "Welcome group creation failed")?;
+        // The GroupInfo signature was verified while staging.
+        super::gossip_key::adopt(&provider, &group_info)?;
         if group.group_id().as_slice() != self.workspace || group.ciphersuite() != SUITE {
             return Err("Welcome belongs to another workspace");
         }
@@ -510,10 +511,13 @@ fn pending_identity_recovers_and_rejected_welcome_does_not_consume_it() {
             .try_into()
             .unwrap(),
     };
-    let (commit, welcome, _) = admin
-        .group
-        .add_members(&admin.provider, &admin._signer, &[package])
-        .unwrap();
+    let (commit, welcome) = super::gossip_key::add_members(
+        &mut admin.group,
+        &admin.provider,
+        &admin._signer,
+        vec![package],
+    )
+    .unwrap();
     let welcome = welcome.to_bytes().unwrap();
     // This reaches successful MLS validation but fails branch authorization.
     assert_eq!(

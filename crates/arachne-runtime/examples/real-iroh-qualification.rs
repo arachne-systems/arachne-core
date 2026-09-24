@@ -866,12 +866,19 @@ async fn enable_gossip_profile(
             }
         }
         let node_policy = policy.clone();
+        let tag_key = match arachne_runtime::harness::gossip_tag_key(owner_handle) {
+            Ok(key) => key,
+            Err(error) => {
+                outcomes.fail(&format!("gossip key: {error}"));
+                return;
+            }
+        };
         let result = match remaining(deadline) {
             Ok(limit) => tokio::time::timeout(limit, async {
                 node.install_verified_policy(workspace, 1, node_policy)
                     .await
                     .map_err(|error| error.to_string())?;
-                node.enable_gossip(workspace, 1, &workspace)
+                node.enable_gossip(workspace, 1, &tag_key)
                     .await
                     .map_err(|error| error.to_string())
             })

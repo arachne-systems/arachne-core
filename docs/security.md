@@ -52,6 +52,22 @@ the path this may include IP addresses, endpoint identifiers, connection
 timing, traffic volume, and routing relationships. The core does not promise
 anonymity or conceal all metadata.
 
+The gossip overlay is named by a tag that a gossip link sends inside its
+encrypted channel. The tag is a hash of the workspace ID and a gossip key. The
+workspace creator makes the gossip key (32 random bytes) one time. Each Add
+sends the key to its joiners only inside the encrypted GroupInfo of the
+Welcome. The key is not in the group context, because MLS handshakes and join
+checkpoints are public. The key does not change when the epoch changes, so
+members at different epochs find the same overlay. A member that is removed
+keeps the key and can still calculate the tag. The tag only stops a party that
+knows the workspace ID, but does not have the key, from connecting the tag to
+the workspace. The tag is not access control: the node accepts a gossip link
+and data-plane traffic only from endpoints in the installed policy. A state
+that has no gossip key cannot join an overlay. There is no fallback.
+
+Operators can replace n0's relays with their own relays, and can stop n0's
+public address lookup (`TransportOptions` in `ClientConfig`).
+
 Any peer, relay, discovery service, ISP, or local network can be unavailable,
 misconfigured, or hostile to availability. A relay or lookup service assists
 connectivity; it is not the authority for MLS membership. Core does not promise

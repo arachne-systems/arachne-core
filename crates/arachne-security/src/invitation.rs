@@ -1309,8 +1309,12 @@ impl Workspace {
                 .propose_group_context_extensions(policy)
                 .map_err(|_| "admission policy proposal failed")?;
         }
+        // Only the Welcome's encrypted GroupInfo carries the gossip key; the
+        // exported GroupInfo of this commit is never sent.
         let bundle = builder
             .load_psks(provider.storage())
+            .map_err(|_| "admission preparation failed")?
+            .create_group_info_with_extensions([super::gossip_key::welcome_extension(&provider)?])
             .map_err(|_| "admission preparation failed")?
             .build(provider.rand(), provider.crypto(), &signer, |_| true)
             .map_err(|_| "admission preparation failed")?
