@@ -892,7 +892,9 @@ fn start_query(
             profiles.first().map_or(&[], Vec::as_slice),
             profiles.get(1).map_or(&[], Vec::as_slice),
         ],
-    }).map_err(crate::errors::legacy)?;
+    })
+    // Our own query; a failure here is a runtime bug, not the peer's.
+    .map_err(ApiError::internal)?;
     // The reply is an outbound event, so it does not enqueue a control
     // request locally. Wake the existing host drain when it completes.
     let request = session.node.request_control(peer, &query);
@@ -1117,7 +1119,8 @@ fn poll_with_budget(
             {
                 return Ok(json!({"state":"membership_update_stale"}));
             }
-            let mut value = wire::decode_reply(&bytes).map_err(crate::errors::legacy)?;
+            let mut value = wire::decode_reply(&bytes)
+                .map_err(|reason| ApiError::transport_failed(None, reason))?;
             if value["state"] == "membership_denied" {
                 return Ok(value);
             }
@@ -1388,8 +1391,8 @@ pub(super) fn bare_test_session(workspace: impl Into<Arc<arachne_security::Works
         .block_on(Node::bind_with_profile(
             ([0, 0, 0, 0], 0).into(),
             None,
-            NetworkProfile::Direct,
-            ConnectionBudget::default(),
+            arachne_node::NetworkProfile::Direct,
+            arachne_node::ConnectionBudget::default(),
         ))
         .unwrap();
     let committed = super::committed_view::Published::new(None);

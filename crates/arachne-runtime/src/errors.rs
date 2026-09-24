@@ -1,4 +1,3 @@
-#![allow(dead_code)] // TODO(A1 step 2): removed once every op group uses these helpers.
 //! The one place where failures from lower crates become [`ApiError`]
 //! (ADR A1/A4, decision 3).
 //!
@@ -173,13 +172,6 @@ pub fn legacy_text(error: &ApiError) -> String {
         ApiError::DeadlineExceeded => "operation deadline exceeded; outcome may be partial".into(),
         other => other.message().to_owned(),
     }
-}
-
-/// Temporary bridge for op bodies that still return `String` (ADR step 2
-/// moves them group by group). The text is kept, the code is `Internal`;
-/// never a guess from the text. Deleted when the last op moves.
-pub(crate) fn legacy(text: String) -> ApiError {
-    ApiError::internal(text)
 }
 
 /// `legacy_text` for `map_err` on the `String` free functions.

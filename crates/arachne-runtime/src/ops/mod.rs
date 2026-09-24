@@ -276,7 +276,7 @@ pub(crate) fn run<T>(
     let ended = if session.ending { guard.take() } else { None };
     drop(guard);
     if let Some(ended) = ended {
-        crate::shutdown_session(ended).map_err(errors::legacy)?;
+        crate::shutdown_session(ended)?;
     }
     result
 }

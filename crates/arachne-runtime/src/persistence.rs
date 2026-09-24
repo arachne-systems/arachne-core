@@ -184,7 +184,7 @@ pub(crate) fn with_session<T>(
     if session.ending {
         let ended = guard.take().ok_or_else(errors::closed)?;
         drop(guard);
-        shutdown_session(ended).map_err(errors::legacy)?;
+        shutdown_session(ended)?;
     }
     Ok(result)
 }

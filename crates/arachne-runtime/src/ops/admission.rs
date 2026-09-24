@@ -364,7 +364,7 @@ pub(crate) fn poll(session: &mut Session, args: PollAdmissionArgs) -> Result<Val
                 .as_ref()
                 .is_some_and(|owner| owner.member_id_for_endpoint(peer).is_ok());
         incoming
-            .respond(membership::encode_reply(&reply).map_err(errors::legacy)?)
+            .respond(membership::encode_reply(&reply).map_err(ApiError::internal)?)
             .map_err(errors::node)?;
         let mut event = json!({"state":"membership_replied", "remote_receipt":false});
         if current_peer {

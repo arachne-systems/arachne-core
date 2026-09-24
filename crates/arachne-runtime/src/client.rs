@@ -7,10 +7,7 @@ use arachne_api::{ApiError, ErrorCode};
 
 use crate::ops::{self, Op, admission, candidate, invitation, join, management, publication, receive};
 use crate::persistence;
-use crate::{
-    FreshnessAnchor, Session, WorkspacePhase, cancel, close, create_with_options, describe,
-    wait_for_work,
-};
+use crate::{FreshnessAnchor, Session, WorkspacePhase};
 
 /// Address discovery and transport selection for a typed runtime client.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -770,16 +767,15 @@ impl Client {
             ));
         }
         let options = config.transport.node_options(config.network)?;
-        let handle = create_with_options(config.secret.as_ref(), options)
-            .map_err(legacy)?;
+        let handle = crate::registry::open(config.secret.as_ref(), options)?;
         Ok(Self {
             handle: Some(handle),
         })
     }
 
     pub fn endpoint(&self) -> Result<EndpointInfo> {
-        let description = describe(self.handle()?).map_err(legacy)?;
-        serde_json::from_str(&description).map_err(|parse_error| {
+        let description = crate::registry::endpoint_value(self.handle()?)?;
+        serde_json::from_value(description).map_err(|parse_error| {
             error(
                 ErrorKind::Internal,
                 format!("invalid endpoint description: {parse_error}"),
@@ -1560,11 +1556,11 @@ impl Client {
     }
 
     pub fn cancel(&self) -> Result<()> {
-        cancel(self.handle()?).map_err(legacy)
+        Ok(crate::registry::cancel_session(self.handle()?)?)
     }
 
     pub fn wait_for_work(&self) -> Result<bool> {
-        wait_for_work(self.handle()?).map_err(legacy)
+        Ok(crate::registry::wait_session(self.handle()?)?)
     }
 
     /// Service one queued peer-control exchange and report whether one was served.
@@ -1980,7 +1976,7 @@ impl Client {
             .handle
             .take()
             .ok_or_else(|| error(ErrorKind::Closed, "client is closed"))?;
-        close(handle).map_err(legacy)
+        Ok(crate::registry::close_session(handle)?)
     }
 
     /// Run one typed op on this client's session (guards and wake-ups
@@ -2022,7 +2018,7 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
-            let _ = close(handle);
+            let _ = crate::registry::close_session(handle);
         }
     }
 }
@@ -2252,11 +2248,6 @@ fn error(kind: ErrorKind, message: impl Into<String>) -> Error {
         message,
         error: api,
     }
-}
-
-/// A `String` error from a free function that has no typed twin yet.
-fn legacy(message: String) -> Error {
-    Error::from(crate::errors::legacy(message))
 }
 
 #[test]
