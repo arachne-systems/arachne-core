@@ -341,6 +341,16 @@ pub(super) fn verify(
             if parent.proof_depth >= MAX_PROOF_DEPTH {
                 return Err("anchor proof nested too deep");
             }
+            // Single use: an earlier application lies between the anchor and
+            // this state. C is at or before the anchor, so the winning steps
+            // hold every step since the anchor on this chain. (Without a proof
+            // the anchor is this state, so no earlier application exists.)
+            let digest = order.digest();
+            if proof.winning.iter().any(|(authorization, _)| {
+                matches!(authorization, MembershipAuthorization::Revocation(s) if s.order.digest() == digest)
+            }) {
+                return Err("revocation order was already applied");
+            }
             let start = |steps: &[(MembershipAuthorization, Vec<u8>)]| {
                 let mut verifier = super::MembershipVerifier::from_proof_checkpoint(
                     workspace,
@@ -653,6 +663,47 @@ pub(crate) mod tests {
         assert_eq!(
             crate::fork_key(&change.authorization, &change.commit).class(),
             crate::ForkClass::Removal
+        );
+    }
+
+    /// An order applies once. A Demote replayed after its target was promoted
+    /// again must not undo the promotion.
+    #[test]
+    fn an_order_cannot_be_applied_twice() {
+        let (admin, members) = team(2);
+        let [target, carrier] = <[Workspace; 2]>::try_from(members).ok().unwrap();
+        let promotion = admin
+            .prepare_management(ManagementAction::Promote(id(&target)))
+            .unwrap();
+        let [target, carrier] = [&target, &carrier].map(|m| follow(m, &promotion));
+        let admin = promotion.workspace;
+        let at_anchor = carrier.public_checkpoint().unwrap();
+        let demotion = admin
+            .prepare_management(ManagementAction::Demote(id(&target)))
+            .unwrap();
+        let MembershipAuthorization::Revocation(step) = demotion.authorization.clone() else {
+            panic!("demotion is an order")
+        };
+        let [target, carrier] = [&target, &carrier].map(|m| follow(m, &demotion));
+        let admin = demotion.workspace;
+        let again = admin
+            .prepare_management(ManagementAction::Promote(id(&target)))
+            .unwrap();
+        let carrier = follow(&carrier, &again);
+        let replay = OrderStep::with_proof(
+            step.order,
+            AnchorProof {
+                checkpoint: at_anchor,
+                winning: vec![
+                    (demotion.authorization.clone(), demotion.commit.clone()),
+                    (again.authorization.clone(), again.commit.clone()),
+                ],
+                losing: vec![],
+            },
+        );
+        assert_eq!(
+            carrier.prepare_revocation(&replay).err(),
+            Some("revocation order was already applied")
         );
     }
 
