@@ -355,7 +355,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let alpn = b"arachne/workspace-gossip/1/dial-test";
+            let alpn = crate::overlay::ALPN;
             let peer = Endpoint::builder(presets::Minimal)
                 .clear_relay_transports()
                 .clear_ip_transports()
@@ -374,8 +374,7 @@ mod tests {
             node.add_address_hint(*unreachable.as_bytes(), blackhole.local_addr().unwrap())
                 .await
                 .unwrap();
-            node.authorize_gossip(alpn.to_vec(), vec![id, *unreachable.as_bytes()])
-                .await;
+            node.authorize_gossip([0; 32], vec![id, *unreachable.as_bytes()]);
             let spawn_gossip = || {
                 iroh_gossip::net::Gossip::builder()
                     .alpn(alpn)
@@ -464,7 +463,7 @@ mod tests {
                 second.id(),
                 "capacity must not unify identities"
             );
-            let gossip = b"arachne/workspace-gossip/1/budget-test";
+            let gossip = crate::overlay::ALPN;
             let peer = Endpoint::builder(presets::Minimal)
                 .clear_relay_transports()
                 .clear_ip_transports()
@@ -479,7 +478,7 @@ mod tests {
                 .await
                 .unwrap();
             let id = *peer.id().as_bytes();
-            first.authorize_gossip(gossip.to_vec(), vec![id]).await;
+            first.authorize_gossip([0; 32], vec![id]);
             second
                 .add_address_hint(id, peer.bound_sockets()[0])
                 .await

@@ -10,8 +10,15 @@ Only `src/net.rs` is changed: `Builder::dial_capacity(Arc<Semaphore>)` passes a
 host-owned semaphore to the existing native dial task. Waiting for a permit and
 the complete Iroh dial live inside the existing cancellation scope. Success,
 failure, cancellation and actor shutdown drop the permit. The actor still owns
-its peer-deduplicated queue, retries, routing and gossip state machine. No wire
-format, protocol version, crypto or dependency version changes.
+its peer-deduplicated queue, retries, routing and gossip state machine. No
+protocol version, crypto or dependency version changes.
+
+`Builder::connect_preamble(Bytes)` is the one wire addition: every connection
+the instance dials first carries these bytes on its own unidirectional stream,
+before any gossip stream. Arachne uses one fixed gossip ALPN for all workspaces
+and sends a keyed workspace tag this way, inside the encrypted connection, so
+the TLS ClientHello does not name the workspace. The accepting side reads the
+preamble before it calls `Gossip::handle_connection`; gossip itself never sees it.
 
 Arachne supplies one gossip-dial semaphore, separate from the data and control
 dial slots, to every workspace gossip instance. Data dials to offline peers

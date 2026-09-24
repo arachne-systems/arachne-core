@@ -24,7 +24,12 @@ use super::{
     wire,
 };
 
-pub(super) const ALPN_PREFIX: &[u8] = b"arachne/workspace-gossip/1/";
+/// One gossip protocol name for every workspace: the ALPN is visible in the
+/// TLS ClientHello. The dialer names its overlay by a keyed tag, sent as the
+/// first stream inside the encrypted connection.
+pub(super) const ALPN: &[u8] = b"arachne/gossip/1";
+/// Keyed workspace tag length; the whole first stream of a gossip link.
+pub(super) const TAG: usize = 32;
 const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_BOOTSTRAPS: usize = 3;
 const BOOTSTRAP_RETRY_DELAYS: [Duration; 3] = [
@@ -98,7 +103,8 @@ pub(super) struct Overlay {
     revision: std::sync::atomic::AtomicU64,
     /// Endpoints authorized in the current revision.
     peers: StdMutex<BTreeSet<PeerId>>,
-    pub(super) alpn: Vec<u8>,
+    /// Keyed workspace tag a dialer sends first on each gossip link.
+    pub(super) tag: [u8; TAG],
     pub(super) gossip: Gossip,
     sender: GossipSender,
     neighbors: Arc<StdMutex<BTreeSet<PeerId>>>,
@@ -152,6 +158,7 @@ impl Overlay {
     pub(super) async fn prepare(
         connections: &super::Connections,
         workspace: WorkspaceId,
+        tag: [u8; TAG],
         revision: u64,
         peers: Vec<PeerId>,
         routing: Arc<Mutex<RoutingTable>>,
@@ -163,10 +170,10 @@ impl Overlay {
         let local_index = peers.binary_search(&local).map_err(|_| Error::Rejected)?;
         let peers_set: BTreeSet<PeerId> = peers.iter().copied().collect();
         let digest = digest(workspace);
-        let alpn = alpn(workspace);
         let config = HyparviewConfig::default();
         let gossip = Gossip::builder()
-            .alpn(&alpn)
+            .alpn(ALPN)
+            .connect_preamble(tag.to_vec())
             .dial_capacity(connections.gossip_dial_capacity())
             .max_message_size(super::MAX_FRAME)
             .membership_config(config)
@@ -320,7 +327,7 @@ impl Overlay {
             workspace,
             revision: std::sync::atomic::AtomicU64::new(revision),
             peers: StdMutex::new(peers_set),
-            alpn,
+            tag,
             gossip,
             sender,
             neighbors,
@@ -434,7 +441,7 @@ mod tests {
                 node.install_verified_policy(workspace, 1, policy.clone())
                     .await
                     .unwrap();
-                node.enable_gossip(workspace, 1).await.unwrap();
+                node.enable_gossip(workspace, 1, &workspace).await.unwrap();
             }
 
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -464,6 +471,123 @@ mod tests {
         .expect("isolated overlay did not recover after its bootstrap route appeared");
     }
 
+    /// A client's ALPN is sent in clear in the TLS ClientHello. It must not
+    /// name the workspace; the overlay is found inside the encrypted channel.
+    #[tokio::test]
+    async fn gossip_links_use_one_fixed_alpn_for_every_workspace() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let bind = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+            let (a, _) = Node::bind_with_identity(bind(), &[84; 32]).await.unwrap();
+            let (b, _) = Node::bind_with_identity(bind(), &[85; 32]).await.unwrap();
+            a.add_address_hint(b.id(), b.address()).await.unwrap();
+            b.add_address_hint(a.id(), a.address()).await.unwrap();
+            let policy = BTreeMap::from([
+                (a.id(), Permissions::AllTopics),
+                (b.id(), Permissions::AllTopics),
+            ]);
+            let workspaces = [[86; 32], [87; 32]];
+            for workspace in workspaces {
+                for node in [&a, &b] {
+                    node.install_verified_policy(workspace, 1, policy.clone())
+                        .await
+                        .unwrap();
+                    node.enable_gossip(workspace, 1, &workspace).await.unwrap();
+                }
+            }
+            for workspace in workspaces {
+                while !a.live_neighbors(workspace).await.contains(&b.id()) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+            let fixed: [&[u8]; 3] = [b"arachne/data/1", b"arachne/control/1", b"arachne/gossip/1"];
+            let alpns = a.connections.live_alpns();
+            assert!(!alpns.is_empty());
+            for alpn in alpns {
+                assert!(
+                    fixed.contains(&alpn.as_slice()),
+                    "{}",
+                    String::from_utf8_lossy(&alpn)
+                );
+            }
+            a.close().await;
+            b.close().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A member of one overlay cannot learn whether this endpoint is in another
+    /// workspace: a tag it may not use closes exactly like an unknown tag.
+    #[tokio::test]
+    async fn a_foreign_tag_closes_like_an_unknown_tag() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let bind = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+            let (a, _) = Node::bind_with_identity(bind(), &[88; 32]).await.unwrap();
+            let prober = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .clear_relay_transports()
+                .clear_ip_transports()
+                .bind_addr("127.0.0.1:0")
+                .unwrap()
+                .secret_key(iroh::SecretKey::from_bytes(&[89; 32]))
+                .bind()
+                .await
+                .unwrap();
+            let prober_id = *prober.id().as_bytes();
+            let (mine, other) = ([90; 32], [91; 32]);
+            let outsider = *iroh::SecretKey::from_bytes(&[92; 32]).public().as_bytes();
+            for (workspace, member) in [(mine, prober_id), (other, outsider)] {
+                a.install_verified_policy(
+                    workspace,
+                    1,
+                    BTreeMap::from([
+                        (a.id(), Permissions::AllTopics),
+                        (member, Permissions::AllTopics),
+                    ]),
+                )
+                .await
+                .unwrap();
+                a.enable_gossip(workspace, 1, &workspace).await.unwrap();
+            }
+            let address = iroh::EndpointAddr::new(iroh::PublicKey::from_bytes(&a.id()).unwrap())
+                .with_ip_addr(a.address());
+            let send_tag = |tag: [u8; TAG]| {
+                let prober = prober.clone();
+                let address = address.clone();
+                async move {
+                    let connection = prober.connect(address, ALPN).await.unwrap();
+                    let mut stream = connection.open_uni().await.unwrap();
+                    stream.write_all(&tag).await.unwrap();
+                    stream.finish().unwrap();
+                    connection
+                }
+            };
+            let mut reasons = Vec::new();
+            for probe in [tag(&other, other), [7; TAG]] {
+                let connection = send_tag(probe).await;
+                reasons.push(format!("{:?}", connection.closed().await));
+            }
+            assert!(reasons[0].contains("gossip denied"), "{}", reasons[0]);
+            assert_eq!(reasons[0], reasons[1]);
+            // Its own overlay's tag is admitted.
+            let admitted = send_tag(tag(&mine, mine)).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(admitted.close_reason().is_none());
+            a.close().await;
+            prober.close().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn discovery_and_protocol_names_say_arachne() {
+        assert_eq!(crate::ALPN, b"arachne/data/1");
+        assert_eq!(crate::control::ALPN, b"arachne/control/1");
+        assert_eq!(NetworkProfile::Lan.settings().0, Some("arachne"));
+        assert_eq!(NetworkProfile::Wan.settings().0, Some("arachne"));
+        assert_eq!(NetworkProfile::Direct.settings().0, None);
+    }
+
     #[test]
     fn bootstrap_retry_backoff_is_bounded() {
         assert_eq!(
@@ -477,14 +601,15 @@ mod tests {
     }
 }
 
-pub(super) fn alpn(workspace: WorkspaceId) -> Vec<u8> {
-    let mut value = ALPN_PREFIX.to_vec();
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for byte in digest(workspace) {
-        value.push(HEX[(byte >> 4) as usize]);
-        value.push(HEX[(byte & 0x0f) as usize]);
-    }
-    value
+/// The tag that names a workspace overlay on a gossip link. `key` is a
+/// secret shared by the workspace members and stable across policy
+/// revisions, so a party without it cannot link a tag to a workspace.
+pub(super) fn tag(key: &[u8; 32], workspace: WorkspaceId) -> [u8; TAG] {
+    let mut hash = Sha256::new();
+    hash.update(b"arachne/gossip-tag/1\0");
+    hash.update(key);
+    hash.update(workspace);
+    hash.finalize().into()
 }
 
 fn digest(workspace: WorkspaceId) -> [u8; 32] {
@@ -552,6 +677,6 @@ fn compact_gossip_preserves_author_and_payload_and_rejects_bad_frames() {
             assert!(wire::decode::<Envelope>(&wire::encode(&envelope).unwrap()).is_err());
         }
     }
-    assert_ne!(alpn([1; 32]), alpn([2; 32]));
-    assert!(alpn([1; 32]).starts_with(b"arachne/workspace-gossip/1/"));
+    assert_ne!(tag(&[0; 32], [1; 32]), tag(&[0; 32], [2; 32]));
+    assert_ne!(tag(&[0; 32], [1; 32]), tag(&[1; 32], [1; 32]));
 }

@@ -871,7 +871,7 @@ async fn enable_gossip_profile(
                 node.install_verified_policy(workspace, 1, node_policy)
                     .await
                     .map_err(|error| error.to_string())?;
-                node.enable_gossip(workspace, 1)
+                node.enable_gossip(workspace, 1, &workspace)
                     .await
                     .map_err(|error| error.to_string())
             })

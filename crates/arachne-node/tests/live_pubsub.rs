@@ -137,7 +137,7 @@ async fn supplied_identity_survives_rebind_without_restoring_authority() {
 #[tokio::test]
 async fn withheld_ack_reports_stage_without_claiming_admission() {
     tokio::time::timeout(Duration::from_secs(15), async {
-        let alpn = b"data-fabric/pubsub-experiment/1";
+        let alpn = b"arachne/data/1";
         let (node, _messages) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         // Make the stalled peer sort first, so serial fanout cannot pass by luck.
         let mut seeds = [[11; 32], [12; 32]];
@@ -590,7 +590,7 @@ async fn wire_sender_cannot_claim_the_receivers_identity() {
             let conn = stranger
                 .connect(
                     iroh::EndpointAddr::new(peer).with_ip_addr(node.address()),
-                    b"data-fabric/pubsub-experiment/1",
+                    b"arachne/data/1",
                 )
                 .await
                 .unwrap();
@@ -793,7 +793,7 @@ async fn stalled_data_connections_do_not_consume_control_capacity() {
     // This is a data-slot attack, not a handshake/CPU flood or membership test.
     for _ in 0..32 {
         let connection = attacker
-            .connect(destination.clone(), b"data-fabric/pubsub-experiment/1")
+            .connect(destination.clone(), b"arachne/data/1")
             .await
             .unwrap();
         let (mut send, recv) = connection.open_bi().await.unwrap();

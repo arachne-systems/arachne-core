@@ -34,7 +34,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-const ALPN: &[u8] = b"data-fabric/pubsub-experiment/1";
+const ALPN: &[u8] = b"arachne/data/1";
 const MAX_PAYLOAD: usize = 16 * 1024;
 const MAX_RECIPIENTS: usize = 64;
 const MAX_FRAME: usize = 128 * 1024;
@@ -61,9 +61,9 @@ impl NetworkProfile {
     fn settings(self) -> (Option<&'static str>, bool, bool, bool) {
         match self {
             Self::Direct => (None, false, false, true),
-            Self::Lan => (Some("data-fabric"), false, false, true),
+            Self::Lan => (Some("arachne"), false, false, true),
             Self::Nearby => (Some("arachne-nearby"), false, false, true),
-            Self::Wan => (Some("data-fabric"), true, false, false),
+            Self::Wan => (Some("arachne"), true, false, false),
             Self::RelayOnly => (None, true, true, false),
             Self::WanOnly => (None, true, false, false),
             #[cfg(feature = "tor")]
@@ -521,7 +521,7 @@ impl Node {
             profile,
             secret.map(iroh::SecretKey::from_bytes),
             budget.clone(),
-            vec![ALPN.to_vec(), control::ALPN.to_vec()],
+            vec![ALPN.to_vec(), control::ALPN.to_vec(), overlay::ALPN.to_vec()],
             relay,
         )
         .await?;
@@ -580,31 +580,36 @@ impl Node {
                         remote = Some(connection.remote_id());
                         connection_id = Some(connection.stable_id());
                         let is_control = connection.alpn() == control::ALPN;
-                        let overlay = {
-                            let overlays = overlays.lock().await;
-                            overlays
-                                .values()
-                                .find(|overlay| overlay.alpn.as_slice() == connection.alpn())
-                                .map(|overlay| {
-                                    (
-                                        overlay.workspace,
-                                        overlay.revision(),
-                                        overlay.gossip.clone(),
-                                    )
-                                })
-                        };
-                        if let Some((workspace, revision, gossip)) = overlay {
-                            routing
-                                .lock()
-                                .await
-                                .authorizes_endpoint(workspace, revision, sender)?;
+                        if connection.alpn() == overlay::ALPN {
                             stage = "accept gossip";
+                            let tag = read_gossip_tag(&connection).await;
+                            let overlay = match tag {
+                                Some(tag) => overlays
+                                    .lock()
+                                    .await
+                                    .values()
+                                    .find(|overlay| overlay.tag == tag)
+                                    .map(|overlay| (overlay.workspace, overlay.revision(), overlay.tag, overlay.gossip.clone())),
+                                None => None,
+                            };
+                            let admitted = match overlay {
+                                Some((workspace, revision, tag, gossip)) => {
+                                    let allowed = connections.gossip_allows(&tag, sender)
+                                        && routing.lock().await.authorizes_endpoint(workspace, revision, sender).is_ok();
+                                    allowed.then_some(gossip)
+                                }
+                                None => None,
+                            };
+                            // An unknown tag and a known tag this peer may not
+                            // use close the same way: no workspace oracle.
+                            let Some(gossip) = admitted else {
+                                connection.close(403u32.into(), b"gossip denied");
+                                return Err(Error::Rejected);
+                            };
                             tokio::time::timeout(control::CONTROL_TIMEOUT, gossip.handle_connection(connection))
                                 .await.map_err(|_| Error::Timeout("accept gossip"))?.map_err(transport)?;
                             return Ok(());
                         }
-                        // A removed overlay's already-negotiated ALPN must never
-                        // be interpreted as the direct-frame schema.
                         if !is_control && connection.alpn() != ALPN {
                             return Err(Error::InvalidFrame);
                         }
@@ -810,6 +815,7 @@ impl Node {
                     let replacement = overlay::Overlay::prepare(
                         &self.connections,
                         overlay.workspace,
+                        overlay.tag,
                         overlay.revision(),
                         peers,
                         self.routing.clone(),
@@ -866,7 +872,7 @@ impl Node {
         revision: u64,
         endpoint_permissions: BTreeMap<PeerId, Permissions>,
     ) -> Result<()> {
-        let replace_overlay = self.overlays.lock().await.contains_key(&workspace);
+        let existing = self.overlays.lock().await.get(&workspace).cloned();
         let peers = endpoint_permissions.keys().copied().collect::<Vec<_>>();
         self.routing.lock().await.install_verified_policy(
             workspace,
@@ -874,26 +880,24 @@ impl Node {
             endpoint_permissions,
         )?;
         self.resources.policy_changed();
-        if replace_overlay {
+        if let Some(existing) = existing {
+            let tag = existing.tag;
             if !peers.contains(&self.id()) {
-                self.connections
-                    .authorize_gossip(overlay::alpn(workspace), Vec::new())
-                    .await;
+                self.connections.authorize_gossip(tag, Vec::new());
                 self.overlays.lock().await.remove(&workspace);
                 return Ok(());
             }
-            self.connections
-                .authorize_gossip(overlay::alpn(workspace), peers.clone())
-                .await;
+            self.connections.authorize_gossip(tag, peers.clone());
             // An epoch that only adds members keeps the swarm: rebuilding it on
             // every admission dropped all neighbors mid-broadcast (ADR 0008).
-            let existing = self.overlays.lock().await.get(&workspace).cloned();
-            if existing.is_some_and(|overlay| overlay.advance(revision, &peers)) {
+            if existing.advance(revision, &peers) {
                 return Ok(());
             }
+            drop(existing);
             let candidate = overlay::Overlay::prepare(
                 &self.connections,
                 workspace,
+                tag,
                 revision,
                 peers,
                 self.routing.clone(),
@@ -911,7 +915,16 @@ impl Node {
 
     /// Enable one bounded workspace-wide live overlay after installing a verified
     /// policy. Direct-recipient publications keep their acknowledged path.
-    pub async fn enable_gossip(&self, workspace: WorkspaceId, revision: u64) -> Result<()> {
+    ///
+    /// `tag_key` must be a secret every member holds and that stays the same
+    /// across policy revisions. It keys the tag that names this overlay inside
+    /// each encrypted gossip link; members with different keys never connect.
+    pub async fn enable_gossip(
+        &self,
+        workspace: WorkspaceId,
+        revision: u64,
+        tag_key: &[u8; 32],
+    ) -> Result<()> {
         if self
             .overlays
             .lock()
@@ -926,12 +939,12 @@ impl Node {
             .lock()
             .await
             .authorized_endpoints(workspace, revision)?;
-        self.connections
-            .authorize_gossip(overlay::alpn(workspace), peers.clone())
-            .await;
+        let tag = overlay::tag(tag_key, workspace);
+        self.connections.authorize_gossip(tag, peers.clone());
         let candidate = overlay::Overlay::prepare(
             &self.connections,
             workspace,
+            tag,
             revision,
             peers,
             self.routing.clone(),
@@ -1264,6 +1277,18 @@ impl Node {
         let _ = (&mut self.listener).await;
 
     }
+}
+
+/// The dialer's first stream on a gossip link: exactly one overlay tag.
+async fn read_gossip_tag(connection: &iroh::endpoint::Connection) -> Option<[u8; overlay::TAG]> {
+    tokio::time::timeout(TIMEOUT, async {
+        let mut recv = connection.accept_uni().await.ok()?;
+        let bytes = recv.read_to_end(overlay::TAG).await.ok()?;
+        bytes.try_into().ok()
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 async fn receive_frame(

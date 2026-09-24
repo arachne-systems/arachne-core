@@ -829,7 +829,9 @@ async fn install_gossip_policy(
         node.install_verified_policy(workspace, revision, policy)
             .await
             .map_err(|error| error.to_string())?;
-        node.enable_gossip(workspace, revision)
+        // ponytail: the workspace ID stands in for a stable members-only
+        // secret until the security layer exports one for the gossip tag.
+        node.enable_gossip(workspace, revision, &workspace)
             .await
             .map_err(|error| error.to_string())
     }

@@ -4,7 +4,7 @@ use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::oneshot;
 
-pub(super) const ALPN: &[u8] = b"data-fabric/control/1";
+pub(super) const ALPN: &[u8] = b"arachne/control/1";
 // Durable host control includes queueing and persistence; data/dial budgets stay short.
 pub(super) const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REQUEST: usize = 32 * 1024;

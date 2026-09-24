@@ -19,8 +19,8 @@ async fn a_large_membership_message_crosses_the_overlay_and_data_stays_bounded()
         }
         a.add_address_hint(b.id(), b.address()).await.unwrap();
         b.add_address_hint(a.id(), a.address()).await.unwrap();
-        a.enable_gossip(workspace, 1).await.unwrap();
-        b.enable_gossip(workspace, 1).await.unwrap();
+        a.enable_gossip(workspace, 1, &workspace).await.unwrap();
+        b.enable_gossip(workspace, 1, &workspace).await.unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while !b.live_neighbors(workspace).await.contains(&a.id()) {
             assert!(tokio::time::Instant::now() < deadline, "the overlay never joined");

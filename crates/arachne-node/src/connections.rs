@@ -48,10 +48,7 @@ impl EndpointHooks for ConnectionObserver {
         &'a self,
         connection: &'a iroh::endpoint::Connection,
     ) -> AfterHandshakeOutcome {
-        if connection
-            .alpn()
-            .starts_with(super::overlay::ALPN_PREFIX)
-        {
+        if connection.alpn() == super::overlay::ALPN {
             tracing::info!(
                 target: "data_fabric_transport",
                 peer = %connection.remote_id().fmt_short(),
@@ -73,16 +70,27 @@ impl EndpointHooks for ConnectionObserver {
     }
 }
 
+/// Gossip endpoints per workspace overlay tag. One ALPN serves every overlay,
+/// so the handshake admits a member of any overlay; the listener checks the
+/// overlay named by the tag.
 #[derive(Clone, Debug, Default)]
-struct GossipAuthorization(Arc<RwLock<BTreeMap<Vec<u8>, BTreeSet<PeerId>>>>);
+struct GossipAuthorization(Arc<RwLock<BTreeMap<[u8; super::overlay::TAG], BTreeSet<PeerId>>>>);
 
 impl GossipAuthorization {
-    fn allows(&self, alpn: &[u8], peer: PeerId) -> bool {
+    fn allows(&self, tag: &[u8; super::overlay::TAG], peer: PeerId) -> bool {
         self.0
             .read()
             .unwrap()
-            .get(alpn)
+            .get(tag)
             .is_some_and(|allowed| allowed.contains(&peer))
+    }
+
+    fn allows_any(&self, peer: PeerId) -> bool {
+        self.0
+            .read()
+            .unwrap()
+            .values()
+            .any(|allowed| allowed.contains(&peer))
     }
 }
 
@@ -92,8 +100,7 @@ impl EndpointHooks for GossipAuthorization {
         remote: &'a EndpointAddr,
         alpn: &'a [u8],
     ) -> BeforeConnectOutcome {
-        let allowed = !alpn.starts_with(super::overlay::ALPN_PREFIX)
-            || self.allows(alpn, *remote.id.as_bytes());
+        let allowed = alpn != super::overlay::ALPN || self.allows_any(*remote.id.as_bytes());
         if allowed {
             BeforeConnectOutcome::Accept
         } else {
@@ -110,10 +117,8 @@ impl EndpointHooks for GossipAuthorization {
         &'a self,
         connection: &'a iroh::endpoint::Connection,
     ) -> AfterHandshakeOutcome {
-        let allowed = !connection
-            .alpn()
-            .starts_with(super::overlay::ALPN_PREFIX)
-            || self.allows(connection.alpn(), *connection.remote_id().as_bytes());
+        let allowed = connection.alpn() != super::overlay::ALPN
+            || self.allows_any(*connection.remote_id().as_bytes());
         if allowed {
             AfterHandshakeOutcome::Accept
         } else {
@@ -147,7 +152,6 @@ pub(super) struct Connections {
     bound_address: SocketAddr,
     addresses: Arc<Mutex<BTreeMap<PeerId, SocketAddr>>>,
     memory: MemoryLookup,
-    alpns: Arc<Mutex<BTreeSet<Vec<u8>>>>,
     gossip_authorization: GossipAuthorization,
     observer: ConnectionObserver,
     outgoing: Arc<Mutex<BTreeMap<PeerProtocol, CachedConnection>>>,
@@ -218,7 +222,7 @@ impl Connections {
         } else {
             builder.bind_addr(address).map_err(transport)?
         }
-        .alpns(alpns.clone())
+        .alpns(alpns)
         .hooks(gossip_authorization.clone())
         .hooks(budget.clone())
         .hooks(observer.clone());
@@ -290,7 +294,6 @@ impl Connections {
             bound_address,
             addresses: Arc::new(Mutex::new(BTreeMap::new())),
             memory,
-            alpns: Arc::new(Mutex::new(alpns.into_iter().collect())),
             gossip_authorization,
             observer,
             outgoing: Arc::new(Mutex::new(BTreeMap::new())),
@@ -323,6 +326,21 @@ impl Connections {
         } else {
             super::TIMEOUT
         }
+    }
+
+    /// Protocols of the open connections this endpoint observed.
+    #[cfg(test)]
+    pub(super) fn live_alpns(&self) -> Vec<Vec<u8>> {
+        self.observer
+            .0
+            .read()
+            .unwrap()
+            .live
+            .iter()
+            .filter_map(|weak| weak.upgrade())
+            .filter(|connection| connection.close_reason().is_none())
+            .map(|connection| connection.alpn().to_vec())
+            .collect()
     }
 
     pub(super) fn endpoint(&self) -> Endpoint {
@@ -392,20 +410,18 @@ impl Connections {
         }
     }
 
-    pub(super) async fn add_alpn(&self, alpn: Vec<u8>) {
-        let mut alpns = self.alpns.lock().await;
-        if alpns.insert(alpn) {
-            self.endpoint.set_alpns(alpns.iter().cloned().collect());
+    /// Replace the endpoints allowed on the overlay named by `tag`.
+    pub(super) fn authorize_gossip(&self, tag: [u8; super::overlay::TAG], peers: Vec<PeerId>) {
+        let mut authorized = self.gossip_authorization.0.write().unwrap();
+        if peers.is_empty() {
+            authorized.remove(&tag);
+        } else {
+            authorized.insert(tag, peers.into_iter().collect());
         }
     }
 
-    pub(super) async fn authorize_gossip(&self, alpn: Vec<u8>, peers: Vec<PeerId>) {
-        self.gossip_authorization
-            .0
-            .write()
-            .unwrap()
-            .insert(alpn.clone(), peers.into_iter().collect());
-        self.add_alpn(alpn).await;
+    pub(super) fn gossip_allows(&self, tag: &[u8; super::overlay::TAG], peer: PeerId) -> bool {
+        self.gossip_authorization.allows(tag, peer)
     }
 
     pub(super) async fn network_change(&self) {

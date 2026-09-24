@@ -23,8 +23,8 @@ async fn an_overlay_joins_the_live_peer_among_many_offline_members() {
         }
         // As on tablets: only one side knows where the other is.
         b.add_address_hint(a.id(), a.address()).await.unwrap();
-        a.enable_gossip(workspace, 1).await.unwrap();
-        b.enable_gossip(workspace, 1).await.unwrap();
+        a.enable_gossip(workspace, 1, &workspace).await.unwrap();
+        b.enable_gossip(workspace, 1, &workspace).await.unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         while !b.live_neighbors(workspace).await.contains(&a.id()) {
             assert!(tokio::time::Instant::now() < deadline, "the overlay never reached the live peer");
