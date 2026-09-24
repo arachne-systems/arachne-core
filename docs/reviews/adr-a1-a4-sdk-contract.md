@@ -395,3 +395,19 @@ longest. Do the ATAK groups first, so the Kotlin typed methods can ship before t
 - A `RecordId` alone may not be unique, because record keys are `(author, [u8; 16])`.
 - Define `Limits` (step 3), the full `Feature` list, and the `Event` payloads (step 4).
 - Error `detail` and `reason` strings must never hold secrets or plaintext. Add a rule and a test.
+
+### UniFFI spike (done: `spike/a1-uniffi`, see `spike-a1-uniffi.md`)
+
+- uniffi `=0.31.2` and uniffi-bindgen-go `v0.7.1+v0.31.0`. Kotlin, Swift, Python and Go all pass:
+  error code 101 crosses the boundary, and `close()` from a second thread wakes a parked
+  `next_event`.
+- `#[non_exhaustive]` works with the derives. Foreign enums stay exhaustive, so foreign code keeps a
+  default branch.
+- Go generator bug: enums with explicit discriminants go on the wire by position. Decision: carry
+  the patch `patches/uniffi-bindgen-go-enum-discr.patch` in the SDK build. An upstream PR needs
+  owner approval (public GitHub).
+- Kotlin: an exported `close` clashes with `AutoCloseable.close()`. Rename it for Kotlin in
+  `uniffi.toml`.
+- Export a free function `api_error_code()`. Go gets no methods on error types, and Python field
+  names hide the method.
+- Generated code is 3,300–4,000 lines per language, all generated.
