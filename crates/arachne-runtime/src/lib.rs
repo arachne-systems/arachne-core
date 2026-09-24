@@ -6922,7 +6922,7 @@ mod tests {
             let shared = session(joiner).unwrap();
             let guard = shared.lock().unwrap();
             // The committed workspace is never edited in place; read on a copy.
-            let mut reader = guard
+            let reader = guard
                 .as_ref()
                 .unwrap()
                 .workspace
@@ -6932,18 +6932,18 @@ mod tests {
                 .unwrap();
             for packet in packets {
                 let context = packet.context.authenticated_bytes();
-                assert_eq!(
-                    reader
-                        .unprotect_application(&context, &packet.ciphertext)
-                        .unwrap()
-                        .payload,
-                    [7]
-                );
-                assert!(
-                    reader
-                        .unprotect_application(&context, &packet.ciphertext)
-                        .is_err()
-                );
+                // Objects carry no ratchet: decryption is repeatable and
+                // side-effect free; the inbox suppresses replays.
+                for _ in 0..2 {
+                    assert_eq!(
+                        reader
+                            .unprotect_object(b"streams", &context, &packet.ciphertext)
+                            .unwrap()
+                            .message
+                            .payload,
+                        [7]
+                    );
+                }
             }
         }
         // Admission polling remains available while another candidate is
@@ -7787,21 +7787,21 @@ mod tests {
         assert_eq!(fetched["step"], step);
         assert!(fetched.get("welcome").is_none());
         let update = json!({"op":"stage_admission_update", "step":fetched["step"]});
+        drop(admission);
+        // 32 recovered objects are still pending: the membership step is not
+        // delayed, and the candidate carries them (A3).
         assert_eq!(
-            call(restored, update.clone()).unwrap_err(),
-            "pending application delivery must be acknowledged before membership update"
-        );
-        assert_eq!(
-            call(restored, admission).unwrap_err(),
-            "pending application delivery must be acknowledged before membership update"
-        );
-        for number in 118..150 {
-            let pending = call(restored, json!({"op":"poll_pending_object"})).unwrap();
-            assert_eq!(pending["payload"], json!([number]));
-            ack(restored, &pending);
-        }
-        println!(
-            "NATIVE_OBJECT_INBOX legacy_preserved=true live_pending_restart=true acknowledgement_restart=true missed_recovery=true adapter_callback=not_exercised"
+            session(restored)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .inbox
+                .as_ref()
+                .unwrap()
+                .pending_count(),
+            32
         );
         let [_, saved] =
             execute_stored(restored, &serde_json::to_vec(&update).unwrap(), &[]).unwrap();
@@ -7823,6 +7823,14 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<Value>(&metadata).unwrap()["members"],
             3
+        );
+        for number in 118..150 {
+            let pending = call(restored, json!({"op":"poll_pending_object"})).unwrap();
+            assert_eq!(pending["payload"], json!([number]));
+            ack(restored, &pending);
+        }
+        println!(
+            "NATIVE_OBJECT_INBOX live_pending_restart=true acknowledgement_restart=true missed_recovery=true pending_carried_across_epoch=true adapter_callback=not_exercised"
         );
         assert!(call(restored, update).is_err()); // replay
         let [_, saved] = execute_stored(
