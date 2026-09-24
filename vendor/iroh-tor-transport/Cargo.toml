@@ -11,9 +11,10 @@
 
 [package]
 edition = "2024"
-name = "iroh-tor-transport"
-version = "0.1.0"
+name = "arachne-iroh-tor-transport"
+version = "0.1.0-arachne.1"
 authors = [
+    "Arachne Systems",
     "Rüdiger Klaehn <rklaehn@protonmail.com>",
     "n0 team",
 ]
@@ -23,17 +24,21 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Tor hidden service transport for iroh"
+description = "Arachne-maintained iroh Tor hidden service transport fork with a built-in Tor control-port client"
 readme = "README.md"
 keywords = [
+    "arachne",
     "iroh",
     "tor",
     "onion",
     "p2p",
-    "networking",
 ]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/n0-computer/iroh-tor"
+repository = "https://github.com/arachne-systems/arachne-core"
+homepage = "https://github.com/arachne-systems/arachne-core"
+documentation = "https://docs.rs/arachne-iroh-tor-transport"
+publish = ["crates-io"]
+exclude = ["Cargo.toml.orig"]
 
 [lib]
 name = "iroh_tor_transport"

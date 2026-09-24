@@ -8,6 +8,7 @@ members = [
     "crates/arachne-runtime",
     "vendor/iroh-gossip",
     "vendor/iroh-blobs",
+    "vendor/iroh-tor-transport",
 ]
 resolver = "3"
 exclude = ["vendor/bao-tree", "vendor/netlink-packet-core", "vendor/hax-lib-macros"]

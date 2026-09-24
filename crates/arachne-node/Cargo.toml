@@ -25,8 +25,9 @@ arachne-routing = { path = "../arachne-routing", version = "0.1.0" }
 # that iroh excludes from its semver guarantees. The vendored gossip/blobs forks
 # are also only qualified against this iroh release. Bump deliberately.
 iroh = { version = "=1.2.0", default-features = false, features = ["tls-ring", "metrics"] }
-# Exact pin: built on the same unstable iroh custom-transport API as above.
-iroh-tor-transport = { version = "=0.1.0", optional = true }
+# Exact pin: built on the same unstable iroh custom-transport API as above, and
+# a renamed Arachne fork (upstream 0.1.0 without the unmaintained `torut`).
+iroh-tor-transport = { package = "arachne-iroh-tor-transport", path = "../../vendor/iroh-tor-transport", version = "=0.1.0-arachne.1", optional = true }
 # Exact pins: renamed Arachne forks whose patched source must match this crate.
 # The `=` is also required because the earlier plain releases (0.103.0 and
 # 0.101.0) sort above the `-arachne.N` pre-releases; a caret would pick them.

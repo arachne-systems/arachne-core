@@ -265,11 +265,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "arachne-iroh-tor-transport"
+version = "0.1.0-arachne.1"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "data-encoding",
+ "iroh",
+ "iroh-base",
+ "n0-error",
+ "n0-future",
+ "n0-watcher",
+ "noq-udp",
+ "sha2 0.10.9",
+ "tokio",
+ "tokio-socks",
+ "tokio-test",
+ "torut",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "arachne-node"
 version = "0.1.0"
 dependencies = [
  "arachne-iroh-blobs",
  "arachne-iroh-gossip",
+ "arachne-iroh-tor-transport",
  "arachne-routing",
  "arachne-security",
  "bytes",
@@ -277,7 +301,6 @@ dependencies = [
  "getrandom 0.4.3",
  "iroh",
  "iroh-mdns-address-lookup 0.5.0",
- "iroh-tor-transport",
  "postcard",
  "serde",
  "serde_json",
@@ -2815,29 +2838,6 @@ dependencies = [
  "n0-error",
  "postcard",
  "serde",
-]
-
-[[package]]
-name = "iroh-tor-transport"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbfee97781ea97f4ca13b85547b83001d0b489902430ba3da13f45348d070ecf"
-dependencies = [
- "bytes",
- "clap",
- "data-encoding",
- "iroh",
- "iroh-base",
- "n0-error",
- "n0-future",
- "n0-watcher",
- "noq-udp",
- "sha2 0.10.9",
- "tokio",
- "tokio-socks",
- "torut",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -5923,6 +5923,17 @@ dependencies = [
  "pin-project-lite",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "tokio-test"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6d24790a10a7af737693a3e8f1d03faef7e6ca0cc99aae5066f533766de545"
+dependencies = [
+ "futures-core",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

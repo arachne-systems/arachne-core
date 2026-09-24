@@ -1,5 +1,12 @@
 # iroh-tor-transport
 
+> This Arachne-maintained fork is published as `arachne-iroh-tor-transport`; its
+> Rust library keeps the `iroh_tor_transport` import name. It replaces the
+> unmaintained `torut` dependency with a small built-in Tor control-port client.
+> The change and upstream provenance are documented in
+> [`ARACHNE-PATCH.md`](ARACHNE-PATCH.md). This is not an official upstream Iroh
+> release. The upstream MIT/Apache-2.0 license terms remain in force.
+
 Tor hidden-service utilities and a custom iroh transport for routing packets over Tor streams.
 
 > **Experimental:** both iroh custom transports and this crate are experimental and may change.
