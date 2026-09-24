@@ -701,7 +701,7 @@ fn create_endpoint(
 fn commit_workspace(session: &mut Session, workspace: arachne_security::Workspace) {
     // Object delivery is the only receive path: an active member always has
     // an inbox and a publisher log.
-    if let Some(member) = workspace.member() {
+    if workspace.member().is_some() {
         if session.inbox.is_none() {
             session.inbox = Some(arachne_delivery::inbox::ObjectInbox::new(
                 workspace.id(),
@@ -709,11 +709,7 @@ fn commit_workspace(session: &mut Session, workspace: arachne_security::Workspac
             ));
         }
         if session.publisher.is_none() {
-            session.publisher = Some(arachne_delivery::PublisherLog::new(
-                workspace.id(),
-                member.id(),
-                workspace.epoch(),
-            ));
+            session.publisher = arachne_delivery::PublisherLog::new(&workspace).ok();
         }
     }
     let workspace = Arc::new(workspace);
@@ -1402,21 +1398,13 @@ fn seal_state(
     .map_err(str::to_owned)
 }
 
-// Epoch changes cannot silently discard accepted pending application work.
+// Pending application objects never block a membership step: they are
+// authenticated plaintext and `carry_delivery` keeps them (A3).
 fn check_epoch_transition(session: &mut Session) -> Result<(), String> {
-    let owner = session
+    session
         .workspace
         .as_ref()
         .ok_or("session has no workspace")?;
-    if let Some(inbox) = &session.inbox {
-        // Keep owner/authentication checks, but count work hidden behind direct gaps too.
-        inbox.pending(owner).map_err(str::to_owned)?;
-        if inbox.pending_count() > 0 {
-            return Err(
-                "pending application delivery must be acknowledged before membership update".into(),
-            );
-        }
-    }
     // Background discovery/download has accepted no application work. A new
     // epoch invalidates its query anyway; cancel it instead of making normal
     // membership actions race the periodic history poller. Accepted inbox and
@@ -1430,6 +1418,42 @@ fn check_epoch_transition(session: &mut Session) -> Result<(), String> {
     drop(session.current_view.take());
     session.ready_current_view = None;
     Ok(())
+}
+
+/// Delivery state for a membership candidate `next` (A3). Pending objects,
+/// replay state of the receive window and per-epoch publisher logs survive
+/// the step; save them with the candidate.
+fn carry_delivery(
+    session: &Session,
+    next: &arachne_security::Workspace,
+) -> Result<
+    (
+        Option<arachne_delivery::PublisherLog>,
+        Option<arachne_delivery::inbox::ObjectInbox>,
+    ),
+    String,
+> {
+    let previous = session
+        .workspace
+        .as_ref()
+        .ok_or("session has no workspace")?;
+    if next.member().is_none() {
+        return Ok((None, None));
+    }
+    let inbox = match &session.inbox {
+        Some(inbox) => inbox.advance(previous, next),
+        None => Ok(arachne_delivery::inbox::ObjectInbox::new(
+            next.id(),
+            next.epoch(),
+        )),
+    }
+    .map_err(str::to_owned)?;
+    let publisher = match &session.publisher {
+        Some(publisher) => publisher.advance(previous, next),
+        None => arachne_delivery::PublisherLog::new(next),
+    }
+    .map_err(str::to_owned)?;
+    Ok((Some(publisher), Some(inbox)))
 }
 
 fn stage_admission(
@@ -1480,12 +1504,19 @@ fn stage_admission_workspace(
         .storage_key
         .as_ref()
         .ok_or("session has no protected root key")?;
-    let snapshot = seal_state(session.records.is_some(), &workspace, key, None, None)?;
+    let (publisher, inbox) = carry_delivery(session, &workspace)?;
+    let snapshot = seal_state(
+        session.records.is_some(),
+        &workspace,
+        key,
+        publisher.as_ref(),
+        inbox.as_ref(),
+    )?;
     let value = json!({"workspace": workspace.id(), "snapshot": snapshot, "state":"awaiting_save", "durable":false,
         "admissions": admission_count});
     session.staged_workspace = Some(StagedWorkspace {
-        inbox: None,
-        publisher: None, // New epoch; this prototype retains current-epoch history only.
+        inbox,
+        publisher,
         transition: WorkspaceTransition::Admission,
         workspace,
         snapshot,
@@ -3555,7 +3586,7 @@ fn execute_in_session(
                 .inbox
                 .as_ref()
                 .ok_or("automatic recovery requires object delivery")?
-                .recovery_progress(author, &topics),
+                .recovery_progress(author, owner.epoch(), &topics),
         };
         let available = through
             .is_none()
@@ -4227,14 +4258,10 @@ fn execute_in_session(
                 .retain_current_view(owner, &query, &reply, now)
                 .map_err(str::to_owned)?;
         }
-        let publisher = session
-            .publisher
-            .clone()
-            .unwrap_or(arachne_delivery::PublisherLog::new(
-                owner.id(),
-                owner.member().ok_or("member required")?.id(),
-                owner.epoch(),
-            ));
+        let publisher = match &session.publisher {
+            Some(publisher) => publisher.clone(),
+            None => arachne_delivery::PublisherLog::new(owner).map_err(str::to_owned)?,
+        };
         let snapshot = seal_state(
             session.records.is_some(),
             owner,
@@ -4371,7 +4398,9 @@ fn execute_in_session(
                 let accepted_through = session
                     .inbox
                     .as_ref()
-                    .map_or(0, |inbox| inbox.recovery_progress(query.author, &query.topics));
+                    .map_or(0, |inbox| {
+                        inbox.recovery_progress(query.author, query.epoch, &query.topics)
+                    });
                 json!({"state":"recovery_cutoff_observed", "workspace":owner.id(),
                 "author":query.author, "peer":pending.peer, "epoch":owner.epoch(), "revision":query.policy_revision,
                 "topics":query.topics.iter().map(|t|t.as_str()).collect::<Vec<_>>(),
@@ -6186,7 +6215,7 @@ mod tests {
             inbox = *next;
         }
         let publisher =
-            PublisherLog::new(reader.id(), reader.member().unwrap().id(), reader.epoch());
+            PublisherLog::new(&reader).unwrap();
         let snapshot = inbox
             .seal(&reader, &StorageKey::derive(&root).unwrap(), &publisher)
             .unwrap();
@@ -6245,7 +6274,8 @@ mod tests {
         {
             let shared = session(handle).unwrap();
             let mut locked = shared.lock().unwrap();
-            assert!(check_epoch_transition(locked.as_mut().unwrap()).is_err());
+            // Pending application objects never block a membership step (A3).
+            check_epoch_transition(locked.as_mut().unwrap()).unwrap();
         }
         let staged = call(
             json!({"op":"stage_object_acknowledgement", "member":pending["member"],
@@ -6262,9 +6292,115 @@ mod tests {
             let mut locked = shared.lock().unwrap();
             let owner = locked.as_mut().unwrap();
             assert_eq!(owner.inbox.as_ref().unwrap().pending_count(), 1);
+            check_epoch_transition(owner).unwrap();
+        }
+        close(handle).unwrap();
+    }
+
+    #[test]
+    fn removal_is_not_delayed_by_pending_objects_and_delivery_state_carries() {
+        use arachne_delivery::{
+            PublisherLog,
+            inbox::{InboxStage, ObjectInbox},
+        };
+        use arachne_routing::PublicationContext;
+        use arachne_security::{PendingJoin, StorageKey, Workspace};
+
+        let root = [105; 32];
+        let handle = create(Some(&root)).unwrap();
+        let call = |request: Value| -> Result<Value, String> {
+            serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
+                .map_err(|error| error.to_string())
+        };
+        let description: Value = serde_json::from_str(&describe(handle).unwrap()).unwrap();
+        let endpoint = serde_json::from_value(description["endpoint_key"].clone()).unwrap();
+        // The runtime session is the administrator; the sender is a member.
+        let admin = Workspace::create(endpoint, "Admin").unwrap();
+        let (registered, invitation, checkpoint) =
+            admin.prepare_invitation(u64::MAX, false, false).unwrap();
+        let admin = registered.workspace;
+        let join =
+            PendingJoin::from_invitation(&invitation, &checkpoint, [106; 32], "Sender").unwrap();
+        let prepared = admin
+            .prepare_admission([106; 32], join.admission_request().unwrap())
+            .unwrap();
+        let mut proof = join.join_proof().unwrap();
+        proof
+            .apply_add(&prepared.authorization, &prepared.commit)
+            .unwrap();
+        let mut sender = join.prepare_workspace(&proof, &prepared.welcome).unwrap();
+        let admin = prepared.workspace;
+        let context = PublicationContext {
+            workspace: admin.id(),
+            revision: 7,
+            topic: Topic::new("chat/messages").unwrap(),
+            id: [3; 16],
+            sequence: std::num::NonZeroU64::new(1),
+        };
+        let object = sender
+            .protect_object(b"chat", &context.authenticated_bytes(), b"still pending")
+            .unwrap();
+        let InboxStage::Prepared(inbox) = ObjectInbox::new(admin.id(), admin.epoch())
+            .stage(&admin, &context, &object)
+            .unwrap()
+        else {
+            panic!("object was not staged")
+        };
+        let publisher = PublisherLog::new(&admin).unwrap();
+        let key = StorageKey::derive(&root).unwrap();
+        let snapshot = inbox.seal(&admin, &key, &publisher).unwrap();
+        call(json!({"op":"restore_workspace","workspace":admin.id(),"snapshot":snapshot}))
+            .unwrap();
+        let pending = call(json!({"op":"poll_pending_object"})).unwrap();
+        assert_eq!(pending["payload"], json!(b"still pending"));
+
+        // The removal stages and adopts while the object is still pending.
+        let staged = call(json!({"op":"stage_management",
+            "action":{"kind":"remove","member":sender.member().unwrap().id()}}))
+        .unwrap();
+        let adopted =
+            call(json!({"op":"adopt_admission","snapshot":staged["snapshot"]})).unwrap();
+        assert_eq!(adopted["epoch"], admin.epoch() + 1);
+        assert_eq!(adopted["members"], 1);
+        // The pending object is carried into the new epoch and survives restart.
+        assert_eq!(call(json!({"op":"poll_pending_object"})).unwrap(), pending);
+        close(handle).unwrap();
+        let handle = create(Some(&root)).unwrap();
+        let call = |request: Value| -> Result<Value, String> {
+            serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
+                .map_err(|error| error.to_string())
+        };
+        call(json!({"op":"restore_workspace","workspace":admin.id(),
+            "snapshot":staged["snapshot"]}))
+        .unwrap();
+        assert_eq!(call(json!({"op":"poll_pending_object"})).unwrap(), pending);
+        let acknowledged = call(json!({"op":"stage_object_acknowledgement",
+            "member":pending["member"], "topic":pending["topic"],
+            "counter":pending["counter"], "id":pending["id"]}))
+        .unwrap();
+        call(json!({"op":"adopt_reception","snapshot":acknowledged["snapshot"]})).unwrap();
+        assert!(call(json!({"op":"poll_pending_object"})).unwrap().is_null());
+        // The removed member's objects are no longer accepted.
+        let late = PublicationContext {
+            id: [4; 16],
+            sequence: std::num::NonZeroU64::new(2),
+            ..context
+        };
+        let backdated = sender
+            .protect_object(b"chat", &late.authenticated_bytes(), b"after removal")
+            .unwrap();
+        {
+            let shared = session(handle).unwrap();
+            let guard = shared.lock().unwrap();
+            let session = guard.as_ref().unwrap();
             assert_eq!(
-                check_epoch_transition(owner).unwrap_err(),
-                "pending application delivery must be acknowledged before membership update"
+                session
+                    .inbox
+                    .as_ref()
+                    .unwrap()
+                    .stage(session.workspace.as_ref().unwrap(), &late, &backdated)
+                    .err(),
+                Some("object author not current")
             );
         }
         close(handle).unwrap();
@@ -6624,7 +6760,15 @@ mod tests {
         for op in ["stage_publication", "stage_reception", "enable_object_delivery"] {
             assert!(call(joiner, json!({"op":op})).is_err());
         }
-        let network_received = call(joiner, json!({"op":"poll_protected"})).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        let network_received = loop {
+            let received = call(joiner, json!({"op":"poll_protected"})).unwrap();
+            if !received.is_null() {
+                break received;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        };
         assert!(network_received.get("payload").is_none());
         assert_eq!(network_received["state"], "awaiting_reception_save");
         call(

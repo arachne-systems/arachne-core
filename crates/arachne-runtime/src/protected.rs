@@ -2,6 +2,17 @@
 use super::*;
 use arachne_routing::PublicationContext;
 
+/// The session's publisher log, or a new one for the owner's current epoch.
+fn publisher_or_new(
+    session: &Session,
+    owner: &arachne_security::Workspace,
+) -> Result<arachne_delivery::PublisherLog, String> {
+    match &session.publisher {
+        Some(publisher) => Ok(publisher.clone()),
+        None => arachne_delivery::PublisherLog::new(owner).map_err(str::to_owned),
+    }
+}
+
 pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, String> {
     let owner = session
         .workspace
@@ -148,14 +159,7 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
             // Start retention with the first routed publication after activation.
             // No coverage for pre-activation data or old epochs is advertised.
             if recipients.is_empty() && publisher.is_none() {
-                publisher = Some(arachne_delivery::PublisherLog::new(
-                    owner.id(),
-                    owner
-                        .member()
-                        .ok_or("publisher requires member identity")?
-                        .id(),
-                    owner.epoch(),
-                ));
+                publisher = Some(arachne_delivery::PublisherLog::new(owner).map_err(str::to_owned)?);
             }
             let packet = context.packet(&ciphertext).map_err(str::to_owned)?;
             if let Some(current) = current {
@@ -290,11 +294,7 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
     };
     let publisher = Some(match publisher {
         Some(publisher) => publisher,
-        None => arachne_delivery::PublisherLog::new(
-            owner.id(),
-            owner.member().ok_or("member required")?.id(),
-            owner.epoch(),
-        ),
+        None => arachne_delivery::PublisherLog::new(owner).map_err(str::to_owned)?,
     });
     let snapshot = seal_state(
         session.records.is_some(),
@@ -338,17 +338,7 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
         .storage_key
         .as_ref()
         .ok_or("session has no protected root key")?;
-    let publisher = session
-        .publisher
-        .clone()
-        .unwrap_or(arachne_delivery::PublisherLog::new(
-            owner.id(),
-            owner
-                .member()
-                .ok_or("publisher requires member identity")?
-                .id(),
-            owner.epoch(),
-        ));
+    let publisher = publisher_or_new(session, owner)?;
     let fresh;
     let inbox = match session.inbox.as_ref() {
         Some(inbox) => inbox,
@@ -359,7 +349,11 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
     };
     {
         if ready.automatic {
-            let progress = inbox.recovery_progress(ready.query.author, &ready.query.topics);
+            let progress = inbox.recovery_progress(
+                ready.query.author,
+                ready.query.epoch,
+                &ready.query.topics,
+            );
             if ready.query.through <= progress {
                 session.ready_range = None;
                 return Ok(json!({"state":"recovery_already_covered"}));
@@ -502,14 +496,7 @@ pub(super) fn stage_direct_recovery(session: &mut Session) -> Result<Value, Stri
         session.ready_direct_range = None;
         return Ok(json!({"state":"direct_recovery_already_covered"}));
     }
-    let publisher = session
-        .publisher
-        .clone()
-        .unwrap_or(arachne_delivery::PublisherLog::new(
-            owner.id(),
-            owner.member().ok_or("member required")?.id(),
-            owner.epoch(),
-        ));
+    let publisher = publisher_or_new(session, owner)?;
     let snapshot = seal_state(
         session.records.is_some(),
         owner,
@@ -551,14 +538,7 @@ pub(super) fn stage_direct_miss(session: &mut Session) -> Result<Value, String> 
         .ok_or("no object delivery state")?
         .skip_direct_gap(owner, query)
         .map_err(str::to_owned)?;
-    let publisher = session
-        .publisher
-        .clone()
-        .unwrap_or(arachne_delivery::PublisherLog::new(
-            owner.id(),
-            owner.member().ok_or("member required")?.id(),
-            owner.epoch(),
-        ));
+    let publisher = publisher_or_new(session, owner)?;
     let snapshot = seal_state(
         session.records.is_some(),
         owner,
@@ -651,14 +631,7 @@ pub(super) fn inbox_operation(session: &mut Session, request: Request) -> Result
             .map_err(str::to_owned)?,
         _ => unreachable!(),
     };
-    let publisher = session
-        .publisher
-        .clone()
-        .unwrap_or(arachne_delivery::PublisherLog::new(
-            owner.id(),
-            owner.member().ok_or("member required")?.id(),
-            owner.epoch(),
-        ));
+    let publisher = publisher_or_new(session, owner)?;
     let snapshot = seal_state(
         session.records.is_some(),
         owner,

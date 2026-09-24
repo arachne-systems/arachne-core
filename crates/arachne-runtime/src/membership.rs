@@ -1923,12 +1923,19 @@ pub(super) fn stage_update(session: &mut Session, step: JoinStep) -> Result<Valu
             return stage_removal(session, removed);
         }
     };
-    let snapshot = seal_state(session.records.is_some(), &prepared, key, None, None)?;
+    let (publisher, inbox) = super::carry_delivery(session, &prepared)?;
+    let snapshot = seal_state(
+        session.records.is_some(),
+        &prepared,
+        key,
+        publisher.as_ref(),
+        inbox.as_ref(),
+    )?;
     let value = json!({"workspace":prepared.id(), "workspace_name":prepared.workspace_name().map_err(str::to_owned)?, "snapshot":snapshot,
             "state":"awaiting_save", "durable":false});
     session.staged_workspace = Some(StagedWorkspace {
-        publisher: None,
-        inbox: None,
+        publisher,
+        inbox,
         transition: WorkspaceTransition::Admission,
         workspace: prepared,
         snapshot,
@@ -2538,6 +2545,7 @@ pub(super) fn stage_prepared(
     session: &mut Session,
     prepared: arachne_security::PreparedManagement,
 ) -> Result<Value, String> {
+    let (publisher, inbox) = super::carry_delivery(session, &prepared.workspace)?;
     let snapshot = seal_state(
         session.records.is_some(),
         &prepared.workspace,
@@ -2545,13 +2553,13 @@ pub(super) fn stage_prepared(
             .storage_key
             .as_ref()
             .ok_or("session has no protected root key")?,
-        None,
-        None,
+        publisher.as_ref(),
+        inbox.as_ref(),
     )?;
     let value = json!({"workspace":prepared.workspace.id(), "workspace_name":prepared.workspace.workspace_name().map_err(str::to_owned)?, "snapshot":snapshot, "state":"awaiting_save", "durable":false});
     session.staged_workspace = Some(StagedWorkspace {
-        publisher: None,
-        inbox: None,
+        publisher,
+        inbox,
         transition: WorkspaceTransition::Management(prepared.action, prepared.commit),
         workspace: prepared.workspace,
         snapshot,

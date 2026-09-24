@@ -277,7 +277,7 @@ fn migration_preserves_pending_inbox_and_removal_cannot_reopen_active_state() {
     else {
         panic!("missing candidate")
     };
-    let publisher = PublisherLog::new(workspace, reader.member().unwrap().id(), reader.epoch());
+    let publisher = PublisherLog::new(&reader).unwrap();
     let key = StorageKey::derive(&root).unwrap();
     let legacy = inbox.seal(&reader, &key, &publisher).unwrap();
     call(

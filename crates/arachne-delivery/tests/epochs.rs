@@ -1,0 +1,264 @@
+//! A3: delivery state survives membership steps. Two members at different
+//! epochs during a partition exchange data after the partition heals.
+use arachne_delivery::inbox::{InboxStage, ObjectInbox};
+use arachne_delivery::{PublisherLog, RangeQuery, RetrievalError, wire};
+use arachne_routing::{Permissions, PublicationContext, RoutingTable, Topic};
+use arachne_security::{
+    ManagementAction, PendingJoin, PreparedManagementUpdate, StorageKey, Workspace,
+};
+use std::collections::{BTreeMap, BTreeSet};
+
+const REVISION: u64 = 7;
+
+fn active(update: PreparedManagementUpdate) -> Workspace {
+    match update {
+        PreparedManagementUpdate::Active(workspace) => *workspace,
+        PreparedManagementUpdate::Removed(_) => panic!("unexpected removal"),
+    }
+}
+
+/// Register an invitation (one commit), then admit `endpoint` with it.
+/// Returns the admin after both steps, the invitation commit and the admission.
+fn admit(
+    admin: Workspace,
+    endpoint: [u8; 32],
+    name: &str,
+) -> (
+    Workspace,
+    Workspace,
+    arachne_security::PreparedManagement,
+    arachne_security::PreparedAdmission,
+) {
+    let (registered, invite, checkpoint) = admin.prepare_invitation(u64::MAX, false, false).unwrap();
+    let admin = registered.workspace.provisional_copy().unwrap();
+    let join = PendingJoin::from_invitation(&invite, &checkpoint, endpoint, name).unwrap();
+    let prepared = admin
+        .prepare_admission(endpoint, join.admission_request().unwrap())
+        .unwrap();
+    let mut proof = join.join_proof().unwrap();
+    proof
+        .apply_add(&prepared.authorization, &prepared.commit)
+        .unwrap();
+    let joined = join.prepare_workspace(&proof, &prepared.welcome).unwrap();
+    let admin = prepared.workspace.provisional_copy().unwrap();
+    (admin, joined, registered, prepared)
+}
+
+fn context(workspace: [u8; 32], sequence: u64, id: u8) -> PublicationContext {
+    PublicationContext {
+        workspace,
+        revision: REVISION,
+        topic: Topic::new("chat/room").unwrap(),
+        id: [id; 16],
+        sequence: std::num::NonZeroU64::new(sequence),
+    }
+}
+
+fn publish(
+    author: &mut Workspace,
+    log: &mut PublisherLog,
+    id: u8,
+) -> (PublicationContext, Vec<u8>) {
+    let context = context(author.id(), log.head() + 1, id);
+    let object = author
+        .protect_object(b"chat", &context.authenticated_bytes(), &[id])
+        .unwrap();
+    log.append(context.clone(), object.clone()).unwrap();
+    (context, object)
+}
+
+fn stage(
+    inbox: &ObjectInbox,
+    owner: &Workspace,
+    context: &PublicationContext,
+    object: &[u8],
+) -> ObjectInbox {
+    match inbox.stage(owner, context, object).unwrap() {
+        InboxStage::Prepared(next) => *next,
+        _ => panic!("object was not new"),
+    }
+}
+
+fn policy(workspace: [u8; 32]) -> RoutingTable {
+    let mut policy = RoutingTable::default();
+    policy
+        .install_verified_policy(
+            workspace,
+            REVISION,
+            BTreeMap::from([
+                ([1; 32], Permissions::AllTopics),
+                ([2; 32], Permissions::AllTopics),
+                ([3; 32], Permissions::AllTopics),
+            ]),
+        )
+        .unwrap();
+    policy
+}
+
+fn range(author: &Workspace, epoch: u64, through: u64) -> RangeQuery {
+    RangeQuery {
+        workspace: author.id(),
+        author: author.member().unwrap().id(),
+        epoch,
+        policy_revision: REVISION,
+        after: 0,
+        through,
+        topics: BTreeSet::from([Topic::new("chat/room").unwrap()]),
+    }
+}
+
+#[test]
+fn members_at_different_epochs_exchange_data_after_a_partition_heals() {
+    // A and B share an epoch.
+    let (mut a, mut b, _, _) = admit(Workspace::create([1; 32], "A").unwrap(), [2; 32], "B");
+    let start = a.epoch();
+    assert_eq!(b.epoch(), start);
+    let mut a_log = PublisherLog::new(&a).unwrap();
+    let mut b_log = PublisherLog::new(&b).unwrap();
+    let mut a_inbox = ObjectInbox::new(a.id(), start);
+    let mut b_inbox = ObjectInbox::new(b.id(), start);
+
+    // Before the partition B receives A's first object and has not acked it.
+    let (a0_context, a0) = publish(&mut a, &mut a_log, 10);
+    b_inbox = stage(&b_inbox, &b, &a0_context, &a0);
+    // B sends one object that A misses.
+    let (b1_context, b1) = publish(&mut b, &mut b_log, 21);
+
+    // Partition. A admits C: two epochs. B does not see the commits.
+    let previous_a = a.provisional_copy().unwrap();
+    let (next_a, c, registered, admission) = admit(a, [3; 32], "C");
+    a = next_a;
+    assert_eq!(a.epoch(), start + 2);
+    // A's delivery state moves forward in the same steps it would be staged.
+    let middle = registered.workspace.provisional_copy().unwrap();
+    a_log = a_log.advance(&previous_a, &middle).unwrap().advance(&middle, &a).unwrap();
+    a_inbox = a_inbox
+        .advance(&previous_a, &middle)
+        .unwrap()
+        .advance(&middle, &a)
+        .unwrap();
+    assert_eq!(a_log.epochs(), vec![start, start + 1, start + 2]);
+    // Both sides keep sending in their own epoch.
+    let (a1_context, a1) = publish(&mut a, &mut a_log, 11);
+    let (b2_context, b2) = publish(&mut b, &mut b_log, 22);
+
+    // Heal. A (two epochs ahead) accepts B's live object from the old epoch.
+    a_inbox = stage(&a_inbox, &a, &b2_context, &b2);
+    // B cannot read A's newer epoch yet; nothing is recorded.
+    assert_eq!(
+        b_inbox.stage(&b, &a1_context, &a1).err(),
+        Some("object epoch ahead")
+    );
+    // A recovers what it missed from B's log of the old epoch.
+    let query = range(&b, start, b_log.head());
+    let reply = wire::serve_range(&b_log, &b, &policy(b.id()), a.endpoint(), &query).unwrap();
+    let wire::RangeReply::Offered(offer) = wire::verify_reply(&a, &query, &reply).unwrap() else {
+        panic!("A could not recover B's old epoch");
+    };
+    for packet in offer.packets() {
+        if let InboxStage::Prepared(next) = a_inbox.stage(&a, &packet.context, &packet.ciphertext).unwrap() {
+            a_inbox = *next;
+        }
+    }
+    let mut received = Vec::new();
+    while let Some(pending) = a_inbox.pending(&a).unwrap() {
+        received.push(pending.message.payload[0]);
+        a_inbox = a_inbox
+            .acknowledge(pending.message.member, &pending.context.topic, pending.counter, pending.context.id)
+            .unwrap();
+    }
+    received.sort_unstable();
+    assert_eq!(received, [21, 22]);
+    // The live copy of a recovered object is a duplicate.
+    assert!(matches!(
+        a_inbox.stage(&a, &b1_context, &b1).unwrap(),
+        InboxStage::Duplicate
+    ));
+
+    // B catches up; its pending object and its old log are carried.
+    let previous_b = b.provisional_copy().unwrap();
+    let b_middle = active(
+        b.prepare_management_update(registered.action, &registered.commit)
+            .unwrap(),
+    );
+    b = b_middle
+        .prepare_admission_update(&admission.authorization, &admission.commit)
+        .unwrap();
+    assert_eq!(b.epoch(), a.epoch());
+    b_inbox = b_inbox
+        .advance(&previous_b, &b_middle)
+        .unwrap()
+        .advance(&b_middle, &b)
+        .unwrap();
+    b_log = b_log
+        .advance(&previous_b, &b_middle)
+        .unwrap()
+        .advance(&b_middle, &b)
+        .unwrap();
+    assert_eq!(b_inbox.pending_count(), 1);
+    b_inbox = stage(&b_inbox, &b, &a1_context, &a1);
+    let first = b_inbox.pending(&b).unwrap().unwrap();
+    assert_eq!(first.message.payload, [10]);
+    assert_eq!(first.epoch, start);
+
+    // The carried state survives save and restore at the new epoch.
+    let key = StorageKey::derive(&[9; 32]).unwrap();
+    let sealed = b_inbox.seal(&b, &key, &b_log).unwrap();
+    let (b, b_log, b_inbox) = ObjectInbox::restore(&key, [2; 32], b.id(), &sealed).unwrap();
+    assert_eq!(b_inbox.pending_count(), 2);
+    assert_eq!(b_log.epochs(), vec![start, start + 1, start + 2]);
+
+    // Who may recover: current members that were members in that epoch.
+    // A still gets B's old epoch after B advanced.
+    let old = range(&b, start, 2);
+    assert!(b_log.authorized_range(&b, &policy(b.id()), a.endpoint(), &old).is_ok());
+    // C joined after it: denied, although C is a current member.
+    assert_eq!(
+        b_log
+            .authorized_range(&b, &policy(b.id()), c.endpoint(), &old)
+            .err(),
+        Some(RetrievalError::Denied)
+    );
+    // C cannot decrypt the old epoch either.
+    assert_eq!(
+        c.unprotect_object(b"chat", &a0_context.authenticated_bytes(), &a0)
+            .unwrap_err(),
+        "object epoch expired"
+    );
+
+    // A removal is never delayed by pending objects: A holds one from B.
+    let (mut b, mut b_log) = (b, b_log);
+    let (b3_context, b3) = publish(&mut b, &mut b_log, 23);
+    let a_inbox = stage(&a_inbox, &a, &b3_context, &b3);
+    let removal = a
+        .prepare_management(ManagementAction::Remove(b.member().unwrap().id()))
+        .unwrap();
+    let a_removed = removal.workspace;
+    let a_inbox = a_inbox.advance(&a, &a_removed).unwrap();
+    // Accepted before the removal, it is still delivered.
+    assert_eq!(
+        a_inbox.pending(&a_removed).unwrap().unwrap().message.payload,
+        [23]
+    );
+    // After the removal, B's objects fail, also in the old epoch.
+    let (b4_context, b4) = publish(&mut b, &mut b_log, 24);
+    assert_eq!(
+        a_inbox.stage(&a_removed, &b4_context, &b4).err(),
+        Some("object author not current")
+    );
+    // B gets nothing from A's retained history; C still does.
+    let a_log = a_log.advance(&a, &a_removed).unwrap();
+    let mine = range(&a_removed, a.epoch(), a_log.epoch_log(a.epoch()).unwrap().head());
+    let policy = policy(a.id());
+    assert_eq!(
+        a_log
+            .authorized_range(&a_removed, &policy, b.endpoint(), &mine)
+            .err(),
+        Some(RetrievalError::Denied)
+    );
+    assert!(
+        a_log
+            .authorized_range(&a_removed, &policy, c.endpoint(), &mine)
+            .is_ok()
+    );
+}

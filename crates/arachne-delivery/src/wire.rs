@@ -462,27 +462,24 @@ pub fn serve_cutoff(
     requester: [u8; 32],
     query: &CutoffQuery,
 ) -> Result<Vec<u8>, &'static str> {
-    if log
-        .authorize_history(
-            owner,
-            policy,
-            requester,
-            (query.workspace, query.author, query.epoch),
-            query.policy_revision,
-            &query.topics,
-        )
-        .is_err()
-    {
+    let Ok(epoch_log) = log.authorize_history(
+        owner,
+        policy,
+        requester,
+        (query.workspace, query.author, query.epoch),
+        query.policy_revision,
+        &query.topics,
+    ) else {
         return Ok(denied_reply());
-    }
+    };
     let after = query
         .topics
         .iter()
-        .filter_map(|t| log.topics.get(t))
+        .filter_map(|t| epoch_log.topics.get(t))
         .map(|h| h.evicted_through)
         .max()
         .unwrap_or(0);
-    owner.sign_recovery_window(&query.request()?, after, log.head())
+    owner.sign_recovery_window(&query.request()?, after, epoch_log.head())
 }
 
 /// None is a generic advisory denial, not a zero head. Caller owns nonce lifetime.
@@ -663,20 +660,18 @@ pub fn serve_available_range(
     requester: [u8; 32],
     request: &AvailableRangeQuery,
 ) -> Result<Vec<u8>, &'static str> {
-    if log
-        .authorize_history(
-            owner,
-            policy,
-            requester,
-            (request.workspace, request.author, request.epoch),
-            request.policy_revision,
-            &request.topics,
-        )
-        .is_err()
-    {
+    let Ok(epoch_log) = log.authorize_history(
+        owner,
+        policy,
+        requester,
+        (request.workspace, request.author, request.epoch),
+        request.policy_revision,
+        &request.topics,
+    ) else {
         return Ok(unavailable_available_reply());
-    }
-    if request.after >= log.head() {
+    };
+    let head = epoch_log.head();
+    if request.after >= head {
         return Ok(unavailable_available_reply());
     }
     // None when (after, through] is authorized but too large for one reply.
@@ -696,9 +691,7 @@ pub fn serve_available_range(
         }
         Ok(available_offer(&query, &reply).ok())
     };
-    let mut high = log
-        .head()
-        .min(request.after.saturating_add(MAX_RECOVERY_PACKETS as u64));
+    let mut high = head.min(request.after.saturating_add(MAX_RECOVERY_PACKETS as u64));
     if let Some(bytes) = offer(high)? {
         return Ok(bytes);
     }

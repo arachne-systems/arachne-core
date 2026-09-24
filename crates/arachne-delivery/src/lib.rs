@@ -3,7 +3,9 @@
 pub mod catalog;
 pub mod current;
 pub mod inbox;
+mod publisher;
 pub mod wire;
+pub use publisher::{MAX_PUBLISHER_SNAPSHOT, PublisherLog};
 
 use arachne_routing::{PublicationContext, Topic};
 use arachne_security::{MAX_APPLICATION_CIPHERTEXT, MAX_RECOVERY_PACKETS, RecoveryRequest};
@@ -35,9 +37,10 @@ struct History {
 
 /// Append-only sequence within one author/workspace/epoch, with bounded retention.
 /// Eviction watermarks never disappear: a missing range cannot become "complete"
-/// merely because all its old packets were evicted. Clone to stage with security.
+/// merely because all its old packets were evicted. `PublisherLog` keeps one
+/// per retained epoch.
 #[derive(Clone)]
-pub struct PublisherLog {
+pub struct EpochLog {
     workspace: [u8; 32],
     author: [u8; 32],
     epoch: u64,
@@ -110,7 +113,7 @@ impl RetainedRange<'_> {
         owner.sign_recovery_offer(&self.request, &packets)
     }
 }
-impl PublisherLog {
+impl EpochLog {
     pub fn new(workspace: [u8; 32], author: [u8; 32], epoch: u64) -> Self {
         Self {
             workspace,
@@ -124,15 +127,8 @@ impl PublisherLog {
     pub fn head(&self) -> u64 {
         self.head
     }
-
-    fn validate_owner(&self, owner: &arachne_security::Workspace) -> Result<(), &'static str> {
-        if owner.id() != self.workspace
-            || owner.epoch() != self.epoch
-            || owner.member().map(|m| m.id()) != Some(self.author)
-        {
-            return Err("publisher index does not match security owner");
-        }
-        Ok(())
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// New publications only. Retransmit existing ciphertext without appending.
@@ -188,7 +184,7 @@ impl PublisherLog {
         }
         Ok(sequence)
     }
-    fn evict_oldest(&mut self) -> bool {
+    pub(crate) fn evict_oldest(&mut self) -> bool {
         let oldest = self
             .topics
             .iter()
@@ -207,49 +203,6 @@ impl PublisherLog {
         let record = history.records.pop_front().unwrap();
         history.evicted_through = record.sequence;
         self.bytes -= record.weight();
-    }
-
-    /// Authorize before disclosing retained data OR history availability. The
-    /// host supplies current accepted membership/policy and a transport-bound peer.
-    /// No active subscription is required or installed by a historical request.
-    pub fn authorized_range(
-        &self,
-        owner: &arachne_security::Workspace,
-        policy: &arachne_routing::RoutingTable,
-        requester: [u8; 32],
-        query: &RangeQuery,
-    ) -> Result<RetainedRange<'_>, RetrievalError> {
-        self.authorize_history(
-            owner,
-            policy,
-            requester,
-            (query.workspace, query.author, query.epoch),
-            query.policy_revision,
-            &query.topics,
-        )?;
-        self.select(query.after, query.through, &query.topics)
-            .map_err(RetrievalError::History)
-    }
-
-    fn authorize_history(
-        &self,
-        owner: &arachne_security::Workspace,
-        policy: &arachne_routing::RoutingTable,
-        requester: [u8; 32],
-        scope: ([u8; 32], [u8; 32], u64),
-        revision: u64,
-        topics: &BTreeSet<Topic>,
-    ) -> Result<(), RetrievalError> {
-        if owner.id() != self.workspace
-            || owner.epoch() != self.epoch
-            || owner.member().map(|m| m.id()) != Some(self.author)
-            || scope.0 != self.workspace
-            || scope.1 != self.author
-            || scope.2 != self.epoch
-        {
-            return Err(RetrievalError::Denied);
-        }
-        authorize_history(owner, policy, requester, self.author, revision, topics)
     }
 
     /// Exact-topic selection over a fixed (after, through] range. Topic ACLs are
@@ -486,7 +439,7 @@ fn number16(bytes: &mut &[u8]) -> Result<usize, &'static str> {
 
 #[test]
 fn retention_watermarks_scope_and_snapshot_bounds() {
-    let mut log = PublisherLog::new([1; 32], [2; 32], 3);
+    let mut log = EpochLog::new([1; 32], [2; 32], 3);
     // Publications are appended in id order, so the id is also the sequence.
     let context = |topic: &str, id: u128| PublicationContext {
         sequence: std::num::NonZeroU64::new(id as u64),
@@ -517,26 +470,26 @@ fn retention_watermarks_scope_and_snapshot_bounds() {
     );
     assert!(log.select(0, 53, &quiet).is_err());
     let snapshot = log.snapshot();
-    let restored = PublisherLog::restore([1; 32], [2; 32], 3, &snapshot).unwrap();
+    let restored = EpochLog::restore([1; 32], [2; 32], 3, &snapshot).unwrap();
     assert_eq!(snapshot, restored.snapshot());
     assert_eq!(restored.select(0, 52, &quiet).unwrap().records().len(), 2);
     assert!(restored.select(0, 52, &busy).is_err());
     for cut in [0, 4, 5, 37, 69, 85, snapshot.len() - 1] {
-        assert!(PublisherLog::restore([1; 32], [2; 32], 3, &snapshot[..cut]).is_err());
+        assert!(EpochLog::restore([1; 32], [2; 32], 3, &snapshot[..cut]).is_err());
     }
     let mut collision = snapshot.clone();
     // First canonical topic is "busy"; its eviction sequence cannot also be
     // the sequence of the still-retained first quiet publication.
     let floor_offset = 5 + 32 + 32 + 8 + 8 + 2 + 1 + "busy".len();
     collision[floor_offset..floor_offset + 8].copy_from_slice(&1u64.to_be_bytes());
-    assert!(PublisherLog::restore([1; 32], [2; 32], 3, &collision).is_err());
+    assert!(EpochLog::restore([1; 32], [2; 32], 3, &collision).is_err());
     let mut trailing = snapshot.clone();
     trailing.push(0);
-    assert!(PublisherLog::restore([1; 32], [2; 32], 3, &trailing).is_err());
-    assert!(PublisherLog::restore([9; 32], [2; 32], 3, &snapshot).is_err());
-    assert!(PublisherLog::restore([1; 32], [9; 32], 3, &snapshot).is_err());
-    assert!(PublisherLog::restore([1; 32], [2; 32], 4, &snapshot).is_err());
-    assert!(PublisherLog::restore([1; 32], [2; 32], 3, &vec![0; MAX_SNAPSHOT_BYTES + 1]).is_err());
+    assert!(EpochLog::restore([1; 32], [2; 32], 3, &trailing).is_err());
+    assert!(EpochLog::restore([9; 32], [2; 32], 3, &snapshot).is_err());
+    assert!(EpochLog::restore([1; 32], [9; 32], 3, &snapshot).is_err());
+    assert!(EpochLog::restore([1; 32], [2; 32], 4, &snapshot).is_err());
+    assert!(EpochLog::restore([1; 32], [2; 32], 3, &vec![0; MAX_SNAPSHOT_BYTES + 1]).is_err());
     assert!(log.append(context("quiet", 52), vec![4]).is_err());
     assert!(log.append(context("quiet", 53), vec![]).is_err());
     assert_eq!(log.head(), 52);
@@ -547,9 +500,9 @@ fn retention_watermarks_scope_and_snapshot_bounds() {
     assert!(log.bytes <= MAX_RETAINED_BYTES);
     assert!(log.snapshot().len() <= MAX_SNAPSHOT_BYTES);
     assert!(log.select(0, log.head(), &quiet).is_err()); // Byte-budget eviction cannot erase the watermark.
-    let restored = PublisherLog::restore([1; 32], [2; 32], 3, &log.snapshot()).unwrap();
+    let restored = EpochLog::restore([1; 32], [2; 32], 3, &log.snapshot()).unwrap();
     assert!(restored.select(0, restored.head(), &quiet).is_err());
-    let mut many = PublisherLog::new([1; 32], [2; 32], 3);
+    let mut many = EpochLog::new([1; 32], [2; 32], 3);
     for id in 0..MAX_TOPICS {
         many.append(context(&format!("topic/{id:02}"), id as u128 + 1), vec![1])
             .unwrap();
@@ -593,7 +546,7 @@ fn restored_index_builds_offer_for_selected_real_objects() {
         .prepare_workspace(&proof, &prepared.welcome)
         .unwrap();
     let mut sender = prepared.workspace;
-    let mut log = PublisherLog::new(sender.id(), sender.member().unwrap().id(), sender.epoch());
+    let mut log = PublisherLog::new(&sender).unwrap();
     for id in 1..=52u128 {
         let topic = if id == 1 || id == 52 { "quiet" } else { "busy" };
         let context = PublicationContext {
@@ -612,13 +565,7 @@ fn restored_index_builds_offer_for_selected_real_objects() {
             .unwrap();
         log.append(context, packet).unwrap();
     }
-    let log = PublisherLog::restore(
-        sender.id(),
-        sender.member().unwrap().id(),
-        sender.epoch(),
-        &log.snapshot(),
-    )
-    .unwrap();
+    let log = PublisherLog::restore(&sender, &log.snapshot()).unwrap();
     let topics = BTreeSet::from([Topic::new("quiet").unwrap()]);
     let mut policy = arachne_routing::RoutingTable::default();
     let owner_access = arachne_routing::Permissions::Selected {
@@ -790,7 +737,7 @@ fn restored_index_builds_offer_for_selected_real_objects() {
     reordered.extend(&response[second..]);
     reordered.extend(&response[first..second]);
     assert!(wire::verify_reply(&receiver, &query, &reordered).is_err());
-    let mut large = PublisherLog::new(sender.id(), sender.member().unwrap().id(), sender.epoch());
+    let mut large = PublisherLog::new(&sender).unwrap();
     for id in 1u128..=8 {
         large
             .append(

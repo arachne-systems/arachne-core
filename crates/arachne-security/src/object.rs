@@ -410,6 +410,13 @@ fn key_id(epoch: u64, leaf: u32) -> u64 {
     (u64::from(leaf) << 16) | (epoch & 0xffff)
 }
 
+/// The epoch in an object's envelope, without authenticating it. Use only to
+/// decide retention; `unprotect_object` is the authority.
+pub fn object_epoch(object: &[u8]) -> Option<u64> {
+    (object.len() >= HEADER && object.starts_with(MAGIC))
+        .then(|| u64::from_be_bytes(object[37..45].try_into().unwrap()))
+}
+
 fn parse_window(bytes: Option<&Vec<u8>>) -> Result<Vec<(u64, [u8; 32])>, &'static str> {
     let Some(bytes) = bytes else {
         return Ok(Vec::new());
@@ -482,6 +489,13 @@ impl Workspace {
     /// Oldest epoch whose objects this owner can still authenticate.
     pub fn oldest_receive_epoch(&self) -> u64 {
         self.epoch().saturating_sub(RECEIVE_EPOCHS)
+    }
+
+    /// The current epoch or one of the retained past epochs. Recovery offers
+    /// and cutoffs for these epochs can be signed and verified; the signer
+    /// must still be a current member.
+    pub fn in_receive_window(&self, epoch: u64) -> bool {
+        (self.oldest_receive_epoch()..=self.epoch()).contains(&epoch)
     }
 
     fn receive_base(&self, epoch: u64) -> Result<Zeroizing<Vec<u8>>, &'static str> {
