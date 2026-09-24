@@ -75,7 +75,9 @@ Each foreign test does these checks:
 | Python | Yes | Yes | Generated modules use relative imports, so they must be in a package. The `code` field hides `code()` (finding 3). |
 | Go | Yes | **Stock v0.7.1: no. Patched: yes.** | Enum discriminant bug (finding 2). No methods on error types (finding 3). |
 
-Exact output lines (from `run.sh`, patched Go generator):
+Exact output lines. Command: `run.sh` with the patched Go generator, output in `run-patched.log`, then
+`grep -E "^==|^ok: .*(error code|discriminant|returned)|PASS|spike_test.go:(41|49|54|61|72|122|132|133)" run-patched.log`
+(an excerpt; the full log has more `ok:` lines):
 
 ```text
 == kotlin
@@ -106,6 +108,7 @@ ok: next_event returned None after 200 ms
 ok: after close error code = 1
 PYTHON PASS
 == go
+=== RUN   TestSpike
     spike_test.go:41: ok: ParseEndpoint error code = 101
     spike_test.go:49: ok: Go ErrorCode value = 101 == ErrorCodeInvalidId
     spike_test.go:54: ok: Go-made ApiError lowers ErrorCodeUnsupported as 103
@@ -115,6 +118,7 @@ PYTHON PASS
     spike_test.go:132: ok: after close error code = 1
     spike_test.go:133: GO PASS
 --- PASS: TestSpike (0.40s)
+PASS
 ```
 
 Go with the stock v0.7.1 generator:
@@ -209,8 +213,10 @@ Generated lines (`wc -l`, not formatted):
 
 ## Recommendations for the ADR
 
-1. Keep decision 1 (UniFFI proc-macro, `=0.31.x`). Pin `=0.31.2`. Build `uniffi-bindgen-go` without
-   `--locked` (or with a lock file update) so it uses the same `uniffi_bindgen` 0.31.2.
+1. Keep decision 1 (UniFFI proc-macro, `=0.31.x`). Pin `=0.31.2`. Build `uniffi-bindgen-go` from a
+   checkout: run `cargo update -p uniffi_bindgen --precise 0.31.2` there, then install with `--locked`.
+   Its own lock file has 0.31.0. The spike used 0.31.2 in both the scaffolding and the Go generator.
+   The mix of a 0.31.0 generator with 0.31.2 scaffolding is not tested.
 2. Before step 8 (Go), fix the Go enum discriminant bug upstream, or carry
    `bindgen-go-enum-discr.patch` in the SDK build. This is the only blocker that we found.
 3. Export the error code as a free function (`api_error_code`) in addition to `code()` in Rust.
@@ -224,7 +230,11 @@ Generated lines (`wc -l`, not formatted):
 ```bash
 # One time: generator and JNA (scratch paths are examples)
 cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go \
-    --tag v0.7.1+v0.31.0 --root /tmp/bgo        # stock; apply the patch to a checkout for the fixed one
+    --tag v0.7.1+v0.31.0 --root /tmp/bgo        # stock generator (fails the Go test)
+# Patched generator: in a checkout of tag v0.7.1+v0.31.0, apply
+# crates/arachne-uniffi-spike/bindgen-go-enum-discr.patch (patch -p1), delete the
+# rust-toolchain file (it pins 1.87; current dependencies need 1.88 or later), then:
+#   cargo install --path bindgen --root /tmp/bgo-patched
 curl -sLo /tmp/jna-5.17.0.jar https://repo1.maven.org/maven2/net/java/dev/jna/jna/5.17.0/jna-5.17.0.jar
 
 JNA_JAR=/tmp/jna-5.17.0.jar BINDGEN_GO=/path/to/patched/uniffi-bindgen-go \
