@@ -6,8 +6,11 @@ test is red → green and the crate tests pass.
 ## Fix-now bugs (core)
 
 - [ ] **B1** New workspaces default to legacy invitations (no expiry, revoke or use limit).
+  Decision: remove the legacy mode entirely. No legacy workspaces, no compatibility path.
 - [ ] **B2** A removed member can rejoin with the old approved request.
-- [ ] **B3** Receivers reject management commits above ~250 members (64 KiB inline bound).
+- [x] **B3** (`fix/sec-mgmt-bound` d226107) Receivers reject management commits above ~250 members (64 KiB inline bound).
+- [ ] **B3a** Joiners cannot receive an invitation above 241 members (64 KiB wire checkpoint carries the full ratchet tree). Needs a smaller joiner checkpoint (wire change).
+- [ ] **B3b** A member restored with `join_history == None` still uses the inline bound and can reject a valid management commit above ~250 members.
 - [ ] **B4** Invitation controls fill at 221 rows and are never pruned.
 - [ ] **B5** `stage_protected_publication` does not send `workspace`; a mismatch leaves the session stuck.
 - [ ] **B6** `create_endpoint` holds the global `REGISTRY` lock during bind (up to 10 s).
@@ -17,8 +20,21 @@ test is red → green and the crate tests pass.
 
 ## SDK bugs (arachne-sdk repo — owned by the SDK agent, not this branch)
 
-- [ ] **B10** Go, Python and Swift hold the client lock in `wait_for_work`; `close()` deadlocks.
-- [ ] **B11** The SDK pins core 7123166, which is missing `fbc4e91` (wake host loop after delivery).
+- [x] **B10** (SDK `fix/b10-b11-locks-pin` d528df4; Go/Python/Swift red→green) Go, Python and Swift hold the client lock in `wait_for_work`; `close()` deadlocks.
+- [x] **B11** (SDK `fix/b10-b11-locks-pin` 3ebd82a; core → b06a72d) The SDK pins core 7123166, which is missing `fbc4e91` (wake host loop after delivery).
+
+## ATAK plugin → SDK readiness (from `arachne-sdk/docs/android-consumer-plan.md`)
+
+The plugin reaches Core through `fabric-android` today; the SDK has its own native entry point
+and a different Core pin. Core work that each plan step depends on:
+
+| Plan step | Core dependency |
+| --- | --- |
+| 1. One Core revision, one native library and session owner | B11 (pin); A4 (owned `Context`, no static registry, no per-cdylib runtimes) |
+| 2. Typed SDK methods for ATAK workflows | A1: add typed methods in core `Client` (management, invitations, workspace name, presence, nearby, seal/restore), not in Kotlin |
+| 3. Candidate safety through Rust and the C boundary | A5 (typed candidate handles that carry their kind, one persistence mode), B5 |
+| 4. Distinct ID types, error categories through the C ABI | A1: core must emit real error codes first; today `ErrorKind` is a substring guess |
+| 5. End-to-end flow through the AAR, then ATAK host | B9 (freshness anchor), A4 (suspend/resume, `wait_for_work(timeout)`) |
 
 ## Architecture work (needs design first)
 
