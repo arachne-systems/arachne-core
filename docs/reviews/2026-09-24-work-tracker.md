@@ -59,7 +59,7 @@ and a different Core pin. Core work that each plan step depends on:
 
 - [ ] **A1** — step 1 done (`arachne-api`, `71cc9db`); UniFFI spike running.
   Original: One typed, versioned contract; stable error codes; `#[non_exhaustive]`; consider UniFFI.
-- [ ] **A2** — steps 1, 7 done (`b995fba`, `624c658`); ADR corrected. Wiring steps 2–6, 8–13 open.
+- [ ] **A2** — steps 1–7 done in security (`b995fba`, `624c658`, `feat/a2-security-wiring` 8 commits). Next: delivery/node/store adaptation (in progress), then runtime integration + steps 8–13 after A1 step 2.
   Original: Commit-ordering authority. **Decision open:** sequencer admin vs deterministic tie-break (recommended).
 - [x] **A3** (`fix/a3-delivery-epochs`, merging)
   - [ ] A3f: runtime recovery ops (`fetch_recovery_range`, `discover_recovery_cutoff`) still ask for the current epoch only; wire the 4-epoch window.
