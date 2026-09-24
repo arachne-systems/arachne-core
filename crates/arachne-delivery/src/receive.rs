@@ -896,3 +896,125 @@ fn live_then_recovery_skips_exact_receipts_but_not_lost_keys() {
     // Never turn that shared error into "already delivered" for the unknown packet.
     assert_eq!(journal.snapshot(), bytes.as_slice());
 }
+
+#[test]
+fn automatic_recovery_serves_byte_bounded_prefix_and_continues() {
+    use arachne_security::{MAX_APPLICATION_PAYLOAD, PendingJoin, Workspace};
+    let admin = Workspace::create([1; 32], "Publisher").unwrap();
+    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let pending = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let prepared = admin
+        .prepare_admission([2; 32], pending.admission_request().unwrap())
+        .unwrap();
+    let mut join = pending.join_proof().unwrap();
+    join.apply_add(&prepared.authorization, &prepared.commit)
+        .unwrap();
+    let mut reader = pending.prepare_workspace(&join, &prepared.welcome).unwrap();
+    let mut sender = prepared.workspace;
+    let id = reader.id();
+    let author = sender.member().unwrap().id();
+    let topic = Topic::new("sample").unwrap();
+    let topics = BTreeSet::from([topic.clone()]);
+    let mut log = PublisherLog::new(id, author, sender.epoch());
+    // Twenty full-size publications cannot fit one 128 KiB reply.
+    let head = 20u64;
+    for number in 1..=head {
+        let context = PublicationContext {
+            sequence: std::num::NonZeroU64::new(number),
+            workspace: id,
+            revision: 1,
+            topic: topic.clone(),
+            id: u128::from(number).to_be_bytes(),
+        };
+        let mut payload = vec![number as u8; MAX_APPLICATION_PAYLOAD];
+        payload[..8].copy_from_slice(&number.to_be_bytes());
+        let packet = sender
+            .protect_application(&context.authenticated_bytes(), &payload)
+            .unwrap();
+        log.append(context, packet).unwrap();
+    }
+    let mut policy = arachne_routing::RoutingTable::default();
+    policy
+        .install_verified_policy(
+            id,
+            1,
+            BTreeMap::from([
+                (
+                    [1; 32],
+                    arachne_routing::Permissions::Selected {
+                        publish: topics.clone(),
+                        subscribe: BTreeSet::new(),
+                    },
+                ),
+                (
+                    [2; 32],
+                    arachne_routing::Permissions::Selected {
+                        publish: BTreeSet::new(),
+                        subscribe: topics.clone(),
+                    },
+                ),
+            ]),
+        )
+        .unwrap();
+    let outgoing = PublisherLog::new(id, reader.member().unwrap().id(), reader.epoch());
+    let mut journal = ReceiveJournal::new(id, reader.epoch());
+    let mut delivered = Vec::new();
+    let mut ranges = Vec::new();
+    while journal.progress(author, &topics).unwrap_or(0) < head {
+        assert!(ranges.len() < head as usize, "recovery made no progress");
+        let request = wire::AvailableRangeQuery {
+            workspace: id,
+            author,
+            epoch: sender.epoch(),
+            policy_revision: 1,
+            after: journal.progress(author, &topics).unwrap_or(0),
+            topics: topics.clone(),
+        };
+        let reply = wire::serve_available_range(&log, &sender, &policy, [2; 32], &request).unwrap();
+        assert!(reply.len() <= wire::MAX_REPLY_BYTES);
+        let (query, reply) = wire::parse_available_reply(&request, &reply)
+            .unwrap()
+            .expect("holder must serve the largest prefix that fits");
+        assert!(query.through > query.after && query.through <= head);
+        let staged = match journal
+            .prepare_recovery(&reader, &outgoing, &query, &reply)
+            .unwrap()
+        {
+            RecoveryStage::Prepared(staged) => staged,
+            RecoveryStage::Rejected(error) => panic!("holder rejected range: {error:?}"),
+            RecoveryStage::AlreadyCovered => panic!("holder offered no progress"),
+        };
+        // Every sequence in (after, through] is covered; nothing is claimed beyond.
+        assert_eq!(
+            staged.publications.len() as u64,
+            query.through - query.after
+        );
+        assert_eq!(
+            staged.received.progress(author, &topics),
+            Some(query.through)
+        );
+        delivered.extend(
+            staged
+                .publications
+                .iter()
+                .map(|(context, _)| context.sequence.unwrap().get()),
+        );
+        let staged = *staged;
+        reader = staged.owner;
+        journal = staged.received;
+        ranges.push((query, reply));
+    }
+    assert!(
+        ranges.len() > 1,
+        "full-size history must span several ranges"
+    );
+    assert!(ranges[0].0.through < head);
+    assert_eq!(delivered, (1..=head).collect::<Vec<_>>());
+    // A replayed earlier partial range grants nothing new.
+    assert!(matches!(
+        journal
+            .prepare_recovery(&reader, &outgoing, &ranges[0].0, &ranges[0].1)
+            .unwrap(),
+        RecoveryStage::AlreadyCovered
+    ));
+}

@@ -310,6 +310,7 @@ impl ObjectInbox {
 
     /// Add or replace one publisher-owned latest value. The returned inbox must
     /// be saved atomically with the already protected publication and owner.
+    /// `now` is the host's current time, in the same units as `expires_at`.
     #[allow(clippy::too_many_arguments)]
     pub fn stage_current(
         &self,
@@ -320,6 +321,7 @@ impl ObjectInbox {
         expires_at: u64,
         tombstone: bool,
         packet: Vec<u8>,
+        now: u64,
     ) -> Result<Self, &'static str> {
         self.validate_owner(owner)?;
         let authority = owner.member().ok_or("member required")?.id();
@@ -339,6 +341,7 @@ impl ObjectInbox {
                 expires_at,
                 tombstone,
                 packet,
+                now,
             )?;
         next.snapshot()?;
         Ok(next)
@@ -1850,6 +1853,7 @@ fn current_value_survives_authenticated_delivery_bundle() {
             metadata.expires_at,
             metadata.tombstone,
             packet,
+            0,
         )
         .unwrap();
     let key = StorageKey::derive(&[3; 32]).unwrap();
@@ -2685,6 +2689,7 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
             metadata.expires_at,
             metadata.tombstone,
             packet,
+            0,
         )
         .unwrap();
     let current_query = current::CurrentViewQuery {

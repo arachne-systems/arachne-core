@@ -159,6 +159,10 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
             }
             let packet = context.packet(&ciphertext).map_err(str::to_owned)?;
             if let Some(current) = current {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| "system clock is before Unix epoch")?
+                    .as_secs();
                 inbox = Some(
                     inbox
                         .as_ref()
@@ -171,6 +175,7 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
                             current.expires_at,
                             current.tombstone,
                             packet.clone(),
+                            now,
                         )
                         .map_err(str::to_owned)?,
                 );
