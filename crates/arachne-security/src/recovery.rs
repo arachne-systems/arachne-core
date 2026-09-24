@@ -218,7 +218,7 @@ impl Workspace {
             return Err("invalid recovery window");
         }
         if request.workspace != self.id()
-            || request.epoch != self.epoch()
+            || !self.in_receive_window(request.epoch)
             || self.member().map(|m| m.id()) != Some(request.author)
         {
             return Err("invalid recovery cutoff scope");
@@ -253,7 +253,7 @@ impl Workspace {
     ) -> Result<(u64, u64), &'static str> {
         if self.member().is_none()
             || expected.workspace != self.id()
-            || expected.epoch != self.epoch()
+            || !self.in_receive_window(expected.epoch)
         {
             return Err("wrong recovery workspace or epoch");
         }
@@ -304,7 +304,7 @@ impl Workspace {
         packets: &[(&[u8], &[u8])],
     ) -> Result<Vec<u8>, &'static str> {
         if request.workspace != self.id()
-            || request.epoch != self.epoch()
+            || !self.in_receive_window(request.epoch)
             || self.member().map(|m| m.id()) != Some(request.author)
             || packets.len() > MAX_RECOVERY_PACKETS
         {
@@ -337,7 +337,7 @@ impl Workspace {
     ) -> Result<VerifiedRecoveryOffer<'a>, &'static str> {
         if self.member().is_none()
             || expected.workspace != self.id()
-            || expected.epoch != self.epoch()
+            || !self.in_receive_window(expected.epoch)
         {
             return Err("wrong recovery workspace or epoch");
         }

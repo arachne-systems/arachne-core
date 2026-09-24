@@ -439,10 +439,12 @@ pub struct PublicationCandidate {
 }
 
 /// Current-value metadata for a protected publication.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PublicationCurrent {
     pub selector: [u8; 32],
     pub replacement_key: [u8; 32],
+    /// Unix seconds (UTC), by the author's clock. Receivers and holders allow
+    /// `arachne_delivery::EXPIRY_SKEW_SECONDS` of clock difference.
     pub expires_at: u64,
     pub tombstone: bool,
 }
@@ -455,7 +457,7 @@ pub struct ProtectedReceptionCandidate {
     pub snapshot: Vec<u8>,
 }
 
-/// An authenticated protected publication released by candidate adoption.
+/// An authenticated pending object from the durable inbox.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReceivedProtectedPublication {
     pub workspace: [u8; 32],
@@ -467,6 +469,10 @@ pub struct ReceivedProtectedPublication {
     pub sequence: Option<u64>,
     pub payload: Vec<u8>,
     pub recipients: Vec<[u8; 32]>,
+    /// Author sender counter; identifies the object for acknowledgement.
+    pub counter: u64,
+    /// Present for a latest-value (current) publication.
+    pub current: Option<PublicationCurrent>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -484,18 +490,6 @@ pub struct Publication {
     pub revision: u64,
     pub sender: [u8; 32],
     pub topic: String,
-    pub payload: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RecoveredPublication {
-    pub workspace: [u8; 32],
-    pub revision: u64,
-    pub member: [u8; 32],
-    pub endpoint: [u8; 32],
-    pub topic: String,
-    pub id: [u8; 16],
-    pub sequence: Option<u64>,
     pub payload: Vec<u8>,
 }
 
@@ -550,7 +544,6 @@ pub struct RecoveryCandidate {
     pub workspace: [u8; 32],
     pub snapshot: Vec<u8>,
     pub publication_count: usize,
-    pub already_received: usize,
     pub durable: bool,
 }
 
@@ -1051,11 +1044,6 @@ impl Client {
         Ok(())
     }
 
-    pub fn enable_object_delivery(&self) -> Result<()> {
-        self.request(json!({"op": "enable_object_delivery"}))?;
-        Ok(())
-    }
-
     pub fn stage_protected_publication(
         &self,
         workspace: [u8; 32],
@@ -1186,25 +1174,34 @@ impl Client {
         }))
     }
 
-    /// Adopt a staged protected reception and release its authenticated payload.
-    pub fn adopt_protected_reception(
-        &self,
-        snapshot: &[u8],
-    ) -> Result<ReceivedProtectedPublication> {
-        let [metadata, _] = execute_stored(
+    /// Adopt a staged inbox candidate: a reception from `poll_protected`, or an
+    /// acknowledgement or rejection. A received object then waits in the
+    /// durable inbox; read it with `poll_pending_object`.
+    pub fn adopt_protected_reception(&self, snapshot: &[u8]) -> Result<()> {
+        execute_stored(
             self.handle()?,
             br#"{"op":"adopt_reception"}"#,
             snapshot,
         )
         .map_err(|message| map_error(&message))?;
-        let raw: RawProtectedPublication =
-            serde_json::from_slice(&metadata).map_err(|parse_error| {
-                error(
-                    ErrorKind::Internal,
-                    format!("invalid adopted protected publication: {parse_error}"),
-                )
-            })?;
-        Ok(ReceivedProtectedPublication {
+        Ok(())
+    }
+
+    /// The next authenticated object that the application has not yet
+    /// acknowledged or rejected. It stays pending (also after a restart) until
+    /// an acknowledgement or rejection is adopted: delivery is at least once.
+    pub fn poll_pending_object(&self) -> Result<Option<ReceivedProtectedPublication>> {
+        let response = self.request(json!({"op": "poll_pending_object"}))?;
+        if response.is_null() {
+            return Ok(None);
+        }
+        let raw: RawProtectedPublication = serde_json::from_value(response).map_err(|parse_error| {
+            error(
+                ErrorKind::Internal,
+                format!("invalid pending object: {parse_error}"),
+            )
+        })?;
+        Ok(Some(ReceivedProtectedPublication {
             workspace: raw.workspace,
             revision: raw.revision,
             member: raw.member,
@@ -1214,6 +1211,60 @@ impl Client {
             sequence: raw.sequence,
             payload: raw.payload,
             recipients: raw.recipients,
+            counter: raw.counter,
+            current: raw.current,
+        }))
+    }
+
+    /// Stage the application's durable acceptance of a pending object. Save
+    /// the snapshot, then `adopt_protected_reception`.
+    pub fn stage_object_acknowledgement(
+        &self,
+        object: &ReceivedProtectedPublication,
+    ) -> Result<ProtectedReceptionCandidate> {
+        self.stage_inbox_resolution("stage_object_acknowledgement", object)
+    }
+
+    /// Stage a permanent application rejection of a pending object. Its
+    /// identity stays recorded, so it is never delivered again.
+    pub fn stage_object_rejection(
+        &self,
+        object: &ReceivedProtectedPublication,
+    ) -> Result<ProtectedReceptionCandidate> {
+        self.stage_inbox_resolution("stage_object_rejection", object)
+    }
+
+    fn stage_inbox_resolution(
+        &self,
+        op: &str,
+        object: &ReceivedProtectedPublication,
+    ) -> Result<ProtectedReceptionCandidate> {
+        let request = serde_json::to_vec(&json!({
+            "op": op,
+            "member": object.member,
+            "topic": object.topic,
+            "counter": object.counter,
+            "id": object.id,
+        }))
+        .map_err(|parse_error| error(ErrorKind::Internal, parse_error.to_string()))?;
+        let [metadata, snapshot] =
+            execute_stored(self.handle()?, &request, &[]).map_err(|message| map_error(&message))?;
+        let raw: RawProtectedReceptionCandidate =
+            serde_json::from_slice(&metadata).map_err(|parse_error| {
+                error(
+                    ErrorKind::Internal,
+                    format!("invalid inbox candidate: {parse_error}"),
+                )
+            })?;
+        if raw.state != "awaiting_reception_save" || snapshot.is_empty() {
+            return Err(error(
+                ErrorKind::Internal,
+                "inbox resolution has no adoptable snapshot",
+            ));
+        }
+        Ok(ProtectedReceptionCandidate {
+            workspace: raw.workspace,
+            snapshot,
         })
     }
 
@@ -1309,22 +1360,6 @@ impl Client {
             })
     }
 
-    pub fn poll_recovered_publication(&self) -> Result<Option<RecoveredPublication>> {
-        let response = self.request(json!({"op": "poll_recovered_publication"}))?;
-        if response.is_null() {
-            return Ok(None);
-        }
-        serde_json::from_value::<RawRecoveredPublication>(response)
-            .map(Into::into)
-            .map(Some)
-            .map_err(|parse_error| {
-                error(
-                    ErrorKind::Internal,
-                    format!("invalid recovered publication: {parse_error}"),
-                )
-            })
-    }
-
     pub fn fetch_recovery_range(
         &self,
         request: RecoveryRangeRequest,
@@ -1361,6 +1396,8 @@ impl Client {
         }
     }
 
+    /// `retain_until` is Unix seconds (UTC) by this node's clock; 0 keeps no
+    /// copy for third-party recovery.
     pub fn stage_recovery_range(&self, retain_until: u64) -> Result<RecoveryStage> {
         let metadata = serde_json::to_vec(&json!({
             "op": "stage_recovery_range",
@@ -1392,7 +1429,6 @@ impl Client {
                     workspace: raw.workspace,
                     snapshot,
                     publication_count: raw.publication_count,
-                    already_received: raw.already_received,
                     durable: raw.durable,
                 }))
             }
@@ -1713,18 +1749,9 @@ struct RawProtectedPublication {
     payload: Vec<u8>,
     #[serde(default)]
     recipients: Vec<[u8; 32]>,
-}
-
-#[derive(Deserialize)]
-struct RawRecoveredPublication {
-    workspace: [u8; 32],
-    revision: u64,
-    member: [u8; 32],
-    endpoint: [u8; 32],
-    topic: String,
-    id: [u8; 16],
-    sequence: Option<u64>,
-    payload: Vec<u8>,
+    counter: u64,
+    #[serde(default)]
+    current: Option<PublicationCurrent>,
 }
 
 #[derive(Deserialize)]
@@ -1761,8 +1788,6 @@ struct RawRecoveryCandidate {
     workspace: [u8; 32],
     #[serde(default)]
     publication_count: usize,
-    #[serde(default)]
-    already_received: usize,
     durable: bool,
 }
 
@@ -1879,21 +1904,6 @@ impl From<RawPublication> for Publication {
             revision: value.revision,
             sender: value.sender,
             topic: value.topic,
-            payload: value.payload,
-        }
-    }
-}
-
-impl From<RawRecoveredPublication> for RecoveredPublication {
-    fn from(value: RawRecoveredPublication) -> Self {
-        Self {
-            workspace: value.workspace,
-            revision: value.revision,
-            member: value.member,
-            endpoint: value.endpoint,
-            topic: value.topic,
-            id: value.id,
-            sequence: value.sequence,
             payload: value.payload,
         }
     }

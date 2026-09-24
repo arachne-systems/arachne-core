@@ -583,7 +583,7 @@ mod tests {
         let creator = admin.member().unwrap().id();
         let key = StorageKey::derive(&[71; 32]).unwrap();
         assert!(member.prepare_workspace_name("Unauthorized").is_err());
-        let retained = admin.protect_object(b"chat", b"Keep this history").unwrap();
+        let retained = admin.protect_object(b"app", b"chat", b"Keep this history").unwrap();
         let fingerprint = admin.epoch_fingerprint();
         let change = admin.prepare_workspace_name("Valley Recovery").unwrap();
         assert_eq!(
@@ -607,7 +607,7 @@ mod tests {
         );
         assert_eq!(
             member
-                .unprotect_object(b"chat", &retained)
+                .unprotect_object(b"app", b"chat", &retained)
                 .unwrap()
                 .message
                 .payload,

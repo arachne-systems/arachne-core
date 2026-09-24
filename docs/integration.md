@@ -131,18 +131,20 @@ There are two paths that must not be conflated:
 
 `publish` is rejected for a workspace after admission; the runtime directs the
 caller to the protected path. Do not use the basic example as a secure group
-messaging recipe. The typed facade currently lacks a corresponding protected
-receive/stage/adopt method set even though lower-level runtime operations and
-tests exercise protected receive. That gap is tracked below.
+messaging recipe. The typed facade receives with `poll_protected` and
+`adopt_protected_reception`, then reads the inbox with `poll_pending_object`
+and resolves each object with `stage_object_acknowledgement` or
+`stage_object_rejection` (save, then `adopt_protected_reception`).
 
 ## Recovery and delivery expectations
 
-The runtime exposes recovery requests, recovery range status, staged recovery,
-adoption, and recovered-publication polling. Recovery is peer-assisted and
-bounded; it is not a central durable queue. A successful send/admission report
-does not mean every offline peer has received the data. Applications must
-define their own retention, retry, acknowledgement, and user-visible delivery
-semantics around the core's reports and recovery results.
+Received and recovered objects wait in a durable inbox. Read them with
+`poll_pending_object`, then stage and adopt an acknowledgement or rejection.
+Recovery is peer-assisted and bounded; it is not a central durable queue. A
+successful send/admission report does not mean every offline peer has
+received the data. [Delivery semantics](delivery.md) states the guarantees
+of each mode: at-least-once delivery, duplicates, ordering, loss, recovery,
+retention bounds and epoch behavior.
 
 ## Known integration gaps
 

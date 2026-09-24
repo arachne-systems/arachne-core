@@ -56,11 +56,6 @@ fn recipient_publication_survives_receiver_restart_with_object_delivery_enabled(
         json!({"op":"adopt_join","snapshot":staged["snapshot"]}),
     );
     for handle in [sender, receiver] {
-        let staged = call(handle, json!({"op":"enable_object_delivery"}));
-        call(
-            handle,
-            json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
-        );
         call(
             handle,
             json!({"op":"install_workspace_policy","revision":3}),

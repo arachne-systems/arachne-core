@@ -67,11 +67,7 @@ fn publication_one_revision_behind_is_received() {
     );
     let topics = json!(["streams/opaque"]);
     for handle in [sender, receiver] {
-        let staged = call(handle, json!({"op":"enable_object_delivery"}));
-        call(
-            handle,
-            json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
-        );
+        // Object delivery is always on (A3); only the policy is installed.
         call(
             handle,
             json!({"op":"install_member_policy","revision":2,"topics":topics}),

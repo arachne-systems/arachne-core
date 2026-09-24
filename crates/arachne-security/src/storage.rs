@@ -522,6 +522,7 @@ impl Workspace {
         }
         workspace.verify_retained_invitation_checkpoints()?;
         workspace.object_counter()?;
+        workspace.object_receive_window()?;
         workspace.name_state()?;
         Ok(workspace)
     }

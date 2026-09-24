@@ -39,6 +39,12 @@ impl Topic {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Application namespace: the first segment ("chat" for "chat/room/1").
+    /// Object keys and AAD are scoped to it (docs/security.md, A8).
+    pub fn namespace(&self) -> &str {
+        self.0.split('/').next().unwrap_or(&self.0)
+    }
 }
 
 /// Topic authorization is independent from subscription interest.
@@ -429,6 +435,13 @@ impl RoutingTable {
             })
             .collect())
     }
+}
+
+#[test]
+fn topic_namespace_is_the_first_segment() {
+    assert_eq!(Topic::new("chat/room/1").unwrap().namespace(), "chat");
+    assert_eq!(Topic::new("atak").unwrap().namespace(), "atak");
+    assert_eq!(Topic::new("a.b-c/d").unwrap().namespace(), "a.b-c");
 }
 
 #[test]

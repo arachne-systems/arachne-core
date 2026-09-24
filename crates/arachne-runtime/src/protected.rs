@@ -2,6 +2,17 @@
 use super::*;
 use arachne_routing::PublicationContext;
 
+/// The session's publisher log, or a new one for the owner's current epoch.
+fn publisher_or_new(
+    session: &Session,
+    owner: &arachne_security::Workspace,
+) -> Result<arachne_delivery::PublisherLog, String> {
+    match &session.publisher {
+        Some(publisher) => Ok(publisher.clone()),
+        None => arachne_delivery::PublisherLog::new(owner).map_err(str::to_owned),
+    }
+}
+
 pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, String> {
     let owner = session
         .workspace
@@ -47,8 +58,13 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
     };
     let mut candidate = owner.provisional_copy().map_err(str::to_owned)?;
     let mut publisher = session.publisher.clone();
-    let mut received = session.received.clone();
-    let mut inbox = session.inbox.clone();
+    // Object delivery is the only receive path.
+    let mut inbox = Some(
+        session
+            .inbox
+            .clone()
+            .unwrap_or_else(|| arachne_delivery::inbox::ObjectInbox::new(owner.id(), owner.epoch())),
+    );
     let (transition, state) = match request {
         Request::StageNetworkPublication {
             workspace: _,
@@ -88,7 +104,7 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
                 None if bulk => arachne_node::DeliveryClass::Bulk,
                 None => arachne_node::DeliveryClass::Critical,
             };
-            if current.is_some() && (!recipients.is_empty() || inbox.is_none()) {
+            if current.is_some() && !recipients.is_empty() {
                 return Err("current values require group object delivery".into());
             }
             let mut endpoints = if recipients.is_empty() {
@@ -135,34 +151,19 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
                     .direct_authenticated_bytes(&recipients)
                     .map_err(str::to_owned)?
             };
-            // A direct publication cannot advance the shared MLS application
-            // ratchet: unselected members would miss that generation. The
-            // authenticated object envelope has independent sender counters and
-            // is carried only on the selected Iroh connections.
-            let ciphertext = if !recipients.is_empty() || inbox.is_some() {
-                candidate.protect_object(&aad, &payload)
-            } else {
-                candidate.protect_application(&aad, &payload)
-            }
-            .map_err(str::to_owned)?;
+            // Independent authenticated objects: each has its own sender
+            // counter and decrypts without any ratchet state.
+            let ciphertext = candidate
+                .protect_object(context.topic.namespace().as_bytes(), &aad, &payload)
+                .map_err(str::to_owned)?;
             // Start retention with the first routed publication after activation.
             // No coverage for pre-activation data or old epochs is advertised.
             if recipients.is_empty() && publisher.is_none() {
-                publisher = Some(arachne_delivery::PublisherLog::new(
-                    owner.id(),
-                    owner
-                        .member()
-                        .ok_or("publisher requires member identity")?
-                        .id(),
-                    owner.epoch(),
-                ));
+                publisher = Some(arachne_delivery::PublisherLog::new(owner).map_err(str::to_owned)?);
             }
             let packet = context.packet(&ciphertext).map_err(str::to_owned)?;
             if let Some(current) = current {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|_| "system clock is before Unix epoch")?
-                    .as_secs();
+                let now = arachne_delivery::UnixSeconds::now()?;
                 inbox = Some(
                     inbox
                         .as_ref()
@@ -235,7 +236,7 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
                 &packet,
             )
             .map_err(str::to_owned)?;
-            if current.is_some() && (!message.recipients.is_empty() || inbox.is_none()) {
+            if current.is_some() && !message.recipients.is_empty() {
                 return Err("current values require group object delivery".into());
             }
             if !message.recipients.is_empty() {
@@ -256,9 +257,10 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
                     .direct_authenticated_bytes(&message.recipients)
                     .map_err(str::to_owned)?
             };
-            if let Some(active_inbox) = inbox.as_ref() {
+            {
+                let active_inbox = inbox.as_ref().ok_or("object inbox missing")?;
                 let authenticated = owner
-                    .unprotect_object(&aad, ciphertext)
+                    .unprotect_object(context.topic.namespace().as_bytes(), &aad, ciphertext)
                     .map_err(str::to_owned)?;
                 if authenticated.message.endpoint != message.sender {
                     return Err("direct author mismatch".into());
@@ -283,61 +285,25 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
                     }
                 }
                 (WorkspaceTransition::Inbox, "awaiting_reception_save")
-            } else {
-                if let Some(journal) = received.as_ref() {
-                    let author = owner
-                        .member_id_for_endpoint(message.sender)
-                        .map_err(str::to_owned)?;
-                    match journal
-                        .check(author, &context, ciphertext)
-                        .map_err(str::to_owned)?
-                    {
-                        arachne_delivery::receive::ReceiveStatus::Known => return Ok(Value::Null),
-                        arachne_delivery::receive::ReceiveStatus::Conflicting => {
-                            return Err("conflicting received publication".into());
-                        }
-                        arachne_delivery::receive::ReceiveStatus::Unseen => (),
-                    }
-                }
-                let plaintext = if message.recipients.is_empty() {
-                    candidate
-                        .unprotect_application(&aad, ciphertext)
-                        .map_err(str::to_owned)?
-                } else {
-                    candidate
-                        .unprotect_object(&aad, ciphertext)
-                        .map_err(str::to_owned)?
-                        .message
-                };
-                if plaintext.endpoint != message.sender {
-                    return Err("direct author mismatch".into());
-                }
-                if let Some(journal) = received.as_mut() {
-                    journal
-                        .record_verified(&plaintext, &context, ciphertext)
-                        .map_err(str::to_owned)?;
-                }
-                (
-                    WorkspaceTransition::RoutedReception(context, plaintext, message.recipients),
-                    "awaiting_reception_save",
-                )
             }
         }
         _ => unreachable!(),
     };
+    let publisher = Some(match publisher {
+        Some(publisher) => publisher,
+        None => arachne_delivery::PublisherLog::new(owner).map_err(str::to_owned)?,
+    });
     let snapshot = seal_state(
         session.records.is_some(),
         &candidate,
         key,
         publisher.as_ref(),
-        received.as_ref(),
         inbox.as_ref(),
     )?;
     let value =
         json!({"workspace":candidate.id(), "snapshot":snapshot, "state":state, "durable":false});
     session.staged_workspace = Some(StagedWorkspace {
         publisher,
-        received,
         inbox,
         transition,
         workspace: candidate,
@@ -369,20 +335,22 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
         .storage_key
         .as_ref()
         .ok_or("session has no protected root key")?;
-    let publisher = session
-        .publisher
-        .clone()
-        .unwrap_or(arachne_delivery::PublisherLog::new(
-            owner.id(),
-            owner
-                .member()
-                .ok_or("publisher requires member identity")?
-                .id(),
-            owner.epoch(),
-        ));
-    if let Some(inbox) = session.inbox.as_ref() {
+    let publisher = publisher_or_new(session, owner)?;
+    let fresh;
+    let inbox = match session.inbox.as_ref() {
+        Some(inbox) => inbox,
+        None => {
+            fresh = arachne_delivery::inbox::ObjectInbox::new(owner.id(), owner.epoch());
+            &fresh
+        }
+    };
+    {
         if ready.automatic {
-            let progress = inbox.recovery_progress(ready.query.author, &ready.query.topics);
+            let progress = inbox.recovery_progress(
+                ready.query.author,
+                ready.query.epoch,
+                &ready.query.topics,
+            );
             if ready.query.through <= progress {
                 session.ready_range = None;
                 return Ok(json!({"state":"recovery_already_covered"}));
@@ -399,10 +367,7 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
         };
         let mut next = inbox.clone();
         if retain_until != 0 {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|_| "system clock is before Unix epoch")?
-                .as_secs();
+            let now = arachne_delivery::UnixSeconds::now()?;
             next = next
                 .retain_range(owner, &ready.query, &ready.reply, retain_until, now)
                 .map_err(str::to_owned)?;
@@ -435,7 +400,11 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
                 |live| live.metadata.authenticated_context(&packet.context),
             );
             let authenticated = owner
-                .unprotect_object(&aad, ciphertext)
+                .unprotect_object(
+                    packet.context.topic.namespace().as_bytes(),
+                    &aad,
+                    ciphertext,
+                )
                 .map_err(str::to_owned)?;
             offer
                 .verify_origin(&authenticated.message)
@@ -472,8 +441,7 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
             owner,
             key,
             Some(&publisher),
-            session.received.as_ref(),
-            Some(&next),
+                Some(&next),
         )?;
         let candidate = owner.provisional_copy().map_err(str::to_owned)?;
         let value = json!({"workspace":owner.id(), "snapshot":snapshot, "state":"awaiting_recovery_save",
@@ -481,51 +449,13 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
         session.staged_workspace = Some(StagedWorkspace {
             workspace: candidate,
             publisher: Some(publisher),
-            received: session.received.clone(),
-            inbox: Some(next),
+                inbox: Some(next),
             snapshot,
             transition: WorkspaceTransition::InboxRecovery { count },
         });
         session.ready_range = None;
-        return Ok(value);
+        Ok(value)
     }
-    if retain_until != 0 {
-        return Err("retained third-holder recovery requires object delivery".into());
-    }
-    let received = session.received.clone().unwrap_or_else(|| {
-        arachne_delivery::receive::ReceiveJournal::new(owner.id(), owner.epoch())
-    });
-    let stage = if session.records.is_some() {
-        received.prepare_recovery(owner, &publisher, &ready.query, &ready.reply)
-    } else {
-        received.stage_recovery(owner, key, &publisher, &ready.query, &ready.reply)
-    }
-    .map_err(str::to_owned)?;
-    let value = match stage {
-        arachne_delivery::receive::RecoveryStage::AlreadyCovered => {
-            json!({"state":"recovery_already_covered"})
-        }
-        arachne_delivery::receive::RecoveryStage::Rejected(error) => return Err(error.to_string()),
-        arachne_delivery::receive::RecoveryStage::Prepared(mut staged) => {
-            if session.records.is_some() {
-                staged.snapshot = persistence::candidate_token()?;
-            }
-            let value = json!({"workspace":staged.owner.id(), "snapshot":staged.snapshot,
-                "state":"awaiting_recovery_save", "publication_count":staged.publications.len(),
-                "already_received":staged.already_received, "durable":false, "accepted_progress":false});
-            session.staged_workspace = Some(StagedWorkspace {
-                publisher: Some(publisher),
-                received: Some(staged.received),
-                inbox: session.inbox.clone(),
-                transition: WorkspaceTransition::Recovery(staged.publications),
-                workspace: staged.owner,
-                snapshot: staged.snapshot,
-            });
-            value
-        }
-    };
-    session.ready_range = None;
-    Ok(value)
 }
 
 pub(super) fn stage_direct_recovery(session: &mut Session) -> Result<Value, String> {
@@ -553,27 +483,19 @@ pub(super) fn stage_direct_recovery(session: &mut Session) -> Result<Value, Stri
     let (next, count) = session
         .inbox
         .as_ref()
-        .ok_or("object delivery not enabled")?
+        .ok_or("no object delivery state")?
         .stage_direct_range(owner, &ready.query, &ready.reply)
         .map_err(str::to_owned)?;
     if count == 0 {
         session.ready_direct_range = None;
         return Ok(json!({"state":"direct_recovery_already_covered"}));
     }
-    let publisher = session
-        .publisher
-        .clone()
-        .unwrap_or(arachne_delivery::PublisherLog::new(
-            owner.id(),
-            owner.member().ok_or("member required")?.id(),
-            owner.epoch(),
-        ));
+    let publisher = publisher_or_new(session, owner)?;
     let snapshot = seal_state(
         session.records.is_some(),
         owner,
         key,
         Some(&publisher),
-        session.received.as_ref(),
         Some(&next),
     )?;
     let candidate = owner.provisional_copy().map_err(str::to_owned)?;
@@ -583,7 +505,6 @@ pub(super) fn stage_direct_recovery(session: &mut Session) -> Result<Value, Stri
     session.staged_workspace = Some(StagedWorkspace {
         workspace: candidate,
         publisher: Some(publisher),
-        received: session.received.clone(),
         inbox: Some(next),
         snapshot,
         transition: WorkspaceTransition::InboxRecovery { count },
@@ -608,23 +529,15 @@ pub(super) fn stage_direct_miss(session: &mut Session) -> Result<Value, String> 
     let (next, missing) = session
         .inbox
         .as_ref()
-        .ok_or("object delivery not enabled")?
+        .ok_or("no object delivery state")?
         .skip_direct_gap(owner, query)
         .map_err(str::to_owned)?;
-    let publisher = session
-        .publisher
-        .clone()
-        .unwrap_or(arachne_delivery::PublisherLog::new(
-            owner.id(),
-            owner.member().ok_or("member required")?.id(),
-            owner.epoch(),
-        ));
+    let publisher = publisher_or_new(session, owner)?;
     let snapshot = seal_state(
         session.records.is_some(),
         owner,
         key,
         Some(&publisher),
-        session.received.as_ref(),
         Some(&next),
     )?;
     let candidate = owner.provisional_copy().map_err(str::to_owned)?;
@@ -634,7 +547,6 @@ pub(super) fn stage_direct_miss(session: &mut Session) -> Result<Value, String> 
     session.staged_workspace = Some(StagedWorkspace {
         workspace: candidate,
         publisher: Some(publisher),
-        received: session.received.clone(),
         inbox: Some(next),
         snapshot,
         transition: WorkspaceTransition::DirectMiss { missing },
@@ -654,10 +566,10 @@ pub(super) fn inbox_operation(session: &mut Session, request: Request) -> Result
         .as_ref()
         .ok_or("session has no protected root key")?;
     if let Request::PollPendingObject { deferred } = request {
-        return match session
-            .inbox
-            .as_ref()
-            .ok_or("object delivery not enabled")?
+        let Some(inbox) = session.inbox.as_ref() else {
+            return Ok(Value::Null);
+        };
+        return match inbox
             .pending_excluding(owner, &deferred)
             .map_err(str::to_owned)?
         {
@@ -679,12 +591,6 @@ pub(super) fn inbox_operation(session: &mut Session, request: Request) -> Result
     }
     let rejected = matches!(request, Request::StageObjectRejection { .. });
     let inbox = match request {
-        Request::EnableObjectDelivery {} => {
-            if session.inbox.is_some() {
-                return Ok(json!({"state":"object_delivery_enabled"}));
-            }
-            arachne_delivery::inbox::ObjectInbox::new(owner.id(), owner.epoch())
-        }
         Request::StageObjectAcknowledgement {
             member,
             topic,
@@ -693,7 +599,7 @@ pub(super) fn inbox_operation(session: &mut Session, request: Request) -> Result
         } => session
             .inbox
             .as_ref()
-            .ok_or("object delivery not enabled")?
+            .ok_or("no object delivery state")?
             .acknowledge(
                 member,
                 &Topic::new(topic).map_err(|e| e.to_string())?,
@@ -709,7 +615,7 @@ pub(super) fn inbox_operation(session: &mut Session, request: Request) -> Result
         } => session
             .inbox
             .as_ref()
-            .ok_or("object delivery not enabled")?
+            .ok_or("no object delivery state")?
             .reject(
                 member,
                 &Topic::new(topic).map_err(|e| e.to_string())?,
@@ -719,20 +625,12 @@ pub(super) fn inbox_operation(session: &mut Session, request: Request) -> Result
             .map_err(str::to_owned)?,
         _ => unreachable!(),
     };
-    let publisher = session
-        .publisher
-        .clone()
-        .unwrap_or(arachne_delivery::PublisherLog::new(
-            owner.id(),
-            owner.member().ok_or("member required")?.id(),
-            owner.epoch(),
-        ));
+    let publisher = publisher_or_new(session, owner)?;
     let snapshot = seal_state(
         session.records.is_some(),
         owner,
         key,
         Some(&publisher),
-        session.received.as_ref(),
         Some(&inbox),
     )?;
     let candidate = owner.provisional_copy().map_err(str::to_owned)?;
@@ -740,7 +638,6 @@ pub(super) fn inbox_operation(session: &mut Session, request: Request) -> Result
     session.staged_workspace = Some(StagedWorkspace {
         workspace: candidate,
         publisher: Some(publisher),
-        received: session.received.clone(),
         inbox: Some(inbox),
         transition: if rejected {
             WorkspaceTransition::InboxRejected

@@ -32,7 +32,7 @@ pub use management::{ManagementAction, PreparedManagement, PreparedManagementUpd
 pub use removed::{MAX_SEALED_REMOVAL, RemovedMembership};
 mod message;
 mod object;
-pub use object::AuthenticatedObject;
+pub use object::{AuthenticatedObject, MAX_OBJECT_NAMESPACE, RECEIVE_EPOCHS, object_epoch};
 mod recovery;
 pub use message::{
     ApplicationMessage, MAX_APPLICATION_CIPHERTEXT, MAX_APPLICATION_CONTEXT,
