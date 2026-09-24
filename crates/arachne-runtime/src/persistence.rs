@@ -52,7 +52,7 @@ impl NativeStore {
 pub(super) fn candidate_token() -> Result<Vec<u8>, String> {
     let mut token = vec![0; 37];
     token[..5].copy_from_slice(b"DFRC\x01");
-    getrandom::getrandom(&mut token[5..]).map_err(|e| e.to_string())?;
+    getrandom::fill(&mut token[5..]).map_err(|e| e.to_string())?;
     Ok(token)
 }
 

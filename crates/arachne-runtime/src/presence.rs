@@ -30,7 +30,7 @@ pub(super) struct Presence {
 impl Presence {
     pub fn new() -> Result<Self, String> {
         let mut instance = [0; 16];
-        getrandom::getrandom(&mut instance).map_err(|error| error.to_string())?;
+        getrandom::fill(&mut instance).map_err(|error| error.to_string())?;
         Ok(Self {
             seen: BTreeMap::new(),
             pending: Vec::new(),

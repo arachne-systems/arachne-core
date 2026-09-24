@@ -99,7 +99,7 @@ impl Store {
         connection.set_limit(
             rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
             (MAX_RECORD_BYTES + MAX_KEY_BYTES + 4096) as i32,
-        );
+        )?;
         connection.execute_batch(
             "PRAGMA locking_mode=EXCLUSIVE;
              PRAGMA journal_mode=DELETE;
@@ -316,7 +316,7 @@ impl Store {
     }
     fn seal(&self, kind: u8, name: &[u8], plain: &[u8]) -> Result<Vec<u8>> {
         let mut nonce = [0; 12];
-        getrandom::getrandom(&mut nonce).map_err(|_| "record randomness failed")?;
+        getrandom::fill(&mut nonce).map_err(|_| "record randomness failed")?;
         let cipher =
             Aes256Gcm::new_from_slice(self.key.as_ref()).map_err(|_| "invalid storage key")?;
         let mut packet = nonce.to_vec();
