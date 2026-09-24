@@ -146,7 +146,15 @@ impl ProtocolHandler for Gossip {
 pub struct Builder {
     config: proto::Config,
     alpn: Option<Bytes>,
-    dial_capacity: Option<Arc<Semaphore>>,
+    dial: DialOptions,
+}
+
+/// Arachne dial settings for the native dial task.
+#[derive(Debug, Clone, Default)]
+struct DialOptions {
+    capacity: Option<Arc<Semaphore>>,
+    preamble: Option<Bytes>,
+    timeout: Option<std::time::Duration>,
 }
 
 impl Builder {
@@ -154,7 +162,23 @@ impl Builder {
     /// Waiting and connecting remain inside the cancellable dial task; dropping
     /// it returns the permit. Established connections are budgeted separately.
     pub fn dial_capacity(mut self, capacity: Arc<Semaphore>) -> Self {
-        self.dial_capacity = Some(capacity);
+        self.dial.capacity = Some(capacity);
+        self
+    }
+
+    /// Bound each dial attempt, so a silent peer returns the dial permit at
+    /// this deadline instead of when Iroh gives up. A timeout is a failed dial.
+    pub fn dial_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.dial.timeout = Some(timeout);
+        self
+    }
+
+    /// Bytes written on the first unidirectional stream of every connection
+    /// this instance dials, before any gossip stream. The accepting side reads
+    /// them before it passes the connection to [`Gossip::handle_connection`].
+    /// A connection whose preamble cannot be written is closed.
+    pub fn connect_preamble(mut self, preamble: impl Into<Bytes>) -> Self {
+        self.dial.preamble = Some(preamble.into());
         self
     }
 
@@ -208,7 +232,7 @@ impl Builder {
             metrics.clone(),
             self.alpn,
             address_lookup,
-            self.dial_capacity,
+            self.dial,
         );
         let me = actor.endpoint.id().fmt_short();
         let max_message_size = actor.state.max_message_size();
@@ -236,7 +260,7 @@ impl Gossip {
         Builder {
             config: Default::default(),
             alpn: None,
-            dial_capacity: None,
+            dial: DialOptions::default(),
         }
     }
 
@@ -322,14 +346,14 @@ impl Actor {
         metrics: Arc<Metrics>,
         alpn: Option<Bytes>,
         address_lookup: GossipAddressLookup,
-        dial_capacity: Option<Arc<Semaphore>>,
+        dial: DialOptions,
     ) -> (
         Self,
         mpsc::Sender<RpcMessage>,
         mpsc::Sender<LocalActorMessage>,
     ) {
         let peer_id = endpoint.id();
-        let dialer = Dialer::new(endpoint.clone(), dial_capacity);
+        let dialer = Dialer::new(endpoint.clone(), dial);
         let state = proto::State::new(
             peer_id,
             Default::default(),
@@ -1013,23 +1037,47 @@ impl Stream for TopicCommandStream {
     }
 }
 
+/// Why a dial produced no connection.
+#[derive(Debug)]
+enum DialError {
+    Connect(iroh::endpoint::ConnectError),
+    Timeout,
+}
+
+impl std::fmt::Display for DialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connect(error) => error.fmt(f),
+            Self::Timeout => f.write_str("dial deadline exceeded"),
+        }
+    }
+}
+
+/// Write the preamble on the connection's first unidirectional stream.
+async fn write_preamble(conn: &Connection, preamble: &[u8]) -> bool {
+    let Ok(mut stream) = conn.open_uni().await else {
+        return false;
+    };
+    stream.write_all(preamble).await.is_ok() && stream.finish().is_ok()
+}
+
 #[derive(Debug)]
 struct Dialer {
     endpoint: Endpoint,
-    capacity: Option<Arc<Semaphore>>,
+    options: DialOptions,
     pending: JoinSet<(
         EndpointId,
-        Option<Result<Connection, iroh::endpoint::ConnectError>>,
+        Option<Result<Connection, DialError>>,
     )>,
     pending_dials: HashMap<EndpointId, CancellationToken>,
 }
 
 impl Dialer {
     /// Create a new dialer for a [`Endpoint`]
-    fn new(endpoint: Endpoint, capacity: Option<Arc<Semaphore>>) -> Self {
+    fn new(endpoint: Endpoint, options: DialOptions) -> Self {
         Self {
             endpoint,
-            capacity,
+            options,
             pending: Default::default(),
             pending_dials: Default::default(),
         }
@@ -1043,7 +1091,11 @@ impl Dialer {
         let cancel = CancellationToken::new();
         self.pending_dials.insert(endpoint_id, cancel.clone());
         let endpoint = self.endpoint.clone();
-        let capacity = self.capacity.clone();
+        let DialOptions {
+            capacity,
+            preamble,
+            timeout,
+        } = self.options.clone();
         self.pending.spawn(
             async move {
                 let res = tokio::select! {
@@ -1054,7 +1106,20 @@ impl Dialer {
                             Some(capacity) => Some(capacity.acquire_owned().await.ok()?),
                             None => None,
                         };
-                        Some(endpoint.connect(endpoint_id, &alpn).await)
+                        let connect = endpoint.connect(endpoint_id, &alpn);
+                        let res = match timeout {
+                            Some(timeout) => match tokio::time::timeout(timeout, connect).await {
+                                Ok(res) => res.map_err(DialError::Connect),
+                                Err(_) => Err(DialError::Timeout),
+                            },
+                            None => connect.await.map_err(DialError::Connect),
+                        };
+                        if let (Ok(conn), Some(preamble)) = (&res, preamble) {
+                            if !write_preamble(conn, &preamble).await {
+                                conn.close(0u32.into(), b"preamble not sent");
+                            }
+                        }
+                        Some(res)
                     } => res,
                 };
                 (endpoint_id, res)
@@ -1074,7 +1139,7 @@ impl Dialer {
         &mut self,
     ) -> (
         EndpointId,
-        Option<Result<Connection, iroh::endpoint::ConnectError>>,
+        Option<Result<Connection, DialError>>,
     ) {
         match self.pending_dials.is_empty() {
             false => {

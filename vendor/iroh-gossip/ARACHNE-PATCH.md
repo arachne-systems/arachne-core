@@ -46,8 +46,21 @@ Found with `diff -ru` against the crates.io archive
    `dial_capacity: Option<Arc<Semaphore>>`. The in-crate test helper that
    calls `Actor::new` passes `None`.
 4. `Semaphore` is added to the `tokio::sync` import.
+5. **Dial deadline.** `Builder::dial_timeout(Duration)` bounds each dial
+   attempt inside the same task, so a silent peer returns the shared dial
+   permit at the host's deadline instead of when Iroh gives up. A timeout is
+   reported as a failed dial.
+6. **Connection preamble (the one wire addition).**
+   `Builder::connect_preamble(Bytes)`: every connection the instance dials
+   first carries these bytes on its own unidirectional stream, before any
+   gossip stream. Arachne uses one fixed gossip ALPN for all workspaces and
+   sends a keyed workspace tag this way, inside the encrypted connection, so
+   the TLS ClientHello does not name the workspace. The accepting side reads
+   the preamble before it calls `Gossip::handle_connection`; gossip itself
+   never sees it.
 
-No wire format, protocol version, crypto or dependency version changes.
+No protocol version, crypto or dependency version changes. Item 6 adds bytes
+before the gossip streams on dialed connections.
 The actor still owns its peer-deduplicated queue, retries, routing and gossip
 state machine.
 
