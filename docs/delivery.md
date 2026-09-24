@@ -174,11 +174,12 @@ Group objects go to every subscriber of the topic.
   caller) stays all-or-nothing and fails at the bound.
   Cost: in the worst case, each cycle fetches up to 128 KiB again to admit
   about two full-size objects. The wire format did not change.
-- **Limit.** Authors and holders serve, and receivers verify, ranges for any
-  epoch in the receive window (`arachne-delivery` API). The runtime recovery
-  operations (`fetch_recovery_range`, `discover_recovery_cutoff`) request the
-  current epoch only. A gap in an older epoch closes by live receipt, not by
-  runtime-driven recovery.
+- **Epochs (A3f).** Authors and holders serve, and receivers verify, ranges
+  for any epoch in the receive window (`arachne-delivery` API). The runtime
+  recovery operations (`fetch_recovery_range`, `discover_recovery_cutoff`)
+  take an optional `epoch` in the receive window; without it they ask for the
+  current epoch. An epoch outside the window fails with `EpochMismatch`
+  (600). Test: `arachne-runtime/tests/recovery_epoch_window.rs`.
 - **Ordering.** No order between authors. Objects of one scope come in author
   order when they are pending together; a late object can come after newer
   ones that were already delivered.

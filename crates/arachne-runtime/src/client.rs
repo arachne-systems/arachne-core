@@ -1885,6 +1885,16 @@ impl Client {
         &self,
         request: RecoveryRangeRequest,
     ) -> Result<RecoveryRangeStatus> {
+        self.fetch_recovery_range_at(request, None)
+    }
+
+    /// `fetch_recovery_range` for an earlier author epoch that is still in
+    /// the receive window (A3f). `None` is the current epoch.
+    pub fn fetch_recovery_range_at(
+        &self,
+        request: RecoveryRangeRequest,
+        epoch: Option<u64>,
+    ) -> Result<RecoveryRangeStatus> {
         let status = self.call(Op::FetchRecoveryRange, |session| {
             ops::recovery::fetch_range(
                 session,
@@ -1895,6 +1905,7 @@ impl Client {
                     topics: request.topics,
                     after: request.after,
                     through: request.through,
+                    epoch,
                 },
             )
         })?;

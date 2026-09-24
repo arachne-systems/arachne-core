@@ -108,6 +108,10 @@ pub(crate) struct FetchRangeArgs {
     pub after: Option<u64>,
     #[serde(default)]
     pub through: Option<u64>,
+    /// The author epoch to recover (A3f): any epoch in the receive window.
+    /// Absent: the current epoch.
+    #[serde(default)]
+    pub epoch: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -147,6 +151,10 @@ pub(crate) struct CutoffArgs {
     pub peer: [u8; 32],
     pub revision: u64,
     pub topics: Vec<String>,
+    /// The epoch whose retained window to ask for (A3f): any epoch in the
+    /// receive window. Absent: the current epoch.
+    #[serde(default)]
+    pub epoch: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -398,7 +406,9 @@ pub(crate) fn check_recovery_policy(
         .workspace
         .as_ref()
         .ok_or_else(errors::no_workspace)?;
-    if owner.id() != workspace || owner.epoch() != epoch {
+    // A3f: any epoch still in the receive window may be recovered. An epoch
+    // change also cancels pending recovery (`check_epoch_transition`).
+    if owner.id() != workspace || !owner.in_receive_window(epoch) {
         return Err(ApiError::epoch_mismatch("recovery scope changed"));
     }
     if !owner
@@ -447,6 +457,18 @@ pub(crate) fn check_recovery_policy(
         }))
 }
 
+/// The epoch a recovery op asks for: the requested one if it is in the
+/// receive window (A3f), else the current epoch.
+fn recovery_epoch(owner: &arachne_security::Workspace, epoch: Option<u64>) -> Result<u64, ApiError> {
+    match epoch {
+        None => Ok(owner.epoch()),
+        Some(epoch) if owner.in_receive_window(epoch) => Ok(epoch),
+        Some(_) => Err(ApiError::epoch_mismatch(
+            "recovery epoch is outside the receive window",
+        )),
+    }
+}
+
 fn topic_set(topics: Vec<String>) -> Result<BTreeSet<Topic>, ApiError> {
     let count = topics.len();
     let topics = topics
@@ -474,6 +496,7 @@ pub(crate) fn fetch_range(session: &mut Session, args: FetchRangeArgs) -> Result
         topics,
         after,
         through,
+        epoch,
     } = args;
     if busy(session) {
         return Err(ApiError::wrong_state("recovery operation already pending"));
@@ -494,6 +517,7 @@ pub(crate) fn fetch_range(session: &mut Session, args: FetchRangeArgs) -> Result
         ));
     }
     let topics = topic_set(topics)?;
+    let epoch = recovery_epoch(owner, epoch)?;
     let author = match (author, peer) {
         (Some(author), _) => owner
             .endpoints_for_members(&[author])
@@ -514,14 +538,14 @@ pub(crate) fn fetch_range(session: &mut Session, args: FetchRangeArgs) -> Result
             .inbox
             .as_ref()
             .ok_or_else(|| ApiError::wrong_state("automatic recovery requires object delivery"))?
-            .recovery_progress(author, owner.epoch(), &topics),
+            .recovery_progress(author, epoch, &topics),
     };
     let available = through
         .is_none()
         .then(|| arachne_delivery::wire::AvailableRangeQuery {
             workspace: owner.id(),
             author,
-            epoch: owner.epoch(),
+            epoch,
             policy_revision: revision,
             after,
             topics: topics.clone(),
@@ -529,7 +553,7 @@ pub(crate) fn fetch_range(session: &mut Session, args: FetchRangeArgs) -> Result
     let query = arachne_delivery::RangeQuery {
         workspace: owner.id(),
         author,
-        epoch: owner.epoch(),
+        epoch,
         policy_revision: revision,
         after,
         through: through.unwrap_or_else(|| after.saturating_add(1)),
@@ -1292,6 +1316,7 @@ pub(crate) fn discover_cutoff(session: &mut Session, args: CutoffArgs) -> Result
         peer,
         revision,
         topics,
+        epoch,
     } = args;
     if busy(session) {
         return Err(ApiError::wrong_state("recovery operation already pending"));
@@ -1307,13 +1332,14 @@ pub(crate) fn discover_cutoff(session: &mut Session, args: CutoffArgs) -> Result
         ));
     }
     let topics = topic_set(topics)?;
+    let epoch = recovery_epoch(owner, epoch)?;
     let expected = owner
         .recovery_cutoff_request(peer, arachne_delivery::selection_digest(&topics), revision)
         .map_err(security(ErrorCode::InvalidInput))?;
     let query = arachne_delivery::wire::CutoffQuery {
         workspace: expected.workspace,
         author: expected.author,
-        epoch: expected.epoch,
+        epoch,
         policy_revision: revision,
         topics,
         nonce: expected.nonce,
@@ -1393,7 +1419,7 @@ pub(crate) fn poll_cutoff(session: &mut Session) -> Result<Option<CutoffStatus>,
                 workspace: owner.id(),
                 author: query.author,
                 peer: pending.peer,
-                epoch: owner.epoch(),
+                epoch: query.epoch,
                 revision: query.policy_revision,
                 topics: query.topics.iter().map(|topic| topic.as_str().to_owned()).collect(),
                 head,
