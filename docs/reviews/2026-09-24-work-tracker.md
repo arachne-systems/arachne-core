@@ -18,8 +18,8 @@ test is red → green and the crate tests pass.
 
 ## SDK bugs (arachne-sdk repo — owned by the SDK agent, not this branch)
 
-- [ ] **B10** Go, Python and Swift hold the client lock in `wait_for_work`; `close()` deadlocks.
-- [ ] **B11** The SDK pins core 7123166, which is missing `fbc4e91` (wake host loop after delivery).
+- [x] **B10** (SDK `fix/b10-b11-locks-pin` d528df4; Go/Python/Swift red→green) Go, Python and Swift hold the client lock in `wait_for_work`; `close()` deadlocks.
+- [x] **B11** (SDK `fix/b10-b11-locks-pin` 3ebd82a; core → b06a72d) The SDK pins core 7123166, which is missing `fbc4e91` (wake host loop after delivery).
 
 ## ATAK plugin → SDK readiness (from `arachne-sdk/docs/android-consumer-plan.md`)
 
