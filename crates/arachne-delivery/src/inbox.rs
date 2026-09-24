@@ -779,15 +779,20 @@ impl ObjectInbox {
         advanced.current = None;
         advanced.retained_current_views.clear();
         advanced.current_progress.clear();
+        let mut missed = 0;
         for stream in &mut advanced.direct {
             while let Some(record) = stream.records.first() {
                 if arachne_security::object_epoch(&record.object).is_some_and(|epoch| epoch >= oldest)
                 {
                     break;
                 }
-                stream.floor = stream.floor.max(stream.records.remove(0).sequence);
+                // B7f-2: copies that left the receive window move the floor
+                // past any gap before them; those sequences are missed, as
+                // on an eviction (B7e).
+                missed += stream.evict_first();
             }
         }
+        advanced.missed = advanced.missed.saturating_add(missed);
         // A direct scope that names a removed member ends: its copies can no
         // longer be authenticated or served to that audience.
         advanced.direct.retain(|stream| {

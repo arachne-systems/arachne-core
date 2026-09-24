@@ -135,3 +135,40 @@ fn a_late_object_below_an_explicit_miss_is_dropped() {
     ));
     assert_eq!(inbox.pending_count(), 1);
 }
+
+/// B7f-2: when an epoch change moves a direct scope's floor past a gap (its
+/// copies left the receive window), the skipped sequences count as missed,
+/// the same as an eviction (B7e).
+#[test]
+fn an_epoch_change_past_a_gap_counts_the_skipped_sequences_as_missed() {
+    let (mut author, mut reader) = author_and_reader();
+    let recipient = [reader.member().unwrap().id()];
+    // Sequence 1 is lost live; 2 waits behind the gap.
+    let (context, object) = direct(&mut author, recipient[0], 2);
+    let InboxStage::Prepared(inbox) = ObjectInbox::new(reader.id(), reader.epoch())
+        .stage_with_recipients(&reader, &context, &recipient, &object)
+        .unwrap()
+    else {
+        panic!("live object was not new")
+    };
+    let mut inbox = *inbox;
+    assert_eq!(inbox.missed_direct(), 0);
+    // The workspace moves past the receive window: the author registers
+    // invitations and the reader follows each step.
+    for _ in 0..=arachne_security::RECEIVE_EPOCHS {
+        let (prepared, _, _) = author.prepare_invitation(u64::MAX, false, false).unwrap();
+        let next = match reader
+            .prepare_management_update(prepared.action, &prepared.commit)
+            .unwrap()
+        {
+            arachne_security::PreparedManagementUpdate::Active(next) => *next,
+            arachne_security::PreparedManagementUpdate::Removed(_) => panic!("reader removed"),
+        };
+        inbox = inbox.advance(&reader, &next).unwrap();
+        author = prepared.workspace;
+        reader = next;
+    }
+    // The copy of sequence 2 left the window; the floor passed sequence 1.
+    assert_eq!(inbox.missed_direct(), 1);
+    assert!(inbox.next_direct_gap(&reader).unwrap().is_none());
+}
