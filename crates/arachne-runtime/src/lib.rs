@@ -10,8 +10,8 @@ use std::{
 };
 
 use arachne_node::{
-    AdmissionReport, ConnectionBudget, ControlClient, NetworkProfile, Node, Permissions,
-    RelayOptions, Topic,
+    AdmissionReport, ConnectionBudget, ControlClient, NetworkProfile, Node, NodeOptions,
+    Permissions, RelayOptions, Timeouts, Topic,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -55,6 +55,7 @@ pub use client::{
     RecoveryRangeRequest, RecoveryRangeStatus, RecoveryStage, Result as ClientResult, RouteHint,
     RouteKind, WorkspaceCandidate, WorkspaceInfo, WorkspaceMetrics, WorkspaceState,
 };
+pub use client::{OperatorRelay, RelayTrust, TransportInfo, TransportOptions, TransportTimeouts};
 pub use arachne_store::FreshnessAnchor;
 pub use persistence::{
     enable_record_storage, record_freshness, restore_record_storage,
@@ -291,6 +292,14 @@ impl Drop for PendingCurrentView {
     }
 }
 
+/// The transport services this endpoint was bound with, for `describe`.
+#[derive(Clone, Copy)]
+struct TransportSummary {
+    public_lookup: bool,
+    operator_relay: bool,
+    timeouts: Timeouts,
+}
+
 struct Session {
     resources: resources::Jobs,
     presence: presence::Presence,
@@ -384,6 +393,7 @@ struct Registry {
     // Kept outside the session mutex: a parked host never blocks `execute`.
     signals: BTreeMap<i64, Arc<work_signal::WorkSignal>>,
     cancellations: BTreeMap<i64, watch::Sender<bool>>,
+    transports: BTreeMap<i64, TransportSummary>,
     connection_budget: ConnectionBudget,
 }
 
@@ -400,6 +410,7 @@ static REGISTRY: std::sync::LazyLock<Mutex<Registry>> = std::sync::LazyLock::new
         sessions: BTreeMap::new(),
         signals: BTreeMap::new(),
         cancellations: BTreeMap::new(),
+        transports: BTreeMap::new(),
         connection_budget: ConnectionBudget::default(),
     })
 });
@@ -543,55 +554,72 @@ fn nearby_workspace_payloads(reply: &[u8]) -> Vec<&[u8]> {
 /// Create an endpoint session. Credentials must be unique to this workspace-facing endpoint.
 /// Blocking: invoke outside an async runtime. Call `close` to release its resources.
 pub fn create(secret: Option<&[u8; 32]>) -> Result<i64, String> {
-    create_endpoint(secret, NetworkProfile::Direct, None)
+    create_endpoint(secret, NodeOptions::new(NetworkProfile::Direct))
 }
 
 /// Opt in to local endpoint advertisement and lookup. No public discovery or relay.
 /// Uses the supplied workspace-scoped identity; discovery does not grant membership.
 pub fn create_lan(secret: &[u8; 32]) -> Result<i64, String> {
-    create_endpoint(Some(secret), NetworkProfile::Lan, None)
+    create_endpoint(Some(secret), NodeOptions::new(NetworkProfile::Lan))
 }
 
 /// Advertise a device-level nearby-invitation endpoint on the local network.
 pub fn create_nearby(secret: &[u8; 32]) -> Result<i64, String> {
-    create_endpoint(Some(secret), NetworkProfile::Nearby, None)
+    create_endpoint(Some(secret), NodeOptions::new(NetworkProfile::Nearby))
 }
 
 /// Opt in to Iroh's public Pkarr lookup and relay network, with LAN discovery
 /// retained as a local fallback. External services provide routes, not authority.
 pub fn create_wan(secret: &[u8; 32]) -> Result<i64, String> {
-    create_endpoint(Some(secret), NetworkProfile::Wan, None)
+    create_endpoint(Some(secret), NodeOptions::new(NetworkProfile::Wan))
 }
 
 /// Force Iroh relay paths for a diagnostic WAN check while preserving the
 /// caller's network connection and workspace-scoped endpoint identity.
 pub fn create_relay(secret: &[u8; 32]) -> Result<i64, String> {
-    create_endpoint(Some(secret), NetworkProfile::RelayOnly, None)
+    create_endpoint(Some(secret), NodeOptions::new(NetworkProfile::RelayOnly))
 }
 
 /// Use a caller-supplied relay map for controlled qualification or an
 /// operator-managed relay deployment.
 pub fn create_relay_with_options(secret: &[u8; 32], relay: RelayOptions) -> Result<i64, String> {
-    create_endpoint(Some(secret), NetworkProfile::RelayOnly, Some(relay))
+    create_endpoint(
+        Some(secret),
+        NodeOptions {
+            relay: Some(relay),
+            ..NodeOptions::new(NetworkProfile::RelayOnly)
+        },
+    )
 }
 
 /// Use public endpoint lookup without LAN discovery or saved address hints.
 /// Direct Iroh paths remain enabled for a diagnostic WAN check.
 pub fn create_wan_only(secret: &[u8; 32]) -> Result<i64, String> {
-    create_endpoint(Some(secret), NetworkProfile::WanOnly, None)
+    create_endpoint(Some(secret), NodeOptions::new(NetworkProfile::WanOnly))
 }
 
 /// Create a Tor-only endpoint using the supplied stable endpoint identity.
 #[cfg(feature = "tor")]
 pub fn create_tor(secret: &[u8; 32]) -> Result<i64, String> {
-    create_endpoint(Some(secret), NetworkProfile::Tor, None)
+    create_endpoint(Some(secret), NodeOptions::new(NetworkProfile::Tor))
 }
 
-fn create_endpoint(
+/// Create an endpoint session with explicit node options: the profile, an
+/// operator relay, n0 lookup on or off, and transport deadlines.
+pub fn create_with_options(
     secret: Option<&[u8; 32]>,
-    profile: NetworkProfile,
-    relay: Option<RelayOptions>,
+    options: NodeOptions,
 ) -> Result<i64, String> {
+    create_endpoint(secret, options)
+}
+
+fn create_endpoint(secret: Option<&[u8; 32]>, options: NodeOptions) -> Result<i64, String> {
+    let profile = options.profile;
+    let transport = TransportSummary {
+        public_lookup: options.public_lookup,
+        operator_relay: options.relay.is_some(),
+        timeouts: options.timeouts,
+    };
     // Hold the registry only to reserve; a bind can take seconds and every
     // other session's lookup needs this lock.
     let (handle, connection_budget) = {
@@ -610,21 +638,8 @@ fn create_endpoint(
         .block_on(async {
             tokio::time::timeout(Duration::from_secs(10), async {
                 let address = ([0, 0, 0, 0], 0).into();
-                let bound = match relay {
-                    Some(relay) => {
-                        Node::bind_with_profile_and_relay(
-                            address,
-                            secret,
-                            profile,
-                            connection_budget,
-                            relay,
-                        )
-                        .await?
-                    }
-                    None => {
-                        Node::bind_with_profile(address, secret, profile, connection_budget).await?
-                    }
-                };
+                let bound =
+                    Node::bind_with_options(address, secret, options, connection_budget).await?;
                 if matches!(profile, NetworkProfile::RelayOnly) {
                     bound.0.wait_online().await;
                 }
@@ -712,6 +727,7 @@ fn create_endpoint(
     let mut registry = REGISTRY.lock().map_err(|_| "node registry unavailable")?;
     registry.signals.insert(handle, signal);
     registry.cancellations.insert(handle, cancellation);
+    registry.transports.insert(handle, transport);
     registry.sessions.insert(handle, shared);
     registry.release();
     reservation.armed = false;
@@ -746,6 +762,13 @@ fn session(handle: i64) -> Result<SharedSession, String> {
 
 /// Return endpoint metadata for a live session.
 pub fn describe(handle: i64) -> Result<String, String> {
+    let transport = REGISTRY
+        .lock()
+        .map_err(|_| "node registry unavailable")?
+        .transports
+        .get(&handle)
+        .copied()
+        .ok_or("invalid or closed node handle")?;
     let shared = session(handle)?;
     let guard = shared.lock().map_err(|_| "node session unavailable")?;
     let session = guard.as_ref().ok_or("node is closed")?;
@@ -754,13 +777,23 @@ pub fn describe(handle: i64) -> Result<String, String> {
         "bound_address": session.node.address().to_string(),
         "workspace_ready": session.workspace.is_some(),
         "activity": activity_value(session),
+        "transport": {
+            "public_lookup": transport.public_lookup,
+            "operator_relay": transport.operator_relay,
+            "peer_id_lookup": session.node.can_dial_by_peer_id(),
+            "timeouts": {
+                "operation": transport.timeouts.operation,
+                "dial": transport.timeouts.dial,
+                "gossip_join": transport.timeouts.gossip_join,
+            },
+        },
     })
     .to_string())
 }
 
 /// Stop a session and release its transport, tasks and runtime.
 pub fn close(handle: i64) -> Result<(), String> {
-    let (shared, signal, cancellation) = {
+    let (shared, signal, cancellation, _) = {
         let mut registry = REGISTRY.lock().map_err(|_| "node registry unavailable")?;
         let shared = registry
             .sessions
@@ -770,6 +803,7 @@ pub fn close(handle: i64) -> Result<(), String> {
             shared,
             registry.signals.remove(&handle),
             registry.cancellations.remove(&handle),
+            registry.transports.remove(&handle),
         )
     };
     if let Some(cancellation) = cancellation {
@@ -6084,6 +6118,7 @@ mod tests {
             sessions: BTreeMap::new(),
             signals: BTreeMap::new(),
             cancellations: BTreeMap::new(),
+            transports: BTreeMap::new(),
             connection_budget: ConnectionBudget::default(),
         };
         let handles: Vec<_> = (0..MAX_SESSIONS)

@@ -4,15 +4,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    WorkspacePhase, cancel, close, create, create_lan, create_nearby, create_relay, create_wan,
-    create_wan_only, describe, enable_record_storage as enable_runtime_record_storage, execute,
-    execute_stored, record_freshness as runtime_record_freshness,
+    WorkspacePhase, cancel, close, create_with_options, describe,
+    enable_record_storage as enable_runtime_record_storage, execute, execute_stored,
+    record_freshness as runtime_record_freshness,
     restore_record_storage as restore_runtime_record_storage,
     restore_record_storage_with_freshness as restore_runtime_record_storage_with_freshness,
     save_candidate as save_runtime_candidate, wait_for_work, FreshnessAnchor,
 };
-#[cfg(feature = "tor")]
-use crate::create_tor;
 
 /// Address discovery and transport selection for a typed runtime client.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +30,129 @@ pub enum Network {
 pub struct ClientConfig {
     pub network: Network,
     pub secret: Option<[u8; 32]>,
+    /// Relay, lookup and deadline overrides. `Default` keeps the profile's.
+    pub transport: TransportOptions,
+}
+
+/// Transport overrides on top of a `Network` profile. Every field left
+/// `None` keeps the profile default.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TransportOptions {
+    /// Operator relays. They replace n0's public relays.
+    pub relay: Option<OperatorRelay>,
+    /// n0's public DNS/Pkarr address lookup and publishing. `Some(false)`
+    /// keeps a WAN endpoint away from n0; pair it with `relay`.
+    pub public_lookup: Option<bool>,
+    /// Deadlines for a slow or constrained link.
+    pub timeouts: Option<TransportTimeouts>,
+}
+
+/// Relays run by the deployment operator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperatorRelay {
+    /// Relay URLs, for example `https://relay.example.org`.
+    pub urls: Vec<String>,
+    /// How the relays' TLS certificates are checked.
+    pub trust: RelayTrust,
+}
+
+/// TLS trust for operator relays.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RelayTrust {
+    /// The built-in WebPKI roots.
+    WebPki,
+    /// Only these DER-encoded root certificates, for a private CA.
+    CustomRoots(Vec<Vec<u8>>),
+}
+
+/// Transport deadlines. Each must be nonzero.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+pub struct TransportTimeouts {
+    /// One data exchange or resource admission, including its dial.
+    pub operation: std::time::Duration,
+    /// One dial.
+    pub dial: std::time::Duration,
+    /// How long a live broadcast waits for a first overlay neighbor.
+    pub gossip_join: std::time::Duration,
+}
+
+/// The transport services an endpoint was bound with.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+pub struct TransportInfo {
+    /// n0's public lookup is in use.
+    pub public_lookup: bool,
+    /// Operator relays replace n0's relays.
+    pub operator_relay: bool,
+    /// The endpoint can find a peer by key alone (mDNS, n0 lookup or Tor).
+    pub peer_id_lookup: bool,
+    pub timeouts: TransportTimeouts,
+}
+
+impl Network {
+    fn profile(self) -> arachne_node::NetworkProfile {
+        use arachne_node::NetworkProfile;
+        match self {
+            Network::Direct => NetworkProfile::Direct,
+            Network::Lan => NetworkProfile::Lan,
+            Network::Nearby => NetworkProfile::Nearby,
+            Network::Wan => NetworkProfile::Wan,
+            Network::RelayOnly => NetworkProfile::RelayOnly,
+            Network::WanOnly => NetworkProfile::WanOnly,
+            #[cfg(feature = "tor")]
+            Network::Tor => NetworkProfile::Tor,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Network::Direct => "direct",
+            Network::Lan => "LAN",
+            Network::Nearby => "nearby",
+            Network::Wan => "WAN",
+            Network::RelayOnly => "relay-only",
+            Network::WanOnly => "WAN-only",
+            #[cfg(feature = "tor")]
+            Network::Tor => "Tor",
+        }
+    }
+}
+
+impl TransportOptions {
+    /// The node options for `network` with these overrides applied.
+    fn node_options(&self, network: Network) -> Result<arachne_node::NodeOptions> {
+        let invalid = |message: &str| error(ErrorKind::InvalidInput, message);
+        let mut options = arachne_node::NodeOptions::new(network.profile());
+        if let Some(lookup) = self.public_lookup {
+            options.public_lookup = lookup;
+        }
+        if let Some(timeouts) = self.timeouts {
+            if timeouts.operation.is_zero()
+                || timeouts.dial.is_zero()
+                || timeouts.gossip_join.is_zero()
+            {
+                return Err(invalid("transport timeouts must be nonzero"));
+            }
+            options.timeouts = arachne_node::Timeouts {
+                operation: timeouts.operation,
+                dial: timeouts.dial,
+                gossip_join: timeouts.gossip_join,
+            };
+        }
+        if let Some(relay) = &self.relay {
+            let roots = match &relay.trust {
+                RelayTrust::WebPki => Vec::new(),
+                RelayTrust::CustomRoots(roots) if roots.is_empty() => {
+                    return Err(invalid("operator relay custom roots must not be empty"));
+                }
+                RelayTrust::CustomRoots(roots) => roots.clone(),
+            };
+            options.relay = Some(
+                arachne_node::RelayOptions::operator(relay.urls.iter().map(String::as_str), roots)
+                    .map_err(invalid)?,
+            );
+        }
+        Ok(options)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,6 +197,7 @@ pub struct EndpointInfo {
     pub endpoint_key: [u8; 32],
     pub bound_address: String,
     pub workspace_ready: bool,
+    pub transport: TransportInfo,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -457,26 +579,17 @@ pub struct Client {
 
 impl Client {
     pub fn open(config: ClientConfig) -> Result<Self> {
-        let handle = match config.network {
-            Network::Direct => {
-                create(config.secret.as_ref()).map_err(|message| map_error(&message))
-            }
-            Network::Lan => create_required_secret(config.secret.as_ref(), "LAN", create_lan),
-            Network::Nearby => {
-                create_required_secret(config.secret.as_ref(), "nearby", create_nearby)
-            }
-            Network::Wan => create_required_secret(config.secret.as_ref(), "WAN", create_wan),
-            Network::RelayOnly => {
-                create_required_secret(config.secret.as_ref(), "relay-only", create_relay)
-            }
-            Network::WanOnly => {
-                create_required_secret(config.secret.as_ref(), "WAN-only", create_wan_only)
-            }
-            #[cfg(feature = "tor")]
-            Network::Tor => create_required_secret(config.secret.as_ref(), "Tor", create_tor),
-        };
+        if config.network != Network::Direct && config.secret.is_none() {
+            return Err(error(
+                ErrorKind::InvalidInput,
+                format!("{} requires a secret", config.network.name()),
+            ));
+        }
+        let options = config.transport.node_options(config.network)?;
+        let handle = create_with_options(config.secret.as_ref(), options)
+            .map_err(|message| map_error(&message))?;
         Ok(Self {
-            handle: Some(handle?),
+            handle: Some(handle),
         })
     }
 
@@ -1823,12 +1936,3 @@ fn map_error(message: &str) -> Error {
     error(kind, message)
 }
 
-fn create_required_secret(
-    secret: Option<&[u8; 32]>,
-    name: &str,
-    create: fn(&[u8; 32]) -> std::result::Result<i64, String>,
-) -> Result<i64> {
-    let secret = secret
-        .ok_or_else(|| error(ErrorKind::InvalidInput, format!("{name} requires a secret")))?;
-    create(secret).map_err(|message| map_error(&message))
-}

@@ -10,6 +10,7 @@ fn typed_client_opens_tor_only_endpoint_with_the_supplied_identity() {
         Client::open(ClientConfig {
             network: Network::Tor,
             secret: None,
+            transport: Default::default(),
         })
         .is_err()
     );
@@ -18,6 +19,7 @@ fn typed_client_opens_tor_only_endpoint_with_the_supplied_identity() {
     let mut client = Client::open(ClientConfig {
         network: Network::Tor,
         secret: Some(secret),
+        transport: Default::default(),
     })
     .unwrap();
     assert_eq!(

@@ -9,6 +9,7 @@ fn typed_client_reports_endpoint_and_workspace_state_then_closes() {
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([7; 32]),
+        transport: Default::default(),
     })
     .unwrap();
 
@@ -35,6 +36,7 @@ fn typed_client_creates_named_workspace_with_typed_state() {
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([10; 32]),
+        transport: Default::default(),
     })
     .unwrap();
 
@@ -58,6 +60,7 @@ fn typed_client_exposes_recovery_result_without_vendor_types() {
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([11; 32]),
+        transport: Default::default(),
     })
     .unwrap();
     client.create_workspace("Owner", None).unwrap();
@@ -72,6 +75,7 @@ fn typed_client_exposes_recovery_request_lifecycle() {
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([15; 32]),
+        transport: Default::default(),
     })
     .unwrap();
     let workspace = client.create_workspace("Owner", None).unwrap();
@@ -102,11 +106,13 @@ fn typed_clients_recover_an_opaque_publication() {
     let mut owner = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([16; 32]),
+        transport: Default::default(),
     })
     .unwrap();
     let mut reader = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([17; 32]),
+        transport: Default::default(),
     })
     .unwrap();
     let workspace = owner
@@ -225,6 +231,7 @@ fn typed_client_rejects_wrong_publication_workspace_before_staging() {
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([18; 32]),
+        transport: Default::default(),
     })
     .unwrap();
     let workspace = client.create_workspace("Owner", None).unwrap();
@@ -262,6 +269,7 @@ fn typed_client_restores_only_with_matching_freshness_anchor() {
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some(root),
+        transport: Default::default(),
     })
     .unwrap();
     let workspace = client.create_workspace("Owner", None).unwrap();
@@ -275,6 +283,7 @@ fn typed_client_restores_only_with_matching_freshness_anchor() {
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some(root),
+        transport: Default::default(),
     })
     .unwrap();
     let rejected = client
@@ -293,6 +302,7 @@ fn typed_client_exposes_workspace_roster_and_profile_projection() {
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([12; 32]),
+        transport: Default::default(),
     })
     .unwrap();
     let workspace = client.create_workspace("Owner", None).unwrap();
@@ -313,6 +323,7 @@ fn typed_client_issues_an_invitation_with_bounded_route_hints() {
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([13; 32]),
+        transport: Default::default(),
     })
     .unwrap();
     let workspace = client
@@ -342,6 +353,7 @@ fn typed_client_reports_connectivity_without_exposing_transport_types() {
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([14; 32]),
+        transport: Default::default(),
     })
     .unwrap();
     let workspace = client.create_workspace("Owner", None).unwrap();
@@ -368,11 +380,13 @@ fn typed_client_routes_opaque_publication_and_reports_interest() {
     let mut publisher = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([8; 32]),
+        transport: Default::default(),
     })
     .unwrap();
     let mut subscriber = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([9; 32]),
+        transport: Default::default(),
     })
     .unwrap();
     let publisher_endpoint = publisher.endpoint().unwrap();

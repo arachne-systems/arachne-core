@@ -92,6 +92,32 @@ impl RelayOptions {
     pub fn new(map: iroh::RelayMap, tls: iroh::tls::CaTlsConfig) -> Self {
         Self { map, tls }
     }
+
+    /// Operator relays from plain URLs, without transport types. `roots`
+    /// empty trusts the built-in WebPKI roots; otherwise only these
+    /// DER-encoded roots are trusted, for a private CA.
+    pub fn operator<'a>(
+        urls: impl IntoIterator<Item = &'a str>,
+        roots: Vec<Vec<u8>>,
+    ) -> std::result::Result<Self, &'static str> {
+        let urls = urls
+            .into_iter()
+            .map(|url| url.parse::<iroh::RelayUrl>())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| "invalid operator relay URL")?;
+        if urls.is_empty() {
+            return Err("operator relay requires at least one URL");
+        }
+        if roots.iter().any(Vec::is_empty) {
+            return Err("operator relay root certificate is empty");
+        }
+        let tls = if roots.is_empty() {
+            iroh::tls::CaTlsConfig::embedded()
+        } else {
+            iroh::tls::CaTlsConfig::custom_roots(roots.into_iter().map(Into::into))
+        };
+        Ok(Self::new(urls.into_iter().collect(), tls))
+    }
 }
 
 /// Transport deadlines. Each profile has defaults (`for_profile`); a slow or
