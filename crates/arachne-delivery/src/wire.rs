@@ -654,6 +654,8 @@ pub fn serve_range(
 
 /// Return the next bounded publisher-signed range after a receiver's durable
 /// cursor. The authenticated requester learns no history state on denial.
+/// When the full packet window exceeds the reply bound, the holder serves the
+/// largest complete prefix that fits; the embedded query states its `through`.
 pub fn serve_available_range(
     log: &PublisherLog,
     owner: &Workspace,
@@ -677,19 +679,44 @@ pub fn serve_available_range(
     if request.after >= log.head() {
         return Ok(unavailable_available_reply());
     }
-    let query = RangeQuery {
-        workspace: request.workspace,
-        author: request.author,
-        epoch: request.epoch,
-        policy_revision: request.policy_revision,
-        after: request.after,
-        through: log
-            .head()
-            .min(request.after.saturating_add(MAX_RECOVERY_PACKETS as u64)),
-        topics: request.topics.clone(),
+    // None when (after, through] is authorized but too large for one reply.
+    let offer = |through: u64| -> Result<Option<Vec<u8>>, &'static str> {
+        let query = RangeQuery {
+            workspace: request.workspace,
+            author: request.author,
+            epoch: request.epoch,
+            policy_revision: request.policy_revision,
+            after: request.after,
+            through,
+            topics: request.topics.clone(),
+        };
+        let reply = serve_range(log, owner, policy, requester, &query)?;
+        if reply == rejected(RetrievalError::History(RangeError::TooLarge)) {
+            return Ok(None);
+        }
+        Ok(available_offer(&query, &reply).ok())
     };
-    let reply = serve_range(log, owner, policy, requester, &query)?;
-    available_offer(&query, &reply).or_else(|_| Ok(unavailable_available_reply()))
+    let mut high = log
+        .head()
+        .min(request.after.saturating_add(MAX_RECOVERY_PACKETS as u64));
+    if let Some(bytes) = offer(high)? {
+        return Ok(bytes);
+    }
+    // Fit only worsens as `through` grows, so bisect for the largest complete
+    // prefix. Each probe is a whole signed range; nothing is ever partial.
+    let mut low = request.after;
+    let mut best = None;
+    while high - low > 1 {
+        let middle = low + (high - low) / 2;
+        match offer(middle)? {
+            Some(bytes) => {
+                low = middle;
+                best = Some(bytes);
+            }
+            None => high = middle,
+        }
+    }
+    Ok(best.unwrap_or_else(unavailable_available_reply))
 }
 
 /// The query is locally established. Validate all framing, scope, contexts and
