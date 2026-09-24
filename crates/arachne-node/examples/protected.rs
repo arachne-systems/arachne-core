@@ -1,7 +1,7 @@
 //! Real Iroh protected pub/sub assembly, no ATAK types or injected member keys.
 //! Run with a NEW repository-local state directory. Endpoint roots live only in
 //! memory: this is an integration check, not a deployable credential store.
-use arachne_node::{Message, MessageReceiver, Node, Permissions, Topic};
+use arachne_node::{IrohEndpointSigner, Message, MessageReceiver, Node, Permissions, Topic};
 use arachne_routing::PublicationContext;
 use arachne_security::{ApplicationMessage, PendingJoin, StorageKey, Workspace};
 use serde_json::json;
@@ -101,11 +101,16 @@ async fn main() -> Result<()> {
     let (outsider, _outsider_events) = Node::bind("127.0.0.1:0".parse()?).await?;
     let alice_key = StorageKey::derive(&alice_root.to_bytes())?;
     let bob_key = StorageKey::derive(&bob_root.to_bytes())?;
-    let admin = Workspace::create(alice.id(), "Stream publisher")?;
+    let admin = Workspace::create(&IrohEndpointSigner(&alice_root), "Stream publisher")?;
     let (registered, invitation, checkpoint) = admin.prepare_invitation(0, false, false)?;
     let admin = registered.workspace;
     let pending =
-        PendingJoin::from_invitation(&invitation, &checkpoint, bob.id(), "Stream subscriber")?;
+        PendingJoin::from_invitation(
+            &invitation,
+            &checkpoint,
+            &IrohEndpointSigner(&bob_root),
+            "Stream subscriber",
+        )?;
     let prepared = admin.prepare_admission(bob.id(), pending.admission_request()?)?;
     let mut proof = pending.join_proof()?;
     proof.apply_add(&prepared.authorization, &prepared.commit)?;

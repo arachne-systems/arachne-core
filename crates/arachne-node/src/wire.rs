@@ -269,7 +269,7 @@ mod tests {
     #[test]
     #[ignore = "prints synthetic payload/ciphertext samples for offline compression measurement"]
     fn compression_samples() {
-        let mut owner = arachne_security::Workspace::create([1; 32], "Wire measurement").unwrap();
+        let mut owner = arachne_security::Workspace::create(&arachne_security::EndpointKey::generate().unwrap(), "Wire measurement").unwrap();
         let observation = br#"{"sensor":"demo-1","observed_at":"2026-09-15T12:00:00Z","latitude":41.2,"longitude":-87.3,"altitude_m":1200,"speed_mps":85,"heading_deg":270,"status":"active"}"#.to_vec();
         let batch = serde_json::to_vec(
             &(0..32)
