@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/arachne-api",
     "crates/arachne-store",
     "crates/arachne-security",
     "crates/arachne-delivery",
