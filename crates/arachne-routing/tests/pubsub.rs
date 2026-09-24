@@ -87,9 +87,10 @@ fn scoped_feed_delivery_revocation_and_stale_policy() {
         table.install_verified_policy(workspace_a, 1, policy.clone()),
         Err(Error::WrongPolicyRevision)
     );
+    // One revision behind is in the window, but the current revocation wins.
     assert_eq!(
         table.subscribe(workspace_a, 1, user, stream.clone()),
-        Err(Error::WrongPolicyRevision)
+        Err(Error::Denied)
     );
     assert_eq!(
         table.subscribe(workspace_a, 2, user, stream.clone()),
@@ -105,8 +106,9 @@ fn scoped_feed_delivery_revocation_and_stale_policy() {
             .unwrap()
             .is_empty()
     );
+    assert!(table.recipients(workspace_a, 2, feed, &stream).is_ok());
     assert_eq!(
-        table.recipients(workspace_a, 2, feed, &stream),
+        table.recipients(workspace_a, 1, feed, &stream),
         Err(Error::WrongPolicyRevision)
     );
     assert_eq!(
@@ -148,4 +150,109 @@ fn invalid_topics_and_policy_limits_fail_without_replacing_policy() {
         Err(Error::LimitExceeded)
     );
     assert!(table.recipients([2; 32], 1, peer, &topic).is_ok());
+}
+
+/// A peer one policy revision behind keeps its data (A3), but only with the
+/// permissions both revisions grant. Two revisions behind is still refused.
+#[test]
+fn one_behind_peer_is_accepted_without_widening_permissions() {
+    let topic = Topic::new("streams/sample").unwrap();
+    let other = Topic::new("streams/other").unwrap();
+    let (feed, user, removed, narrowed) = ([1; 32], [2; 32], [3; 32], [4; 32]);
+    let workspace = [10; 32];
+    let only = |topic: &Topic| Permissions::Selected {
+        publish: BTreeSet::from([topic.clone()]),
+        subscribe: BTreeSet::from([topic.clone()]),
+    };
+    let mut table = RoutingTable::default();
+    table
+        .install_verified_policy(
+            workspace,
+            1,
+            BTreeMap::from([
+                (feed, Permissions::AllTopics),
+                (user, Permissions::AllTopics),
+                (removed, Permissions::AllTopics),
+                (narrowed, Permissions::AllTopics),
+            ]),
+        )
+        .unwrap();
+    table
+        .install_verified_policy(
+            workspace,
+            2,
+            BTreeMap::from([
+                (feed, Permissions::AllTopics),
+                (user, Permissions::AllTopics),
+                (narrowed, only(&topic)),
+            ]),
+        )
+        .unwrap();
+    // A subscriber still on revision 1 announces interest; the current
+    // publisher reaches it.
+    table.subscribe(workspace, 1, user, topic.clone()).unwrap();
+    assert!(table.subscribed(workspace, 1, user, &topic).unwrap());
+    assert_eq!(
+        table.recipients(workspace, 2, feed, &topic).unwrap(),
+        vec![user]
+    );
+    // A publisher still on revision 1 reaches the current subscriber.
+    assert_eq!(
+        table.recipients(workspace, 1, feed, &topic).unwrap(),
+        vec![user]
+    );
+    assert_eq!(
+        table
+            .direct_recipients(workspace, 1, feed, &topic, &[user])
+            .unwrap(),
+        vec![user]
+    );
+    assert_eq!(table.authorizes_endpoint(workspace, 1, feed), Ok(()));
+    // Removed in the current revision: its old revision grants nothing.
+    assert_eq!(
+        table.recipients(workspace, 1, removed, &topic),
+        Err(Error::Denied)
+    );
+    assert_eq!(
+        table.authorizes_endpoint(workspace, 1, removed),
+        Err(Error::Denied)
+    );
+    assert!(
+        !table
+            .authorized_endpoints(workspace, 1)
+            .unwrap()
+            .contains(&removed)
+    );
+    // Narrowed in the current revision: the narrower grant applies.
+    assert_eq!(
+        table.recipients(workspace, 1, narrowed, &other),
+        Err(Error::Denied)
+    );
+    assert_eq!(
+        table.subscribe(workspace, 1, narrowed, other.clone()),
+        Err(Error::Denied)
+    );
+    assert!(table.recipients(workspace, 1, narrowed, &topic).is_ok());
+    assert!(
+        !table
+            .publishers(workspace, 1, user, &other)
+            .unwrap()
+            .contains(&narrowed)
+    );
+    // Two revisions behind is outside the window.
+    table
+        .install_verified_policy(
+            workspace,
+            3,
+            BTreeMap::from([
+                (feed, Permissions::AllTopics),
+                (user, Permissions::AllTopics),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(
+        table.recipients(workspace, 1, feed, &topic),
+        Err(Error::WrongPolicyRevision)
+    );
+    assert!(table.recipients(workspace, 2, feed, &topic).is_ok());
 }
