@@ -107,6 +107,88 @@ fn range(author: &Workspace, epoch: u64, through: u64) -> RangeQuery {
     }
 }
 
+fn acknowledge(inbox: &ObjectInbox, owner: &Workspace) -> (ObjectInbox, u8) {
+    let pending = inbox.pending(owner).unwrap().unwrap();
+    let next = inbox
+        .acknowledge(
+            pending.message.member,
+            &pending.context.topic,
+            pending.counter,
+            pending.context.id,
+        )
+        .unwrap();
+    (next, pending.message.payload[0])
+}
+
+#[test]
+fn fair_scheduling_gap_fill_and_cross_epoch_dedup() {
+    // A (admin) and B both send to C.
+    let (a, b, _, _) = admit(Workspace::create([1; 32], "A").unwrap(), [2; 32], "B");
+    let (mut a, c, registered, admission) = admit(a, [3; 32], "C");
+    let mut b = active(
+        b.prepare_management_update(registered.action, &registered.commit)
+            .unwrap(),
+    )
+    .prepare_admission_update(&admission.authorization, &admission.commit)
+    .unwrap();
+    assert_eq!((a.epoch(), b.epoch()), (c.epoch(), c.epoch()));
+    let mut a_log = PublisherLog::new(&a).unwrap();
+    let mut b_log = PublisherLog::new(&b).unwrap();
+    let mut inbox = ObjectInbox::new(c.id(), c.epoch());
+
+    // A floods five objects before B's one arrives. B is not starved: each
+    // scope gets a turn in round-robin order once work is acknowledged.
+    for id in 1..=5 {
+        let (context, object) = publish(&mut a, &mut a_log, id);
+        inbox = stage(&inbox, &c, &context, &object);
+    }
+    let (context, object) = publish(&mut b, &mut b_log, 50);
+    inbox = stage(&inbox, &c, &context, &object);
+    let mut order = Vec::new();
+    while inbox.pending_count() > 0 {
+        let (next, payload) = acknowledge(&inbox, &c);
+        inbox = next;
+        order.push(payload);
+    }
+    assert_eq!(order, [1, 50, 2, 3, 4, 5]);
+
+    // Late (recovered) objects fill gaps below newer ones; replays stay out.
+    let objects: Vec<_> = (60..65).map(|id| publish(&mut a, &mut a_log, id)).collect();
+    for index in [0, 2, 4, 1, 3] {
+        let (context, object) = &objects[index];
+        inbox = stage(&inbox, &c, context, object);
+    }
+    for (context, object) in &objects {
+        assert!(matches!(
+            inbox.stage(&c, context, object).unwrap(),
+            InboxStage::Duplicate
+        ));
+    }
+    assert_eq!(inbox.pending_count(), 5);
+
+    // The same publication re-published under a new epoch (ADR A2 step 10)
+    // is a duplicate: its stable id was already delivered.
+    let (first_context, _) = &objects[0];
+    let previous = a.provisional_copy().unwrap();
+    let (registered, _, _) = a.prepare_invitation(u64::MAX, false, false).unwrap();
+    a = registered.workspace;
+    let c_next = active(
+        c.prepare_management_update(registered.action, &registered.commit)
+            .unwrap(),
+    );
+    inbox = inbox.advance(&c, &c_next).unwrap();
+    a_log = a_log.advance(&previous, &a).unwrap();
+    let mut again = first_context.clone();
+    again.sequence = std::num::NonZeroU64::new(a_log.head() + 1);
+    let republished = a
+        .protect_object(b"chat", &again.authenticated_bytes(), &[60])
+        .unwrap();
+    assert!(matches!(
+        inbox.stage(&c_next, &again, &republished).unwrap(),
+        InboxStage::Duplicate
+    ));
+}
+
 #[test]
 fn members_at_different_epochs_exchange_data_after_a_partition_heals() {
     // A and B share an epoch.

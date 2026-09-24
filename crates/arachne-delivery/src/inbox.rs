@@ -14,6 +14,8 @@ const MAX_REPLAY_WINDOWS: usize = 4096;
 /// given up as lost.
 pub const REPLAY_ENTRIES: usize = 1024;
 const MAX_PENDING_OBJECTS: usize = 4096;
+/// Recently accepted publication ids kept for cross-epoch dedup.
+pub const RECENT_IDS: usize = 256;
 const MAX_RETAINED_RANGES: usize = 4;
 const MAX_RETAINED_CURRENT_VIEWS: usize = 4;
 const MAX_RECOVERY_SELECTIONS: usize = 64;
@@ -37,6 +39,15 @@ struct Replay {
     floor: u64,
     /// Accepted counters above `floor`: at most `REPLAY_ENTRIES`.
     seen: BTreeSet<u64>,
+}
+
+/// Stable publication identity, independent of epoch and counter.
+fn publication_identity(author: [u8; 32], id: [u8; 16]) -> [u8; 16] {
+    let mut hash = Sha256::new();
+    hash.update(b"arachne/publication-identity/v1\0");
+    hash.update(author);
+    hash.update(id);
+    hash.finalize()[..16].try_into().unwrap()
 }
 
 enum ReplayState {
@@ -213,6 +224,14 @@ pub struct ObjectInbox {
     replay: Vec<Replay>,
     /// Arrival order.
     pending: Vec<Pending>,
+    /// Recently accepted (author, publication id) digests, across epochs. A
+    /// copy that the author re-publishes under a new epoch or counter is a
+    /// duplicate.
+    recent: VecDeque<[u8; 16]>,
+    /// Round-robin service: acknowledgement tick of each delivery scope that
+    /// has pending work.
+    clock: u64,
+    served: Vec<([u8; 32], u64)>,
     #[serde(skip)]
     retained_ranges: Vec<RetainedRange>,
     #[serde(skip)]
@@ -234,6 +253,9 @@ struct Snapshot {
     epoch: u64,
     replay: Vec<Replay>,
     pending: Vec<Pending>,
+    recent: VecDeque<[u8; 16]>,
+    clock: u64,
+    served: Vec<([u8; 32], u64)>,
     #[serde(default)]
     progress: Vec<SelectionProgress>,
     #[serde(default)]
@@ -331,6 +353,9 @@ impl ObjectInbox {
             epoch,
             replay: Vec::new(),
             pending: Vec::new(),
+            recent: VecDeque::new(),
+            clock: 0,
+            served: Vec::new(),
             retained_ranges: Vec::new(),
             retained_current_views: Vec::new(),
             current: None,
@@ -719,6 +744,10 @@ impl ObjectInbox {
         } else if self.replay.len() == MAX_REPLAY_WINDOWS {
             return Err("inbox replay capacity exhausted");
         }
+        let identity = publication_identity(author, context.id);
+        if self.recent.contains(&identity) {
+            return Ok(InboxStage::Duplicate);
+        }
         if self.pending.len() == MAX_PENDING_OBJECTS {
             // Never discard an undelivered object to make room. The caller
             // drains pending work; the unrecorded object can come again.
@@ -736,6 +765,10 @@ impl ObjectInbox {
             next.replay.len() - 1
         });
         next.replay[index].accept(counter);
+        next.recent.push_back(identity);
+        if next.recent.len() > RECENT_IDS {
+            next.recent.pop_front();
+        }
         next.pending.push(Pending {
             author,
             endpoint: authenticated.message.endpoint,
@@ -1247,10 +1280,14 @@ impl ObjectInbox {
                     && scope.recipients == pending.recipients
             })
         };
-        let Some(first) = self
+        // Round robin: the eligible scope served longest ago goes first (ties:
+        // earliest arrival), so one busy author cannot starve the others.
+        let Some((_, first)) = self
             .pending
             .iter()
-            .find(|pending| !deferred_scope(pending) && !self.behind_direct_gap(pending))
+            .enumerate()
+            .filter(|(_, pending)| !deferred_scope(pending) && !self.behind_direct_gap(pending))
+            .min_by_key(|(arrival, pending)| (self.last_served(pending), *arrival))
         else {
             return Ok(None);
         };
@@ -1262,6 +1299,27 @@ impl ObjectInbox {
             .min_by_key(|pending| (pending.epoch, pending.counter))
             .unwrap_or(first);
         Ok(Some(self.pending_object(chosen)?))
+    }
+
+    fn scope_key(pending: &Pending) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"arachne/delivery-scope/v1\0");
+        hash.update(pending.author);
+        hash.update(pending.revision.to_be_bytes());
+        hash.update([pending.topic.len() as u8]);
+        hash.update(pending.topic.as_bytes());
+        for recipient in &pending.recipients {
+            hash.update(recipient);
+        }
+        hash.finalize().into()
+    }
+
+    fn last_served(&self, pending: &Pending) -> u64 {
+        let key = Self::scope_key(pending);
+        self.served
+            .iter()
+            .find(|(scope, _)| *scope == key)
+            .map_or(0, |(_, tick)| *tick)
     }
 
     fn pending_object(&self, pending: &Pending) -> Result<PendingObject, &'static str> {
@@ -1299,7 +1357,14 @@ impl ObjectInbox {
         let mut next = self.clone();
         // The replay window still records the counter: resolved objects are
         // never delivered again.
-        next.pending.remove(position);
+        let resolved = next.pending.remove(position);
+        let key = Self::scope_key(&resolved);
+        next.clock = next.clock.checked_add(1).ok_or("service clock exhausted")?;
+        next.served.retain(|(scope, _)| *scope != key);
+        next.served.push((key, next.clock));
+        // Keep ticks only for scopes that still have work.
+        let live: BTreeSet<_> = next.pending.iter().map(Self::scope_key).collect();
+        next.served.retain(|(scope, _)| live.contains(scope));
         Ok(next)
     }
 
@@ -1717,6 +1782,9 @@ impl ObjectInbox {
             epoch: parsed.epoch,
             replay: parsed.replay,
             pending: parsed.pending,
+            recent: parsed.recent,
+            clock: parsed.clock,
+            served: parsed.served,
             retained_ranges: ranges,
             retained_current_views,
             current,
@@ -1763,6 +1831,15 @@ impl ObjectInbox {
         }
         if inbox.pending.len() > MAX_PENDING_OBJECTS {
             return Err("pending inbox capacity exceeded");
+        }
+        let live: BTreeSet<_> = inbox.pending.iter().map(Self::scope_key).collect();
+        let mut scopes = BTreeSet::new();
+        if inbox.recent.len() > RECENT_IDS
+            || inbox.served.iter().any(|(scope, tick)| {
+                *tick == 0 || *tick > inbox.clock || !live.contains(scope) || !scopes.insert(*scope)
+            })
+        {
+            return Err("invalid inbox service state");
         }
         let mut identities = BTreeSet::new();
         for pending in &inbox.pending {
@@ -2247,7 +2324,8 @@ fn deferred_streams_preserve_order_identity_and_restart() {
             .unwrap()
             .context
             .id,
-        2u128.to_be_bytes()
+        // Round robin: another scope goes before the served one continues.
+        3u128.to_be_bytes()
     );
     assert_eq!(acknowledged.pending_count(), 4);
     assert!(
@@ -2580,7 +2658,9 @@ fn durable_pending_objects_and_bounded_topic_replay() {
         inbox.stage(&reader, &newer, &newer_object).unwrap(),
         InboxStage::Duplicate
     ));
-    assert!(inbox.snapshot().unwrap().len() < 12 * 1024);
+    // Replay state stays small after 1,025 acknowledged objects (JSON codec;
+    // the cross-epoch id ring is the largest part).
+    assert!(inbox.snapshot().unwrap().len() < 24 * 1024);
     // Topic floors are independent; a feed does not retire chat receipts.
     let feed = Topic::new("feeds/opaque").unwrap();
     let first_feed = context(20_000, feed.clone());
