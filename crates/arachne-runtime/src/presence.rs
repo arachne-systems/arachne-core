@@ -1,5 +1,7 @@
 //! Workspace reachability over authenticated control, independent of application topics.
 use super::*;
+use crate::errors::{self, delivery, security};
+use arachne_api::{ApiError, ErrorCode};
 use std::time::Instant;
 
 const PREFIX: &[u8; 5] = b"DFPR\x01";
@@ -28,9 +30,9 @@ pub(super) struct Presence {
 }
 
 impl Presence {
-    pub fn new() -> Result<Self, String> {
+    pub fn new() -> Result<Self, ApiError> {
         let mut instance = [0; 16];
-        getrandom::fill(&mut instance).map_err(|error| error.to_string())?;
+        getrandom::fill(&mut instance).map_err(|error| ApiError::internal(error.to_string()))?;
         Ok(Self {
             seen: BTreeMap::new(),
             pending: Vec::new(),
@@ -58,14 +60,14 @@ fn base_packet(
     owner: &arachne_security::Workspace,
     instance: [u8; 16],
     announce: bool,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, ApiError> {
     let mut bytes = PREFIX.to_vec();
     bytes.push(u8::from(announce));
     bytes.extend(instance);
     bytes.extend(owner.id());
     bytes.extend(owner.epoch().to_be_bytes());
     bytes.extend(owner.epoch_fingerprint());
-    bytes.extend(owner.workspace_name_head().map_err(str::to_owned)?);
+    bytes.extend(owner.workspace_name_head().map_err(security(ErrorCode::Internal))?);
     Ok(bytes)
 }
 
@@ -83,13 +85,15 @@ pub fn harness_presence_packet(
     bytes
 }
 
-fn packet(session: &mut Session, peer: [u8; 32], announce: bool) -> Result<Vec<u8>, String> {
-    let owner = session.workspace.as_ref().ok_or("no workspace")?;
-    let recipient = owner.member_id_for_endpoint(peer).map_err(str::to_owned)?;
+fn packet(session: &mut Session, peer: [u8; 32], announce: bool) -> Result<Vec<u8>, ApiError> {
+    let owner = session.workspace.as_ref().ok_or_else(|| ApiError::wrong_state("no workspace"))?;
+    let recipient = owner
+        .member_id_for_endpoint(peer)
+        .map_err(security(ErrorCode::NotMember))?;
     let mut heads = match session.delivery.inbox.as_ref() {
         Some(inbox) => inbox
             .direct_heads_for(owner, recipient)
-            .map_err(str::to_owned)?,
+            .map_err(delivery(ErrorCode::Internal))?,
         None => Vec::new(),
     };
     let local = session.node.id();
@@ -118,7 +122,7 @@ fn packet(session: &mut Session, peer: [u8; 32], announce: bool) -> Result<Vec<u
     for offset in 0..count {
         let encoded = heads[(start + offset) % heads.len()]
             .to_wire()
-            .map_err(str::to_owned)?;
+            .map_err(delivery(ErrorCode::Internal))?;
         bytes.extend((encoded.len() as u16).to_be_bytes());
         bytes.extend(encoded);
     }
@@ -133,8 +137,8 @@ fn packet(session: &mut Session, peer: [u8; 32], announce: bool) -> Result<Vec<u
     Ok(bytes)
 }
 
-fn observe(session: &mut Session, peer: [u8; 32], bytes: &[u8]) -> Result<bool, String> {
-    let owner = session.workspace.as_ref().ok_or("no workspace")?;
+fn observe(session: &mut Session, peer: [u8; 32], bytes: &[u8]) -> Result<bool, ApiError> {
+    let owner = session.workspace.as_ref().ok_or_else(|| ApiError::wrong_state("no workspace"))?;
     if bytes.len() < 127
         || !bytes.starts_with(PREFIX)
         || bytes[5] > 1
@@ -142,39 +146,39 @@ fn observe(session: &mut Session, peer: [u8; 32], bytes: &[u8]) -> Result<bool, 
         || peer == session.node.id()
         || owner.member_id_for_endpoint(peer).is_err()
     {
-        return Err("invalid workspace presence".into());
+        return Err(invalid_presence());
     }
     let instance = bytes[6..22].try_into().unwrap();
     let announce = bytes[5] == 1;
     let mut heads = Vec::new();
     let count = bytes[126] as usize;
     if count > MAX_HEADS {
-        return Err("invalid workspace presence".into());
+        return Err(invalid_presence());
     }
     let mut cursor = 127_usize;
     for _ in 0..count {
-        let end = cursor.checked_add(2).ok_or("invalid workspace presence")?;
+        let end = cursor.checked_add(2).ok_or_else(invalid_presence)?;
         let length = u16::from_be_bytes(
             bytes
                 .get(cursor..end)
-                .ok_or("invalid workspace presence")?
+                .ok_or_else(invalid_presence)?
                 .try_into()
                 .unwrap(),
         ) as usize;
         cursor = end;
         let end = cursor
             .checked_add(length)
-            .ok_or("invalid workspace presence")?;
+            .ok_or_else(invalid_presence)?;
         heads.push(
             arachne_delivery::wire::DirectHead::from_wire(
-                bytes.get(cursor..end).ok_or("invalid workspace presence")?,
+                bytes.get(cursor..end).ok_or_else(invalid_presence)?,
             )
-            .map_err(str::to_owned)?,
+            .map_err(delivery(ErrorCode::InvalidInput))?,
         );
         cursor = end;
     }
     if cursor != bytes.len() {
-        return Err("invalid workspace presence".into());
+        return Err(invalid_presence());
     }
     let next_inbox = session.delivery.inbox.clone().map(|mut next| {
         // Heads are advisory gap triggers. A peer can still have an older
@@ -228,7 +232,7 @@ pub(super) fn receive(
     session: &mut Session,
     peer: [u8; 32],
     bytes: &[u8],
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, ApiError> {
     if observe(session, peer, bytes)? {
         session.interests.repair();
         // A committed/restarted peer announces before its first steady
@@ -268,11 +272,11 @@ pub(super) fn fresh_for(age: Duration) -> Duration {
 /// Presence is processed by the native control drain.  Use that authenticated
 /// observation directly to start reconciliation; the host's display refresh
 /// must not be the membership trigger.
-fn reconcile_seen(session: &mut Session) -> Result<Option<[u8; 32]>, String> {
-    let owner = session.workspace.as_ref().ok_or("no workspace")?;
+fn reconcile_seen(session: &mut Session) -> Result<Option<[u8; 32]>, ApiError> {
+    let owner = session.workspace.as_ref().ok_or_else(|| ApiError::wrong_state("no workspace"))?;
     let epoch = owner.epoch();
     let fingerprint = owner.epoch_fingerprint();
-    let name_head = owner.workspace_name_head().map_err(str::to_owned)?;
+    let name_head = owner.workspace_name_head().map_err(security(ErrorCode::Internal))?;
     let now = Instant::now();
     let ahead: Vec<(u64, [u8; 32])> = session
         .presence
@@ -300,17 +304,17 @@ fn reconcile_seen(session: &mut Session) -> Result<Option<[u8; 32]>, String> {
         })
         .map(|(peer, _)| *peer);
     if let Some(peer) = sync_peer {
-        super::membership::start_query_if_needed(session, peer).map_err(crate::errors::text)?;
+        super::membership::start_query_if_needed(session, peer)?;
     }
     Ok(sync_peer)
 }
 
-pub(super) fn poll(session: &mut Session, announce: bool) -> Result<Value, String> {
-    let owner = session.workspace.as_ref().ok_or("no workspace")?;
+pub(super) fn poll(session: &mut Session, announce: bool) -> Result<PresenceReply, ApiError> {
+    let owner = session.workspace.as_ref().ok_or_else(|| ApiError::wrong_state("no workspace"))?;
     let epoch = owner.epoch();
     let peers: BTreeSet<_> = owner
         .member_endpoints()
-        .map_err(str::to_owned)?
+        .map_err(security(ErrorCode::Internal))?
         .into_iter()
         .filter(|peer| *peer != session.node.id())
         .collect();
@@ -345,7 +349,7 @@ pub(super) fn poll(session: &mut Session, announce: bool) -> Result<Value, Strin
                 Ok(false) => (),
                 Err(error) => {
                     response_errors = response_errors.saturating_add(1);
-                    response_error.get_or_insert(error);
+                    response_error.get_or_insert(errors::legacy_text(&error));
                 }
             },
             Ok(Err(error)) => {
@@ -391,8 +395,26 @@ pub(super) fn poll(session: &mut Session, announce: bool) -> Result<Value, Strin
     // Same-epoch name/profile changes start an authenticated query
     // from this Rust-side observation, not from a host refresh timer.
     let sync_peer = reconcile_seen(session)?;
-    Ok(json!({"state":"workspace_presence", "sync_peer":sync_peer,
-        "response_errors":response_errors, "response_error":response_error}))
+    Ok(PresenceReply {
+        state: "workspace_presence",
+        sync_peer,
+        response_errors,
+        response_error,
+    })
+}
+
+/// One presence round: who was asked, and the first answer that failed.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct PresenceReply {
+    pub state: &'static str,
+    /// A peer this round started a membership query with.
+    pub sync_peer: Option<[u8; 32]>,
+    pub response_errors: u32,
+    pub response_error: Option<String>,
+}
+
+fn invalid_presence() -> ApiError {
+    ApiError::invalid_input("presence", "invalid workspace presence")
 }
 
 #[cfg(test)]

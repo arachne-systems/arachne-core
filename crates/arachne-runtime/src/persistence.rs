@@ -1,5 +1,10 @@
 //! Native persistence owns secrets; callers exchange only candidate tokens.
 use super::*;
+use crate::errors::{self, delivery, security};
+use crate::ops::candidate::Removed;
+use crate::ops::join::PendingJoinInfo;
+use crate::ops::workspace::WorkspaceOpened;
+use arachne_api::{ApiError, ErrorCode};
 use arachne_security::{SecurityRecords, Workspace};
 use arachne_store::{FreshnessAnchor, Store};
 use std::path::Path;
@@ -18,13 +23,15 @@ pub(super) struct NativeStore {
     committed: Vec<u8>,
 }
 impl NativeStore {
-    pub(super) fn require_committed(&self, token: &[u8]) -> Result<(), String> {
+    pub(super) fn require_committed(&self, token: &[u8]) -> Result<(), ApiError> {
         if token != self.committed {
-            return Err("candidate has not been committed to native storage".into());
+            return Err(ApiError::wrong_state(
+                "candidate has not been committed to native storage",
+            ));
         }
         Ok(())
     }
-    fn commit(&mut self, mut records: SecurityRecords, token: &[u8]) -> Result<(), String> {
+    fn commit(&mut self, mut records: SecurityRecords, token: &[u8]) -> Result<(), ApiError> {
         records.insert(TOKEN.to_vec(), Zeroizing::new(token.to_vec()));
         let deleted: Vec<_> = self
             .store
@@ -34,24 +41,51 @@ impl NativeStore {
             .collect();
         let mut changes = Vec::new();
         for (name, value) in &records {
-            if self.store.get(name).map_err(|e| e.to_string())?.as_deref() != Some(value.as_ref()) {
+            if self.store.get(name).map_err(errors::store)?.as_deref() != Some(value.as_ref()) {
                 changes.push((name.as_slice(), Some(value.as_slice())));
             }
         }
         changes.extend(deleted.iter().map(|name| (name.as_slice(), None)));
         self.store
             .commit(self.store.revision(), &changes)
-            .map_err(|e| e.to_string())?;
+            .map_err(errors::store)?;
         self.committed = token.to_vec();
         Ok(())
     }
 }
 
-pub(super) fn candidate_token() -> Result<Vec<u8>, arachne_api::ApiError> {
+/// A restored session: a pending join, this member's removal (the session
+/// then ends), or an active workspace.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(untagged)]
+pub(crate) enum Restored {
+    Pending(PendingJoinInfo),
+    Removed(RemovedDurably),
+    Opened(WorkspaceOpened),
+}
+
+/// A durable removal: `Removed` plus `durable: true`.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct RemovedDurably {
+    #[serde(flatten)]
+    pub removed: Removed,
+    pub durable: bool,
+}
+
+pub(super) fn candidate_token() -> Result<Vec<u8>, ApiError> {
     let mut token = vec![0; 37];
     token[..5].copy_from_slice(b"DFRC\x01");
-    getrandom::fill(&mut token[5..]).map_err(|e| arachne_api::ApiError::internal(e.to_string()))?;
+    getrandom::fill(&mut token[5..]).map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(token)
+}
+
+fn encode_activity(activity: &WorkspaceActivity) -> Result<Vec<u8>, ApiError> {
+    serde_json::to_vec(activity).map_err(errors::encode)
+}
+
+fn decode_activity(bytes: &[u8]) -> Result<WorkspaceActivity, ApiError> {
+    serde_json::from_slice::<WorkspaceActivity>(bytes)
+        .map_err(|error| ApiError::storage_corrupt(error.to_string()))
 }
 
 fn active_records(
@@ -59,12 +93,11 @@ fn active_records(
     publisher: Option<&arachne_delivery::PublisherLog>,
     inbox: Option<&arachne_delivery::inbox::ObjectInbox>,
     activity: &WorkspaceActivity,
-) -> Result<SecurityRecords, String> {
-    let mut records = owner.export_records().map_err(str::to_owned)?;
-    records.insert(
-        ACTIVITY.to_vec(),
-        Zeroizing::new(serde_json::to_vec(activity).map_err(|error| error.to_string())?),
-    );
+) -> Result<SecurityRecords, ApiError> {
+    let mut records = owner
+        .export_records()
+        .map_err(security(ErrorCode::StorageFailed))?;
+    records.insert(ACTIVITY.to_vec(), Zeroizing::new(encode_activity(activity)?));
     match (inbox, publisher) {
         (Some(inbox), Some(publisher)) => {
             records.insert(
@@ -72,35 +105,50 @@ fn active_records(
                 Zeroizing::new(
                     inbox
                         .snapshot_with_publisher(owner, publisher)
-                        .map_err(str::to_owned)?,
+                        .map_err(delivery(ErrorCode::StorageFailed))?,
                 ),
             );
         }
         (None, None) => {}
-        _ => return Err("object inbox and publisher state go together".into()),
+        _ => {
+            return Err(ApiError::internal(
+                "object inbox and publisher state go together",
+            ));
+        }
     }
     Ok(records)
 }
 
-fn pending_records(session: &Session, pending: &arachne_security::PendingJoin) -> Result<SecurityRecords, String> {
+fn root_required() -> ApiError {
+    ApiError::wrong_state("protected root required")
+}
+
+fn not_enabled() -> ApiError {
+    ApiError::wrong_state("native record storage not enabled")
+}
+
+fn pending_records(
+    session: &Session,
+    pending: &arachne_security::PendingJoin,
+) -> Result<SecurityRecords, ApiError> {
     let bytes = pending
-        .seal(session.storage_key.as_ref().ok_or("protected root required")?)
-        .map_err(str::to_owned)?;
+        .seal(session.storage_key.as_ref().ok_or_else(root_required)?)
+        .map_err(security(ErrorCode::StorageFailed))?;
     let mut records = BTreeMap::from([(PENDING.to_vec(), Zeroizing::new(bytes))]);
     if let Some(lifecycle) = &session.join.lifecycle {
         records.insert(
             JOIN_LIFECYCLE.to_vec(),
-            Zeroizing::new(serde_json::to_vec(lifecycle).map_err(|error| error.to_string())?),
+            Zeroizing::new(serde_json::to_vec(lifecycle).map_err(errors::encode)?),
         );
     }
     records.insert(
         ACTIVITY.to_vec(),
-        Zeroizing::new(serde_json::to_vec(&session.activity).map_err(|error| error.to_string())?),
+        Zeroizing::new(encode_activity(&session.activity)?),
     );
     Ok(records)
 }
 
-fn idle(session: &Session) -> Result<(), String> {
+fn idle(session: &Session) -> Result<(), ApiError> {
     if session.records.is_some()
         || session.transition.staged.is_some()
         || session.transition.removal.is_some()
@@ -112,9 +160,33 @@ fn idle(session: &Session) -> Result<(), String> {
         || session.recovery.range.is_some()
         || session.recovery.ready_range.is_some()
     {
-        return Err("record storage requires an idle session".into());
+        return Err(ApiError::wrong_state(
+            "record storage requires an idle session",
+        ));
     }
     Ok(())
+}
+
+/// Run `body` on the live session under its lock. The persistence calls do
+/// not pass the op guards, as before; a body that ends the session (a
+/// restored removal) sets `ending`, and the session is then shut down
+/// outside the lock.
+pub(crate) fn with_session<T>(
+    handle: i64,
+    body: impl FnOnce(&mut Session) -> Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    let shared = session(handle)?;
+    let mut guard = shared
+        .lock()
+        .map_err(errors::poisoned("node session unavailable"))?;
+    let session = guard.as_mut().ok_or_else(errors::closed)?;
+    let result = body(session)?;
+    if session.ending {
+        let ended = guard.take().ok_or_else(errors::closed)?;
+        drop(guard);
+        shutdown_session(ended).map_err(errors::legacy)?;
+    }
+    Ok(result)
 }
 
 /// Atomically migrate the current accepted owner and delivery state into an empty
@@ -124,12 +196,13 @@ fn idle(session: &Session) -> Result<(), String> {
 /// A pending join may migrate too; admission atomically replaces its records.
 /// Host route/unknown-outcome metadata remains separate and must be preserved.
 pub fn enable_record_storage(handle: i64, path: &Path, root: &[u8; 32]) -> Result<(), String> {
-    let shared = session(handle).map_err(errors::text)?;
-    let mut guard = shared.lock().map_err(|_| "node session unavailable")?;
-    let session = guard.as_mut().ok_or("node is closed")?;
+    with_session(handle, |session| enable(session, path, root)).map_err(errors::text)
+}
+
+pub(crate) fn enable(session: &mut Session, path: &Path, root: &[u8; 32]) -> Result<(), ApiError> {
     idle(session)?;
     if session.storage_key.is_none() {
-        return Err("protected endpoint root required".into());
+        return Err(ApiError::wrong_state("protected endpoint root required"));
     }
     let (workspace, records) = if let Some(owner) = &session.workspace {
         (
@@ -144,17 +217,21 @@ pub fn enable_record_storage(handle: i64, path: &Path, root: &[u8; 32]) -> Resul
     } else if let Some(pending) = &session.join.pending {
         (pending.workspace_id(), pending_records(session, pending)?)
     } else {
-        return Err("session has no workspace or pending join".into());
+        return Err(ApiError::wrong_state(
+            "session has no workspace or pending join",
+        ));
     };
-    let store = Store::open(path, root, workspace).map_err(|e| e.to_string())?;
+    let store = Store::open(path, root, workspace).map_err(errors::store)?;
     if store.revision() != 0 {
-        return Err("record store already initialized; restore it".into());
+        return Err(ApiError::wrong_state(
+            "record store already initialized; restore it",
+        ));
     }
     let mut native = NativeStore {
         store,
         committed: Vec::new(),
     };
-    native.commit(records, &candidate_token().map_err(crate::errors::text)?)?;
+    native.commit(records, &candidate_token()?)?;
     session.records = Some(native);
     Ok(())
 }
@@ -163,19 +240,16 @@ pub fn enable_record_storage(handle: i64, path: &Path, root: &[u8; 32]) -> Resul
 /// This does not adopt, send, reply or release application data. Retry after a
 /// successful commit is idempotent; callers still invoke the matching adoption.
 pub fn save_candidate(handle: i64, token: &[u8]) -> Result<(), String> {
-    let shared = session(handle).map_err(errors::text)?;
-    let mut guard = shared.lock().map_err(|_| "node session unavailable")?;
-    let session = guard.as_mut().ok_or("node is closed")?;
-    commit_candidate(session, token)
+    with_session(handle, |session| commit_candidate(session, token)).map_err(errors::text)
 }
 
 /// Commit the exact staged candidate using the native store already attached to
 /// this session. The lifecycle driver calls this before adoption, so Android
 /// never becomes the authority for the save/adopt ordering.
-pub(super) fn commit_candidate(session: &mut Session, token: &[u8]) -> Result<(), String> {
+pub(super) fn commit_candidate(session: &mut Session, token: &[u8]) -> Result<(), ApiError> {
     let records = if let Some(staged) = &session.transition.staged {
         if token != staged.snapshot {
-            return Err("token does not match candidate".into());
+            return Err(ApiError::candidate_stale("token does not match candidate"));
         }
         let activity = if matches!(staged.transition, WorkspaceTransition::Join) {
             WorkspaceActivity {
@@ -193,24 +267,16 @@ pub(super) fn commit_candidate(session: &mut Session, token: &[u8]) -> Result<()
         )?
     } else if let Some((removed, expected)) = &session.transition.removal {
         if token != expected {
-            return Err("token does not match removal".into());
+            return Err(ApiError::candidate_stale("token does not match removal"));
         }
         let bytes = removed
-            .seal(
-                session
-                    .storage_key
-                    .as_ref()
-                    .ok_or("protected root required")?,
-            )
-            .map_err(str::to_owned)?;
+            .seal(session.storage_key.as_ref().ok_or_else(root_required)?)
+            .map_err(security(ErrorCode::StorageFailed))?;
         BTreeMap::from([(REMOVED.to_vec(), Zeroizing::new(bytes))])
     } else {
-        return Err("session has no candidate".into());
+        return Err(ApiError::wrong_state("session has no candidate"));
     };
-    let store = session
-        .records
-        .as_mut()
-        .ok_or("native record storage not enabled")?;
+    let store = session.records.as_mut().ok_or_else(not_enabled)?;
     if store.require_committed(token).is_ok() {
         return Ok(());
     }
@@ -219,14 +285,18 @@ pub(super) fn commit_candidate(session: &mut Session, token: &[u8]) -> Result<()
 
 /// Persist pending join routing before an Iroh admission exchange can leave the
 /// endpoint. This makes an interrupted send retry the same attempt/peer.
-pub(super) fn commit_pending_join(session: &mut Session) -> Result<(), String> {
-    let pending = session.join.pending.as_ref().ok_or("session has no pending join")?;
+pub(super) fn commit_pending_join(session: &mut Session) -> Result<(), ApiError> {
+    let pending = session
+        .join
+        .pending
+        .as_ref()
+        .ok_or_else(errors::no_pending_join)?;
     let records = pending_records(session, pending)?;
-    let token = candidate_token().map_err(crate::errors::text)?;
+    let token = candidate_token()?;
     session
         .records
         .as_mut()
-        .ok_or("native record storage not enabled")?
+        .ok_or_else(not_enabled)?
         .commit(records, &token)
 }
 
@@ -236,22 +306,19 @@ pub(super) fn commit_pending_join(session: &mut Session) -> Result<(), String> {
 pub(super) fn reset_records(
     session: &mut Session,
     activity: &WorkspaceActivity,
-) -> Result<(), String> {
+) -> Result<(), ApiError> {
     let records = BTreeMap::from([
         (
             RESET.to_vec(),
             Zeroizing::new(vec![b'D', b'F', b'R', b'S', 1]),
         ),
-        (
-            ACTIVITY.to_vec(),
-            Zeroizing::new(serde_json::to_vec(activity).map_err(|error| error.to_string())?),
-        ),
+        (ACTIVITY.to_vec(), Zeroizing::new(encode_activity(activity)?)),
     ]);
-    let token = candidate_token().map_err(crate::errors::text)?;
+    let token = candidate_token()?;
     session
         .records
         .as_mut()
-        .ok_or("native record storage not enabled")?
+        .ok_or_else(not_enabled)?
         .commit(records, &token)
 }
 
@@ -260,13 +327,14 @@ pub(super) fn reset_records(
 /// enabled read this after every call and persist it outside the database
 /// before releasing that call's result.
 pub fn record_freshness(handle: i64) -> Result<FreshnessAnchor, String> {
-    let shared = session(handle).map_err(errors::text)?;
-    let guard = shared.lock().map_err(|_| "node session unavailable")?;
-    let session = guard.as_ref().ok_or("node is closed")?;
+    with_session(handle, |session| freshness(session)).map_err(errors::text)
+}
+
+pub(crate) fn freshness(session: &mut Session) -> Result<FreshnessAnchor, ApiError> {
     Ok(session
         .records
         .as_ref()
-        .ok_or("native record storage not enabled")?
+        .ok_or_else(not_enabled)?
         .store
         .freshness())
 }
@@ -294,133 +362,145 @@ pub fn restore_record_storage_with_freshness(
     workspace: [u8; 32],
     expected: Option<FreshnessAnchor>,
 ) -> Result<Value, String> {
-    let shared = session(handle).map_err(errors::text)?;
-    let mut guard = shared.lock().map_err(|_| "node session unavailable")?;
-    let session = guard.as_mut().ok_or("node is closed")?;
+    with_session(handle, |session| {
+        let restored = restore(session, path, root, workspace, expected)?;
+        serde_json::to_value(restored).map_err(errors::encode)
+    })
+    .map_err(errors::text)
+}
+
+pub(crate) fn restore(
+    session: &mut Session,
+    path: &Path,
+    root: &[u8; 32],
+    workspace: [u8; 32],
+    expected: Option<FreshnessAnchor>,
+) -> Result<Restored, ApiError> {
     idle(session)?;
     if session.workspace.is_some() || session.join.pending.is_some() {
-        return Err("session already owns a workspace".into());
+        return Err(ApiError::wrong_state("session already owns a workspace"));
     }
     // An absent authoritative store must never become a new empty database.
-    std::fs::metadata(path).map_err(|e| e.to_string())?;
-    let store = Store::open(path, root, workspace).map_err(|e| e.to_string())?;
+    std::fs::metadata(path).map_err(errors::store)?;
+    let store = Store::open(path, root, workspace).map_err(errors::store)?;
     // Before any record is read: a rolled-back store would replay MLS state
     // and reuse sender counters (AES-GCM nonces).
     if let Some(expected) = expected {
-        store.verify_freshness(expected).map_err(|e| e.to_string())?;
+        store
+            .verify_freshness(expected)
+            .map_err(|error| ApiError::candidate_stale(error.to_string()))?;
     }
-    let get = |name: &[u8]| store.get(name).map_err(|e| e.to_string());
-    let committed = get(TOKEN)?.ok_or("missing native commit token")?.to_vec();
+    let get = |name: &[u8]| store.get(name).map_err(errors::store);
+    let corrupt = |detail: &str| ApiError::storage_corrupt(detail);
+    let committed = get(TOKEN)?
+        .ok_or_else(|| corrupt("missing native commit token"))?
+        .to_vec();
     if committed.len() != 37 || !committed.starts_with(b"DFRC\x01") {
-        return Err("invalid native commit token".into());
+        return Err(corrupt("invalid native commit token"));
     }
     if get(RESET)?.is_some() {
-        return Err("native record store was reset".into());
+        return Err(ApiError::wrong_state("native record store was reset"));
     }
     if let Some(bytes) = get(PENDING)? {
         if store.keys(b"").any(|name| {
             name != PENDING && name != TOKEN && name != JOIN_LIFECYCLE && name != ACTIVITY
         }) {
-            return Err("pending store contains other lifecycle state".into());
+            return Err(corrupt("pending store contains other lifecycle state"));
         }
         let pending = arachne_security::PendingJoin::restore(
-            session
-                .storage_key
-                .as_ref()
-                .ok_or("protected root required")?,
+            session.storage_key.as_ref().ok_or_else(root_required)?,
             session.node.id(),
             workspace,
             &bytes,
         )
-        .map_err(str::to_owned)?;
-        let mut value = pending_metadata(&pending, session.node.id()).map_err(crate::errors::text)?;
+        .map_err(security(ErrorCode::StorageCorrupt))?;
+        let mut value = pending_metadata(&pending, session.node.id())?;
         value.durable = true;
         let activity = get(ACTIVITY)?
-            .map(|bytes| serde_json::from_slice::<WorkspaceActivity>(&bytes).map_err(|error| error.to_string()))
+            .map(|bytes| decode_activity(&bytes))
             .transpose()?
             .unwrap_or(WorkspaceActivity {
                 phase: WorkspacePhase::Joining,
                 reason: None,
             });
         if activity.phase != WorkspacePhase::Joining {
-            return Err("pending store has invalid workspace activity".into());
+            return Err(corrupt("pending store has invalid workspace activity"));
         }
         value.activity = Some(activity.view());
         session.activity = activity;
         session.join.lifecycle = get(JOIN_LIFECYCLE)?
             .map(|bytes| {
-                let lifecycle: JoinLifecycle =
-                    serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-                lifecycle.validate().map_err(crate::errors::text)?;
-                Ok::<JoinLifecycle, String>(lifecycle)
+                let lifecycle: JoinLifecycle = serde_json::from_slice(&bytes)
+                    .map_err(|error| ApiError::storage_corrupt(error.to_string()))?;
+                lifecycle.validate()?;
+                Ok::<JoinLifecycle, ApiError>(lifecycle)
             })
             .transpose()?;
         session.join.pending = Some(pending);
         session.records = Some(NativeStore { store, committed });
-        return serde_json::to_value(value).map_err(|error| error.to_string());
+        return Ok(Restored::Pending(value));
     }
     if let Some(bytes) = get(REMOVED)? {
         if store.keys(b"").count() != 2 {
-            return Err("removed store contains active state".into());
+            return Err(corrupt("removed store contains active state"));
         }
         let removed = arachne_security::RemovedMembership::restore(
-            session
-                .storage_key
-                .as_ref()
-                .ok_or("protected root required")?,
+            session.storage_key.as_ref().ok_or_else(root_required)?,
             session.node.id(),
             workspace,
             &bytes,
         )
-        .map_err(str::to_owned)?;
-        let value = json!({"workspace": workspace, "state":"removed", "epoch":removed.epoch(),
-            "member":{"id":removed.member().id(),"display_name":removed.member().display_name()},
-            "commit_digest":removed.commit_digest(), "workspace_ready":false,"durable":true});
-        let ended = guard.take().ok_or("node is closed")?;
-        drop(guard);
-        shutdown_session(ended)?;
-        return Ok(value);
+        .map_err(security(ErrorCode::StorageCorrupt))?;
+        let mut value = Removed::of(&removed);
+        value.workspace = workspace;
+        session.ending = true;
+        return Ok(Restored::Removed(RemovedDurably {
+            removed: value,
+            durable: true,
+        }));
     }
     for name in store.keys(b"") {
-        if !name.starts_with(b"security/")
-            && ![TOKEN, INBOX, ACTIVITY].contains(&name)
-        {
-            return Err("unknown native runtime record".into());
+        if !name.starts_with(b"security/") && ![TOKEN, INBOX, ACTIVITY].contains(&name) {
+            return Err(corrupt("unknown native runtime record"));
         }
     }
-    let security: SecurityRecords = store
+    let security_records: SecurityRecords = store
         .keys(b"security/")
-        .map(|name| Ok((name.to_vec(), get(name)?.ok_or("missing security record")?)))
-        .collect::<Result<_, String>>()?;
-    let owner = Workspace::restore_records(session.node.id(), workspace, &security)
-        .map_err(str::to_owned)?;
+        .map(|name| {
+            Ok((
+                name.to_vec(),
+                get(name)?.ok_or_else(|| corrupt("missing security record"))?,
+            ))
+        })
+        .collect::<Result<_, ApiError>>()?;
+    let owner = Workspace::restore_records(session.node.id(), workspace, &security_records)
+        .map_err(security(ErrorCode::StorageCorrupt))?;
     let (publisher, inbox) = match get(INBOX)? {
         Some(bytes) => {
             let (publisher, inbox) =
                 arachne_delivery::inbox::ObjectInbox::restore_snapshot(&owner, &bytes)
-                    .map_err(str::to_owned)?;
+                    .map_err(delivery(ErrorCode::StorageCorrupt))?;
             (Some(publisher), Some(inbox))
         }
         None => (None, None),
     };
-    let value = json!({"workspace":workspace,"workspace_name":owner.workspace_name().map_err(str::to_owned)?,"epoch":owner.epoch(),"members":owner.member_count(),
-        "member":member_metadata(&owner),"durable":true});
+    let mut value = WorkspaceOpened::of(&owner, None, true)?;
+    value.workspace = workspace;
     let activity = get(ACTIVITY)?
-        .map(|bytes| serde_json::from_slice::<WorkspaceActivity>(&bytes).map_err(|error| error.to_string()))
+        .map(|bytes| decode_activity(&bytes))
         .transpose()?
         .unwrap_or(WorkspaceActivity {
             phase: WorkspacePhase::Active,
             reason: None,
         });
     if !matches!(activity.phase, WorkspacePhase::Active | WorkspacePhase::Recovering) {
-        return Err("active store has invalid workspace activity".into());
+        return Err(corrupt("active store has invalid workspace activity"));
     }
-    let mut value = value;
-    value["activity"] = activity.projection();
+    value.activity = activity.view();
     session.activity = activity;
     session.delivery.publisher = publisher;
     session.delivery.inbox = inbox;
     commit_workspace(session, owner);
     session.records = Some(NativeStore { store, committed });
-    Ok(value)
+    Ok(Restored::Opened(value))
 }

@@ -6,14 +6,10 @@ use serde_json::{Value, json};
 use arachne_api::{ApiError, ErrorCode};
 
 use crate::ops::{self, Op, admission, candidate, invitation, join, management, publication, receive};
+use crate::persistence;
 use crate::{
-    Session, WorkspacePhase, cancel, close, create_with_options, describe,
-    enable_record_storage as enable_runtime_record_storage, execute_stored_with_code,
-    execute_with_code,
-    record_freshness as runtime_record_freshness,
-    restore_record_storage as restore_runtime_record_storage,
-    restore_record_storage_with_freshness as restore_runtime_record_storage_with_freshness,
-    save_candidate as save_runtime_candidate, wait_for_work, FreshnessAnchor,
+    FreshnessAnchor, Session, WorkspacePhase, cancel, close, create_with_options, describe,
+    execute_stored_with_code, execute_with_code, wait_for_work,
 };
 
 /// Address discovery and transport selection for a typed runtime client.
@@ -428,6 +424,51 @@ pub struct RemovedMembership {
     pub commit_digest: [u8; 32],
 }
 
+/// A nearby endpoint and the name it announced, if it answered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NearbyEndpoint {
+    pub endpoint: [u8; 32],
+    pub name: Option<String>,
+}
+
+/// How a nearby workspace admits people.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NearbyMode {
+    /// A person asks; an administrator approves.
+    RequestAccess,
+    /// Anyone nearby with the link may join.
+    OpenJoining,
+}
+
+/// One workspace a nearby device advertises.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NearbyAdvertisement {
+    pub peer: [u8; 32],
+    pub mode: NearbyMode,
+    pub workspace_name: Option<String>,
+    pub invitation: Vec<u8>,
+}
+
+/// The result of one nearby workspace scan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NearbyScan {
+    pub workspaces: Vec<NearbyAdvertisement>,
+    pub endpoints_checked: usize,
+    /// The scan did not reach every nearby endpoint.
+    pub limited: bool,
+}
+
+/// The outcome of one presence round.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PresenceRound {
+    /// A member this round started a membership query with.
+    pub sync_peer: Option<[u8; 32]>,
+    /// Answers that failed, and the first failure's text.
+    pub response_errors: u32,
+    pub response_error: Option<String>,
+}
+
 /// A verified invitation checkpoint and the member that served it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InvitationCheckpoint {
@@ -521,21 +562,21 @@ pub struct WorkspaceMetrics {
 }
 
 /// A duration series measured in microseconds since the endpoint started.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DurationSummary {
     pub count: u64,
     pub total_us: u64,
     pub max_us: u64,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ControlTimingMetrics {
     pub inquiry: DurationSummary,
     pub host_wait: DurationSummary,
     pub host_service: DurationSummary,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MembershipGossipMetrics {
     pub sent: u64,
     pub no_overlay: u64,
@@ -547,7 +588,7 @@ pub struct MembershipGossipMetrics {
     pub range_failed: u64,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConnectionCapacityMetrics {
     pub evicted: u64,
     pub refused: u64,
@@ -743,39 +784,14 @@ impl Client {
 
     pub fn workspace_state(&self) -> Result<WorkspaceState> {
         let endpoint_key = self.endpoint()?.endpoint_key;
-        let response = self.request(json!({"op": "workspace_state"}))?;
-        let activity = response
-            .get("activity")
-            .ok_or_else(|| error(ErrorKind::Internal, "workspace state has no activity"))?;
-        let projection: ActivityProjection =
-            serde_json::from_value(activity.clone()).map_err(|parse_error| {
-                error(
-                    ErrorKind::Internal,
-                    format!("invalid workspace activity: {parse_error}"),
-                )
-            })?;
+        let state = self.call(Op::WorkspaceState, ops::workspace::state)?;
         Ok(WorkspaceState {
             endpoint_key,
-            workspace: response
-                .get("workspace")
-                .map(|value| serde_json::from_value(value.clone()))
-                .transpose()
-                .map_err(|parse_error| {
-                    error(
-                        ErrorKind::Internal,
-                        format!("invalid workspace id: {parse_error}"),
-                    )
-                })?,
-            workspace_ready: response
-                .get("workspace_ready")
-                .and_then(Value::as_bool)
-                .ok_or_else(|| error(ErrorKind::Internal, "workspace state has no readiness"))?,
-            durable: response
-                .get("durable")
-                .and_then(Value::as_bool)
-                .ok_or_else(|| error(ErrorKind::Internal, "workspace state has no durability"))?,
-            phase: projection.phase,
-            reason: projection.reason,
+            workspace: state.workspace,
+            workspace_ready: state.workspace_ready,
+            durable: state.durable,
+            phase: state.activity.phase,
+            reason: state.activity.reason,
         })
     }
 
@@ -784,26 +800,58 @@ impl Client {
         display_name: &str,
         workspace_name: Option<&str>,
     ) -> Result<WorkspaceInfo> {
-        let response = self.request(json!({
-            "op": "create_workspace",
-            "display_name": display_name,
-            "workspace_name": workspace_name,
-        }))?;
-        let raw: RawWorkspaceInfo = serde_json::from_value(response).map_err(|parse_error| {
-            error(
-                ErrorKind::Internal,
-                format!("invalid workspace creation result: {parse_error}"),
+        let opened = self.call(Op::CreateWorkspace, |session| {
+            ops::workspace::create(
+                session,
+                ops::workspace::CreateArgs {
+                    display_name: display_name.to_owned(),
+                    workspace_name: workspace_name.map(str::to_owned),
+                },
             )
         })?;
-        Ok(WorkspaceInfo {
-            workspace: raw.workspace,
-            workspace_name: raw.workspace_name,
-            epoch: raw.epoch,
-            member_count: raw.members,
-            durable: raw.durable,
-            phase: raw.activity.phase,
-            reason: raw.activity.reason,
+        Ok(opened_info(opened))
+    }
+
+    /// Seal the workspace for a host without native record storage.
+    pub fn seal_workspace(&self) -> Result<WorkspaceCandidate> {
+        let sealed = self.call(Op::SealWorkspace, ops::workspace::seal)?;
+        Ok(WorkspaceCandidate {
+            workspace: sealed.workspace,
+            snapshot: stored_output(sealed.snapshot)?,
         })
+    }
+
+    /// Restore a sealed workspace into this empty session. A sealed removal
+    /// ends the session and gives `WrongState`.
+    pub fn restore_workspace(&self, workspace: [u8; 32], snapshot: &[u8]) -> Result<WorkspaceInfo> {
+        stored_input(snapshot)?;
+        let restored = self.call(Op::RestoreWorkspace, |session| {
+            ops::workspace::restore(
+                session,
+                ops::workspace::RestoreArgs {
+                    workspace,
+                    snapshot: snapshot.to_vec(),
+                },
+            )
+        })?;
+        match restored {
+            ops::workspace::RestoreReply::Opened(opened) => Ok(opened_info(opened)),
+            ops::workspace::RestoreReply::Removed(_) => Err(Error::from(ApiError::wrong_state(
+                "this member was removed",
+            ))),
+        }
+    }
+
+    /// Forget all workspace state. Returns whether anything changed.
+    pub fn reset_workspace(&self) -> Result<bool> {
+        Ok(self.call(Op::ResetWorkspace, ops::workspace::reset)?.changed)
+    }
+
+    /// Drop the staged candidate. Returns whether one was staged.
+    pub fn discard_workspace_candidate(&self) -> Result<bool> {
+        Ok(self
+            .call(Op::DiscardWorkspaceCandidate, ops::workspace::discard_candidate)?
+            .discarded)
     }
 
     pub fn begin_join(
@@ -1036,8 +1084,7 @@ impl Client {
 
     /// Enable encrypted native storage for this client's workspace.
     pub fn enable_record_storage(&self, path: &Path, root: &[u8; 32]) -> Result<()> {
-        enable_runtime_record_storage(self.handle()?, path, root)
-            .map_err(|message| error(ErrorKind::Storage, message))
+        self.stored(|session| persistence::enable(session, path, root))
     }
 
     /// Restore a workspace from encrypted native storage.
@@ -1047,8 +1094,7 @@ impl Client {
         root: &[u8; 32],
         workspace: [u8; 32],
     ) -> Result<Value> {
-        restore_runtime_record_storage(self.handle()?, path, root, workspace)
-            .map_err(|message| error(ErrorKind::Storage, message))
+        self.restore_record_storage_with_freshness(path, root, workspace, None)
     }
 
     /// Restore, rejecting a store that does not match the host's saved anchor.
@@ -1059,27 +1105,36 @@ impl Client {
         workspace: [u8; 32],
         expected: Option<FreshnessAnchor>,
     ) -> Result<Value> {
-        restore_runtime_record_storage_with_freshness(
-            self.handle()?,
-            path,
-            root,
-            workspace,
-            expected,
-        )
-        .map_err(|message| error(ErrorKind::Storage, message))
+        self.stored(|session| {
+            let restored = persistence::restore(session, path, root, workspace, expected)?;
+            serde_json::to_value(restored).map_err(crate::errors::encode)
+        })
     }
 
     /// Anchor after the latest native commit. With record storage enabled, read
     /// it after every call and save it outside the database.
     pub fn record_freshness(&self) -> Result<FreshnessAnchor> {
-        runtime_record_freshness(self.handle()?)
-            .map_err(|message| error(ErrorKind::Storage, message))
+        self.stored(persistence::freshness)
     }
 
     /// Save the exact staged snapshot before adopting it.
     pub fn save_candidate(&self, snapshot: &[u8]) -> Result<()> {
-        save_runtime_candidate(self.handle()?, snapshot)
-            .map_err(|message| error(ErrorKind::Storage, message))
+        self.stored(|session| persistence::commit_candidate(session, snapshot))
+    }
+
+    /// A native storage call. These report every failure as `Storage`, as
+    /// before; `code()` gives the exact failure.
+    fn stored<T>(
+        &self,
+        body: impl FnOnce(&mut Session) -> std::result::Result<T, ApiError>,
+    ) -> Result<T> {
+        persistence::with_session(self.handle()?, body).map_err(|api| {
+            let mut error = Error::from(api);
+            if error.kind != ErrorKind::Closed {
+                error.kind = ErrorKind::Storage;
+            }
+            error
+        })
     }
 
     pub fn member_roster(&self) -> Result<MemberRoster> {
@@ -1317,14 +1372,7 @@ impl Client {
     }
 
     pub fn metrics(&self) -> Result<WorkspaceMetrics> {
-        let response = self.request(json!({"op": "workspace_metrics"}))?;
-        let raw: RawWorkspaceMetrics =
-            serde_json::from_value(response).map_err(|parse_error| {
-                error(
-                    ErrorKind::Internal,
-                    format!("invalid workspace metrics: {parse_error}"),
-                )
-            })?;
+        let raw = self.call(Op::WorkspaceMetrics, ops::workspace::metrics)?;
         Ok(WorkspaceMetrics {
             workspace: raw.workspace,
             phase: raw.activity.phase,
@@ -1348,7 +1396,7 @@ impl Client {
                 .into_iter()
                 .map(|path| PeerRoute {
                     member: path.member,
-                    route: match path.route.as_str() {
+                    route: match path.route {
                         "direct" => RouteKind::Direct,
                         "relay" => RouteKind::Relay,
                         "tor" => RouteKind::Tor,
@@ -1361,8 +1409,148 @@ impl Client {
         })
     }
 
+    /// One presence round with the workspace's members: send this node's
+    /// head to each and read their answers. `announce` marks a restart.
+    pub fn poll_presence(&self, announce: bool) -> Result<PresenceRound> {
+        let round = self.call(Op::PollWorkspacePresence, |session| {
+            ops::membership::poll_presence(session, ops::membership::PresenceArgs { announce })
+        })?;
+        Ok(PresenceRound {
+            sync_peer: round.sync_peer,
+            response_errors: round.response_errors,
+            response_error: round.response_error,
+        })
+    }
+
+    /// Ask `peer` for the membership step after this node's epoch. Read the
+    /// answer with `poll_membership_update`.
+    pub fn fetch_membership_update(&self, peer: [u8; 32], replace_pending: bool) -> Result<()> {
+        self.call(Op::FetchMembershipUpdate, |session| {
+            ops::membership::fetch_update(
+                session,
+                ops::membership::FetchUpdateArgs {
+                    peer,
+                    replace_pending,
+                },
+            )
+        })?;
+        Ok(())
+    }
+
+    /// The answer to `fetch_membership_update`, once it arrived. The value
+    /// is an open event (typed with `Event` in ADR step 4).
+    pub fn poll_membership_update(&self) -> Result<Option<Value>> {
+        let event = self.call(Op::PollMembershipUpdate, ops::membership::poll_update)?;
+        Ok((!event.is_null()).then_some(event))
+    }
+
+    /// Nearby endpoints on the local network and the names they announce.
+    pub fn nearby_endpoints(&self) -> Result<Vec<NearbyEndpoint>> {
+        let found = self.call(Op::NearbyEndpoints, ops::nearby::endpoints)?;
+        Ok(found
+            .endpoints
+            .iter()
+            .map(|endpoint| NearbyEndpoint {
+                endpoint: *endpoint,
+                name: found
+                    .names
+                    .iter()
+                    .find(|name| name.id == *endpoint)
+                    .map(|name| name.name.clone()),
+            })
+            .collect())
+    }
+
+    /// Workspaces that nearby devices advertise.
+    pub fn nearby_workspaces(&self) -> Result<NearbyScan> {
+        let found = self.call(Op::NearbyWorkspaces, ops::nearby::workspaces)?;
+        Ok(NearbyScan {
+            workspaces: found
+                .workspaces
+                .into_iter()
+                .map(|workspace| NearbyAdvertisement {
+                    peer: workspace.peer,
+                    mode: if workspace.mode == "request_access" {
+                        NearbyMode::RequestAccess
+                    } else {
+                        NearbyMode::OpenJoining
+                    },
+                    workspace_name: workspace.workspace_name,
+                    invitation: workspace.invitation,
+                })
+                .collect(),
+            endpoints_checked: found.endpoints_checked,
+            limited: found.limited,
+        })
+    }
+
+    /// Advertise one workspace's invitation to nearby devices. Returns
+    /// whether this device now advertises anything.
+    pub fn advertise_nearby_workspace(
+        &self,
+        workspace: Option<[u8; 32]>,
+        mode: NearbyMode,
+        invitation: &[u8],
+        workspace_name: Option<&str>,
+    ) -> Result<bool> {
+        self.nearby_advertisement(ops::nearby::AdvertiseArgs {
+            mode: Some(
+                match mode {
+                    NearbyMode::RequestAccess => "request_access",
+                    NearbyMode::OpenJoining => "open_joining",
+                }
+                .to_owned(),
+            ),
+            invitation: invitation.to_vec(),
+            workspace_name: workspace_name.map(str::to_owned),
+            workspace,
+        })
+    }
+
+    /// Stop advertising `workspace`, or every workspace for `None`.
+    pub fn withdraw_nearby_workspace(&self, workspace: Option<[u8; 32]>) -> Result<bool> {
+        self.nearby_advertisement(ops::nearby::AdvertiseArgs {
+            workspace,
+            ..Default::default()
+        })
+    }
+
+    fn nearby_advertisement(&self, args: ops::nearby::AdvertiseArgs) -> Result<bool> {
+        let state = self.call(Op::SetNearbyWorkspace, |session| {
+            ops::nearby::advertise(session, args)
+        })?;
+        Ok(state.state == "nearby_workspace_advertised")
+    }
+
+    /// The name this device answers to nearby identity asks.
+    pub fn set_nearby_identity(&self, name: &str) -> Result<()> {
+        self.call(Op::SetNearbyIdentity, |session| {
+            ops::nearby::set_identity(
+                session,
+                ops::nearby::IdentityArgs {
+                    name: name.to_owned(),
+                },
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Hand an invitation to one nearby device.
+    pub fn send_nearby_invitation(&self, peer: [u8; 32], invitation: &[u8]) -> Result<()> {
+        self.call(Op::SendNearbyInvitation, |session| {
+            ops::nearby::send_invitation(
+                session,
+                ops::nearby::SendInvitationArgs {
+                    peer,
+                    invitation: invitation.to_vec(),
+                },
+            )
+        })?;
+        Ok(())
+    }
+
     pub fn network_change(&self) -> Result<()> {
-        self.request(json!({"op": "network_change"}))?;
+        self.call(Op::NetworkChange, ops::debug::network_change)?;
         Ok(())
     }
 
@@ -1383,34 +1571,67 @@ impl Client {
     }
 
     pub fn add_address_hint(&self, peer: [u8; 32], address: &str) -> Result<()> {
-        self.request(json!({
-            "op": "add_address_hint",
-            "peer": peer,
-            "address": address,
-        }))?;
-        Ok(())
+        self.call(Op::AddAddressHint, |session| {
+            ops::policy::add_address_hint(
+                session,
+                ops::policy::AddressHintArgs {
+                    peer,
+                    address: address.to_owned(),
+                },
+            )
+        })
     }
 
+    /// Fixture: install a caller-made routing policy. Rejected once the
+    /// session owns a workspace.
     pub fn install_policy(
         &self,
         workspace: [u8; 32],
         revision: u64,
         endpoints: &[PeerPolicy],
     ) -> Result<()> {
-        self.request(json!({
-            "op": "install_verified_policy",
-            "workspace": workspace,
-            "revision": revision,
-            "endpoints": endpoints,
-        }))?;
+        let endpoints = endpoints
+            .iter()
+            .map(|policy| ops::policy::EndpointPolicy {
+                peer: policy.peer,
+                publish: policy.publish.clone(),
+                subscribe: policy.subscribe.clone(),
+            })
+            .collect();
+        self.call(Op::InstallVerifiedPolicy, |session| {
+            ops::policy::install_verified_policy(
+                session,
+                ops::policy::VerifiedPolicyArgs {
+                    workspace,
+                    revision,
+                    endpoints,
+                },
+            )
+        })
+    }
+
+    /// Route every topic between all members at `revision` (epoch + 1).
+    pub fn install_workspace_policy(&self, revision: u64) -> Result<()> {
+        self.call(Op::InstallWorkspacePolicy, |session| {
+            ops::policy::install_workspace_policy(
+                session,
+                ops::policy::WorkspacePolicyArgs { revision },
+            )
+        })?;
         Ok(())
     }
 
-    pub fn install_workspace_policy(&self, revision: u64) -> Result<()> {
-        self.request(json!({
-            "op": "install_workspace_policy",
-            "revision": revision,
-        }))?;
+    /// Route only `topics` between all members at `revision`.
+    pub fn install_member_policy(&self, revision: u64, topics: &[&str]) -> Result<()> {
+        self.call(Op::InstallMemberPolicy, |session| {
+            ops::policy::install_member_policy(
+                session,
+                ops::policy::MemberPolicyArgs {
+                    revision,
+                    topics: topics.iter().map(|topic| (*topic).to_owned()).collect(),
+                },
+            )
+        })?;
         Ok(())
     }
 
@@ -1571,18 +1792,23 @@ impl Client {
         topic: &str,
         subscribed: bool,
     ) -> Result<()> {
-        self.request(json!({
-            "op": "set_interest",
-            "workspace": workspace,
-            "revision": revision,
-            "topic": topic,
-            "subscribed": subscribed,
-        }))?;
+        self.call(Op::SetInterest, |session| {
+            ops::policy::set_interest(
+                session,
+                ops::policy::InterestArgs {
+                    workspace,
+                    revision,
+                    topic: topic.to_owned(),
+                    subscribed,
+                },
+            )
+        })?;
         Ok(())
     }
 
     pub fn poll_interest(&self) -> Result<Option<InterestObservation>> {
-        let response = self.request(json!({"op": "poll_interest"}))?;
+        // The interest outcome is still an open event (typed in ADR step 4).
+        let response = self.call(Op::PollInterest, ops::policy::poll_interest)?;
         if response.is_null()
             || matches!(
                 response.get("state").and_then(Value::as_str),
@@ -1616,6 +1842,8 @@ impl Client {
         }))
     }
 
+    /// Fixture: an unprotected publication. Rejected once the session owns
+    /// a workspace.
     pub fn publish(
         &self,
         workspace: [u8; 32],
@@ -1623,37 +1851,29 @@ impl Client {
         topic: &str,
         payload: Vec<u8>,
     ) -> Result<DeliveryReport> {
-        let response = self.request(json!({
-            "op": "publish",
-            "workspace": workspace,
-            "revision": revision,
-            "topic": topic,
-            "payload": payload,
-        }))?;
-        serde_json::from_value::<RawDeliveryReport>(response)
-            .map(Into::into)
-            .map_err(|parse_error| {
-                error(
-                    ErrorKind::Internal,
-                    format!("invalid delivery report: {parse_error}"),
-                )
-            })
+        self.call(Op::Publish, |session| {
+            ops::policy::publish(
+                session,
+                ops::policy::PublishArgs {
+                    workspace,
+                    revision,
+                    topic: topic.to_owned(),
+                    payload,
+                },
+            )
+        })
     }
 
+    /// Fixture: the next unprotected message.
     pub fn poll(&self) -> Result<Option<Publication>> {
-        let response = self.request(json!({"op": "poll"}))?;
-        if response.is_null() {
-            return Ok(None);
-        }
-        serde_json::from_value::<RawPublication>(response)
-            .map(Into::into)
-            .map(Some)
-            .map_err(|parse_error| {
-                error(
-                    ErrorKind::Internal,
-                    format!("invalid publication: {parse_error}"),
-                )
-            })
+        let message = self.call(Op::Poll, ops::policy::poll)?;
+        Ok(message.map(|message| Publication {
+            workspace: message.workspace,
+            revision: message.revision,
+            sender: message.sender,
+            topic: message.topic,
+            payload: message.payload,
+        }))
     }
 
     pub fn fetch_recovery_range(
@@ -1827,52 +2047,6 @@ impl Drop for Client {
     }
 }
 
-#[derive(Deserialize)]
-struct ActivityProjection {
-    #[serde(rename = "state")]
-    phase: WorkspacePhase,
-    reason: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct RawWorkspaceInfo {
-    workspace: [u8; 32],
-    workspace_name: Option<String>,
-    epoch: u64,
-    members: usize,
-    durable: bool,
-    activity: ActivityProjection,
-}
-
-#[derive(Deserialize)]
-struct RawWorkspaceMetrics {
-    workspace: [u8; 32],
-    activity: ActivityProjection,
-    received_bytes: u64,
-    sent_bytes: u64,
-    receive_queue: usize,
-    admission_queue: usize,
-    admission_queue_bytes: usize,
-    admission_waiters: usize,
-    admission_in_flight: usize,
-    approval_pending: usize,
-    pending_objects: usize,
-    repair_jobs: usize,
-    gossip_neighbors: usize,
-    control_timing: ControlTimingMetrics,
-    membership_gossip: MembershipGossipMetrics,
-    connection_capacity: ConnectionCapacityMetrics,
-    paths: Vec<RawPeerRoute>,
-    paths_limited: bool,
-}
-
-#[derive(Deserialize)]
-struct RawPeerRoute {
-    member: [u8; 32],
-    route: String,
-    rtt_ms: u64,
-}
-
 /// The bound `execute_stored` puts on a snapshot the host passes in.
 fn stored_input(snapshot: &[u8]) -> Result<()> {
     if snapshot.len() > crate::MAX_STORED_SNAPSHOT {
@@ -1922,6 +2096,18 @@ fn join_request(pending: join::PendingJoinInfo) -> Result<JoinRequest> {
             .admission_request
             .ok_or_else(|| error(ErrorKind::InvalidInput, "invitation has no admission request"))?,
     })
+}
+
+fn opened_info(opened: ops::workspace::WorkspaceOpened) -> WorkspaceInfo {
+    WorkspaceInfo {
+        workspace: opened.workspace,
+        workspace_name: opened.workspace_name,
+        epoch: opened.epoch,
+        member_count: opened.members,
+        durable: opened.durable,
+        phase: opened.activity.phase,
+        reason: opened.activity.reason,
+    }
 }
 
 fn workspace_info(adopted: candidate::Adopted) -> WorkspaceInfo {

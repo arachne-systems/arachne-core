@@ -506,7 +506,7 @@ fn no_lifecycle() -> ApiError {
 }
 
 fn commit_pending_join(session: &mut Session) -> Result<(), ApiError> {
-    persistence::commit_pending_join(session).map_err(errors::legacy)
+    persistence::commit_pending_join(session)
 }
 
 /// Stage the join through its own op's guards, as a drive op's inner step.
@@ -730,7 +730,7 @@ pub(crate) fn drive(session: &mut Session) -> Result<Value, ApiError> {
             .map_err(|_| bad_reply("admission reply has no Welcome"))?;
         let staged = nested_stage(session, commits, welcome)?;
         let snapshot = staged.snapshot;
-        persistence::commit_candidate(live_mut(session)?, &snapshot).map_err(errors::legacy)?;
+        persistence::commit_candidate(live_mut(session)?, &snapshot)?;
         let joined = {
             let session = live_mut(session)?;
             ops::nested(session, Op::AdoptJoin, |session| {

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::client::DeliveryReport;
-use crate::errors::{self, security};
+use crate::errors::security;
 use crate::ops::admission::{admission_reply_page, queue_admission_push, send_inbound_admission_reply};
 use crate::session::{activity_view, commit_workspace, transition_activity};
 use crate::workspace_activity::ActivityView;
@@ -201,7 +201,7 @@ pub(crate) fn adopt_current_view(
 
 fn require_committed(session: &Session, snapshot: &[u8]) -> Result<(), ApiError> {
     if let Some(store) = &session.records {
-        store.require_committed(snapshot).map_err(errors::legacy)?;
+        store.require_committed(snapshot)?;
     }
     Ok(())
 }

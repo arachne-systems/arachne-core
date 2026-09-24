@@ -1,5 +1,7 @@
 //! Immediate local interests and bounded, serialized remote announcements.
 use crate::*;
+use crate::ops::policy::InterestQueued;
+use arachne_api::ApiError;
 use std::time::Instant;
 
 const MAX_INTERESTS: usize = 64;
@@ -36,26 +38,39 @@ impl Updates {
     pub fn is_idle(&self) -> bool {
         self.pending.is_none() && self.queued.is_empty() && self.repair.is_empty()
     }
-    pub fn set(&mut self, node: &Node, runtime: &Runtime, update: Update) -> Result<Value, String> {
+    pub fn set(
+        &mut self,
+        node: &Node,
+        runtime: &Runtime,
+        update: Update,
+    ) -> Result<InterestQueued, ApiError> {
         let key = (update.workspace, update.topic.clone());
         let existing = self
             .queued
             .iter()
             .position(|old| old.workspace == update.workspace && old.topic == update.topic);
         if existing.is_none() && self.queued.len() >= MAX_INTERESTS {
-            return Err("interest update queue is full".into());
+            return Err(ApiError::capacity_exceeded(
+                "interest update queue",
+                MAX_INTERESTS as u64,
+                "interest update queue is full",
+            ));
         }
         if !self.desired.contains_key(&key) && self.desired.len() >= MAX_INTERESTS {
-            return Err("desired interest set is full".into());
+            return Err(ApiError::limit_reached(
+                "desired interests",
+                MAX_INTERESTS as u64,
+                "desired interest set is full",
+            ));
         }
         let sending = runtime
             .block_on(node.prepare_interest(
                 update.workspace,
                 update.revision,
-                Topic::new(update.topic.clone()).map_err(|e| e.to_string())?,
+                Topic::new(update.topic.clone()).map_err(errors::routing)?,
                 update.subscribed,
             ))
-            .map_err(|e| e.to_string())?;
+            .map_err(errors::node)?;
         self.desired.insert(key.clone(), update.clone());
         self.repair
             .retain(|old| (old.workspace, old.topic.clone()) != key);
@@ -71,7 +86,10 @@ impl Updates {
         } else {
             self.queued.push_back(update);
         }
-        Ok(json!({"state":"interest_queued", "queued":self.queued.len()}))
+        Ok(InterestQueued {
+            state: "interest_queued",
+            queued: self.queued.len(),
+        })
     }
 
     /// Replay the bounded desired set after a transport or peer lifecycle change.

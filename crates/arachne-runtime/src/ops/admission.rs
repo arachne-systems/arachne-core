@@ -10,16 +10,17 @@ use serde_json::{Value, json};
 
 use crate::client::{AdmissionAuthorization, AdmissionReply};
 use crate::errors::{self, security};
-use crate::json::Request;
 use crate::membership::{self, JoinStep};
 use crate::ops::{self, Op, candidate, management};
 use crate::session::{activity_value, carry_delivery, check_epoch_transition, seal_state};
 use crate::{
-    MAX_RUNTIME_ADMISSION_BATCH, NEARBY_IDENTITY, NEARBY_INVITATION, NEARBY_WORKSPACE,
-    PendingAdmissionApproval, PendingControl, QueuedAdmission, Session, StagedWorkspace,
-    WorkspaceTransition, admission_state, nearby_workspace_reply, persistence, presence,
+    MAX_RUNTIME_ADMISSION_BATCH, PendingAdmissionApproval, PendingControl, QueuedAdmission, Session, StagedWorkspace,
+    WorkspaceTransition, admission_state, persistence, presence,
 };
 use crate::ops::join::{INVITATION_CHECKPOINT_REQUEST, invitation_checkpoint_reply};
+use crate::ops::nearby::{
+    NEARBY_IDENTITY, NEARBY_INVITATION, NEARBY_WORKSPACE, nearby_workspace_reply,
+};
 
 /// Queued control requests scanned for a range pull on each poll.
 const RANGE_SCAN_DEPTH: usize = 64;
@@ -494,7 +495,9 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
             staged["activity"] = activity_value(live(session)?);
             return Ok(staged);
         }
-        let membership = nested_json(session, Request::PollMembershipUpdate {})?;
+        let membership = ops::nested(live_mut(session)?, Op::PollMembershipUpdate, |session| {
+            ops::membership::poll_update(session)
+        })?;
         if !membership.is_null() {
             let state = membership
                 .get("state")
@@ -527,7 +530,7 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
                 };
                 let snapshot = staged_name.snapshot;
                 persistence::commit_candidate(live_mut(session)?, &snapshot)
-                    .map_err(errors::legacy)?;
+                    ?;
                 let mut committed = adopt_admission_value(session, snapshot)?;
                 committed["state"] = json!("workspace_name_committed");
                 committed["activity"] = activity_value(live(session)?);
@@ -556,7 +559,7 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
     }
     let snapshot: Vec<u8> = serde_json::from_value(staged["snapshot"].clone())
         .map_err(|_| ApiError::internal("workspace candidate snapshot is invalid"))?;
-    persistence::commit_candidate(live_mut(session)?, &snapshot).map_err(errors::legacy)?;
+    persistence::commit_candidate(live_mut(session)?, &snapshot)?;
     let mut committed = adopt_admission_value(session, snapshot)?;
     if live(session)?.transition.inbound.is_some() {
         let reply = ops::nested(session, Op::SendAdmissionReply, send_reply)?;
@@ -565,14 +568,6 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
     committed["state"] = json!("workspace_committed");
     committed["activity"] = activity_value(live(session)?);
     Ok(committed)
-}
-
-/// An inner op of a drive op that is still dispatched as JSON.
-fn nested_json(session: &mut Session, request: Request) -> Result<Value, ApiError> {
-    let session = live_mut(session)?;
-    ops::nested(session, crate::json::op(&request), |session| {
-        crate::json::dispatch(session, request)
-    })
 }
 
 /// Adopt the saved admission candidate as an inner op of a drive op.

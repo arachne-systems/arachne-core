@@ -14,17 +14,17 @@ use crate::Session;
 
 pub(crate) mod admission;
 pub(crate) mod candidate;
-// pub(crate) mod debug;
+pub(crate) mod debug;
 pub(crate) mod invitation;
 pub(crate) mod join;
 pub(crate) mod management;
-// pub(crate) mod membership;
-// pub(crate) mod nearby;
-// pub(crate) mod policy;
+pub(crate) mod membership;
+pub(crate) mod nearby;
+pub(crate) mod policy;
 pub(crate) mod publication;
 pub(crate) mod receive;
 pub(crate) mod recovery;
-// pub(crate) mod workspace;
+pub(crate) mod workspace;
 
 /// Every op, without its arguments. The guards key on this.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

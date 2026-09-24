@@ -13,8 +13,10 @@ use serde_json::Value;
 
 use crate::errors;
 use crate::ops::candidate::{self, AdoptArgs};
-use crate::ops::{self, Op, admission, invitation, join, management, publication, receive};
-use crate::{legacy_dispatch, resources};
+use crate::ops::{self, Op, admission, debug, invitation, join, management, membership, nearby, policy, publication,
+    receive, workspace,
+};
+use crate::legacy_dispatch;
 
 /// Maximum JSON request or metadata size in bytes.
 pub const MAX_REQUEST: usize = 128 * 1024;
@@ -23,52 +25,23 @@ pub const MAX_REQUEST: usize = 128 * 1024;
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Request {
-    Resource {
-        request: resources::Request,
-    },
+    Resource(debug::ResourceArgs),
     WorkspaceMetrics {},
     WorkspaceState {},
     ResetWorkspace {},
     DiscardWorkspaceCandidate {},
     NetworkChange {},
     NearbyEndpoints {},
-    SetNearbyIdentity {
-        name: String,
-    },
+    SetNearbyIdentity(nearby::IdentityArgs),
     NearbyWorkspaces {},
-    SetNearbyWorkspace {
-        mode: Option<String>,
-        #[serde(default)]
-        invitation: Vec<u8>,
-        #[serde(default)]
-        workspace_name: Option<String>,
-        #[serde(default)]
-        workspace: Option<[u8; 32]>,
-    },
-    SendNearbyInvitation {
-        peer: [u8; 32],
-        invitation: Vec<u8>,
-    },
-    PollWorkspacePresence {
-        #[serde(default)]
-        announce: bool,
-    },
-    FetchMembershipUpdate {
-        peer: [u8; 32],
-        #[serde(default)]
-        replace_pending: bool,
-    },
+    SetNearbyWorkspace(nearby::AdvertiseArgs),
+    SendNearbyInvitation(nearby::SendInvitationArgs),
+    PollWorkspacePresence(membership::PresenceArgs),
+    FetchMembershipUpdate(membership::FetchUpdateArgs),
     PollMembershipUpdate {},
-    NextMembershipPeer {
-        after: Option<[u8; 32]>,
-    },
-    OfferMembershipUpdate {
-        peer: [u8; 32],
-        after: u64,
-    },
-    OfferStagedMembershipUpdate {
-        peer: [u8; 32],
-    },
+    NextMembershipPeer(membership::NextPeerArgs),
+    OfferMembershipUpdate(membership::OfferArgs),
+    OfferStagedMembershipUpdate(membership::OfferStagedArgs),
     PollMembershipOffer {},
     FetchRecoveryRange {
         #[serde(default)]
@@ -132,11 +105,7 @@ pub(crate) enum Request {
     /// One control request to a peer by endpoint key, with an optional
     /// address hint; returns the peer's reply bytes. No workspace authority is
     /// involved. Used by the debug rig link to dial its controller.
-    ControlExchange {
-        peer: [u8; 32],
-        address: Option<String>,
-        payload: Vec<u8>,
-    },
+    ControlExchange(debug::ControlExchangeArgs),
     AdoptPublication(AdoptArgs),
     AdoptReception(AdoptArgs),
     PollAdmission(admission::PollAdmissionArgs),
@@ -171,68 +140,24 @@ pub(crate) enum Request {
     DriveJoin {},
     SealPendingJoin {},
     RestorePendingJoin(join::RestorePendingJoinArgs),
-    CreateWorkspace {
-        display_name: String,
-        workspace_name: Option<String>,
-    },
+    CreateWorkspace(workspace::CreateArgs),
     SealWorkspace {},
-    RestoreWorkspace {
-        workspace: [u8; 32],
-        #[serde(default)]
-        snapshot: Vec<u8>,
-    },
-    AddAddressHint {
-        peer: [u8; 32],
-        address: String,
-    },
+    RestoreWorkspace(workspace::RestoreArgs),
+    AddAddressHint(policy::AddressHintArgs),
     // Explicit all-member topic default; endpoints come from verified membership.
-    InstallWorkspacePolicy {
-        revision: u64,
-    },
-    InstallMemberPolicy {
-        revision: u64,
-        topics: Vec<String>,
-    },
+    InstallWorkspacePolicy(policy::WorkspacePolicyArgs),
+    InstallMemberPolicy(policy::MemberPolicyArgs),
     // Development fixture only; rejected when the session owns a workspace.
-    InstallVerifiedPolicy {
-        workspace: [u8; 32],
-        revision: u64,
-        endpoints: Vec<EndpointPolicy>,
-    },
-    SetInterest {
-        workspace: [u8; 32],
-        revision: u64,
-        topic: String,
-        subscribed: bool,
-    },
+    InstallVerifiedPolicy(policy::VerifiedPolicyArgs),
+    SetInterest(policy::InterestArgs),
     PollInterest {},
-    Subscribe {
-        workspace: [u8; 32],
-        revision: u64,
-        topic: String,
-    },
-    Unsubscribe {
-        workspace: [u8; 32],
-        revision: u64,
-        topic: String,
-    },
-    Publish {
-        workspace: [u8; 32],
-        revision: u64,
-        topic: String,
-        payload: Vec<u8>,
-    },
+    Subscribe(policy::TopicArgs),
+    Unsubscribe(policy::TopicArgs),
+    Publish(policy::PublishArgs),
     Poll {},
 }
 
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct EndpointPolicy {
-    pub(crate) peer: [u8; 32],
-    pub(crate) publish: Vec<String>,
-    pub(crate) subscribe: Vec<String>,
-}
 
 
 /// The op of a request, for the guards.
@@ -362,6 +287,43 @@ pub(crate) fn dispatch(session: &mut crate::Session, request: Request) -> Result
         Request::AdoptReception(args) => reply(candidate::adopt_reception(session, args)?),
         Request::AdoptRecovery(args) => reply(candidate::adopt_recovery(session, args)?),
         Request::AdoptCurrentView(args) => reply(candidate::adopt_current_view(session, args)?),
+        Request::ResetWorkspace {} => reply(workspace::reset(session)?),
+        Request::DiscardWorkspaceCandidate {} => reply(workspace::discard_candidate(session)?),
+        Request::WorkspaceState {} => reply(workspace::state(session)?),
+        Request::WorkspaceMetrics {} => reply(workspace::metrics(session)?),
+        Request::CreateWorkspace(args) => reply(workspace::create(session, args)?),
+        Request::SealWorkspace {} => reply(workspace::seal(session)?),
+        Request::RestoreWorkspace(args) => reply(workspace::restore(session, args)?),
+        Request::Resource(args) => debug::resource(session, args),
+        Request::EndpointInfo {} => reply(debug::endpoint_info(session)?),
+        Request::ControlExchange(args) => reply(debug::control_exchange(session, args)?),
+        Request::NetworkChange {} => reply(debug::network_change(session)?),
+        Request::AddAddressHint(args) => reply(policy::add_address_hint(session, args)?),
+        Request::InstallWorkspacePolicy(args) => {
+            reply(policy::install_workspace_policy(session, args)?)
+        }
+        Request::InstallMemberPolicy(args) => reply(policy::install_member_policy(session, args)?),
+        Request::InstallVerifiedPolicy(args) => {
+            reply(policy::install_verified_policy(session, args)?)
+        }
+        Request::SetInterest(args) => reply(policy::set_interest(session, args)?),
+        Request::PollInterest {} => policy::poll_interest(session),
+        Request::Subscribe(args) => reply(policy::subscribe(session, args)?),
+        Request::Unsubscribe(args) => reply(policy::unsubscribe(session, args)?),
+        Request::Publish(args) => reply(policy::publish(session, args)?),
+        Request::Poll {} => reply(policy::poll(session)?),
+        Request::NearbyEndpoints {} => reply(nearby::endpoints(session)?),
+        Request::NearbyWorkspaces {} => reply(nearby::workspaces(session)?),
+        Request::SetNearbyWorkspace(args) => reply(nearby::advertise(session, args)?),
+        Request::SetNearbyIdentity(args) => reply(nearby::set_identity(session, args)?),
+        Request::SendNearbyInvitation(args) => reply(nearby::send_invitation(session, args)?),
+        Request::PollWorkspacePresence(args) => reply(membership::poll_presence(session, args)?),
+        Request::FetchMembershipUpdate(args) => membership::fetch_update(session, args),
+        Request::PollMembershipUpdate {} => membership::poll_update(session),
+        Request::NextMembershipPeer(args) => membership::next_peer(session, args),
+        Request::OfferMembershipUpdate(args) => membership::offer_update(session, args),
+        Request::OfferStagedMembershipUpdate(args) => membership::offer_staged(session, args),
+        Request::PollMembershipOffer {} => membership::poll_offer(session),
         Request::MemberRoster(args) => reply(management::member_roster(session, args)?),
         Request::UseServiceProfile {} => reply(management::use_service_profile(session)?),
         Request::StageManagement(args) => reply(management::stage(session, args)?),
@@ -484,7 +446,7 @@ pub fn execute_stored_with_code(
     }
     if stored {
         let target = match &mut request {
-            Request::RestoreWorkspace { snapshot, .. }
+            Request::RestoreWorkspace(workspace::RestoreArgs { snapshot, .. })
             | Request::RestorePendingJoin(join::RestorePendingJoinArgs { snapshot, .. })
             | Request::AdoptAdmission(AdoptArgs { snapshot })
             | Request::AdoptJoin(AdoptArgs { snapshot })

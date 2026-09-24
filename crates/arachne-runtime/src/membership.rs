@@ -805,8 +805,26 @@ pub(super) fn choose_membership_peer(
     })
 }
 
-pub(super) fn poll(session: &mut Session, request: Request) -> Result<Value, ApiError> {
-    poll_with_budget(session, request, MAX_PROFILE_SET_BYTES)
+/// One membership reconciliation step, from the host or a drive op.
+pub(crate) enum Reconcile {
+    /// The next peer to ask, round-robin after `after`.
+    NextPeer { after: Option<[u8; 32]> },
+    /// Offer the step after `after` to `peer`.
+    Offer { peer: [u8; 32], after: u64 },
+    /// Offer the staged administrator promotion to `peer` before adoption.
+    OfferStaged { peer: [u8; 32] },
+    /// The outcome of the pending offer, if finished.
+    PollOffer,
+    /// Ask `peer` for the next step.
+    Fetch { peer: [u8; 32], replace_pending: bool },
+    /// The outcome of the pending query, if finished.
+    PollUpdate,
+}
+
+/// Run one reconciliation step. The reply is an open event (typed with
+/// `Event` in ADR step 4); `null` means nothing finished yet.
+pub(crate) fn reconcile(session: &mut Session, step: Reconcile) -> Result<Value, ApiError> {
+    poll_with_budget(session, step, MAX_PROFILE_SET_BYTES)
 }
 
 /// Start one authenticated membership query from a native work signal.  The
@@ -941,7 +959,7 @@ fn queue_membership_offer(
 /// merge into overflow with a handful of real admitted members.
 fn poll_with_budget(
     session: &mut Session,
-    request: Request,
+    request: Reconcile,
     budget: usize,
 ) -> Result<Value, ApiError> {
     let owner = session
@@ -949,7 +967,7 @@ fn poll_with_budget(
         .as_ref()
         .ok_or_else(errors::no_workspace)?;
     match request {
-        Request::NextMembershipPeer { after } => {
+        Reconcile::NextPeer { after } => {
             let now = std::time::Instant::now();
             session.membership.peer_failures.retain(|_, failed| {
                 now.saturating_duration_since(*failed) < MEMBERSHIP_PEER_COOLDOWN
@@ -978,7 +996,7 @@ fn poll_with_budget(
                 .map_err(security(ErrorCode::InvalidInput))?;
             Ok(json!({"peer":peer,"member":member,"epoch":owner.epoch()}))
         }
-        Request::OfferMembershipUpdate { peer, after } => {
+        Reconcile::Offer { peer, after } => {
             if session.membership.offer.is_some() {
                 return Err(ApiError::wrong_state("membership offer already pending"));
             }
@@ -993,7 +1011,7 @@ fn poll_with_budget(
             };
             queue_membership_offer(session, peer, after, authorization, commit, false)
         }
-        Request::OfferStagedMembershipUpdate { peer } => {
+        Reconcile::OfferStaged { peer } => {
             let (after, action, commit) = {
                 let owner = session
                     .workspace
@@ -1023,7 +1041,7 @@ fn poll_with_budget(
                 true,
             )
         }
-        Request::PollMembershipOffer {} => {
+        Reconcile::PollOffer => {
             if !session
                 .membership.offer
                 .as_ref()
@@ -1053,14 +1071,14 @@ fn poll_with_budget(
             // Peer acknowledgments are availability only. They never install local authority.
             Ok(json!({"state":"membership_offer_finished","peer":pending.peer,"next_after":next}))
         }
-        Request::FetchMembershipUpdate {
+        Reconcile::Fetch {
             peer,
             replace_pending,
         } => {
             start_query(session, peer, replace_pending, budget)?;
             Ok(json!({"state":"membership_update_pending"}))
         }
-        Request::PollMembershipUpdate {} => {
+        Reconcile::PollUpdate => {
             if !session
                 .membership.update
                 .as_ref()
@@ -1262,7 +1280,6 @@ fn poll_with_budget(
             // the complete signed authorization and commit against local state.
             Ok(value)
         }
-        _ => unreachable!(),
     }
 }
 
@@ -1543,7 +1560,7 @@ fn budget_pressure_never_fails_member_roster_or_poll_membership_update() {
     {
         std::thread::yield_now();
     }
-    let result = poll_with_budget(session, Request::PollMembershipUpdate {}, tiny_budget).unwrap();
+    let result = poll_with_budget(session, Reconcile::PollUpdate, tiny_budget).unwrap();
     assert_ne!(
         result["state"],
         json!("membership_denied"),
@@ -1706,7 +1723,7 @@ fn missing_names_come_back_from_one_peer_in_pages() {
         peer: answerer_endpoint,
         task,
     });
-    let polled = poll(&mut requester, Request::PollMembershipUpdate {}).unwrap();
+    let polled = reconcile(&mut requester, Reconcile::PollUpdate).unwrap();
     assert_eq!(polled["state"], "membership_current", "{polled}");
 
     // Its page pulls, carried in-process: three pages hold 70 names.
@@ -2107,13 +2124,20 @@ impl GossipCounts {
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub(super) fn json(&self) -> Value {
+    pub(crate) fn metrics(&self) -> crate::client::MembershipGossipMetrics {
         let get = |counter: &std::sync::atomic::AtomicU64| {
             counter.load(std::sync::atomic::Ordering::Relaxed)
         };
-        json!({"sent":get(&self.sent), "no_overlay":get(&self.no_overlay), "failed":get(&self.failed),
-            "received":get(&self.received), "staged":get(&self.staged), "rejected":get(&self.rejected),
-            "range_pulled":get(&self.range_pulled), "range_failed":get(&self.range_failed)})
+        crate::client::MembershipGossipMetrics {
+            sent: get(&self.sent),
+            no_overlay: get(&self.no_overlay),
+            failed: get(&self.failed),
+            received: get(&self.received),
+            staged: get(&self.staged),
+            rejected: get(&self.rejected),
+            range_pulled: get(&self.range_pulled),
+            range_failed: get(&self.range_failed),
+        }
     }
 }
 const MAX_GOSSIP_STEPS_AHEAD: usize = 32;
