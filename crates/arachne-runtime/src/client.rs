@@ -552,6 +552,10 @@ pub enum RecoveryStage {
     Candidate(RecoveryCandidate),
     AlreadyCovered,
     NoNewObjects,
+    /// Automatic recovery: nothing fits the pending bounds until the
+    /// application acknowledges or rejects pending objects. No progress was
+    /// claimed; request the range again after draining.
+    AwaitingApplication,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1434,6 +1438,7 @@ impl Client {
             }
             "recovery_already_covered" => Ok(RecoveryStage::AlreadyCovered),
             "recovery_no_new_objects" => Ok(RecoveryStage::NoNewObjects),
+            "recovery_awaiting_application" => Ok(RecoveryStage::AwaitingApplication),
             other => Err(error(
                 ErrorKind::Internal,
                 format!("unknown recovery stage: {other}"),
