@@ -373,3 +373,25 @@ longest. Do the ATAK groups first, so the Kotlin typed methods can ship before t
   The ATAK plugin moves from JNI to JNA.
 - Open: the JNA check in the ATAK host (step 9). If the host blocks a second JNA, the fallback is a
   small hand JNI shim over the same UniFFI scaffolding for Android only. We decide that after the check.
+
+## Implementation notes
+
+### Step 1 (done: `arachne-api`, `71cc9db`)
+
+- `ApiError` is the enum from decision 3, with `code()`. It adds `InvalidId` for code 101.
+- Error code ranges: 1–99 lifecycle, 100–199 input/state, 200–299 capacity, 300–399 storage,
+  400–499 transport, 500–599 authorization, 600–699 consistency, 900–999 internal. A golden test
+  pins every value.
+- Also added: `Capabilities`, `Feature`, and an `Event` skeleton (types only).
+
+### Open points for step 2
+
+- Give every code a variant or a constructor. Today `LimitReached` (201) has no variant,
+  `Unsupported` (103) and 600–601 go through `State { code }`, and public variant fields allow a
+  wrong code (for example `Storage { code: Timeout }`). Add checked constructors.
+- Move `CandidateStale` (302) out of the storage range, or document why it stays there.
+- `arachne_routing::Topic` and `arachne_api::TopicName` duplicate the topic rules. Make routing use
+  `TopicName`, or add a test that both accept and reject the same inputs.
+- A `RecordId` alone may not be unique, because record keys are `(author, [u8; 16])`.
+- Define `Limits` (step 3), the full `Feature` list, and the `Event` payloads (step 4).
+- Error `detail` and `reason` strings must never hold secrets or plaintext. Add a rule and a test.
