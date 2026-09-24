@@ -44,6 +44,8 @@ pub(super) const MEMBERSHIP_TOPIC: &str = "arachne/membership/1";
 const MAX_MEMBERSHIP_PER_SENDER: usize = 8;
 /// Authors with queued steps. Only verified overlay members can author one.
 const MAX_MEMBERSHIP_SENDERS: usize = 64;
+/// Steps queued across all authors (each up to a frame).
+const MAX_MEMBERSHIP_QUEUE: usize = 64;
 
 /// Queued membership steps of one workspace author: (revision, bytes).
 type SenderQueue = std::collections::VecDeque<(u64, Vec<u8>)>;
@@ -51,6 +53,8 @@ type SenderQueue = std::collections::VecDeque<(u64, Vec<u8>)>;
 #[derive(Default)]
 struct MembershipQueues {
     by_sender: std::collections::BTreeMap<(WorkspaceId, PeerId), SenderQueue>,
+    /// Steps queued across all authors.
+    total: usize,
     /// Authors with queued steps, in the order they are served.
     turn: std::collections::VecDeque<(WorkspaceId, PeerId)>,
 }
@@ -62,6 +66,7 @@ impl MembershipQueues {
         let key = self.turn.remove(index)?;
         let queue = self.by_sender.get_mut(&key)?;
         let (_, payload) = queue.pop_front()?;
+        self.total -= 1;
         if queue.is_empty() {
             self.by_sender.remove(&key);
         } else {
@@ -93,6 +98,16 @@ impl MembershipInbox {
     fn offer(&self, workspace: WorkspaceId, sender: PeerId, revision: u64, payload: Vec<u8>) {
         let mut queues = self.queues.lock().unwrap();
         let key = (workspace, sender);
+        let author_full = queues
+            .by_sender
+            .get(&key)
+            .is_some_and(|queue| queue.len() >= MAX_MEMBERSHIP_PER_SENDER);
+        // A full author queue replaces within itself; otherwise the step
+        // needs room in the whole inbox.
+        if !author_full && queues.total >= MAX_MEMBERSHIP_QUEUE {
+            tracing::warn!(target: "data_fabric_transport", "GOSSIP_MEMBERSHIP_QUEUE_FULL");
+            return;
+        }
         if !queues.by_sender.contains_key(&key) {
             if queues.by_sender.len() >= MAX_MEMBERSHIP_SENDERS {
                 tracing::warn!(target: "data_fabric_transport", "GOSSIP_MEMBERSHIP_QUEUE_FULL");
@@ -101,7 +116,7 @@ impl MembershipInbox {
             queues.turn.push_back(key);
         }
         let queue = queues.by_sender.entry(key).or_default();
-        if queue.len() >= MAX_MEMBERSHIP_PER_SENDER {
+        if author_full {
             let oldest = queue
                 .iter()
                 .enumerate()
@@ -118,6 +133,10 @@ impl MembershipInbox {
             }
         }
         queue.push_back((revision, payload));
+        // A replacement keeps the count; a new step adds one.
+        if !author_full {
+            queues.total += 1;
+        }
         drop(queues);
         self.signal.notify_one();
     }
@@ -872,6 +891,19 @@ fn a_flooding_member_cannot_crowd_out_another_members_step() {
     assert_eq!(drained[1].1, b"from-b");
     assert_eq!(drained.len(), MAX_MEMBERSHIP_PER_SENDER + 1);
     assert!(drained.iter().any(|(_, payload)| payload == b"next-revision"));
+}
+
+/// Many authors together still hold a bounded inbox: at most 64 steps of
+/// frame size, as before the per-author queues.
+#[test]
+fn many_authors_together_stay_within_the_inbox_bound() {
+    let inbox = MembershipInbox::new(Arc::new(Notify::new()));
+    for author in 0..32_u8 {
+        for step in 0..MAX_MEMBERSHIP_PER_SENDER as u8 {
+            inbox.offer([1; 32], [author; 32], 1, vec![step]);
+        }
+    }
+    assert_eq!(std::iter::from_fn(|| inbox.pop()).count(), 64);
 }
 
 #[test]
