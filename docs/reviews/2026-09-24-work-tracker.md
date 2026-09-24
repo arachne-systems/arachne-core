@@ -16,6 +16,8 @@ test is red → green and the crate tests pass.
 - [x] **B5** (`7dc9201`, workspace tests 387 pass / 0 fail) `stage_protected_publication` does not send `workspace`; a mismatch leaves the session stuck.
 - [x] **B6** (`3236e4f`, workspace tests 387 pass / 0 fail) `create_endpoint` holds the global `REGISTRY` lock during bind (up to 10 s).
 - [x] **B7** (`7984237`, workspace tests 387 pass / 0 fail) Automatic recovery never shrinks the range; large payloads can never catch up.
+- [ ] **B7b** Recovery stages a whole range, but A6 caps pending objects at 32 KiB per author, so runtime recovery of large payloads stops again (`fix/b7b-recovery-quota`, in progress).
+- [ ] **T1** Flake: `admission_staging` `admission_batch_staging_keeps_committing_under_continuous_intake` "node shutdown timed out" under load (`fix/flake-admission-staging`, in progress).
 - [x] **B8** (`c142361`, workspace tests 387 pass / 0 fail) The latest-value index never prunes and fills for good.
 - [x] **B9** (`71f8cfa`, workspace tests 387 pass / 0 fail) The freshness anchor is not wired into restore (rollback → state replay, SFrame counter reuse).
 
