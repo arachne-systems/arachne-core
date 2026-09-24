@@ -9,6 +9,7 @@
 //! It is fork class 4: it never displaces an administrator step. How often a
 //! member sends one is runtime policy, not a validity rule.
 use super::{MembershipAuthorization, PreparedManagementUpdate, Workspace};
+use openmls::treesync::LeafNodeSource;
 use openmls_traits::OpenMlsProvider;
 
 /// A staged self-update. Save `workspace` before adopting it or sending
@@ -57,6 +58,31 @@ impl Workspace {
             workspace: candidate,
             commit,
         })
+    }
+
+    /// True while this member's leaf still comes from its KeyPackage: it has
+    /// never committed an update path. Until it does, its leaf sits unmerged
+    /// in the tree and every path commit encrypts to it separately (B3c,
+    /// about 82 bytes per such member). Runtime policy: self-update when true.
+    pub fn needs_self_update(&self) -> bool {
+        self.group
+            .own_leaf_node()
+            .is_some_and(|leaf| matches!(leaf.leaf_node_source(), LeafNodeSource::KeyPackage(_)))
+    }
+
+    /// Members whose leaf still comes from a KeyPackage. Each adds about 82
+    /// bytes to every management commit until it self-updates (B3c). A host
+    /// can use it to predict commit size and nudge members.
+    pub fn members_without_self_update(&self) -> usize {
+        let group = self.group.public_group();
+        group
+            .members()
+            .filter(|member| {
+                group.leaf(member.index).is_some_and(|leaf| {
+                    matches!(leaf.leaf_node_source(), LeafNodeSource::KeyPackage(_))
+                })
+            })
+            .count()
     }
 
     /// Stage another member's verified self-update.
@@ -306,6 +332,25 @@ mod tests {
             sizes.first_self_update = raw_self_update(&mut probe).len();
         }
         sizes
+    }
+
+    /// B3c policy hint: a joined member needs a self-update until it commits
+    /// its own path; the admin sees how many members still need one.
+    #[test]
+    fn members_report_whether_they_still_need_a_self_update() {
+        let (admin, members) = team(2);
+        let [member, other] = <[Workspace; 2]>::try_from(members).ok().unwrap();
+        assert!(member.needs_self_update());
+        assert!(other.needs_self_update());
+        // The creator committed a path when it registered the link.
+        assert!(!admin.needs_self_update());
+        assert_eq!(admin.members_without_self_update(), 2);
+        let update = member.prepare_self_update().unwrap();
+        assert!(!update.workspace.needs_self_update());
+        let admin = active(admin.prepare_self_update_update(&update.commit).unwrap());
+        assert_eq!(admin.members_without_self_update(), 1);
+        let other = active(other.prepare_self_update_update(&update.commit).unwrap());
+        assert!(other.needs_self_update());
     }
 
     /// B3c: members that self-update after joining shrink later management
