@@ -634,7 +634,6 @@ mod tests {
                 None,
                 budget.clone(),
                 vec![],
-                None,
             )
             .await
             .unwrap();
@@ -727,7 +726,6 @@ mod tests {
                 None,
                 budget.clone(),
                 vec![],
-                None,
             )
             .await
             .unwrap();
@@ -737,7 +735,6 @@ mod tests {
                 None,
                 budget.clone(),
                 vec![],
-                None,
             )
             .await
             .unwrap();

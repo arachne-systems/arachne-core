@@ -130,19 +130,28 @@ impl Timeouts {
     }
 }
 
-/// How a node binds: its network profile and transport deadlines.
+/// How a node binds: its network profile, transport deadlines and the
+/// lookup and relay services it may use.
 #[derive(Clone, Debug)]
 pub struct NodeOptions {
     pub profile: NetworkProfile,
     pub timeouts: Timeouts,
+    /// Operator relays with their TLS trust. Replaces n0's public relays.
+    pub relay: Option<RelayOptions>,
+    /// Use n0's public DNS/Pkarr address lookup and publishing. The WAN
+    /// profiles default to true; set false for a deployment that must not
+    /// contact n0 (with `relay` for operator relays).
+    pub public_lookup: bool,
 }
 
 impl NodeOptions {
-    /// The profile with its default deadlines.
+    /// The profile with its default deadlines and services.
     pub fn new(profile: NetworkProfile) -> Self {
         Self {
             profile,
             timeouts: Timeouts::for_profile(profile),
+            relay: None,
+            public_lookup: profile.settings().1,
         }
     }
 }
@@ -554,7 +563,7 @@ impl Node {
         options: NodeOptions,
         budget: ConnectionBudget,
     ) -> Result<(Self, MessageReceiver)> {
-        Self::bind_with_profile_and_relays(address, secret, options, budget, None).await
+        Self::bind_with_profile_and_relays(address, secret, options, budget).await
     }
 
     /// Bind with a caller-supplied relay map and TLS trust configuration.
@@ -569,14 +578,11 @@ impl Node {
         budget: ConnectionBudget,
         relay: RelayOptions,
     ) -> Result<(Self, MessageReceiver)> {
-        Self::bind_with_profile_and_relays(
-            address,
-            secret,
-            NodeOptions::new(profile),
-            budget,
-            Some(relay),
-        )
-        .await
+        let options = NodeOptions {
+            relay: Some(relay),
+            ..NodeOptions::new(profile)
+        };
+        Self::bind_with_options(address, secret, options, budget).await
     }
 
     async fn bind_with_profile_and_relays(
@@ -584,7 +590,6 @@ impl Node {
         secret: Option<&[u8; 32]>,
         options: NodeOptions,
         budget: ConnectionBudget,
-        relay: Option<RelayOptions>,
     ) -> Result<(Self, MessageReceiver)> {
         let connections = Connections::bind(
             address,
@@ -592,7 +597,6 @@ impl Node {
             secret.map(iroh::SecretKey::from_bytes),
             budget.clone(),
             vec![ALPN.to_vec(), control::ALPN.to_vec(), overlay::ALPN.to_vec()],
-            relay,
         )
         .await?;
         let routing = Arc::new(Mutex::new(RoutingTable::default()));

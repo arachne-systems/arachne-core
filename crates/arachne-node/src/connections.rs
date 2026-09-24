@@ -15,7 +15,7 @@ use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use tokio::sync::{Mutex, OnceCell};
 
 use super::{
-    ConnectionBudget, Error, NodeOptions, PeerId, RelayOptions, Result, Timeouts, transport,
+    ConnectionBudget, Error, NodeOptions, PeerId, Result, Timeouts, transport,
 };
 
 const MAX_ADDRESS_HINTS: usize = 4096;
@@ -135,6 +135,49 @@ impl EndpointHooks for GossipAuthorization {
     }
 }
 
+/// Which relays an endpoint uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Relays {
+    None,
+    /// n0's public relay network.
+    Public,
+    /// The operator's relays from `NodeOptions::relay`.
+    Operator,
+}
+
+/// Public address lookup and relays, from the profile and the options.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TransportPlan {
+    /// n0's DNS/Pkarr address lookup and publishing.
+    public_lookup: bool,
+    relays: Relays,
+}
+
+impl TransportPlan {
+    fn new(options: &NodeOptions) -> Self {
+        Self {
+            public_lookup: options.public_lookup,
+            relays: match (&options.relay, options.public_lookup) {
+                (Some(_), _) => Relays::Operator,
+                (None, true) => Relays::Public,
+                (None, false) => Relays::None,
+            },
+        }
+    }
+
+    /// A builder with only the services this plan names. Operator relays are
+    /// set on it later; direct transports follow the profile.
+    fn builder(self) -> iroh::endpoint::Builder {
+        match (self.public_lookup, self.relays) {
+            (true, _) => Endpoint::builder(presets::N0),
+            (false, Relays::None) => Endpoint::builder(presets::Minimal)
+                .clear_relay_transports()
+                .clear_ip_transports(),
+            (false, _) => Endpoint::builder(presets::Minimal).clear_ip_transports(),
+        }
+    }
+}
+
 /// Wait before redialing a peer after `failures` consecutive dial timeouts:
 /// 5 s, doubling, capped at 120 s.
 fn unreachable_backoff(failures: u32) -> std::time::Duration {
@@ -176,10 +219,11 @@ impl Connections {
         secret: Option<iroh::SecretKey>,
         budget: ConnectionBudget,
         alpns: Vec<Vec<u8>>,
-        relay: Option<RelayOptions>,
     ) -> Result<Self> {
         let profile = options.profile;
-        let (mdns_service, wan_lookup, relay_only, use_ip_hints) = profile.settings();
+        let (mdns_service, _, relay_only, use_ip_hints) = profile.settings();
+        let plan = TransportPlan::new(options);
+        let relay = options.relay.clone();
         #[cfg(feature = "tor")]
         let tor_transport = if profile.uses_tor() {
             if relay.is_some() {
@@ -205,21 +249,11 @@ impl Connections {
         #[cfg(feature = "tor")]
         let builder = if let Some(tor_transport) = tor_transport.as_ref() {
             Endpoint::builder(tor_transport.preset())
-        } else if wan_lookup {
-            Endpoint::builder(presets::N0)
         } else {
-            Endpoint::builder(presets::Minimal)
-                .clear_relay_transports()
-                .clear_ip_transports()
+            plan.builder()
         };
         #[cfg(not(feature = "tor"))]
-        let builder = if wan_lookup {
-            Endpoint::builder(presets::N0)
-        } else {
-            Endpoint::builder(presets::Minimal)
-                .clear_relay_transports()
-                .clear_ip_transports()
-        };
+        let builder = plan.builder();
         let memory = MemoryLookup::new();
         let mut builder = if relay_only {
             builder.clear_ip_transports()
@@ -308,7 +342,7 @@ impl Connections {
             nearby,
             nearby_listener: Arc::new(Mutex::new(nearby_listener)),
             unreachable: Arc::new(Mutex::new(BTreeMap::new())),
-            address_lookup: mdns_service.is_some() || wan_lookup || profile.uses_tor(),
+            address_lookup: mdns_service.is_some() || plan.public_lookup || profile.uses_tor(),
             use_ip_hints,
             timeouts: options.timeouts,
             tor: profile.uses_tor(),
@@ -674,7 +708,7 @@ impl Connections {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::NetworkProfile;
+    use crate::{NetworkProfile, RelayOptions};
 
     #[cfg(feature = "tor")]
     #[test]
@@ -682,6 +716,79 @@ mod tests {
         let (mdns, wan_lookup, relay_only, use_ip_hints) = NetworkProfile::Tor.settings();
         assert_eq!((mdns, wan_lookup, relay_only, use_ip_hints), (None, false, true, false));
         assert!(NetworkProfile::Tor.uses_tor());
+    }
+
+    fn operator_relay() -> RelayOptions {
+        RelayOptions::new(
+            iroh::RelayMap::from("https://relay.example.invalid".parse::<iroh::RelayUrl>().unwrap()),
+            iroh::tls::CaTlsConfig::embedded(),
+        )
+    }
+
+    /// A WAN deployment can use its operator's relays and leave n0's public
+    /// lookup out; the defaults keep n0 for WAN and nothing for local profiles.
+    #[test]
+    fn transport_plan_follows_profile_and_options() {
+        let plan = |options: &NodeOptions| TransportPlan::new(options);
+        let wan = NodeOptions::new(NetworkProfile::Wan);
+        assert_eq!(
+            plan(&wan),
+            TransportPlan {
+                public_lookup: true,
+                relays: Relays::Public
+            }
+        );
+        let operator = NodeOptions {
+            relay: Some(operator_relay()),
+            public_lookup: false,
+            ..wan.clone()
+        };
+        assert_eq!(
+            plan(&operator),
+            TransportPlan {
+                public_lookup: false,
+                relays: Relays::Operator
+            }
+        );
+        let isolated = NodeOptions {
+            public_lookup: false,
+            ..wan
+        };
+        assert_eq!(plan(&isolated).relays, Relays::None);
+        for profile in [NetworkProfile::Direct, NetworkProfile::Lan, NetworkProfile::Nearby] {
+            assert_eq!(
+                plan(&NodeOptions::new(profile)),
+                TransportPlan {
+                    public_lookup: false,
+                    relays: Relays::None
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wan_binds_with_operator_relays_and_no_public_lookup() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let options = NodeOptions {
+                relay: Some(operator_relay()),
+                public_lookup: false,
+                ..NodeOptions::new(NetworkProfile::Wan)
+            };
+            let node = Connections::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                &options,
+                None,
+                ConnectionBudget::default(),
+                vec![],
+            )
+            .await
+            .unwrap();
+            // LAN lookup remains, so peers still resolve by endpoint ID nearby.
+            assert!(node.can_dial_by_peer_id());
+            node.close().await;
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -720,7 +827,6 @@ mod tests {
                 None,
                 ConnectionBudget::default(),
                 vec![],
-                None,
             )
             .await
             .unwrap();
@@ -801,7 +907,6 @@ mod tests {
                 None,
                 ConnectionBudget::default(),
                 vec![],
-                None,
             )
             .await
             .unwrap();
@@ -856,7 +961,6 @@ mod tests {
                 None,
                 ConnectionBudget::default(),
                 vec![],
-                None,
             )
             .await
             .unwrap();
@@ -917,7 +1021,6 @@ mod tests {
                 None,
                 ConnectionBudget::default(),
                 vec![],
-                None,
             )
             .await
             .unwrap();
@@ -991,7 +1094,6 @@ mod tests {
                 None,
                 ConnectionBudget::default(),
                 vec![],
-                None,
             )
             .await
             .unwrap();
