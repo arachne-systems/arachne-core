@@ -22,6 +22,27 @@ Small host-integration changes, with no Bao, wire, hashing or crypto changes:
 - The copied CLI example rejects non-UTF-8 arguments explicitly, rather than
   panicking during argument decoding. It is not included in Arachne binaries.
 
+- Depend on the renamed `arachne-bao-tree` fork (`=0.16.1-arachne.1`, see
+  `vendor/bao-tree/ARACHNE-PATCH.md`) with `package =` and a path. The
+  dependency key stays `bao-tree`, so `bao-tree/fs` and `use bao_tree` are
+  unchanged. This replaces the earlier workspace-only `[patch.crates-io]`, so
+  the fix now reaches downstream consumers.
+
+Package identity and other file changes (normalized `Cargo.toml` and docs):
+`name = "arachne-iroh-blobs"`, version `0.103.0-arachne.1`, "Arachne Systems"
+added to `authors`, new `description`, an `arachne` keyword, and new
+`repository`, `homepage`, `documentation`, `publish = ["crates-io"]` and
+`exclude = ["Cargo.toml.orig"]` fields. `README.md` has a fork banner.
+`Cargo.toml.orig` is the unchanged upstream original. Source changes are in
+`src/lib.rs` (`ticket` module behind the `tickets` feature), `src/store/fs.rs`
+(`worker_threads(2)`), `src/store/mod.rs` (export `gc_run_once`) and
+`examples/transfer.rs`. The other differences are whitespace normalization in
+`CHANGELOG.md`, `DESIGN.md`, `.config/nextest.toml` and `.github/workflows/`.
+
+The earlier `arachne-iroh-blobs` 0.103.0 release reused the upstream number.
+Under semver it sorts above `0.103.0-arachne.1`, so dependents must pin the fork
+with `=`. Fork versions use `<upstream version>-arachne.<N>`.
+
 Remove each change when the corresponding upstream feature/API is available.
 `crates/arachne-node/tests/resource_stream.rs` checks >100 MiB streaming, verified
 resume, recipient/hash/length authorization, revocation and external-file safety.

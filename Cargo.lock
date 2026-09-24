@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "arachne-iroh-blobs"
-version = "0.103.0"
+version = "0.103.0-arachne.1"
 dependencies = [
  "anyhow",
  "arachne-bao-tree",
@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "arachne-iroh-gossip"
-version = "0.101.0"
+version = "0.101.0-arachne.1"
 dependencies = [
  "blake3",
  "bytes",
