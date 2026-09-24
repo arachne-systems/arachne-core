@@ -13,8 +13,9 @@
 // This test puts a UDP delay relay between a peer and the owner, so that the
 // owner measures a round trip time of about 2 s. The drain then needs at least
 // 3 x 2 s = 6 s, since a PTO is never less than the smoothed RTT. The owner's
-// operation deadline is 3 s: long enough for the 2 s handshake, and short
-// enough that close must end before the drain would.
+// close drain deadline is 3 s, so close must end before the drain would. Its
+// operation deadline is 60 s, so a close that followed the operation deadline
+// instead would wait for the whole drain.
 
 use arachne_node::{ConnectionBudget, NetworkProfile, Node, NodeOptions, Timeouts};
 use arachne_runtime::{close, create_with_options, describe, wait_for_work};
@@ -28,8 +29,8 @@ use tokio::net::UdpSocket;
 /// Delay added in each direction; the owner measures about twice this.
 const ONE_WAY_DELAY: Duration = Duration::from_millis(1000);
 
-/// The owner's operation deadline, which bounds its close drain.
-const OWNER_OPERATION: Duration = Duration::from_secs(3);
+/// The owner's close drain deadline.
+const OWNER_CLOSE_DRAIN: Duration = Duration::from_secs(3);
 
 /// Forward UDP datagrams between one client and `server`, each after
 /// `ONE_WAY_DELAY`. The client is the first address that is not `server`.
@@ -64,9 +65,10 @@ async fn delay_relay(server: SocketAddr) -> SocketAddr {
 }
 
 #[test]
-fn close_succeeds_when_the_drain_outlasts_the_operation_deadline() {
+fn close_succeeds_when_the_drain_outlasts_the_close_drain_deadline() {
     let mut owner_options = NodeOptions::new(NetworkProfile::Direct);
-    owner_options.timeouts.operation = OWNER_OPERATION;
+    owner_options.timeouts.operation = Duration::from_secs(60);
+    owner_options.timeouts.close_drain = OWNER_CLOSE_DRAIN;
     let owner = create_with_options(None, owner_options).unwrap();
     let info: Value = serde_json::from_str(&describe(owner).unwrap()).unwrap();
     let owner_peer: [u8; 32] = info["endpoint_key"]
@@ -102,6 +104,7 @@ fn close_succeeds_when_the_drain_outlasts_the_operation_deadline() {
             operation: Duration::from_secs(60),
             dial: Duration::from_secs(60),
             gossip_join: Duration::from_secs(60),
+            close_drain: Duration::from_secs(60),
         };
         let (peer, _) = Node::bind_with_options(
             "127.0.0.1:0".parse().unwrap(),
@@ -140,12 +143,11 @@ fn close_succeeds_when_the_drain_outlasts_the_operation_deadline() {
         Ok(()),
         "a slow drain must not fail close (took {elapsed:?})"
     );
-    // The drain follows the owner's configured operation deadline (3 s), not
-    // the transport's 3 x PTO (at least 6 s here). A fixed deadline, however
-    // large, fails this bound or the `Ok` above.
+    // The drain follows the owner's close drain deadline (3 s), not the
+    // transport's 3 x PTO (at least 6 s here) and not the operation deadline.
     assert!(
         elapsed < Duration::from_secs(5),
-        "close must follow the operation deadline ({OWNER_OPERATION:?}), took {elapsed:?}"
+        "close must follow the close drain deadline ({OWNER_CLOSE_DRAIN:?}), took {elapsed:?}"
     );
     println!("close_drain: close took {elapsed:?}");
 }

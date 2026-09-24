@@ -720,11 +720,13 @@ impl Connections {
         // with the measured round trip time, so a slow link (Tor) or a starved
         // host can make the drain outlast any fixed deadline. The drain is best
         // effort: a peer that misses the close frame learns of it by its own
-        // idle timeout. Bound it by the operation deadline, as any other wait
-        // on a peer, and finish the local teardown. The drain runs on its own
-        // task, so an overrun leaves it to finish the endpoint's shutdown in
-        // the background instead of dropping it halfway.
-        let drain = self.timeouts.operation;
+        // idle timeout. The caller blocks on close (a JNI thread on Android),
+        // so bound the drain by the short close drain deadline, not by the
+        // operation deadline (300 s on Tor), and finish the local teardown.
+        // The drain runs on its own task, so an overrun leaves it to finish
+        // the endpoint's shutdown in the background instead of dropping it
+        // halfway.
+        let drain = self.timeouts.close_drain;
         let endpoint = self.endpoint.clone();
         let draining = tokio::spawn(async move { endpoint.close().await });
         if tokio::time::timeout(drain, draining).await.is_err() {

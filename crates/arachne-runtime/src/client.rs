@@ -74,6 +74,9 @@ pub struct TransportTimeouts {
     pub dial: std::time::Duration,
     /// How long a live broadcast waits for a first overlay neighbor.
     pub gossip_join: std::time::Duration,
+    /// How long `close` waits for peers to acknowledge the close. It blocks
+    /// the caller, so keep it short. The default is 5 s on every network.
+    pub close_drain: std::time::Duration,
 }
 
 /// The transport services an endpoint was bound with.
@@ -129,6 +132,7 @@ impl TransportOptions {
             if timeouts.operation.is_zero()
                 || timeouts.dial.is_zero()
                 || timeouts.gossip_join.is_zero()
+                || timeouts.close_drain.is_zero()
             {
                 return Err(invalid("transport timeouts must be nonzero"));
             }
@@ -136,6 +140,7 @@ impl TransportOptions {
                 operation: timeouts.operation,
                 dial: timeouts.dial,
                 gossip_join: timeouts.gossip_join,
+                close_drain: timeouts.close_drain,
             };
         }
         if let Some(relay) = &self.relay {

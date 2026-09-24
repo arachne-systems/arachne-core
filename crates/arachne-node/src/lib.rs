@@ -39,6 +39,8 @@ const MAX_PAYLOAD: usize = 16 * 1024;
 const MAX_RECIPIENTS: usize = 64;
 const MAX_FRAME: usize = 128 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(5);
+/// Default bound on the close drain, the same on every profile.
+const CLOSE_DRAIN: Duration = Duration::from_secs(5);
 const CONNECTION_IDLE: Duration = Duration::from_secs(60);
 const CRITICAL_QUEUE: usize = 256;
 const CURRENT_QUEUE: usize = 64;
@@ -124,13 +126,16 @@ impl RelayOptions {
 /// constrained link overrides them through `NodeOptions`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timeouts {
-    /// One data exchange or resource admission, including its dial. Also
-    /// bounds how long `Node::close` waits for peers to acknowledge the close.
+    /// One data exchange or resource admission, including its dial.
     pub operation: Duration,
     /// One dial. A gossip dial holds its dial slot at most this long.
     pub dial: Duration,
     /// How long a live broadcast waits for a first overlay neighbor.
     pub gossip_join: Duration,
+    /// How long `Node::close` waits for peers to acknowledge the close. The
+    /// wait is best effort and blocks the closing caller, so it stays short
+    /// (5 s) on every profile, including Tor.
+    pub close_drain: Duration,
 }
 
 impl Timeouts {
@@ -141,12 +146,14 @@ impl Timeouts {
                 operation: Duration::from_secs(300),
                 dial: Duration::from_secs(240),
                 gossip_join: Duration::from_secs(30),
+                close_drain: CLOSE_DRAIN,
             };
         }
         Self {
             operation: TIMEOUT,
             dial: TIMEOUT,
             gossip_join: Duration::from_secs(2),
+            close_drain: CLOSE_DRAIN,
         }
     }
 
@@ -1380,8 +1387,8 @@ impl Node {
         self.connections.timeouts()
     }
 
-    /// Release the transport. Waits at most `Timeouts::operation` for peers to
-    /// acknowledge the close, then finishes the local teardown.
+    /// Release the transport. Waits at most `Timeouts::close_drain` for peers
+    /// to acknowledge the close, then finishes the local teardown.
     pub async fn close(mut self) {
         self.resources.close().await;
         self.overlays.lock().await.clear();
@@ -1710,7 +1717,36 @@ fn deadlines_follow_the_profile_and_scale_the_resource_grant() {
         operation: Duration::from_secs(300),
         dial: Duration::from_secs(240),
         gossip_join: Duration::from_secs(30),
+        close_drain: CLOSE_DRAIN,
     };
     assert!(slow.resource_grant() >= slow.dial + slow.operation);
     assert_eq!(NodeOptions::new(NetworkProfile::Lan).timeouts, direct);
+}
+
+/// `close` blocks its caller (a JNI thread on Android) for up to the close
+/// drain. That bound must stay short on every profile, even where the
+/// operation deadline is minutes.
+#[test]
+fn every_profile_keeps_a_short_close_drain() {
+    let profiles = [
+        NetworkProfile::Direct,
+        NetworkProfile::Lan,
+        NetworkProfile::Nearby,
+        NetworkProfile::Wan,
+        NetworkProfile::RelayOnly,
+        NetworkProfile::WanOnly,
+    ];
+    for profile in profiles {
+        assert_eq!(Timeouts::for_profile(profile).close_drain, CLOSE_DRAIN);
+    }
+    assert_eq!(CLOSE_DRAIN, Duration::from_secs(5));
+}
+
+#[cfg(feature = "tor")]
+#[test]
+fn tor_close_drain_is_not_the_tor_operation_deadline() {
+    let tor = Timeouts::for_profile(NetworkProfile::Tor);
+    assert_eq!(tor.operation, Duration::from_secs(300));
+    assert_eq!(tor.close_drain, CLOSE_DRAIN);
+    assert_ne!(tor.close_drain, tor.operation);
 }
