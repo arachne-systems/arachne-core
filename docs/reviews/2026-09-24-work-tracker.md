@@ -52,7 +52,7 @@ and a different Core pin. Core work that each plan step depends on:
   - [x] A9b (`fix/a9b-tor`; torut replaced, deny clean): `tor` feature pulls `torut` → `ed25519-dalek 1.0.1` / `curve25519-dalek 3.2.0` (RUSTSEC-2022-0093, RUSTSEC-2024-0344).
   - [ ] A9c: behind latest: sha2 0.11, aes-gcm 0.11, hkdf 0.13, sframe 2.0, rusqlite 0.40; getrandom 0.2 vs 0.4 split.
   - [x] A9d (`334ab7f`): in-file change notices in fork sources; stale `release = false` in `release-plz.toml`.
-  - [ ] A9f: Tor control client uses plain COOKIE auth; add SAFECOOKIE. Full `tor_transport` node test not run (no Tor network reach here).
+  - [x] A9f (`8fcf5f8`, live Tor SAFECOOKIE passed): Tor control client uses plain COOKIE auth; add SAFECOOKIE. Full `tor_transport` node test not run (no Tor network reach here).
   - [ ] A9e (owner approval): publish `arachne-bao-tree`, then blobs, gossip, node, runtime; decide on yanking old fork versions.
 - [ ] **A10** Split `arachne-runtime/src/lib.rs` by subsystem; test through the typed Client.
 - [ ] Fix stale docs (`docs/integration.md` gaps list, missing ADR 0008/0009).
