@@ -17,9 +17,12 @@ Backport the macro-package portion of genuine upstream removal commit
 https://github.com/cryspen/hax/commit/8f9cb576e58f6cc7e9ed249a7d4439b0f7ed0da7 :
 
 - Remove `proc-macro-error2` from the normalized manifest's `cfg(hax)` dependencies.
-- `src/implementation.rs` exactly matches that commit: ordinary `syn::Error`
+- `src/implementation.rs` matches that commit: ordinary `syn::Error`
   compile errors replace abort wrappers, using the already-present `syn`.
   The non-hax implementation and all crypto/proof algorithms are unchanged.
+  The file also has a comment header at the top. This header is the
+  notice of modification that Apache-2.0 section 4(b) requires. The header is
+  the only difference from the upstream commit.
 - Add `tests/check-diagnostics.py` to exercise actual rustc diagnostics and
   successful expansion from the built `cfg(hax)` macro library.
 

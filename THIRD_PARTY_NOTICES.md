@@ -17,3 +17,11 @@ This is an inventory of in-tree vendored source, not a complete inventory of
 packages fetched by Cargo. Registry dependencies retain their own terms and are
 version-pinned in [`Cargo.lock`](Cargo.lock). Generate notices for the exact
 platform and feature set before distributing a binary.
+
+Modified files in Apache-2.0 components carry an in-file notice of
+modification (Apache-2.0 section 4(b)), for example
+`vendor/hax-lib-macros/src/implementation.rs`.
+
+Binary distributions (the SDK `cdylib`, an Android AAR, or an application)
+must carry the MPL-2.0 source pointer and the third-party notices. See
+[Binary distributions](LICENSING.md#binary-distributions).

@@ -16,7 +16,9 @@ exclude = ["vendor/bao-tree", "vendor/netlink-packet-core", "vendor/hax-lib-macr
 version = "0.1.0"
 authors = ["Arachne Systems"]
 edition = "2024"
-license-file = "LICENSE"
+# SPDX expression. Each crate directory carries a `LICENSE` symlink to the root
+# MPL-2.0 text so `cargo package` still ships the full license with the crate.
+license = "MPL-2.0"
 rust-version = "1.91"
 repository = "https://github.com/arachne-systems/arachne-core"
 homepage = "https://github.com/arachne-systems"

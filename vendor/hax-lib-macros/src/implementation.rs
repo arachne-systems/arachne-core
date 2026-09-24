@@ -1,3 +1,11 @@
+// NOTICE OF MODIFICATION (Apache License 2.0, section 4(b)):
+// This file was modified by Arachne Systems in 2026 from the published
+// hax-lib-macros 0.3.7 crate. The `cfg(hax)` abort wrappers from
+// `proc-macro-error2` are replaced with ordinary `syn::Error` compile errors,
+// backporting upstream commit
+// https://github.com/cryspen/hax/commit/8f9cb576e58f6cc7e9ed249a7d4439b0f7ed0da7 .
+// See ../ARACHNE-PATCH.md for the full change record.
+
 mod hax_paths;
 mod impl_fn_decoration;
 mod quote;
