@@ -47,7 +47,7 @@ and a different Core pin. Core work that each plan step depends on:
 - [ ] **A5** One persistence mode behind a `Storage` trait; schema versions and migrations.
 - [ ] **A6** Delivery spec; per-author quotas; bitmap dedup; remove the legacy receive stack.
 - [x] **A7** (`fix/a7-network`, merged)
-  - [ ] A7r: runtime wiring — members-only gossip tag key, revision window in runtime checks and `real_node_lifecycle` test, one-behind `Message.revision`, `NodeOptions` into `create_endpoint`, stranger error kind Gate the data plane at handshake; fix metadata leaks; relay config; `Link` trait.
+  - [x] A7r (`79adbe4`, merged): runtime wiring — members-only gossip tag key, revision window in runtime checks and `real_node_lifecycle` test, one-behind `Message.revision`, `NodeOptions` into `create_endpoint`, stranger error kind Gate the data plane at handshake; fix metadata leaks; relay config; `Link` trait.
 - [ ] **A8** Per-app or per-topic isolation.
 - [x] **A9** Version ranges; renamed forks with own versions; SPDX license field. (`fix/a9-supply-chain`, merged into `integrate/wave1`)
   - [ ] A9a: ~40 `.rs` comments cite ADR 0008/0009/0010 that live only in `arachne-development`. Replace with inline rationale.
