@@ -141,6 +141,201 @@ mod tests {
         let _ = follow;
     }
 
+    /// A raw self-update by a member that tracks the group with raw MLS
+    /// processing. Measurement only: it skips the Workspace history.
+    fn raw_self_update(owner: &mut Workspace) -> Vec<u8> {
+        let commit = owner
+            .group
+            .commit_builder()
+            .force_self_update(true)
+            .load_psks(owner.provider.storage())
+            .unwrap()
+            .build(
+                owner.provider.rand(),
+                owner.provider.crypto(),
+                &owner._signer,
+                |_| true,
+            )
+            .unwrap()
+            .stage_commit(&owner.provider)
+            .unwrap()
+            .into_contents()
+            .0
+            .to_bytes()
+            .unwrap();
+        owner.group.merge_pending_commit(&owner.provider).unwrap();
+        commit
+    }
+
+    fn raw_apply(owner: &mut Workspace, commit: &[u8]) {
+        use openmls::prelude::tls_codec::Deserialize;
+        let message = MlsMessageIn::tls_deserialize_exact(commit)
+            .unwrap()
+            .try_into_protocol_message()
+            .unwrap();
+        let processed = owner.group.process_message(&owner.provider, message).unwrap();
+        let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
+            panic!("not a commit")
+        };
+        owner
+            .group
+            .merge_staged_commit(&owner.provider, *staged)
+            .unwrap();
+    }
+
+    /// Sizes of management commits in one grown workspace.
+    #[derive(Debug, Default)]
+    struct Sizes {
+        members: usize,
+        registration: usize,
+        remove: usize,
+        /// Largest self-update commit sent while growing (policy B only).
+        largest_self_update: usize,
+        /// First self-update of an early member at the end (policy A only).
+        first_self_update: usize,
+    }
+
+    /// Grow a workspace to `size` members in batches of 128, one fresh link
+    /// per batch. With `self_update`, every new member self-updates right
+    /// after its batch joins (policy B); otherwise nobody does (policy A).
+    fn grow(size: usize, self_update: bool) -> Sizes {
+        use crate::history::tests::endpoint;
+        use crate::{AdmissionAssessment, MAX_ADMISSION_BATCH, PendingJoin};
+        let mut owner = Workspace::create([90; 32], "Owner").unwrap();
+        let mut sizes = Sizes::default();
+        let mut probe: Option<Workspace> = None;
+        let mut next = 0;
+        let mut link = None;
+        while owner.member_count() < size {
+            // Policy A reuses one link: a registration past ~785 members no
+            // longer fits the 64 KiB bound (B3c). Policy B registers a fresh
+            // link per batch so each joiner replays one step.
+            if link.is_none() || self_update {
+                let (registration, invitation, checkpoint) =
+                    owner.prepare_invitation(0, false, false).unwrap();
+                owner = registration.workspace;
+                link = Some((invitation, checkpoint));
+            }
+            let (invitation, checkpoint) = link.as_ref().unwrap();
+            let (invitation, checkpoint) = (invitation, checkpoint.as_slice());
+            let count = (size - owner.member_count()).min(MAX_ADMISSION_BATCH);
+            let range = next..next + count;
+            next = range.end;
+            let joins: Vec<_> = range
+                .clone()
+                .map(|i| {
+                    PendingJoin::from_invitation(invitation, checkpoint, endpoint(i), "Member")
+                        .unwrap()
+                })
+                .collect();
+            let requests: Vec<_> = joins
+                .iter()
+                .map(|join| join.admission_request().unwrap().to_vec())
+                .collect();
+            let validated: Vec<_> = range
+                .clone()
+                .zip(&requests)
+                .map(|(i, request)| match owner.assess_admission(endpoint(i), request).unwrap() {
+                    AdmissionAssessment::Ready(validated) => validated,
+                    _ => panic!("open invitation needs no approval"),
+                })
+                .collect();
+            let entries: Vec<_> = range
+                .clone()
+                .zip(requests.iter().zip(&validated))
+                .map(|(i, (request, validated))| (endpoint(i), request.as_slice(), validated))
+                .collect();
+            let prepared = owner.prepare_validated_admission_batch(&entries).unwrap();
+            let authorization = if count == 1 {
+                MembershipAuthorization::Admission(prepared.replies[0].authorization.clone())
+            } else {
+                MembershipAuthorization::AdmissionBatch(
+                    prepared.replies.iter().map(|r| r.authorization.clone()).collect(),
+                )
+            };
+            if let Some(probe) = probe.as_mut() {
+                raw_apply(probe, &prepared.commit);
+            }
+            owner = prepared.workspace;
+            let join = |join: &PendingJoin| {
+                let mut proof = join.join_proof().unwrap();
+                proof.apply_transition(&authorization, &prepared.commit).unwrap();
+                join.prepare_workspace(&proof, &prepared.welcome).unwrap()
+            };
+            if probe.is_none() && !self_update {
+                probe = Some(join(&joins[0]));
+            }
+            if self_update {
+                let mut members: Vec<Workspace> = joins.iter().map(join).collect();
+                for i in 0..members.len() {
+                    let commit = raw_self_update(&mut members[i]);
+                    sizes.largest_self_update = sizes.largest_self_update.max(commit.len());
+                    owner = active(owner.prepare_self_update_update(&commit).unwrap());
+                    for member in &mut members[i + 1..] {
+                        raw_apply(member, &commit);
+                    }
+                }
+            }
+        }
+        sizes.members = owner.member_count();
+        // Raw commits on copies: the 64 KiB verifier bound would refuse the
+        // large ones, and the point is to measure them. A registration is a
+        // policy (GroupContextExtensions) commit with a path.
+        let mut copy = owner.provisional_copy().unwrap();
+        let extensions = copy.group.extensions().clone();
+        sizes.registration = copy
+            .group
+            .update_group_context_extensions(&copy.provider, extensions, &copy._signer)
+            .unwrap()
+            .0
+            .to_bytes()
+            .unwrap()
+            .len();
+        let mut copy = owner.provisional_copy().unwrap();
+        let own = copy.group.own_leaf_index();
+        let target = copy.group.members().find(|m| m.index != own).unwrap().index;
+        sizes.remove = copy
+            .group
+            .remove_members(&copy.provider, &copy._signer, &[target])
+            .unwrap()
+            .0
+            .to_bytes()
+            .unwrap()
+            .len();
+        if let Some(mut probe) = probe {
+            sizes.first_self_update = raw_self_update(&mut probe).len();
+        }
+        sizes
+    }
+
+    /// B3c: members that self-update after joining shrink later management
+    /// commits. Small size so the check runs in every test pass.
+    #[test]
+    fn self_updates_after_joining_shrink_management_commits() {
+        let without = grow(33, false);
+        let with = grow(33, true);
+        eprintln!("B3c 33 members: without {without:?}, with {with:?}");
+        assert!(with.registration * 2 < without.registration, "{with:?} vs {without:?}");
+        assert!(with.remove * 2 < without.remove, "{with:?} vs {without:?}");
+    }
+
+    /// B3c measurement. Run alone, in release:
+    /// `cargo test --release -p arachne-security --lib b3c_measure -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore]
+    fn b3c_measure_management_commit_sizes() {
+        let sizes: Vec<usize> = std::env::var("B3C_SIZES")
+            .ok()
+            .map(|v| v.split(',').map(|s| s.parse().unwrap()).collect())
+            .unwrap_or_else(|| vec![385, 769, 1025]);
+        for size in sizes {
+            let without = grow(size, false);
+            eprintln!("B3c policy=none {without:?}");
+            let with = grow(size, true);
+            eprintln!("B3c policy=self_update_after_join {with:?}");
+        }
+    }
+
     /// ADR A2 T10: a self-update that changes anything but its own keys is
     /// rejected.
     #[test]
