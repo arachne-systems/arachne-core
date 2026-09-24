@@ -28,7 +28,15 @@ fn publication_one_revision_behind_is_received() {
         sender,
         json!({"op":"create_workspace","display_name":"Publisher"}),
     );
-    let invite = call(sender, json!({"op":"issue_invitation"}));
+    let staged = call(
+        sender,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    );
+    let invite = call(
+        sender,
+        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+    )["issued_invitation"]
+        .clone();
     let pending = call(
         receiver,
         json!({"op":"begin_join","invitation":invite["invitation"],
