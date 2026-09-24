@@ -20,7 +20,7 @@ test is red → green and the crate tests pass.
 - [x] **B7c** (`ddb20d3`; direct prefix admission + stuck-gap exemption per author) `stage_direct_range` was all-or-nothing under the per-author quota.
 - [x] **B7d** (`c6af1de`) Proved not reachable: receiver eviction opens gaps first (max 185 of 512 pending while all blocked). Guard test `direct_global_bound.rs`.
 - [x] **B7e** (`eecd315`; eviction records misses as `missing_count`; late copies at/below floor dropped) Eviction moves the floor past a gap silently: the late object is delivered after newer ones and no miss is recorded (breaks `docs/delivery.md`). In progress.
-- [ ] **B7f** (runtime `lib.rs`, with A1 recovery group): report `missing_count` on the adoption response too; count sequences skipped by `advance()` at epoch change as missed.
+- [x] **B7f** (`8272b66`, `518f328`): report `missing_count` on the adoption response too; count sequences skipped by `advance()` at epoch change as missed.
 - [x] **B3d** (`2dbe0e2`) Admission history pages were size-checked before a 20-byte `history_page` field was added; ~1–2% of runs landed in the gap. Now each page is measured in final form. Sweep test over every fill point.
 - [x] **T1** (`670f068`, `afd1b9a`) `admission_staging` flake: close drain waited 3×PTO (26 s under load) vs a fixed 5 s. Now a separate `close_drain` deadline (5 s, all profiles incl. Tor; host can override); drain finishes in background. Test `close_drain.rs`.
 - [x] **B8** (`c142361`, workspace tests 387 pass / 0 fail) The latest-value index never prunes and fills for good.
@@ -57,12 +57,12 @@ and a different Core pin. Core work that each plan step depends on:
 
 ## Architecture work (needs design first)
 
-- [ ] **A1** — step 1 done (`arachne-api`, `71cc9db`); UniFFI spike running.
+- [ ] **A1** — steps 1–2 done (`71cc9db`, `feat/a1-typed-ops` → `bfd10cc`); UniFFI spike done. Next: A4 (steps 3–4), A5 (step 5) in progress; then steps 6–9.
   Original: One typed, versioned contract; stable error codes; `#[non_exhaustive]`; consider UniFFI.
 - [ ] **A2** — steps 1–7 done in security (`b995fba`, `624c658`, `feat/a2-security-wiring` 8 commits). Next: delivery/node/store adaptation (in progress), then runtime integration + steps 8–13 after A1 step 2.
   Original: Commit-ordering authority. **Decision open:** sequencer admin vs deterministic tie-break (recommended).
 - [x] **A3** (`fix/a3-delivery-epochs`, merging)
-  - [ ] A3f: runtime recovery ops (`fetch_recovery_range`, `discover_recovery_cutoff`) still ask for the current epoch only; wire the 4-epoch window.
+  - [x] A3f (`8078d8e`): runtime recovery ops (`fetch_recovery_range`, `discover_recovery_cutoff`) still ask for the current epoch only; wire the 4-epoch window.
   - [ ] A3g: check that a large workspace plus a full attachment fits the store's 1 MiB record limit.
   - [ ] A3h: drop unused `serde_json` in `arachne-delivery`; run `cargo fmt` workspace-wide once branches settle.
   Original: Decouple delivery and routing from the exact epoch and policy revision.
@@ -81,5 +81,5 @@ and a different Core pin. Core work that each plan step depends on:
   - [x] A9d (`334ab7f`): in-file change notices in fork sources; stale `release = false` in `release-plz.toml`.
   - [x] A9f (`8fcf5f8`, live Tor SAFECOOKIE passed): Tor control client uses plain COOKIE auth; add SAFECOOKIE. Full `tor_transport` node test not run (no Tor network reach here).
   - [ ] A9e (owner approval): publish `arachne-bao-tree`, then blobs, gossip, node, runtime; decide on yanking old fork versions.
-- [ ] **A10** Split `arachne-runtime/src/lib.rs` by subsystem; test through the typed Client.
+- [x] **A10** (`feat/a1-typed-ops` merged; lib.rs 8k → 163 lines, 14 ops modules) Split `arachne-runtime/src/lib.rs` by subsystem; test through the typed Client.
 - [x] Fix stale docs (A9 `bbb5488`, A9a `fd189aa`) (`docs/integration.md` gaps list, missing ADR 0008/0009).
