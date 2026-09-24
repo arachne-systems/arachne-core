@@ -856,6 +856,9 @@ pub fn wait_for_work(handle: i64) -> Result<bool, String> {
     Ok(signal.wait())
 }
 
+/// Time `shutdown_session` allows for local teardown after the peer drain.
+const LOCAL_TEARDOWN: Duration = Duration::from_secs(5);
+
 fn shutdown_session(mut session: Session) -> Result<(), String> {
     release_overlay_paths(&DEVICE_OVERLAY_PATHS, session.overlay_paths);
     session.overlay_paths = 0;
@@ -868,9 +871,14 @@ fn shutdown_session(mut session: Session) -> Result<(), String> {
     session.ready_current_view = None;
     drop(session.range.take());
     session.resources = resources::Jobs::default();
-    let result = session.runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(5), session.node.close()).await
-    });
+    // `Node::close` bounds its peer drain by the operation deadline, which
+    // scales with the profile (Tor) and the host's override. This guard only
+    // catches a stuck local teardown, so it allows the drain plus a fixed
+    // margin for the local work.
+    let deadline = session.node.timeouts().operation + LOCAL_TEARDOWN;
+    let result = session
+        .runtime
+        .block_on(async { tokio::time::timeout(deadline, session.node.close()).await });
     session.runtime.shutdown_timeout(Duration::from_secs(2));
     result.map_err(|_| "node shutdown timed out".into())
 }

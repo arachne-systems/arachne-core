@@ -715,7 +715,21 @@ impl Connections {
             listener.abort();
             let _ = listener.await;
         }
-        self.endpoint.close().await;
+        // The drain waits for peers to acknowledge the close, up to three
+        // probe timeouts of the slowest open connection. A probe timeout grows
+        // with the measured round trip time, so a slow link (Tor) or a starved
+        // host can make the drain outlast any fixed deadline. The drain is best
+        // effort: a peer that misses the close frame learns of it by its own
+        // idle timeout. Bound it by the operation deadline, as any other wait
+        // on a peer, and finish the local teardown. The drain runs on its own
+        // task, so an overrun leaves it to finish the endpoint's shutdown in
+        // the background instead of dropping it halfway.
+        let drain = self.timeouts.operation;
+        let endpoint = self.endpoint.clone();
+        let draining = tokio::spawn(async move { endpoint.close().await });
+        if tokio::time::timeout(drain, draining).await.is_err() {
+            tracing::warn!(target: "data_fabric_transport", ?drain, "TRANSPORT_CLOSE_DRAIN_TIMEOUT");
+        }
         self.outgoing.lock().await.clear();
     }
 }

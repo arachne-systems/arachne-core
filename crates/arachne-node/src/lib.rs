@@ -124,7 +124,8 @@ impl RelayOptions {
 /// constrained link overrides them through `NodeOptions`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timeouts {
-    /// One data exchange or resource admission, including its dial.
+    /// One data exchange or resource admission, including its dial. Also
+    /// bounds how long `Node::close` waits for peers to acknowledge the close.
     pub operation: Duration,
     /// One dial. A gossip dial holds its dial slot at most this long.
     pub dial: Duration,
@@ -1374,6 +1375,13 @@ impl Node {
         }
     }
 
+    /// The transport deadlines this node was bound with.
+    pub fn timeouts(&self) -> Timeouts {
+        self.connections.timeouts()
+    }
+
+    /// Release the transport. Waits at most `Timeouts::operation` for peers to
+    /// acknowledge the close, then finishes the local teardown.
     pub async fn close(mut self) {
         self.resources.close().await;
         self.overlays.lock().await.clear();
