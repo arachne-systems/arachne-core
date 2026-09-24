@@ -373,6 +373,13 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
                 .map_err(str::to_owned)?;
         }
         let mut count = 0;
+        // B7b: the whole range is verified above. Automatic recovery admits
+        // the longest in-order prefix that fits the pending bounds and claims
+        // progress only through its last record. The first refused record and
+        // all after it are not recorded; a later request after the
+        // application drains brings them again.
+        let mut covered = ready.query.after;
+        let mut stopped = false;
         for packet in offer.packets() {
             let live = packet
                 .ciphertext
@@ -414,8 +421,17 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
                     next.stage_live_current(owner, &packet.context, live.metadata, ciphertext)
                 }
                 None => next.stage(owner, &packet.context, ciphertext),
-            }
-            .map_err(str::to_owned)?;
+            };
+            let staged = match staged {
+                Err(error)
+                    if ready.automatic
+                        && arachne_delivery::inbox::drains_with_application(error) =>
+                {
+                    stopped = true;
+                    break;
+                }
+                staged => staged.map_err(str::to_owned)?,
+            };
             match staged {
                 arachne_delivery::inbox::InboxStage::Prepared(candidate) => {
                     next = *candidate;
@@ -426,15 +442,30 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
                     return Err("recovered object outside receive window".into());
                 }
             }
+            covered = packet
+                .context
+                .sequence
+                .ok_or("recovered publication lacks sequence")?
+                .get();
         }
-        if ready.automatic {
+        if !stopped {
+            covered = ready.query.through;
+        }
+        if ready.automatic && covered > ready.query.after {
             next = next
-                .accept_recovery_coverage(owner, &ready.query, &ready.reply)
+                .accept_recovery_prefix(owner, &ready.query, &ready.reply, covered)
                 .map_err(str::to_owned)?;
         }
         if count == 0 && retain_until == 0 && !ready.automatic {
             session.ready_range = None;
             return Ok(json!({"state":"recovery_no_new_objects"}));
+        }
+        if ready.automatic && covered == ready.query.after && retain_until == 0 {
+            // Nothing fits until the application drains this author's
+            // pending objects. No progress is claimed; request again later.
+            session.ready_range = None;
+            return Ok(json!({"state":"recovery_awaiting_application",
+                "accepted_through":covered, "accepted_progress":false}));
         }
         let snapshot = seal_state(
             session.records.is_some(),
@@ -444,8 +475,11 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
                 Some(&next),
         )?;
         let candidate = owner.provisional_copy().map_err(str::to_owned)?;
-        let value = json!({"workspace":owner.id(), "snapshot":snapshot, "state":"awaiting_recovery_save",
+        let mut value = json!({"workspace":owner.id(), "snapshot":snapshot, "state":"awaiting_recovery_save",
             "publication_count":count, "durable":false, "accepted_progress":false});
+        if ready.automatic {
+            value["accepted_through"] = json!(covered);
+        }
         session.staged_workspace = Some(StagedWorkspace {
             workspace: candidate,
             publisher: Some(publisher),

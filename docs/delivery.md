@@ -92,7 +92,9 @@ value data). An author is charged for its own metadata too.
 An object over a bound is refused (`author pending quota exhausted` or
 `pending inbox full`) and is **not recorded**. It can come again, live or by
 recovery, after the application drains work. One author cannot use up the
-space of the others.
+space of the others. The bounds apply to recovered objects too: recovery is
+not exempt. Automatic recovery stops at the bound and continues later (see
+[prefix admission](#group-mode)).
 
 ### Scheduling
 
@@ -154,6 +156,22 @@ Group objects go to every subscriber of the topic.
   topic selection, after, through). Automatic recovery progress is per
   (author, epoch, selection). A holder may keep an exact author-signed range
   (`retain_until`) and serve only that range.
+- **Prefix admission (B7b).** A served range can be up to
+  `MAX_REPLY_BYTES` = 128 KiB, but one author may hold only 32 KiB pending.
+  The requester verifies the **whole** signed range first. Then automatic
+  recovery (`stage_recovery_range`) admits records in order until the first
+  record that the pending bounds refuse. It stops there. Progress moves only
+  to the sequence of the last record admitted (or found duplicate); the
+  candidate reports it as `accepted_through`. The refused record and the
+  records after it are not recorded, so a later request after the
+  application drains brings them again. Because the signature covers the
+  whole range, the records at or below that sequence are exactly the
+  complete prefix. When no record fits, the state is
+  `recovery_awaiting_application`: no candidate, no progress. Drain, then
+  request again. An explicit range (with `after` and `through` from the
+  caller) stays all-or-nothing and fails at the bound.
+  Cost: in the worst case, each cycle fetches up to 128 KiB again to admit
+  about two full-size objects. The wire format did not change.
 - **Limit.** Authors and holders serve, and receivers verify, ranges for any
   epoch in the receive window (`arachne-delivery` API). The runtime recovery
   operations (`fetch_recovery_range`, `discover_recovery_cutoff`) request the
@@ -214,6 +232,10 @@ topic, selector, replacement key).
 | Partitioned peers at different epochs; who may recover; removal | `arachne-delivery/tests/epochs.rs` `members_at_different_epochs_exchange_data_after_a_partition_heals` |
 | Round robin, gap fill, cross-epoch dedup | `epochs.rs` `fair_scheduling_gap_fill_and_cross_epoch_dedup` |
 | Per-author quota, binary storage | `epochs.rs` `per_author_quota_and_binary_pending_storage` |
+| Quota still refuses a flooding author's live traffic | `recovery_bound.rs` `flooding_author_still_hits_the_pending_quota_for_live_traffic` |
+| Byte-bounded served range (B7) | `recovery_bound.rs` `automatic_recovery_serves_byte_bounded_prefix_and_continues` |
+| Prefix progress stays inside the signed range | `recovery_bound.rs` `recovery_prefix_progress_is_bounded_by_the_signed_range` |
+| Automatic recovery progresses under the author quota (runtime) | `arachne-runtime/tests/recovery_quota.rs` `automatic_recovery_of_large_objects_progresses_under_author_quota`, `automatic_recovery_waits_for_the_application_when_the_quota_is_full` |
 | Save never shrinks publisher history | `epochs.rs` `publisher_history_never_shrinks_to_make_room_for_inbox_state` |
 | Replay window bound, restart, acknowledgement | `inbox::durable_pending_objects_and_bounded_topic_replay` |
 | Deferred scopes | `inbox::deferred_streams_preserve_order_identity_and_restart` |

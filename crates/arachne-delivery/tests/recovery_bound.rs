@@ -178,3 +178,204 @@ fn automatic_recovery_serves_byte_bounded_prefix_and_continues() {
         ));
     }
 }
+
+/// Full-size history of `head` objects on one topic, readable by the reader.
+struct History {
+    sender: Workspace,
+    reader: Workspace,
+    log: PublisherLog,
+    policy: RoutingTable,
+    topic: Topic,
+    topics: BTreeSet<Topic>,
+    author: [u8; 32],
+}
+
+fn full_size_history(head: u64) -> History {
+    let (mut sender, reader) = author_and_reader();
+    let id = sender.id();
+    let author = sender.member().unwrap().id();
+    let topic = Topic::new("sample").unwrap();
+    let topics = BTreeSet::from([topic.clone()]);
+    let mut log = PublisherLog::new(&sender).unwrap();
+    for number in 1..=head {
+        let context = PublicationContext {
+            sequence: std::num::NonZeroU64::new(number),
+            workspace: id,
+            revision: REVISION,
+            topic: topic.clone(),
+            id: u128::from(number).to_be_bytes(),
+        };
+        let mut payload = vec![number as u8; MAX_APPLICATION_PAYLOAD];
+        payload[..8].copy_from_slice(&number.to_be_bytes());
+        let object = sender
+            .protect_object(
+                topic.namespace().as_bytes(),
+                &context.authenticated_bytes(),
+                &payload,
+            )
+            .unwrap();
+        log.append(context, object).unwrap();
+    }
+    let mut policy = RoutingTable::default();
+    policy
+        .install_verified_policy(
+            id,
+            REVISION,
+            BTreeMap::from([
+                (
+                    [1; 32],
+                    Permissions::Selected {
+                        publish: topics.clone(),
+                        subscribe: BTreeSet::new(),
+                    },
+                ),
+                (
+                    [2; 32],
+                    Permissions::Selected {
+                        publish: BTreeSet::new(),
+                        subscribe: topics.clone(),
+                    },
+                ),
+            ]),
+        )
+        .unwrap();
+    History {
+        sender,
+        reader,
+        log,
+        policy,
+        topic,
+        topics,
+        author,
+    }
+}
+
+/// B7b: progress may stop inside a verified range, but only at or before its
+/// signed `through`, and only continuing accepted progress.
+#[test]
+fn recovery_prefix_progress_is_bounded_by_the_signed_range() {
+    let history = full_size_history(6);
+    let epoch = history.sender.epoch();
+    let request = wire::AvailableRangeQuery {
+        workspace: history.sender.id(),
+        author: history.author,
+        epoch,
+        policy_revision: REVISION,
+        after: 0,
+        topics: history.topics.clone(),
+    };
+    let reply = wire::serve_available_range(
+        &history.log,
+        &history.sender,
+        &history.policy,
+        history.reader.endpoint(),
+        &request,
+    )
+    .unwrap();
+    let (query, reply) = wire::parse_available_reply(&request, &reply)
+        .unwrap()
+        .unwrap();
+    assert_eq!(query.through, 6);
+    let inbox = ObjectInbox::new(history.reader.id(), history.reader.epoch());
+    let reader = &history.reader;
+    // Beyond the signed range, or no progress at all: refused.
+    assert!(
+        inbox
+            .accept_recovery_prefix(reader, &query, &reply, 7)
+            .is_err()
+    );
+    assert!(
+        inbox
+            .accept_recovery_prefix(reader, &query, &reply, 0)
+            .is_err()
+    );
+    let mut forged = reply.clone();
+    *forged.last_mut().unwrap() ^= 1;
+    assert!(
+        inbox
+            .accept_recovery_prefix(reader, &query, &forged, 3)
+            .is_err()
+    );
+    let inbox = inbox
+        .accept_recovery_prefix(reader, &query, &reply, 3)
+        .unwrap();
+    assert_eq!(
+        inbox.recovery_progress(history.author, epoch, &history.topics),
+        3
+    );
+    // A replayed range at or below progress grants nothing.
+    let replayed = inbox
+        .accept_recovery_prefix(reader, &query, &reply, 2)
+        .unwrap();
+    assert_eq!(
+        replayed.recovery_progress(history.author, epoch, &history.topics),
+        3
+    );
+    // The same range no longer continues progress: it starts at 0, not 3.
+    assert!(
+        inbox
+            .accept_recovery_prefix(reader, &query, &reply, 6)
+            .is_err()
+    );
+    assert!(
+        inbox
+            .accept_recovery_coverage(reader, &query, &reply)
+            .is_err()
+    );
+}
+
+/// The quota still protects the inbox from a flooding member's live traffic.
+#[test]
+fn flooding_author_still_hits_the_pending_quota_for_live_traffic() {
+    let mut history = full_size_history(0);
+    let id = history.sender.id();
+    let mut inbox = ObjectInbox::new(history.reader.id(), history.reader.epoch());
+    let mut accepted = Vec::new();
+    let mut refused = None;
+    for number in 1..=8u64 {
+        let context = PublicationContext {
+            sequence: std::num::NonZeroU64::new(number),
+            workspace: id,
+            revision: REVISION,
+            topic: history.topic.clone(),
+            id: u128::from(number).to_be_bytes(),
+        };
+        let object = history
+            .sender
+            .protect_object(
+                history.topic.namespace().as_bytes(),
+                &context.authenticated_bytes(),
+                &vec![number as u8; MAX_APPLICATION_PAYLOAD],
+            )
+            .unwrap();
+        match inbox.stage(&history.reader, &context, &object) {
+            Ok(InboxStage::Prepared(next)) => {
+                inbox = *next;
+                accepted.push(number);
+            }
+            Ok(_) => panic!("live object was not new"),
+            Err(error) => {
+                refused.get_or_insert((number, error, context, object));
+            }
+        }
+    }
+    let (number, error, context, object) = refused.expect("flood was never refused");
+    assert_eq!(error, "author pending quota exhausted");
+    assert_eq!(number, 3);
+    assert_eq!(accepted, vec![1, 2]);
+    // The refused object was not recorded: after the application drains one
+    // object it is accepted, not treated as a duplicate.
+    let pending = inbox.pending(&history.reader).unwrap().unwrap();
+    inbox = inbox
+        .acknowledge(
+            pending.message.member,
+            &pending.context.topic,
+            pending.counter,
+            pending.context.id,
+        )
+        .unwrap();
+    assert!(matches!(
+        inbox.stage(&history.reader, &context, &object).unwrap(),
+        InboxStage::Prepared(_)
+    ));
+}
