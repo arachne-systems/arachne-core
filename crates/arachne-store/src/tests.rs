@@ -1,5 +1,5 @@
 use super::*;
-use arachne_security::{PendingJoin, StorageKey, Workspace};
+use arachne_security::{EndpointKey, EndpointSigner, PendingJoin, StorageKey, Workspace};
 
 struct Directory(tempfile::TempDir);
 impl Directory {
@@ -33,17 +33,19 @@ fn admission_records_commit_together_and_reject_mixed_restoration() {
     let directory = Directory::new();
     let path = directory.0.path().join("workspace.db");
     let root = [7; 32]; // Isolated test fixture, never a runtime default.
-    let owner = Workspace::create([1; 32], "Storage gate admin").unwrap();
+    let owner_key = EndpointKey::generate().unwrap();
+    let member_key = EndpointKey::generate().unwrap();
+    let owner = Workspace::create(&owner_key, "Storage gate admin").unwrap();
     let scope = owner.id();
     let key = StorageKey::derive(&root).unwrap();
     let old = owner.seal(&key).unwrap();
     let (registered, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
     let owner = registered.workspace;
     let pending =
-        PendingJoin::from_invitation(&invitation, &checkpoint, [2; 32], "Storage gate member")
+        PendingJoin::from_invitation(&invitation, &checkpoint, &member_key, "Storage gate member")
             .unwrap();
     let admitted = owner
-        .prepare_admission([2; 32], pending.admission_request().unwrap())
+        .prepare_admission(member_key.endpoint(), pending.admission_request().unwrap())
         .unwrap();
     let next = admitted.workspace.seal(&key).unwrap();
     let mut store = Store::open(&path, &root, scope).unwrap();
@@ -97,7 +99,7 @@ fn admission_records_commit_together_and_reject_mixed_restoration() {
     let store = Store::open(&path, &root, scope).unwrap();
     assert_eq!(store.revision(), 2);
     let saved = store.get(b"state").unwrap().unwrap();
-    let restored = Workspace::restore(&key, [1; 32], scope, &saved).unwrap();
+    let restored = Workspace::restore(&key, owner_key.endpoint(), scope, &saved).unwrap();
     assert_eq!(restored.member_count(), 2);
     let commit = store.get(b"history").unwrap().unwrap();
     let welcome = store.get(b"reply").unwrap().unwrap();
