@@ -373,3 +373,41 @@ longest. Do the ATAK groups first, so the Kotlin typed methods can ship before t
   The ATAK plugin moves from JNI to JNA.
 - Open: the JNA check in the ATAK host (step 9). If the host blocks a second JNA, the fallback is a
   small hand JNI shim over the same UniFFI scaffolding for Android only. We decide that after the check.
+
+## Implementation notes
+
+### Step 1 (done: `arachne-api`, `71cc9db`)
+
+- `ApiError` is the enum from decision 3, with `code()`. It adds `InvalidId` for code 101.
+- Error code ranges: 1–99 lifecycle, 100–199 input/state, 200–299 capacity, 300–399 storage,
+  400–499 transport, 500–599 authorization, 600–699 consistency, 900–999 internal. A golden test
+  pins every value.
+- Also added: `Capabilities`, `Feature`, and an `Event` skeleton (types only).
+
+### Open points for step 2
+
+- Give every code a variant or a constructor. Today `LimitReached` (201) has no variant,
+  `Unsupported` (103) and 600–601 go through `State { code }`, and public variant fields allow a
+  wrong code (for example `Storage { code: Timeout }`). Add checked constructors.
+- Move `CandidateStale` (302) out of the storage range, or document why it stays there.
+- `arachne_routing::Topic` and `arachne_api::TopicName` duplicate the topic rules. Make routing use
+  `TopicName`, or add a test that both accept and reject the same inputs.
+- A `RecordId` alone may not be unique, because record keys are `(author, [u8; 16])`.
+- Define `Limits` (step 3), the full `Feature` list, and the `Event` payloads (step 4).
+- Error `detail` and `reason` strings must never hold secrets or plaintext. Add a rule and a test.
+
+### UniFFI spike (done: `spike/a1-uniffi`, see `spike-a1-uniffi.md`)
+
+- uniffi `=0.31.2` and uniffi-bindgen-go `v0.7.1+v0.31.0`. Kotlin, Swift, Python and Go all pass:
+  error code 101 crosses the boundary, and `close()` from a second thread wakes a parked
+  `next_event`.
+- `#[non_exhaustive]` works with the derives. Foreign enums stay exhaustive, so foreign code keeps a
+  default branch.
+- Go generator bug: enums with explicit discriminants go on the wire by position. Decision: carry
+  the patch `patches/uniffi-bindgen-go-enum-discr.patch` in the SDK build. An upstream PR needs
+  owner approval (public GitHub).
+- Kotlin: an exported `close` clashes with `AutoCloseable.close()`. Rename it for Kotlin in
+  `uniffi.toml`.
+- Export a free function `api_error_code()`. Go gets no methods on error types, and Python field
+  names hide the method.
+- Generated code is 3,300–4,000 lines per language, all generated.
