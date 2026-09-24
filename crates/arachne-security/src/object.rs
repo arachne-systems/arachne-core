@@ -47,12 +47,12 @@ pub struct AuthenticatedObject {
 #[test]
 fn objects_are_independent_authenticated_and_epoch_scoped() {
     use super::{PendingJoin, StorageKey};
-    let admin = Workspace::create([1; 32], "Publisher").unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     let (registration, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let admin = registration.workspace;
-    let pending = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let pending = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], pending.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
         .unwrap();
     let mut proof = pending.join_proof().unwrap();
     proof
@@ -87,7 +87,7 @@ fn objects_are_independent_authenticated_and_epoch_scoped() {
     // No ratchet/replay side effects in crypto; delivery must suppress repeats.
     assert_eq!(reader.unprotect_object(b"app", b"chat/first", &old).unwrap(), first);
     assert!(reader.unprotect_object(b"app", b"feed", &old).is_err());
-    let outsider = Workspace::create([3; 32], "Other workspace").unwrap();
+    let outsider = Workspace::create(crate::test_key(3), "Other workspace").unwrap();
     assert!(outsider.unprotect_object(b"app", b"chat/first", &old).is_err());
     for offset in [0, 5, 37, 45, HEADER, old.len() - 1] {
         let mut changed = old.clone();
@@ -203,13 +203,13 @@ fn recent_epochs_stay_readable_for_receive_only_then_expire() {
         PreparedManagementUpdate::Active(workspace) => *workspace,
         PreparedManagementUpdate::Removed(_) => panic!("unexpected removal"),
     };
-    let admin = Workspace::create([1; 32], "Publisher").unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     // Registering the link is one membership commit (B1).
     let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let admin = registered.workspace;
-    let pending = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let pending = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], pending.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
         .unwrap();
     let mut proof = pending.join_proof().unwrap();
     proof
@@ -245,9 +245,9 @@ fn recent_epochs_stay_readable_for_receive_only_then_expire() {
     admin = registered.workspace;
     assert_eq!(admin.epoch(), start + 1);
     both_read(&admin, &reader);
-    let third = PendingJoin::from_invitation(&invite, &checkpoint, [3; 32], "Third").unwrap();
+    let third = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(3), "Third").unwrap();
     let added = admin
-        .prepare_admission([3; 32], third.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(3), third.admission_request().unwrap())
         .unwrap();
     reader = reader
         .prepare_admission_update(&added.authorization, &added.commit)
@@ -339,12 +339,12 @@ fn recent_epochs_stay_readable_for_receive_only_then_expire() {
 #[test]
 fn objects_are_bound_to_their_application_namespace() {
     use super::PendingJoin;
-    let admin = Workspace::create([1; 32], "Publisher").unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let admin = registered.workspace;
-    let pending = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let pending = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], pending.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
         .unwrap();
     let mut proof = pending.join_proof().unwrap();
     proof

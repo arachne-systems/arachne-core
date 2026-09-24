@@ -412,14 +412,14 @@ pub(crate) mod tests {
 
     /// An administrator and `count` ordinary members, all at one epoch.
     pub(crate) fn team(count: u8) -> (Workspace, Vec<Workspace>) {
-        let owner = Workspace::create([1; 32], "Administrator").unwrap();
+        let owner = Workspace::create(crate::test_key(1), "Administrator").unwrap();
         let (registration, invite, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
         let mut admin = registration.workspace;
         let mut members: Vec<Workspace> = Vec::new();
         for n in 0..count {
-            let endpoint = [n + 2; 32];
+            let endpoint = crate::test_endpoint(u64::from(n) + 2);
             let pending =
-                PendingJoin::from_invitation(&invite, &checkpoint, endpoint, "Member").unwrap();
+                PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key_for(endpoint), "Member").unwrap();
             let request = pending.admission_request().unwrap();
             let admitted = admin.prepare_admission(endpoint, request).unwrap();
             let mut proof = pending.join_proof().unwrap();

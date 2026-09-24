@@ -82,20 +82,17 @@ pub(crate) mod tests {
     };
 
     pub(crate) fn endpoint(index: usize) -> [u8; 32] {
-        let mut value = [0; 32];
-        value[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
-        value[8..16].copy_from_slice(&(!(index as u64)).to_be_bytes());
-        value
+        crate::test_endpoint(1_000_000 + index as u64)
     }
 
     /// An owner and one early member, both grown to at least `size` members
     /// through batch admissions from one early invitation.
     pub(crate) fn grown(seed: u8, size: usize) -> (Workspace, Workspace) {
-        let owner = Workspace::create([seed; 32], "Large workspace owner").unwrap();
+        let owner = Workspace::create(crate::test_key(u64::from(seed)), "Large workspace owner").unwrap();
         let (registration, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
         let mut owner = registration.workspace;
         let joiner = |index: usize| {
-            PendingJoin::from_invitation(&invitation, &checkpoint, endpoint(index), "Member").unwrap()
+            PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key_for(endpoint(index)), "Member").unwrap()
         };
         let early = joiner(0);
         let request = early.admission_request().unwrap().to_vec();

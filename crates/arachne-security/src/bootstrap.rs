@@ -335,7 +335,7 @@ pub(super) fn binding(credential: &Credential) -> Result<([u8; 32], [u8; 32]), &
         BasicCredential::try_from(credential.clone()).map_err(|_| "unsupported credential")?;
     let bytes = credential
         .identity()
-        .strip_prefix(b"data-fabric/candidate-member/v2/")
+        .strip_prefix(super::MEMBER_IDENTITY)
         .ok_or("member credential upgrade required")?;
     if bytes.len() != 64 || bytes[..32] == [0; 32] || bytes[32..] == [0; 32] {
         return Err("invalid member binding");
@@ -344,6 +344,52 @@ pub(super) fn binding(credential: &Credential) -> Result<([u8; 32], [u8; 32]), &
         bytes[..32].try_into().unwrap(),
         bytes[32..].try_into().unwrap(),
     ))
+}
+
+/// Verify a leaf's endpoint binding (ADR A2 step 6): the endpoint named in
+/// its credential signed (workspace, member id, MLS signature key). A leaf
+/// without a valid binding is rejected; no leaf can claim an endpoint whose
+/// key did not consent. Returns the leaf's (member id, endpoint).
+pub(super) fn verify_endpoint_binding(
+    crypto: &impl OpenMlsCrypto,
+    workspace: &GroupId,
+    leaf: &LeafNode,
+) -> Result<([u8; 32], [u8; 32]), &'static str> {
+    let (member, endpoint) = binding(leaf.credential())?;
+    let workspace: [u8; 32] = workspace
+        .as_slice()
+        .try_into()
+        .map_err(|_| "invalid workspace id")?;
+    let signature = leaf
+        .extensions()
+        .unknown(super::ENDPOINT_BINDING)
+        .ok_or("member leaf has no endpoint binding")?;
+    crypto
+        .verify_signature(
+            SignatureScheme::ED25519,
+            &super::endpoint_binding_message(workspace, member, leaf.signature_key().as_slice()),
+            &endpoint,
+            &signature.0,
+        )
+        .map_err(|_| "invalid endpoint binding")?;
+    Ok((member, endpoint))
+}
+
+/// A committer's new path leaf keeps its credential, key and extensions,
+/// so its endpoint binding stays valid.
+pub(super) fn check_path_leaf(
+    group: &PublicGroup,
+    actor: LeafNodeIndex,
+    leaf: &LeafNode,
+) -> Result<(), &'static str> {
+    let old = group.leaf(actor).ok_or("unknown committer")?;
+    if leaf.credential() != old.credential()
+        || leaf.signature_key() != old.signature_key()
+        || leaf.extensions() != old.extensions()
+    {
+        return Err("commit cannot replace committer identity");
+    }
+    Ok(())
 }
 
 pub(super) fn grant(group: &GroupId, key: &[u8; 32]) -> Vec<u8> {
@@ -452,7 +498,9 @@ impl MembershipVerifier {
         let mut ids = std::collections::BTreeSet::new();
         let mut endpoints = std::collections::BTreeSet::new();
         for member in &members {
-            let (id, endpoint) = binding(&member.credential)?;
+            let leaf = group.leaf(member.index).ok_or("invalid checkpoint tree")?;
+            let (id, endpoint) =
+                verify_endpoint_binding(provider.crypto(), group.group_id(), leaf)?;
             if !ids.insert(id) || !endpoints.insert(endpoint) {
                 return Err("duplicate member binding");
             }
@@ -678,17 +726,15 @@ impl MembershipVerifier {
         {
             return Err("invitation authorizes only Adds without policy changes");
         }
-        if let Some(leaf) = staged.update_path_leaf_node()
-            && (leaf.credential() != &actor.credential
-                || leaf.signature_key().as_slice() != actor.signature_key)
-        {
-            return Err("admission cannot replace committer identity");
+        if let Some(leaf) = staged.update_path_leaf_node() {
+            check_path_leaf(&self.group, actor.index, leaf)?;
         }
         let mut bindings = std::collections::BTreeSet::new();
         let crypto = self.provider.crypto();
         for (authorization, add) in authorizations.iter().zip(adds) {
             let package = add.add_proposal().key_package();
-            let (id, endpoint) = binding(package.leaf_node().credential())?;
+            let (id, endpoint) =
+                verify_endpoint_binding(crypto, self.group.group_id(), package.leaf_node())?;
             if !bindings.insert((id, endpoint))
                 || self.group.members().any(|member| {
                     binding(&member.credential)
@@ -1034,25 +1080,37 @@ mod tests {
         package: KeyPackage,
     }
     impl Candidate {
-        fn new(n: u8) -> Self {
+        fn new(n: u8, workspace: [u8; 32]) -> Self {
+            Self::bound_by(n, workspace, crate::test_key(u64::from(n) + 10))
+        }
+        /// A candidate whose endpoint is test key `n + 10`, with the binding
+        /// signed by `binder` (a wrong key makes an invalid binding).
+        fn bound_by(n: u8, workspace: [u8; 32], binder: &dyn crate::EndpointSigner) -> Self {
+            Self::build(n, Some((workspace, binder)))
+        }
+        /// A candidate whose leaf carries no endpoint binding.
+        fn unbound(n: u8) -> Self {
+            Self::build(n, None)
+        }
+        fn build(n: u8, binding: Option<([u8; 32], &dyn crate::EndpointSigner)>) -> Self {
             let provider = OpenMlsRustCrypto::default();
             let signer = SignatureKeyPair::new(SUITE.signature_algorithm()).unwrap();
             signer.store(provider.storage()).unwrap();
             let profile = MemberProfile::new([n; 32], "Alex").unwrap();
-            let endpoint = [n + 10; 32];
+            let endpoint = crate::test_endpoint(u64::from(n) + 10);
             let credential = CredentialWithKey {
                 credential: BasicCredential::new(credential_identity(endpoint, Some(&profile)))
                     .into(),
                 signature_key: signer.to_public_vec().into(),
             };
-            let package = KeyPackage::builder()
-                .leaf_node_capabilities(Capabilities::new(
-                    None,
-                    None,
-                    Some(&[ExtensionType::Unknown(AUTHORITY)]),
-                    None,
-                    None,
-                ))
+            let mut builder = KeyPackage::builder().leaf_node_capabilities(crate::leaf_capabilities());
+            if let Some((workspace, binder)) = binding {
+                builder = builder.leaf_node_extensions(
+                    crate::endpoint_binding(binder, workspace, profile.id(), signer.public())
+                        .unwrap(),
+                );
+            }
+            let package = builder
                 .build(SUITE, &provider, &signer, credential)
                 .unwrap()
                 .key_package()
@@ -1117,7 +1175,7 @@ mod tests {
         let invitation_key: [u8; 32] = invite.public().try_into().unwrap();
         // Expiry far in the past of every verifier's clock.
         let expires_at = 1_000;
-        let mut admin = Workspace::create([1; 32], "Coordinator")
+        let mut admin = Workspace::create(crate::test_key(1), "Coordinator")
             .unwrap()
             .prepare_management(crate::ManagementAction::CreateInvitation(
                 invitation_key,
@@ -1128,7 +1186,7 @@ mod tests {
             .workspace;
         let checkpoint = admin.join_checkpoint().unwrap();
         let digest = checkpoint_digest(&checkpoint).unwrap();
-        let candidate = Candidate::new(3);
+        let candidate = Candidate::new(3, admin.id());
         let authorization = AdmissionAuthorization {
             invitation_key,
             grant_signature: admin
@@ -1173,6 +1231,72 @@ mod tests {
         }
     }
 
+    /// ADR A2 T11: every verifier rejects a leaf whose endpoint binding is
+    /// missing, signed by another key, or made for another workspace.
+    #[test]
+    fn a_leaf_without_a_valid_endpoint_binding_is_rejected() {
+        let invite = SignatureKeyPair::new(SUITE.signature_algorithm()).unwrap();
+        let invitation_key: [u8; 32] = invite.public().try_into().unwrap();
+        let mut admin = Workspace::create(crate::test_key(1), "Coordinator")
+            .unwrap()
+            .prepare_management(crate::ManagementAction::CreateInvitation(
+                invitation_key,
+                0,
+                false,
+            ))
+            .unwrap()
+            .workspace;
+        let checkpoint = admin.join_checkpoint().unwrap();
+        let digest = checkpoint_digest(&checkpoint).unwrap();
+        // The creator's own leaf is bound.
+        verify_endpoint_binding(
+            admin.provider.crypto(),
+            admin.group.group_id(),
+            admin.group.own_leaf_node().unwrap(),
+        )
+        .unwrap();
+        let authorize = |admin: &Workspace, package: &KeyPackage| AdmissionAuthorization {
+            invitation_key,
+            grant_signature: admin
+                ._signer
+                .sign(&grant(admin.group.group_id(), &invitation_key))
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            redemption_signature: invite
+                .sign(&redemption(admin.group.group_id(), &invitation_key, package).unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        };
+        let cases = [
+            (
+                Candidate::bound_by(7, admin.id(), crate::test_key(999)),
+                "invalid endpoint binding",
+            ),
+            (
+                Candidate::bound_by(8, [9; 32], crate::test_key(18)),
+                "invalid endpoint binding",
+            ),
+            (Candidate::unbound(9), "member leaf has no endpoint binding"),
+        ];
+        for (candidate, error) in cases {
+            let authorization = authorize(&admin, &candidate.package);
+            let (commit, _) = add_raw(&mut admin, &candidate.package, now_for_test());
+            admin
+                .group
+                .clear_pending_commit(admin.provider.storage())
+                .unwrap();
+            let mut proof = JoinProof::from_trusted_checkpoint(admin.id(), digest, &checkpoint).unwrap();
+            assert_eq!(proof.apply_add(&authorization, &commit), Err(error));
+        }
+        let good = Candidate::new(10, admin.id());
+        let authorization = authorize(&admin, &good.package);
+        let (commit, _) = add_raw(&mut admin, &good.package, now_for_test());
+        let mut proof = JoinProof::from_trusted_checkpoint(admin.id(), digest, &checkpoint).unwrap();
+        proof.apply_add(&authorization, &commit).unwrap();
+    }
+
     #[test]
     fn trusted_checkpoint_rejects_substitution_and_unauthorized_branch() {
         let invalid = BasicCredential::new(credential_identity(
@@ -1183,7 +1307,7 @@ mod tests {
         assert!(binding(&invalid).is_err());
         let invite = SignatureKeyPair::new(SUITE.signature_algorithm()).unwrap();
         let invitation_key = invite.public().try_into().unwrap();
-        let mut admin = Workspace::create([1; 32], "Coordinator")
+        let mut admin = Workspace::create(crate::test_key(1), "Coordinator")
             .unwrap()
             .prepare_management(crate::ManagementAction::CreateInvitation(
                 invitation_key,
@@ -1197,7 +1321,7 @@ mod tests {
         let mut proof =
             JoinProof::from_trusted_checkpoint(admin.id(), digest, &checkpoint).unwrap();
         assert!(proof.matches_workspace(&admin).unwrap());
-        let other = Workspace::create([2; 32], "Coordinator")
+        let other = Workspace::create(crate::test_key(2), "Coordinator")
             .unwrap()
             .join_checkpoint()
             .unwrap();
@@ -1236,7 +1360,7 @@ mod tests {
                 .is_err()
         );
 
-        let helper = Candidate::new(3);
+        let helper = Candidate::new(3, admin.id());
         let grant_signature = admin
             ._signer
             .sign(&grant(admin.group.group_id(), &invitation_key))
@@ -1290,7 +1414,7 @@ mod tests {
 
         // ADR A2 step 2 (T10): an ordinary member cannot commit an Add, even
         // for a valid grant and redemption. Only administrators admit.
-        let joined = Candidate::new(4);
+        let joined = Candidate::new(4, admin.id());
         let joined_auth = authorize(helper.group.group_id(), &joined.package);
         let (member_commit, _) = add_raw(&mut helper, &joined.package, now_for_test());
         assert_eq!(
@@ -1306,7 +1430,7 @@ mod tests {
         // An independent copy of the administrator at the same epoch.
         let mut fork = admin.provisional_copy().unwrap();
         let (commit, welcome) = add_raw(&mut admin, &joined.package, now_for_test());
-        let mismatched = authorize(admin.group.group_id(), &Candidate::new(5).package);
+        let mismatched = authorize(admin.group.group_id(), &Candidate::new(5, admin.id()).package);
         assert!(proof.apply_add(&mismatched, &commit).is_err());
         assert_eq!(proof.epoch(), 2);
         proof.apply_add(&joined_auth, &commit).unwrap();
@@ -1332,7 +1456,7 @@ mod tests {
         // roster is not the authorized branch. This catches more than staleness.
         // The grant is signed by an ordinary member, not an administrator.
         let before_fork = fork.join_checkpoint().unwrap();
-        let uninvited = Candidate::new(6);
+        let uninvited = Candidate::new(6, admin.id());
         let mut forged = authorize(fork.group.group_id(), &uninvited.package);
         forged.grant_signature = helper
             ._signer

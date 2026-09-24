@@ -201,7 +201,7 @@ mod tests {
     fn grow(size: usize, self_update: bool) -> Sizes {
         use crate::history::tests::endpoint;
         use crate::{AdmissionAssessment, MAX_ADMISSION_BATCH, PendingJoin};
-        let mut owner = Workspace::create([90; 32], "Owner").unwrap();
+        let mut owner = Workspace::create(crate::test_key(90), "Owner").unwrap();
         let mut sizes = Sizes::default();
         let mut probe: Option<Workspace> = None;
         let mut next = 0;
@@ -224,7 +224,7 @@ mod tests {
             let joins: Vec<_> = range
                 .clone()
                 .map(|i| {
-                    PendingJoin::from_invitation(invitation, checkpoint, endpoint(i), "Member")
+                    PendingJoin::from_invitation(invitation, checkpoint, crate::test_key_for(endpoint(i)), "Member")
                         .unwrap()
                 })
                 .collect();
@@ -390,7 +390,11 @@ mod tests {
         let capabilities = Capabilities::new(
             None,
             None,
-            Some(&[ExtensionType::Unknown(crate::AUTHORITY), ExtensionType::Unknown(0xff42)]),
+            Some(&[
+                ExtensionType::Unknown(crate::AUTHORITY),
+                ExtensionType::Unknown(crate::ENDPOINT_BINDING),
+                ExtensionType::Unknown(0xff42),
+            ]),
             None,
             None,
         );

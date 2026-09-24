@@ -1,6 +1,7 @@
 //! A recoverable join request. No membership is implied by owning this state.
 use super::{
-    AUTHORITY, JoinProof, MemberProfile, SUITE, StorageKey, Workspace, credential_identity, storage,
+    EndpointSigner, JoinProof, MemberProfile, SUITE, StorageKey, Workspace, credential_identity,
+    storage,
 };
 use openmls::prelude::{
     tls_codec::{Deserialize, Serialize},
@@ -34,9 +35,10 @@ impl PendingJoin {
     pub(crate) fn new(
         workspace: [u8; 32],
         checkpoint_digest: [u8; 32],
-        endpoint: [u8; 32],
+        endpoint_key: &dyn EndpointSigner,
         display_name: &str,
     ) -> Result<Self, &'static str> {
+        let endpoint = endpoint_key.endpoint();
         if workspace == [0; 32] || checkpoint_digest == [0; 32] || endpoint == [0; 32] {
             return Err("invalid join context");
         }
@@ -57,14 +59,15 @@ impl PendingJoin {
             credential: BasicCredential::new(credential_identity(endpoint, Some(&member))).into(),
             signature_key: signer.to_public_vec().into(),
         };
+        // ADR A2 step 6: the endpoint key signs this member's binding.
         let package = KeyPackage::builder()
-            .leaf_node_capabilities(Capabilities::new(
-                None,
-                None,
-                Some(&[ExtensionType::Unknown(AUTHORITY)]),
-                None,
-                None,
-            ))
+            .leaf_node_capabilities(super::leaf_capabilities())
+            .leaf_node_extensions(super::endpoint_binding(
+                endpoint_key,
+                workspace,
+                member.id(),
+                signer.public(),
+            )?)
             .build(SUITE, &provider, &signer, credential)
             .map_err(|_| "KeyPackage creation failed")?
             .key_package()
@@ -88,7 +91,7 @@ impl PendingJoin {
     /// callers receive only the public pending metadata.
     pub fn from_compact_invitation(
         invitation: &super::Invitation,
-        endpoint: [u8; 32],
+        endpoint: &dyn EndpointSigner,
         display_name: &str,
     ) -> Result<Self, &'static str> {
         let mut pending = Self::new(invitation.workspace_id(), invitation.checkpoint_digest(), endpoint, display_name)?;
@@ -98,7 +101,7 @@ impl PendingJoin {
     pub fn from_invitation(
         invitation: &super::Invitation,
         checkpoint: &[u8],
-        endpoint: [u8; 32],
+        endpoint: &dyn EndpointSigner,
         display_name: &str,
     ) -> Result<Self, &'static str> {
         invitation.join_proof(checkpoint)?;
@@ -289,6 +292,12 @@ impl PendingJoin {
             .map_err(|_| "invalid join credential")?;
         if package.ciphersuite() != SUITE
             || credential.identity() != credential_identity(endpoint, Some(&member))
+            || super::bootstrap::verify_endpoint_binding(
+                provider.crypto(),
+                &GroupId::from_slice(&workspace),
+                package.leaf_node(),
+            )
+            .is_err()
         {
             return Err("join identity mismatch");
         }
@@ -421,28 +430,28 @@ impl PendingJoin {
 /// checkpoint's content, never its size.
 #[test]
 fn a_pending_join_seals_a_maximum_size_checkpoint() {
-    let mut pending = PendingJoin::new([7; 32], [8; 32], [9; 32], "Jordan").unwrap();
+    let mut pending = PendingJoin::new([7; 32], [8; 32], crate::test_key(9), "Jordan").unwrap();
     pending.request = Some(vec![1; super::invitation::MAX_REQUEST]);
     pending.checkpoint = Some(vec![0; super::MAX_CHECKPOINT]);
     let key = StorageKey::derive(&[10; 32]).unwrap();
     let sealed = pending.seal(&key).unwrap();
     assert!(sealed.len() <= super::MAX_SEALED_PENDING_JOIN);
-    let error = PendingJoin::restore(&key, [9; 32], [7; 32], &sealed).err().unwrap();
+    let error = PendingJoin::restore(&key, crate::test_endpoint(9), [7; 32], &sealed).err().unwrap();
     assert!(!matches!(error, "invalid protected snapshot" | "saved checkpoint exceeds bounds"), "{error}");
 }
 
 #[test]
 fn compact_pending_invitation_survives_restart_and_becomes_admission_ready() {
-    let admin = Workspace::create([4; 32], "Coordinator").unwrap();
+    let admin = Workspace::create(crate::test_key(4), "Coordinator").unwrap();
     let (invitation, checkpoint) = admin.issue_invitation().unwrap();
-    let pending = PendingJoin::from_compact_invitation(&invitation, [5; 32], "Field helper").unwrap();
+    let pending = PendingJoin::from_compact_invitation(&invitation, crate::test_key(5), "Field helper").unwrap();
     let member = pending.member().clone();
     let key = StorageKey::derive(&[6; 32]).unwrap();
     let sealed = pending.seal(&key).unwrap();
     assert!(sealed.starts_with(LEGACY));
     drop(pending);
 
-    let mut restored = PendingJoin::restore(&key, [5; 32], admin.id(), &sealed).unwrap();
+    let mut restored = PendingJoin::restore(&key, crate::test_endpoint(5), admin.id(), &sealed).unwrap();
     assert_eq!(restored.member(), &member);
     assert_eq!(restored.deferred_invitation().unwrap().as_slice(), invitation.export_secret_token().as_slice());
     assert!(restored.admission_request().is_err());
@@ -458,7 +467,7 @@ fn pending_identity_recovers_and_rejected_welcome_does_not_consume_it() {
     use openmls_traits::signatures::Signer;
     let invite = SignatureKeyPair::new(SUITE.signature_algorithm()).unwrap();
     let invitation_key = invite.public().try_into().unwrap();
-    let mut admin = Workspace::create([1; 32], "Coordinator")
+    let mut admin = Workspace::create(crate::test_key(1), "Coordinator")
         .unwrap()
         .prepare_management(super::ManagementAction::CreateInvitation(
             invitation_key,
@@ -470,7 +479,7 @@ fn pending_identity_recovers_and_rejected_welcome_does_not_consume_it() {
     let checkpoint = admin.join_checkpoint().unwrap();
     let digest = crate::checkpoint_digest(&checkpoint).unwrap();
     let mut proof = JoinProof::from_trusted_checkpoint(admin.id(), digest, &checkpoint).unwrap();
-    let pending = PendingJoin::new(admin.id(), digest, [2; 32], "Jordan Lee").unwrap();
+    let pending = PendingJoin::new(admin.id(), digest, crate::test_key(2), "Jordan Lee").unwrap();
     let member = pending.member().clone();
     let package = pending.key_package().unwrap();
     let key = StorageKey::derive(&[3; 32]).unwrap();
@@ -478,15 +487,15 @@ fn pending_identity_recovers_and_rejected_welcome_does_not_consume_it() {
     assert_ne!(sealed, pending.seal(&key).unwrap());
     assert!(sealed.starts_with(LEGACY));
     drop(pending);
-    let pending = PendingJoin::restore(&key, [2; 32], admin.id(), &sealed).unwrap();
+    let pending = PendingJoin::restore(&key, crate::test_endpoint(2), admin.id(), &sealed).unwrap();
     assert_eq!(pending.member(), &member);
     assert_eq!(pending.key_package().unwrap(), package);
-    assert!(PendingJoin::restore(&key, [9; 32], admin.id(), &sealed).is_err());
-    assert!(PendingJoin::restore(&key, [2; 32], [9; 32], &sealed).is_err());
+    assert!(PendingJoin::restore(&key, crate::test_endpoint(9), admin.id(), &sealed).is_err());
+    assert!(PendingJoin::restore(&key, crate::test_endpoint(2), crate::test_endpoint(9), &sealed).is_err());
     assert!(
         PendingJoin::restore(
             &StorageKey::derive(&[4; 32]).unwrap(),
-            [2; 32],
+            crate::test_endpoint(2),
             admin.id(),
             &sealed
         )
@@ -495,18 +504,18 @@ fn pending_identity_recovers_and_rejected_welcome_does_not_consume_it() {
     assert!(
         PendingJoin::restore(
             &key,
-            [2; 32],
+            crate::test_endpoint(2),
             admin.id(),
             &vec![0; MAX_SEALED_PENDING_JOIN + 1]
         )
         .is_err()
     );
-    assert!(Workspace::restore(&key, [2; 32], admin.id(), &sealed).is_err());
-    assert!(PendingJoin::restore(&key, [1; 32], admin.id(), &admin.seal(&key).unwrap()).is_err());
+    assert!(Workspace::restore(&key, crate::test_endpoint(2), admin.id(), &sealed).is_err());
+    assert!(PendingJoin::restore(&key, crate::test_endpoint(1), admin.id(), &admin.seal(&key).unwrap()).is_err());
     for index in [0, 5, 37, 49, sealed.len() - 1] {
         let mut bad = sealed.clone();
         bad[index] ^= 1;
-        assert!(PendingJoin::restore(&key, [2; 32], admin.id(), &bad).is_err());
+        assert!(PendingJoin::restore(&key, crate::test_endpoint(2), admin.id(), &bad).is_err());
     }
     let package = KeyPackageIn::tls_deserialize_exact(&package)
         .unwrap()
@@ -569,7 +578,7 @@ fn pending_identity_recovers_and_rejected_welcome_does_not_consume_it() {
     );
     let saved = joined.seal(&key).unwrap();
     drop(joined);
-    let mut joined = Workspace::restore(&key, [2; 32], admin.id(), &saved).unwrap();
+    let mut joined = Workspace::restore(&key, crate::test_endpoint(2), admin.id(), &saved).unwrap();
     assert_eq!(joined.member(), Some(&member));
     let publication = joined
         .group

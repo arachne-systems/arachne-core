@@ -1,3 +1,5 @@
+mod common;
+use common::{test_endpoint, test_key};
 use arachne_security::{
     Invitation, ManagementAction, OrderStep, PendingJoin, PreparedManagementUpdate,
     RevocationKind, StorageKey, Workspace,
@@ -15,15 +17,15 @@ fn add(
     endpoint: u8,
 ) -> (Workspace, Workspace, arachne_security::PreparedAdmission) {
     let join =
-        PendingJoin::from_invitation(invite, checkpoint, [endpoint; 32], "Member").unwrap();
+        PendingJoin::from_invitation(invite, checkpoint, test_key(u64::from(endpoint)), "Member").unwrap();
     let admitted = owner
-        .prepare_admission([endpoint; 32], join.admission_request().unwrap())
+        .prepare_admission(test_endpoint(u64::from(endpoint)), join.admission_request().unwrap())
         .unwrap();
     let mut proof = join.join_proof().unwrap();
     // A reused link replays every step since its checkpoint, ending with this Add.
     for (authorization, commit) in admitted
         .workspace
-        .membership_history([endpoint; 32], join.admission_request().unwrap(), checkpoint)
+        .membership_history(test_endpoint(u64::from(endpoint)), join.admission_request().unwrap(), checkpoint)
         .unwrap()
     {
         proof.apply_transition(&authorization, &commit).unwrap();
@@ -38,7 +40,7 @@ fn add(
 
 #[test]
 fn member_departure_requires_own_signature_rotates_keys_and_survives_restore() {
-    let (admin, invite, checkpoint) = register(&Workspace::create([1; 32], "Admin").unwrap());
+    let (admin, invite, checkpoint) = register(&Workspace::create(test_key(1), "Admin").unwrap());
     let (admin, member, _) = add(&admin, (&invite, &checkpoint), 2);
     let (admin, helper, joined) = add(&admin, (&invite, &checkpoint), 3);
     let member = member
@@ -61,7 +63,7 @@ fn member_departure_requires_own_signature_rotates_keys_and_survives_restore() {
     );
     let step = OrderStep::new(order);
     assert!(
-        Workspace::create([4; 32], "Other group")
+        Workspace::create(test_key(4), "Other group")
             .unwrap()
             .prepare_revocation(&step)
             .is_err()
@@ -102,7 +104,7 @@ fn member_departure_requires_own_signature_rotates_keys_and_survives_restore() {
 
 #[test]
 fn last_member_can_end_locally_but_admin_must_handover_a_team() {
-    let solo = Workspace::create([1; 32], "Admin").unwrap();
+    let solo = Workspace::create(test_key(1), "Admin").unwrap();
     let ended = solo.prepare_solo_leave().unwrap();
     let key = StorageKey::derive(&[9; 32]).unwrap();
     assert_eq!(

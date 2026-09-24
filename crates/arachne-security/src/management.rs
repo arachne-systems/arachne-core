@@ -610,11 +610,9 @@ fn verify_change(
     {
         return Err("management cannot change unrelated group policy");
     }
-    if let Some(leaf) = staged.update_path_leaf_node()
-        && (leaf.credential() != &actor.credential
-            || leaf.signature_key().as_slice() != actor.signature_key)
-    {
-        return Err("management cannot replace committer identity");
+    if let Some(leaf) = staged.update_path_leaf_node() {
+        bootstrap::check_path_leaf(group, actor.index, leaf)
+            .map_err(|_| "management cannot replace committer identity")?;
     }
     let removes = change == Change::Remove;
     let mut removals = 0;
@@ -654,10 +652,10 @@ mod tests {
         let (registration, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
         let admin = &registration.workspace;
         let pending =
-            PendingJoin::from_invitation(&invite, &checkpoint, [endpoint; 32], "Field member")
+            PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(u64::from(endpoint)), "Field member")
                 .unwrap();
         let prepared = admin
-            .prepare_admission([endpoint; 32], pending.admission_request().unwrap())
+            .prepare_admission(crate::test_endpoint(u64::from(endpoint)), pending.admission_request().unwrap())
             .unwrap();
         let mut proof = pending.join_proof().unwrap();
         proof
@@ -669,7 +667,7 @@ mod tests {
         (registration, member, prepared)
     }
     fn pair() -> (Workspace, Workspace) {
-        let (_, member, prepared) = add(Workspace::create([1; 32], "Coordinator").unwrap(), 2);
+        let (_, member, prepared) = add(Workspace::create(crate::test_key(1), "Coordinator").unwrap(), 2);
         (prepared.workspace, member)
     }
 
@@ -805,7 +803,7 @@ mod tests {
                 .verify_management(ManagementAction::Promote([99; 32]), &commit)
                 .is_err()
         );
-        let unrelated = Workspace::create([9; 32], "Other workspace").unwrap();
+        let unrelated = Workspace::create(crate::test_key(9), "Other workspace").unwrap();
         assert!(
             unrelated
                 .verify_management(ManagementAction::Promote(member_id), &commit)
@@ -848,7 +846,7 @@ mod tests {
         let next_keys = vec![member._signer.to_public_vec()];
         let authorization = order(&mut member, RevocationKind::Demote, admin_id);
         let demotion = role_commit(&mut member, next_keys);
-        let mut returning = Workspace::restore(&key, [1; 32], workspace, &snapshot).unwrap();
+        let mut returning = Workspace::restore(&key, crate::test_endpoint(1), workspace, &snapshot).unwrap();
         accept(&mut returning, &authorization, &demotion);
         assert!(returning.issue_invitation().is_err());
         assert_eq!(returning.member_count(), 2);
@@ -978,7 +976,7 @@ mod tests {
         accept(&mut survivor, &registration.authorization, &registration.commit);
         let mut removed = registration.workspace;
         let pending =
-            PendingJoin::from_invitation(&invite, &checkpoint, [4; 32], "Late arrival").unwrap();
+            PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(4), "Late arrival").unwrap();
         let ext = extensions(&admin, vec![admin._signer.to_public_vec()]);
         let index = admin
             .group
@@ -1035,7 +1033,7 @@ mod tests {
         assert!(survivor.unprotect_object(b"app", b"test", &stale).is_err());
         assert_eq!(
             admin
-                .prepare_admission([4; 32], pending.admission_request().unwrap())
+                .prepare_admission(crate::test_endpoint(4), pending.admission_request().unwrap())
                 .err(),
             Some("invitation issuer is no longer an administrator")
         );
@@ -1112,7 +1110,7 @@ mod tests {
     }
     #[test]
     fn staged_role_change_restores_and_old_invitation_crosses_mixed_history() {
-        let admin = Workspace::create([1; 32], "Coordinator").unwrap();
+        let admin = Workspace::create(crate::test_key(1), "Coordinator").unwrap();
         let (registration, old_invitation, old_checkpoint) =
             admin.prepare_invitation(0, false, false).unwrap();
         let admin = registration.workspace;
@@ -1120,13 +1118,12 @@ mod tests {
         let (mut admin, helper) = {
             let pending = PendingJoin::from_invitation(
                 &old_invitation,
-                &old_checkpoint,
-                [2; 32],
+                &old_checkpoint,crate::test_key(2),
                 "Field member",
             )
             .unwrap();
             let prepared = admin
-                .prepare_admission([2; 32], pending.admission_request().unwrap())
+                .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
                 .unwrap();
             let mut proof = pending.join_proof().unwrap();
             proof
@@ -1162,9 +1159,9 @@ mod tests {
             b"DFJH\x03"
         );
         let snapshot = promoted.seal(&key).unwrap();
-        let promoted = Workspace::restore(&key, [2; 32], helper.id(), &snapshot).unwrap();
+        let promoted = Workspace::restore(&key, crate::test_endpoint(2), helper.id(), &snapshot).unwrap();
         let mut records = promoted.export_records().unwrap();
-        let promoted = Workspace::restore_records([2; 32], helper.id(), &records).unwrap();
+        let promoted = Workspace::restore_records(crate::test_endpoint(2), helper.id(), &records).unwrap();
         let history_key = records
             .keys()
             .find(|name| name.starts_with(b"security/history/step/"))
@@ -1173,18 +1170,18 @@ mod tests {
         let bytes = records.get_mut(&history_key).unwrap();
         assert_eq!(bytes[0], 0); // Admission authorization record.
         bytes[34] ^= 1; // Administrator grant signature; publicly verifiable.
-        assert!(Workspace::restore_records([2; 32], helper.id(), &records).is_err());
+        assert!(Workspace::restore_records(crate::test_endpoint(2), helper.id(), &records).is_err());
         assert!(promoted.issue_invitation().is_ok());
         admin = prepared.workspace;
         let saved_admin = admin.seal(&key).unwrap();
-        admin = Workspace::restore(&key, [1; 32], admin.id(), &saved_admin).unwrap();
+        admin = Workspace::restore(&key, crate::test_endpoint(1), admin.id(), &saved_admin).unwrap();
         let late =
-            PendingJoin::from_invitation(&old_invitation, &old_checkpoint, [3; 32], "Late member")
+            PendingJoin::from_invitation(&old_invitation, &old_checkpoint, crate::test_key(3), "Late member")
                 .unwrap();
         let request = late.admission_request().unwrap();
         for owner in [&admin, &promoted] {
             let steps = owner
-                .membership_history([3; 32], request, &old_checkpoint)
+                .membership_history(crate::test_endpoint(3), request, &old_checkpoint)
                 .unwrap();
             assert_eq!(steps.len(), 2);
             let mut proof = late.join_proof().unwrap();
@@ -1194,17 +1191,17 @@ mod tests {
             assert!(proof.matches_workspace(owner).unwrap());
             assert_eq!(
                 owner
-                    .admission_history([3; 32], request, &old_checkpoint)
+                    .admission_history(crate::test_endpoint(3), request, &old_checkpoint)
                     .err(),
                 Some("membership history requires management support")
             );
         }
         drop(admin);
         drop(helper);
-        let admitted = promoted.prepare_admission([3; 32], request).unwrap();
+        let admitted = promoted.prepare_admission(crate::test_endpoint(3), request).unwrap();
         let steps = admitted
             .workspace
-            .membership_history([3; 32], request, &old_checkpoint)
+            .membership_history(crate::test_endpoint(3), request, &old_checkpoint)
             .unwrap();
         let mut proof = late.join_proof().unwrap();
         for (auth, commit) in &steps {
@@ -1212,7 +1209,7 @@ mod tests {
         }
         let joined = late.prepare_workspace(&proof, &admitted.welcome).unwrap();
         let restored =
-            Workspace::restore(&key, [3; 32], joined.id(), &joined.seal(&key).unwrap()).unwrap();
+            Workspace::restore(&key, crate::test_endpoint(3), joined.id(), &joined.seal(&key).unwrap()).unwrap();
         assert_eq!(restored.member_count(), 3);
         assert_eq!(restored.epoch(), 4); // Registration, admission, promotion, admission.
         let encoded = proof.history();
@@ -1370,8 +1367,8 @@ mod tests {
             )
             .is_err()
         );
-        assert!(RemovedMembership::restore(&key, [9; 32], workspace, &sealed).is_err());
-        assert!(RemovedMembership::restore(&key, endpoint, [9; 32], &sealed).is_err());
+        assert!(RemovedMembership::restore(&key, crate::test_endpoint(9), workspace, &sealed).is_err());
+        assert!(RemovedMembership::restore(&key, endpoint, crate::test_endpoint(9), &sealed).is_err());
         for length in 0..sealed.len() {
             assert!(
                 RemovedMembership::restore(&key, endpoint, workspace, &sealed[..length]).is_err()
@@ -1423,7 +1420,7 @@ mod tests {
 
 #[test]
 fn provisional_copy_exceeds_legacy_size_and_isolates_sender_state() {
-    let owner = Workspace::create([1; 32], "Publisher").unwrap();
+    let owner = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     // An opaque provider record crosses the old serialization size boundary.
     owner.provider.storage().values.write().unwrap().insert(
         b"test/large-native-record".to_vec(),

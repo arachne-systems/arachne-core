@@ -371,11 +371,9 @@ pub(super) fn verify(
     {
         return Err("invitation action changed unrelated policy");
     }
-    if let Some(leaf) = staged.update_path_leaf_node()
-        && (leaf.credential() != &actor.credential
-            || leaf.signature_key().as_slice() != actor.signature_key)
-    {
-        return Err("invitation action replaced actor identity");
+    if let Some(leaf) = staged.update_path_leaf_node() {
+        bootstrap::check_path_leaf(group, actor.index, leaf)
+            .map_err(|_| "invitation action replaced actor identity")?;
     }
     if staged.queued_proposals().count() != 1
         || !staged.queued_proposals().all(|p| {
@@ -391,13 +389,13 @@ pub(super) fn verify(
 
 #[test]
 fn new_workspace_rejects_unregistered_admin_signed_invitation() {
-    let admin = Workspace::create([1; 32], "Coordinator").unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Coordinator").unwrap();
     let (invitation, checkpoint) = admin.issue_invitation().unwrap();
     let pending =
-        super::PendingJoin::from_invitation(&invitation, &checkpoint, [2; 32], "Member").unwrap();
+        super::PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(2), "Member").unwrap();
     assert_eq!(
         admin
-            .prepare_admission([2; 32], pending.admission_request().unwrap())
+            .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
             .err(),
         Some(INVITATION_DISABLED)
     );
@@ -412,7 +410,7 @@ fn full_invitation_controls_reuse_disabled_rows() {
     };
     let create = |n| ManagementAction::CreateInvitation(key(n), 0, false);
     // The first link is real, so the owner retains its checkpoint.
-    let (registration, first, _) = Workspace::create([1; 32], "Coordinator")
+    let (registration, first, _) = Workspace::create(crate::test_key(1), "Coordinator")
         .unwrap()
         .prepare_invitation(0, false, false)
         .unwrap();
@@ -437,20 +435,20 @@ fn full_invitation_controls_reuse_disabled_rows() {
     assert!(controls.iter().all(|c| c.key != first.key() && c.enabled));
     // Its retained checkpoint went with it, so the owner still restores.
     let restored =
-        Workspace::restore_records([1; 32], admin.id(), &admin.export_records().unwrap()).unwrap();
+        Workspace::restore_records(crate::test_endpoint(1), admin.id(), &admin.export_records().unwrap()).unwrap();
     assert_eq!(restored.invitation_controls().unwrap(), controls);
 }
 
 #[test]
 fn admission_cannot_carry_a_policy_change_it_does_not_consume() {
     use openmls::prelude::tls_codec::Deserialize;
-    let admin = Workspace::create([1; 32], "Coordinator").unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Coordinator").unwrap();
     let (registration, invitation, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let mut admin = registration.workspace;
     let pending =
-        super::PendingJoin::from_invitation(&invitation, &checkpoint, [2; 32], "Member").unwrap();
+        super::PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(2), "Member").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], pending.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
         .unwrap();
     let package = KeyPackageIn::tls_deserialize_exact(pending.key_package().unwrap())
         .unwrap()

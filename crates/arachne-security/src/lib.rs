@@ -116,9 +116,127 @@ impl MemberProfile {
     }
 }
 
+/// Credential identity prefix of a member: then member id, then endpoint.
+const MEMBER_IDENTITY: &[u8] = b"data-fabric/member/v3/";
+/// Leaf extension with the endpoint key's signature (ADR A2 step 6).
+const ENDPOINT_BINDING: u16 = 0xff01;
+const ENDPOINT_BINDING_DOMAIN: &[u8] = b"arachne/endpoint-binding/v1";
+
+/// The transport endpoint key (the Iroh Ed25519 key). It signs the binding
+/// between a workspace member and its endpoint, so no leaf can claim an
+/// endpoint whose key did not consent. Signatures are plain Ed25519 over the
+/// raw message, as Iroh's `SecretKey::sign` produces.
+pub trait EndpointSigner {
+    /// The Ed25519 public key, which is the endpoint id.
+    fn endpoint(&self) -> [u8; 32];
+    /// Plain Ed25519 signature over `message`.
+    fn sign_endpoint(&self, message: &[u8]) -> Result<[u8; 64], &'static str>;
+}
+
+/// An Ed25519 endpoint key held in memory. For hosts and tests without an
+/// Iroh key; production hosts implement [`EndpointSigner`] for their key.
+pub struct EndpointKey(SignatureKeyPair);
+
+impl EndpointKey {
+    pub fn generate() -> Result<Self, &'static str> {
+        SignatureKeyPair::new(SignatureScheme::ED25519)
+            .map(Self)
+            .map_err(|_| "endpoint key generation failed")
+    }
+}
+
+impl EndpointSigner for EndpointKey {
+    fn endpoint(&self) -> [u8; 32] {
+        self.0.public().try_into().expect("Ed25519 public key")
+    }
+    fn sign_endpoint(&self, message: &[u8]) -> Result<[u8; 64], &'static str> {
+        use openmls_traits::signatures::Signer;
+        self.0
+            .sign(message)
+            .map_err(|_| "endpoint signing failed")?
+            .try_into()
+            .map_err(|_| "invalid endpoint signature length")
+    }
+}
+
+/// A process-wide endpoint key per test label. Tests name endpoints by small
+/// labels; the endpoint itself is the key's public key.
+#[cfg(test)]
+fn test_keys() -> &'static std::sync::Mutex<std::collections::HashMap<u64, &'static EndpointKey>> {
+    static KEYS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u64, &'static EndpointKey>>,
+    > = std::sync::OnceLock::new();
+    KEYS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn test_key(label: u64) -> &'static EndpointKey {
+    test_keys()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(label)
+        .or_insert_with(|| Box::leak(Box::new(EndpointKey::generate().unwrap())))
+}
+
+#[cfg(test)]
+pub(crate) fn test_endpoint(label: u64) -> [u8; 32] {
+    test_key(label).endpoint()
+}
+
+/// The test key whose public key is `endpoint`.
+#[cfg(test)]
+pub(crate) fn test_key_for(endpoint: [u8; 32]) -> &'static EndpointKey {
+    let key = test_keys()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .copied()
+        .find(|key| key.endpoint() == endpoint);
+    key.expect("endpoint has no test key")
+}
+
+fn endpoint_binding_message(workspace: [u8; 32], member: [u8; 32], signature_key: &[u8]) -> Vec<u8> {
+    let mut message = ENDPOINT_BINDING_DOMAIN.to_vec();
+    message.extend(workspace);
+    message.extend(member);
+    message.extend((signature_key.len() as u32).to_be_bytes());
+    message.extend(signature_key);
+    message
+}
+
+/// Leaf extensions that bind `member` and its MLS key to the endpoint.
+fn endpoint_binding(
+    endpoint: &dyn EndpointSigner,
+    workspace: [u8; 32],
+    member: [u8; 32],
+    signature_key: &[u8],
+) -> Result<Extensions<LeafNode>, &'static str> {
+    let signature =
+        endpoint.sign_endpoint(&endpoint_binding_message(workspace, member, signature_key))?;
+    Extensions::single(Extension::Unknown(
+        ENDPOINT_BINDING,
+        UnknownExtension(signature.to_vec()),
+    ))
+    .map_err(|_| "invalid endpoint binding extension")
+}
+
+/// Capabilities every member leaf declares.
+fn leaf_capabilities() -> Capabilities {
+    Capabilities::new(
+        None,
+        None,
+        Some(&[
+            ExtensionType::Unknown(AUTHORITY),
+            ExtensionType::Unknown(ENDPOINT_BINDING),
+        ]),
+        None,
+        None,
+    )
+}
+
 fn credential_identity(endpoint: [u8; 32], member: Option<&MemberProfile>) -> Vec<u8> {
     let mut identity = if let Some(member) = member {
-        let mut bytes = b"data-fabric/candidate-member/v2/".to_vec();
+        let mut bytes = MEMBER_IDENTITY.to_vec();
         bytes.extend(member.id);
         bytes
     } else {
@@ -181,7 +299,7 @@ impl Workspace {
     }
 
     pub fn create_named(
-        endpoint: [u8; 32],
+        endpoint: &dyn EndpointSigner,
         display_name: &str,
         workspace_name: Option<&str>,
     ) -> Result<Self, &'static str> {
@@ -191,7 +309,11 @@ impl Workspace {
             None => Ok(owner),
         }
     }
-    pub fn create(endpoint: [u8; 32], display_name: &str) -> Result<Self, &'static str> {
+    /// Create a workspace. `endpoint` is this device's transport key; it signs
+    /// the endpoint binding in the creator's leaf (ADR A2 step 6).
+    pub fn create(endpoint: &dyn EndpointSigner, display_name: &str) -> Result<Self, &'static str> {
+        let signer_endpoint = endpoint;
+        let endpoint = signer_endpoint.endpoint();
         if endpoint == [0; 32] {
             return Err("invalid workspace-facing endpoint");
         }
@@ -224,7 +346,10 @@ impl Workspace {
         let extensions = Extensions::from_vec(vec![
             Extension::Unknown(AUTHORITY, UnknownExtension(authority)),
             Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
-                &[ExtensionType::Unknown(AUTHORITY)],
+                &[
+                    ExtensionType::Unknown(AUTHORITY),
+                    ExtensionType::Unknown(ENDPOINT_BINDING),
+                ],
                 &[],
                 &[],
             )),
@@ -237,13 +362,14 @@ impl Workspace {
             // MLS application messages remain PrivateMessage ciphertext.
             .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
             .use_ratchet_tree_extension(true)
-            .capabilities(Capabilities::new(
-                None,
-                None,
-                Some(&[ExtensionType::Unknown(AUTHORITY)]),
-                None,
-                None,
-            ))
+            .capabilities(leaf_capabilities())
+            .with_leaf_node_extensions(endpoint_binding(
+                signer_endpoint,
+                id,
+                member.id,
+                signer.public(),
+            )?)
+            .map_err(|_| "invalid endpoint binding extension")?
             .with_group_context_extensions(extensions)
             .build();
         let group = MlsGroup::new_with_group_id(
@@ -298,16 +424,7 @@ impl Workspace {
     pub fn member_endpoints(&self) -> Result<Vec<[u8; 32]>, &'static str> {
         self.group
             .members()
-            .map(|member| {
-                let credential = BasicCredential::try_from(member.credential)
-                    .map_err(|_| "unsupported member credential")?;
-                let identity = credential
-                    .identity()
-                    .strip_prefix(b"data-fabric/candidate-member/v2/")
-                    .filter(|identity| identity.len() == 64)
-                    .ok_or("member identity binding required")?;
-                Ok(identity[32..].try_into().unwrap())
-            })
+            .map(|member| Ok(bootstrap::binding(&member.credential)?.1))
             .collect()
     }
 
@@ -346,9 +463,18 @@ impl Workspace {
 
 #[test]
 fn creation_owns_distinct_groups_and_initial_authority() {
-    assert!(Workspace::create([0; 32], "Alex").is_err());
-    let a = Workspace::create([1; 32], "Alex").unwrap();
-    let b = Workspace::create([2; 32], "Alex").unwrap();
+    struct Zero;
+    impl EndpointSigner for Zero {
+        fn endpoint(&self) -> [u8; 32] {
+            [0; 32]
+        }
+        fn sign_endpoint(&self, _: &[u8]) -> Result<[u8; 64], &'static str> {
+            Ok([0; 64])
+        }
+    }
+    assert!(Workspace::create(&Zero, "Alex").is_err());
+    let a = Workspace::create(crate::test_key(1), "Alex").unwrap();
+    let b = Workspace::create(crate::test_key(2), "Alex").unwrap();
     assert_ne!(a.id(), b.id());
     assert_ne!(a.member().unwrap().id(), b.member().unwrap().id());
     assert_ne!(a.member().unwrap().id(), a.id());
@@ -371,7 +497,7 @@ fn creation_owns_distinct_groups_and_initial_authority() {
         &"a".repeat(81),
         &"😀".repeat(65),
     ] {
-        assert!(Workspace::create([1; 32], name).is_err());
+        assert!(Workspace::create(crate::test_key(1), name).is_err());
     }
     assert_eq!(a.epoch(), 0);
     assert_eq!(a.member_count(), 1);
