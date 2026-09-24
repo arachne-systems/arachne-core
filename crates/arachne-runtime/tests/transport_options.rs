@@ -24,6 +24,7 @@ fn wan_without_n0_uses_the_operator_relay_and_deadlines() {
         operation: Duration::from_secs(30),
         dial: Duration::from_secs(20),
         gossip_join: Duration::from_secs(9),
+        close_drain: Duration::from_secs(7),
     };
     let mut client = open(
         Network::Wan,
@@ -98,20 +99,32 @@ fn invalid_relay_settings_are_invalid_input() {
         .expect("invalid relay settings must not bind");
         assert_eq!(error.kind(), ErrorKind::InvalidInput, "{error}");
     }
-    let zero = TransportTimeouts {
-        operation: Duration::ZERO,
+    let valid = TransportTimeouts {
+        operation: Duration::from_secs(1),
         dial: Duration::from_secs(1),
         gossip_join: Duration::from_secs(1),
+        close_drain: Duration::from_secs(1),
     };
-    let error = open(
-        Network::Direct,
-        65,
-        TransportOptions {
-            timeouts: Some(zero),
-            ..TransportOptions::default()
+    for zero in [
+        TransportTimeouts {
+            operation: Duration::ZERO,
+            ..valid
         },
-    )
-    .err()
-    .expect("zero deadlines must not bind");
-    assert_eq!(error.kind(), ErrorKind::InvalidInput, "{error}");
+        TransportTimeouts {
+            close_drain: Duration::ZERO,
+            ..valid
+        },
+    ] {
+        let error = open(
+            Network::Direct,
+            65,
+            TransportOptions {
+                timeouts: Some(zero),
+                ..TransportOptions::default()
+            },
+        )
+        .err()
+        .expect("zero deadlines must not bind");
+        assert_eq!(error.kind(), ErrorKind::InvalidInput, "{error}");
+    }
 }
