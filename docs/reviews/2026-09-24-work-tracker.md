@@ -21,6 +21,7 @@ test is red → green and the crate tests pass.
 - [x] **B7d** (`c6af1de`) Proved not reachable: receiver eviction opens gaps first (max 185 of 512 pending while all blocked). Guard test `direct_global_bound.rs`.
 - [x] **B7e** (`eecd315`; eviction records misses as `missing_count`; late copies at/below floor dropped) Eviction moves the floor past a gap silently: the late object is delivered after newer ones and no miss is recorded (breaks `docs/delivery.md`). In progress.
 - [ ] **B7f** (runtime `lib.rs`, with A1 recovery group): report `missing_count` on the adoption response too; count sequences skipped by `advance()` at epoch change as missed.
+- [ ] **B3d** `checkpoint_rollover` 100-epoch redeem failed once with "admission reply exceeds transport bound" (size varies by timing). Investigating on `fix/b3d-admission-reply`.
 - [ ] **T1** Flake: `admission_staging` `admission_batch_staging_keeps_committing_under_continuous_intake` "node shutdown timed out" under load (`fix/flake-admission-staging`, in progress).
 - [x] **B8** (`c142361`, workspace tests 387 pass / 0 fail) The latest-value index never prunes and fills for good.
 - [x] **B9** (`71f8cfa`, workspace tests 387 pass / 0 fail) The freshness anchor is not wired into restore (rollback → state replay, SFrame counter reuse).
