@@ -1,3 +1,4 @@
+// Modified by Arachne Systems from iroh-gossip 0.101.0; see ARACHNE-PATCH.md.
 //! Networking for the `iroh-gossip` protocol
 
 use std::{
