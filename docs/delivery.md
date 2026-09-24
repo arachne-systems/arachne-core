@@ -94,7 +94,9 @@ An object over a bound is refused (`author pending quota exhausted` or
 recovery, after the application drains work. One author cannot use up the
 space of the others. The bounds apply to recovered objects too: recovery is
 not exempt. Automatic recovery stops at the bound and continues later (see
-[prefix admission](#group-mode)).
+[prefix admission](#group-mode)). One exception: a direct object that fills
+a gap which holds back all of an author's pending objects may go over the
+author quota by that one object (see [direct mode](#direct-mode)).
 
 ### Scheduling
 
@@ -197,6 +199,18 @@ Direct objects go to an explicit, sorted list of recipient members.
   Only members of the audience can ask for them.
 - **Heads.** A head tells an audience member how far a scope goes. It only
   starts gap recovery; it proves nothing about content.
+- **Recovery under the quota (B7c).** A direct range is verified whole, then
+  admitted as its in-order prefix up to the first record that the pending
+  bounds refuse. The records not admitted are not recorded, so the scope
+  keeps its gap from there and `next_direct_gap` asks for them again. When
+  no record fits, `stage_direct_recovery` returns
+  `direct_recovery_awaiting_application` and stages nothing.
+- **Gap that holds back everything.** When every pending object of an author
+  waits behind a direct gap, the application cannot acknowledge any of them.
+  The object that is the next missing sequence of its scope is then admitted
+  even over the author quota, from recovery or live. It is deliverable, so the
+  next object of that author meets the quota again: an author goes over its
+  quota by one object at most. The all-authors bound still applies.
 
 ## Current mode
 
@@ -235,6 +249,7 @@ topic, selector, replacement key).
 | Quota still refuses a flooding author's live traffic | `recovery_bound.rs` `flooding_author_still_hits_the_pending_quota_for_live_traffic` |
 | Byte-bounded served range (B7) | `recovery_bound.rs` `automatic_recovery_serves_byte_bounded_prefix_and_continues` |
 | Prefix progress stays inside the signed range | `recovery_bound.rs` `recovery_prefix_progress_is_bounded_by_the_signed_range` |
+| Direct recovery prefix, gap that blocks all pending objects, direct flood | `direct_quota.rs` `direct_recovery_admits_the_prefix_that_fits_the_author_quota`, `a_gap_that_holds_back_all_pending_objects_can_always_be_filled`, `deliverable_direct_flood_still_hits_the_author_quota` |
 | Automatic recovery progresses under the author quota (runtime) | `arachne-runtime/tests/recovery_quota.rs` `automatic_recovery_of_large_objects_progresses_under_author_quota`, `automatic_recovery_waits_for_the_application_when_the_quota_is_full` |
 | Save never shrinks publisher history | `epochs.rs` `publisher_history_never_shrinks_to_make_room_for_inbox_state` |
 | Replay window bound, restart, acknowledgement | `inbox::durable_pending_objects_and_bounded_topic_replay` |

@@ -514,12 +514,21 @@ pub(super) fn stage_direct_recovery(session: &mut Session) -> Result<Value, Stri
         .storage_key
         .as_ref()
         .ok_or("session has no protected root key")?;
-    let (next, count) = session
+    // B7c: a partial range is admitted as its in-order prefix; the stream
+    // keeps its gap for the rest. When nothing fits, nothing is staged.
+    let (next, count) = match session
         .inbox
         .as_ref()
         .ok_or("no object delivery state")?
         .stage_direct_range(owner, &ready.query, &ready.reply)
-        .map_err(str::to_owned)?;
+    {
+        Err(error) if arachne_delivery::inbox::drains_with_application(error) => {
+            session.ready_direct_range = None;
+            return Ok(json!({"state":"direct_recovery_awaiting_application",
+                "accepted_progress":false}));
+        }
+        staged => staged.map_err(str::to_owned)?,
+    };
     if count == 0 {
         session.ready_direct_range = None;
         return Ok(json!({"state":"direct_recovery_already_covered"}));
