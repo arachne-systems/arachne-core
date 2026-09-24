@@ -576,13 +576,61 @@ mod tests {
         .unwrap();
     }
 
+    /// A gossip dial to a silent peer held its dial slot until Iroh gave up,
+    /// with the overlay still running. The dial deadline returns the slot.
+    #[tokio::test]
+    async fn a_gossip_dial_to_a_silent_peer_returns_its_slot_at_the_dial_deadline() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let budget = ConnectionBudget::default().with_gossip_dials(1);
+            let (node, _) = crate::Node::bind_with_profile(
+                "127.0.0.1:0".parse().unwrap(),
+                Some(&[65; 32]),
+                NetworkProfile::Direct,
+                budget.clone(),
+            )
+            .await
+            .unwrap();
+            let blackhole = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let silent = *iroh::SecretKey::from_bytes(&[66; 32]).public().as_bytes();
+            node.add_address_hint(silent, blackhole.local_addr().unwrap())
+                .await
+                .unwrap();
+            let workspace = [67; 32];
+            node.install_verified_policy(
+                workspace,
+                1,
+                std::collections::BTreeMap::from([
+                    (node.id(), crate::Permissions::AllTopics),
+                    (silent, crate::Permissions::AllTopics),
+                ]),
+            )
+            .await
+            .unwrap();
+            node.enable_gossip(workspace, 1, &workspace).await.unwrap();
+            while budget.gossip_dials.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+            let started = Instant::now();
+            while budget.gossip_dials.available_permits() == 0 {
+                assert!(
+                    started.elapsed() < crate::TIMEOUT + Duration::from_secs(2),
+                    "the silent dial held its slot past the dial deadline"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            node.close().await;
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn native_gossip_dials_use_their_own_capacity_and_release_on_cancel_and_success() {
         tokio::time::timeout(Duration::from_secs(10), async {
             let budget = ConnectionBudget::new([4, 1], [1, 1]).with_gossip_dials(1);
             let node = Connections::bind(
                 "127.0.0.1:0".parse().unwrap(),
-                NetworkProfile::Direct,
+                &crate::NodeOptions::new(NetworkProfile::Direct),
                 None,
                 budget.clone(),
                 vec![],
@@ -675,7 +723,7 @@ mod tests {
             drop(dial);
             let first = Connections::bind(
                 "127.0.0.1:0".parse().unwrap(),
-                NetworkProfile::Direct,
+                &crate::NodeOptions::new(NetworkProfile::Direct),
                 None,
                 budget.clone(),
                 vec![],
@@ -685,7 +733,7 @@ mod tests {
             .unwrap();
             let second = Connections::bind(
                 "127.0.0.1:0".parse().unwrap(),
-                NetworkProfile::Direct,
+                &crate::NodeOptions::new(NetworkProfile::Direct),
                 None,
                 budget.clone(),
                 vec![],

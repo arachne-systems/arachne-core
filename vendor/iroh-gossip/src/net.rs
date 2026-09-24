@@ -154,6 +154,7 @@ pub struct Builder {
 struct DialOptions {
     capacity: Option<Arc<Semaphore>>,
     preamble: Option<Bytes>,
+    timeout: Option<std::time::Duration>,
 }
 
 impl Builder {
@@ -162,6 +163,13 @@ impl Builder {
     /// it returns the permit. Established connections are budgeted separately.
     pub fn dial_capacity(mut self, capacity: Arc<Semaphore>) -> Self {
         self.dial.capacity = Some(capacity);
+        self
+    }
+
+    /// Bound each dial attempt, so a silent peer returns the dial permit at
+    /// this deadline instead of when Iroh gives up. A timeout is a failed dial.
+    pub fn dial_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.dial.timeout = Some(timeout);
         self
     }
 
@@ -1029,6 +1037,22 @@ impl Stream for TopicCommandStream {
     }
 }
 
+/// Why a dial produced no connection.
+#[derive(Debug)]
+enum DialError {
+    Connect(iroh::endpoint::ConnectError),
+    Timeout,
+}
+
+impl std::fmt::Display for DialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connect(error) => error.fmt(f),
+            Self::Timeout => f.write_str("dial deadline exceeded"),
+        }
+    }
+}
+
 /// Write the preamble on the connection's first unidirectional stream.
 async fn write_preamble(conn: &Connection, preamble: &[u8]) -> bool {
     let Ok(mut stream) = conn.open_uni().await else {
@@ -1043,7 +1067,7 @@ struct Dialer {
     options: DialOptions,
     pending: JoinSet<(
         EndpointId,
-        Option<Result<Connection, iroh::endpoint::ConnectError>>,
+        Option<Result<Connection, DialError>>,
     )>,
     pending_dials: HashMap<EndpointId, CancellationToken>,
 }
@@ -1067,7 +1091,11 @@ impl Dialer {
         let cancel = CancellationToken::new();
         self.pending_dials.insert(endpoint_id, cancel.clone());
         let endpoint = self.endpoint.clone();
-        let DialOptions { capacity, preamble } = self.options.clone();
+        let DialOptions {
+            capacity,
+            preamble,
+            timeout,
+        } = self.options.clone();
         self.pending.spawn(
             async move {
                 let res = tokio::select! {
@@ -1078,7 +1106,14 @@ impl Dialer {
                             Some(capacity) => Some(capacity.acquire_owned().await.ok()?),
                             None => None,
                         };
-                        let res = endpoint.connect(endpoint_id, &alpn).await;
+                        let connect = endpoint.connect(endpoint_id, &alpn);
+                        let res = match timeout {
+                            Some(timeout) => match tokio::time::timeout(timeout, connect).await {
+                                Ok(res) => res.map_err(DialError::Connect),
+                                Err(_) => Err(DialError::Timeout),
+                            },
+                            None => connect.await.map_err(DialError::Connect),
+                        };
                         if let (Ok(conn), Some(preamble)) = (&res, preamble) {
                             if !write_preamble(conn, &preamble).await {
                                 conn.close(0u32.into(), b"preamble not sent");
@@ -1104,7 +1139,7 @@ impl Dialer {
         &mut self,
     ) -> (
         EndpointId,
-        Option<Result<Connection, iroh::endpoint::ConnectError>>,
+        Option<Result<Connection, DialError>>,
     ) {
         match self.pending_dials.is_empty() {
             false => {

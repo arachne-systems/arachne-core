@@ -14,7 +14,9 @@ use iroh::{
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use tokio::sync::{Mutex, OnceCell};
 
-use super::{ConnectionBudget, Error, NetworkProfile, PeerId, RelayOptions, Result, transport};
+use super::{
+    ConnectionBudget, Error, NodeOptions, PeerId, RelayOptions, Result, Timeouts, transport,
+};
 
 const MAX_ADDRESS_HINTS: usize = 4096;
 const MAX_CACHED_CONNECTIONS: usize = 32;
@@ -22,8 +24,6 @@ const MAX_CONTROL_CONNECTIONS: usize = 32;
 /// First wait after a failed dial; doubles per consecutive failure.
 const UNREACHABLE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_UNREACHABLE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(120);
-const TOR_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
-const TOR_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 // The owning Connections instance supplies the local endpoint identity.
 // A peer path/address is deliberately absent from this key.
@@ -163,6 +163,7 @@ pub(super) struct Connections {
     unreachable: Arc<Mutex<BTreeMap<PeerId, (Instant, u32)>>>,
     address_lookup: bool,
     use_ip_hints: bool,
+    timeouts: Timeouts,
     tor: bool,
     #[cfg(feature = "tor")]
     _tor_transport: Option<Arc<iroh_tor_transport::TorCustomTransport>>,
@@ -171,12 +172,13 @@ pub(super) struct Connections {
 impl Connections {
     pub(super) async fn bind(
         address: SocketAddr,
-        profile: NetworkProfile,
+        options: &NodeOptions,
         secret: Option<iroh::SecretKey>,
         budget: ConnectionBudget,
         alpns: Vec<Vec<u8>>,
         relay: Option<RelayOptions>,
     ) -> Result<Self> {
+        let profile = options.profile;
         let (mdns_service, wan_lookup, relay_only, use_ip_hints) = profile.settings();
         #[cfg(feature = "tor")]
         let tor_transport = if profile.uses_tor() {
@@ -308,6 +310,7 @@ impl Connections {
             unreachable: Arc::new(Mutex::new(BTreeMap::new())),
             address_lookup: mdns_service.is_some() || wan_lookup || profile.uses_tor(),
             use_ip_hints,
+            timeouts: options.timeouts,
             tor: profile.uses_tor(),
             #[cfg(feature = "tor")]
             _tor_transport: tor_transport,
@@ -327,11 +330,11 @@ impl Connections {
     }
 
     pub(super) fn operation_timeout(&self) -> std::time::Duration {
-        if self.tor {
-            TOR_OPERATION_TIMEOUT
-        } else {
-            super::TIMEOUT
-        }
+        self.timeouts.operation
+    }
+
+    pub(super) fn timeouts(&self) -> Timeouts {
+        self.timeouts
     }
 
     /// Protocols of the open connections this endpoint observed.
@@ -581,7 +584,7 @@ impl Connections {
         let outcome = if self.tor {
             // Tor hidden-service descriptors can take up to two minutes to
             // propagate. Retry failed SOCKS connects within a bounded window.
-            let deadline = Instant::now() + TOR_DIAL_TIMEOUT;
+            let deadline = Instant::now() + self.timeouts.dial;
             let mut delay = std::time::Duration::from_secs(3);
             loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -608,7 +611,7 @@ impl Connections {
                 }
             }
         } else {
-            attempt(destination, super::TIMEOUT).await
+            attempt(destination, self.timeouts.dial).await
         };
         let mut unreachable = self.unreachable.lock().await;
         match &outcome {
@@ -671,6 +674,7 @@ impl Connections {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NetworkProfile;
 
     #[cfg(feature = "tor")]
     #[test]
@@ -712,7 +716,7 @@ mod tests {
             });
             let cache = Connections::bind(
                 "127.0.0.1:0".parse().unwrap(),
-                NetworkProfile::Direct,
+                &NodeOptions::new(NetworkProfile::Direct),
                 None,
                 ConnectionBudget::default(),
                 vec![],
@@ -793,7 +797,7 @@ mod tests {
             let alpn = super::super::control::ALPN.to_vec();
             let cache = Connections::bind(
                 "127.0.0.1:0".parse().unwrap(),
-                NetworkProfile::Direct,
+                &NodeOptions::new(NetworkProfile::Direct),
                 None,
                 ConnectionBudget::default(),
                 vec![],
@@ -848,7 +852,7 @@ mod tests {
             let alpn = super::super::control::ALPN.to_vec();
             let cache = Connections::bind(
                 "127.0.0.1:0".parse().unwrap(),
-                NetworkProfile::Direct,
+                &NodeOptions::new(NetworkProfile::Direct),
                 None,
                 ConnectionBudget::default(),
                 vec![],
@@ -909,7 +913,7 @@ mod tests {
             });
             let cache = Connections::bind(
                 "127.0.0.1:0".parse().unwrap(),
-                NetworkProfile::Direct,
+                &NodeOptions::new(NetworkProfile::Direct),
                 None,
                 ConnectionBudget::default(),
                 vec![],
@@ -983,7 +987,7 @@ mod tests {
                 .unwrap();
             let mut cache = Connections::bind(
                 "127.0.0.1:0".parse().unwrap(),
-                NetworkProfile::Direct,
+                &NodeOptions::new(NetworkProfile::Direct),
                 None,
                 ConnectionBudget::default(),
                 vec![],

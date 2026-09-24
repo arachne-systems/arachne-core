@@ -13,6 +13,10 @@ failure, cancellation and actor shutdown drop the permit. The actor still owns
 its peer-deduplicated queue, retries, routing and gossip state machine. No
 protocol version, crypto or dependency version changes.
 
+`Builder::dial_timeout(Duration)` bounds each dial attempt inside the same task,
+so a silent peer returns the shared dial permit at the host's deadline instead
+of when Iroh gives up. A timeout is reported as a failed dial.
+
 `Builder::connect_preamble(Bytes)` is the one wire addition: every connection
 the instance dials first carries these bytes on its own unidirectional stream,
 before any gossip stream. Arachne uses one fixed gossip ALPN for all workspaces

@@ -94,6 +94,59 @@ impl RelayOptions {
     }
 }
 
+/// Transport deadlines. Each profile has defaults (`for_profile`); a slow or
+/// constrained link overrides them through `NodeOptions`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Timeouts {
+    /// One data exchange or resource admission, including its dial.
+    pub operation: Duration,
+    /// One dial. A gossip dial holds its dial slot at most this long.
+    pub dial: Duration,
+    /// How long a live broadcast waits for a first overlay neighbor.
+    pub gossip_join: Duration,
+}
+
+impl Timeouts {
+    pub fn for_profile(profile: NetworkProfile) -> Self {
+        if profile.uses_tor() {
+            // Hidden-service descriptors can take minutes to propagate.
+            return Self {
+                operation: Duration::from_secs(300),
+                dial: Duration::from_secs(240),
+                gossip_join: Duration::from_secs(30),
+            };
+        }
+        Self {
+            operation: TIMEOUT,
+            dial: TIMEOUT,
+            gossip_join: Duration::from_secs(2),
+        }
+    }
+
+    /// Lifetime of a resource read grant. Its ticket travels in a message
+    /// and the recipient then dials, so the grant outlasts both.
+    pub(crate) fn resource_grant(&self) -> Duration {
+        resources::ADMISSION_LIFETIME.max(self.dial + self.operation * 2)
+    }
+}
+
+/// How a node binds: its network profile and transport deadlines.
+#[derive(Clone, Debug)]
+pub struct NodeOptions {
+    pub profile: NetworkProfile,
+    pub timeouts: Timeouts,
+}
+
+impl NodeOptions {
+    /// The profile with its default deadlines.
+    pub fn new(profile: NetworkProfile) -> Self {
+        Self {
+            profile,
+            timeouts: Timeouts::for_profile(profile),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("routing rejected: {0:?}")]
@@ -491,7 +544,17 @@ impl Node {
         profile: NetworkProfile,
         budget: ConnectionBudget,
     ) -> Result<(Self, MessageReceiver)> {
-        Self::bind_with_profile_and_relays(address, secret, profile, budget, None).await
+        Self::bind_with_options(address, secret, NodeOptions::new(profile), budget).await
+    }
+
+    /// Bind with explicit options, for example deadlines for a slow link.
+    pub async fn bind_with_options(
+        address: SocketAddr,
+        secret: Option<&[u8; 32]>,
+        options: NodeOptions,
+        budget: ConnectionBudget,
+    ) -> Result<(Self, MessageReceiver)> {
+        Self::bind_with_profile_and_relays(address, secret, options, budget, None).await
     }
 
     /// Bind with a caller-supplied relay map and TLS trust configuration.
@@ -506,19 +569,26 @@ impl Node {
         budget: ConnectionBudget,
         relay: RelayOptions,
     ) -> Result<(Self, MessageReceiver)> {
-        Self::bind_with_profile_and_relays(address, secret, profile, budget, Some(relay)).await
+        Self::bind_with_profile_and_relays(
+            address,
+            secret,
+            NodeOptions::new(profile),
+            budget,
+            Some(relay),
+        )
+        .await
     }
 
     async fn bind_with_profile_and_relays(
         address: SocketAddr,
         secret: Option<&[u8; 32]>,
-        profile: NetworkProfile,
+        options: NodeOptions,
         budget: ConnectionBudget,
         relay: Option<RelayOptions>,
     ) -> Result<(Self, MessageReceiver)> {
         let connections = Connections::bind(
             address,
-            profile,
+            &options,
             secret.map(iroh::SecretKey::from_bytes),
             budget.clone(),
             vec![ALPN.to_vec(), control::ALPN.to_vec(), overlay::ALPN.to_vec()],
@@ -574,7 +644,7 @@ impl Node {
                     let mut observed_connection = None;
                     let result = async {
                         let observed_address = incoming.remote_addr();
-                        let connection = tokio::time::timeout(TIMEOUT, incoming).await
+                        let connection = tokio::time::timeout(connections.operation_timeout(), incoming).await
                             .map_err(|_| Error::Timeout("accept connection"))?.map_err(transport)?;
                         drop(permit);
                         observed_connection = Some(connection.clone());
@@ -584,7 +654,7 @@ impl Node {
                         let is_control = connection.alpn() == control::ALPN;
                         if connection.alpn() == overlay::ALPN {
                             stage = "accept gossip";
-                            let tag = read_gossip_tag(&connection).await;
+                            let tag = read_gossip_tag(&connection, connections.operation_timeout()).await;
                             let overlay = match tag {
                                 Some(tag) => overlays
                                     .lock()
@@ -621,7 +691,7 @@ impl Node {
                         let (capacity, budget) = if is_control {
                             (control_capacity, control::CONTROL_TIMEOUT)
                         } else {
-                            (data_capacity, TIMEOUT)
+                            (data_capacity, connections.operation_timeout())
                         };
                         let address = match observed_address {
                             iroh::endpoint::IncomingAddr::Ip(address) => Some(address),
@@ -659,7 +729,7 @@ impl Node {
                                         let result = async {
                                             if !is_control {
                                                 let mut kind = [0; 1];
-                                                tokio::time::timeout(TIMEOUT, recv.read_exact(&mut kind)).await
+                                                tokio::time::timeout(connections.operation_timeout(), recv.read_exact(&mut kind)).await
                                                     .map_err(|_| Error::Timeout("stream kind"))?.map_err(transport)?;
                                                 match kind[0] {
                                                     resources::STREAM_KIND => return resources.serve(connection, &mut send, &mut recv).await,
@@ -1285,8 +1355,11 @@ impl Node {
 }
 
 /// The dialer's first stream on a gossip link: exactly one overlay tag.
-async fn read_gossip_tag(connection: &iroh::endpoint::Connection) -> Option<[u8; overlay::TAG]> {
-    tokio::time::timeout(TIMEOUT, async {
+async fn read_gossip_tag(
+    connection: &iroh::endpoint::Connection,
+    timeout: Duration,
+) -> Option<[u8; overlay::TAG]> {
+    tokio::time::timeout(timeout, async {
         let mut recv = connection.accept_uni().await.ok()?;
         let bytes = recv.read_to_end(overlay::TAG).await.ok()?;
         bytes.try_into().ok()
@@ -1587,4 +1660,19 @@ fn current_queue_preserves_distinct_replacement_keys() {
     assert_eq!(queue.state.lock().unwrap().current.len(), 2);
     assert_eq!(queue.pop().unwrap().payload, vec![1]);
     assert_eq!(queue.pop().unwrap().payload, vec![2]);
+}
+
+#[test]
+fn deadlines_follow_the_profile_and_scale_the_resource_grant() {
+    let direct = Timeouts::for_profile(NetworkProfile::Direct);
+    assert_eq!((direct.operation, direct.dial), (TIMEOUT, TIMEOUT));
+    assert_eq!(direct.resource_grant(), resources::ADMISSION_LIFETIME);
+    // A slow link's grant outlasts delivering the ticket and dialing back.
+    let slow = Timeouts {
+        operation: Duration::from_secs(300),
+        dial: Duration::from_secs(240),
+        gossip_join: Duration::from_secs(30),
+    };
+    assert!(slow.resource_grant() >= slow.dial + slow.operation);
+    assert_eq!(NodeOptions::new(NetworkProfile::Lan).timeouts, direct);
 }

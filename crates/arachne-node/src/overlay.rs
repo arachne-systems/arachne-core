@@ -30,7 +30,6 @@ use super::{
 pub(super) const ALPN: &[u8] = b"arachne/gossip/1";
 /// Keyed workspace tag length; the whole first stream of a gossip link.
 pub(super) const TAG: usize = 32;
-const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_BOOTSTRAPS: usize = 3;
 const BOOTSTRAP_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(35),
@@ -198,6 +197,8 @@ pub(super) struct Overlay {
     secret: iroh::SecretKey,
     neighbors: Arc<StdMutex<BTreeSet<PeerId>>>,
     changed: Arc<Notify>,
+    /// How long a broadcast waits for a first neighbor (profile deadline).
+    join_timeout: Duration,
     receiver: JoinHandle<()>,
     bootstrap_retry: Option<JoinHandle<()>>,
 }
@@ -264,6 +265,7 @@ impl Overlay {
         let gossip = Gossip::builder()
             .alpn(ALPN)
             .connect_preamble(tag.to_vec())
+            .dial_timeout(connections.timeouts().dial)
             .dial_capacity(connections.gossip_dial_capacity())
             .max_message_size(super::MAX_FRAME)
             .membership_config(config)
@@ -423,6 +425,7 @@ impl Overlay {
             secret,
             neighbors,
             changed,
+            join_timeout: connections.timeouts().gossip_join,
             receiver,
             bootstrap_retry,
         })
@@ -443,7 +446,7 @@ impl Overlay {
         }
         let changed = self.changed.notified();
         if self.neighbors.lock().unwrap().is_empty() {
-            tokio::time::timeout(JOIN_TIMEOUT, changed)
+            tokio::time::timeout(self.join_timeout, changed)
                 .await
                 .map_err(|_| Error::MissingPeer)?;
             if self.neighbors.lock().unwrap().is_empty() {
