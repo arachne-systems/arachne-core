@@ -21,6 +21,17 @@ pub const MAX_PENDING_OBJECTS_PER_AUTHOR: usize = 128;
 pub const MAX_PENDING_BYTES_PER_AUTHOR: usize = 32 * 1024;
 /// Pending payload bytes of all authors together.
 pub const MAX_PENDING_BYTES: usize = 96 * 1024;
+/// Refusal when one author's pending objects fill its quota.
+pub const AUTHOR_QUOTA_EXHAUSTED: &str = "author pending quota exhausted";
+/// Refusal when all authors' pending objects fill the inbox.
+pub const PENDING_INBOX_FULL: &str = "pending inbox full";
+
+/// True when a refused object can be accepted after the application
+/// acknowledges or rejects pending objects. Recovery stops at such a refusal
+/// and continues later; it does not skip the object.
+pub fn drains_with_application(error: &str) -> bool {
+    error == AUTHOR_QUOTA_EXHAUSTED || error == PENDING_INBOX_FULL
+}
 /// Encoded bound of the inbox. With `PUBLISHER_BUDGET` it fits one workspace
 /// attachment: saving never evicts publisher history to make room, and the
 /// operation that would grow the inbox past it fails instead.
@@ -976,7 +987,25 @@ impl ObjectInbox {
         query: &RangeQuery,
         reply: &[u8],
     ) -> Result<Self, &'static str> {
+        self.accept_recovery_prefix(owner, query, reply, query.through)
+    }
+
+    /// Accept progress through `through` inside one verified publisher-signed
+    /// range (B7b). The signature covers the whole range, so every record with
+    /// a sequence at or below `through` is the complete prefix. The caller
+    /// passes the last sequence it admitted or found duplicate; records above
+    /// it were not recorded and come again by a later request.
+    pub fn accept_recovery_prefix(
+        &self,
+        owner: &arachne_security::Workspace,
+        query: &RangeQuery,
+        reply: &[u8],
+        through: u64,
+    ) -> Result<Self, &'static str> {
         self.validate_owner(owner)?;
+        if through <= query.after || through > query.through {
+            return Err("recovery progress outside the signed range");
+        }
         if query.workspace != self.workspace || !owner.in_receive_window(query.epoch) {
             return Err("recovery coverage has wrong workspace or epoch");
         }
@@ -993,7 +1022,7 @@ impl ObjectInbox {
                 && progress.selection == selection
         });
         let current = position.map_or(0, |index| self.progress[index].through);
-        if query.through <= current {
+        if through <= current {
             return Ok(self.clone());
         }
         if query.after != current {
@@ -1004,13 +1033,13 @@ impl ObjectInbox {
         }
         let mut next = self.clone();
         if let Some(index) = position {
-            next.progress[index].through = query.through;
+            next.progress[index].through = through;
         } else {
             next.progress.push(SelectionProgress {
                 author: query.author,
                 epoch: query.epoch,
                 selection,
-                through: query.through,
+                through,
             });
             next.progress
                 .sort_by_key(|progress| (progress.author, progress.epoch, progress.selection));
@@ -1125,11 +1154,11 @@ impl ObjectInbox {
         if author_objects == MAX_PENDING_OBJECTS_PER_AUTHOR
             || author_bytes + size > MAX_PENDING_BYTES_PER_AUTHOR
         {
-            return Err("author pending quota exhausted");
+            return Err(AUTHOR_QUOTA_EXHAUSTED);
         }
         let total: usize = self.pending.iter().map(Pending::encoded_len).sum();
         if self.pending.len() == MAX_PENDING_OBJECTS || total + size > MAX_PENDING_BYTES {
-            return Err("pending inbox full");
+            return Err(PENDING_INBOX_FULL);
         }
         let mut next = self.clone();
         let index = position.unwrap_or_else(|| {
