@@ -1910,6 +1910,10 @@ fn map_error(message: &str) -> Error {
     let lower = message.to_ascii_lowercase();
     let kind = if lower.contains("invalid or closed") || lower == "node is closed" {
         ErrorKind::Closed
+    } else if lower.starts_with("transport:") {
+        // The node's own Transport error, for example a stranger refused at
+        // the handshake. The transport's reason text must not reclassify it.
+        ErrorKind::Transport
     } else if lower.contains("limit") || lower.contains("capacity") || lower.contains("queue") {
         ErrorKind::Capacity
     } else if lower.contains("storage") || lower.contains("snapshot") || lower.contains("record") {
@@ -1936,3 +1940,16 @@ fn map_error(message: &str) -> Error {
     error(kind, message)
 }
 
+
+/// A stranger on a member's data plane is refused at the handshake and sees
+/// the node's `Transport` error, whatever words the transport's reason uses.
+#[test]
+fn a_refused_handshake_is_a_transport_error() {
+    for message in [
+        "transport: aborted by peer: connection limit for unknown endpoints",
+        "transport: the cryptographic handshake failed: stranger queue full",
+        "peer rejected operation",
+    ] {
+        assert_eq!(map_error(message).kind(), ErrorKind::Transport, "{message}");
+    }
+}
