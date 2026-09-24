@@ -279,7 +279,14 @@ fn bench_inquiries_under_a_paced_host() {
 /// Admit `joiner` to `admin`'s workspace in-process (no network), as the
 /// management tests do.
 fn add_member(admin: i64, joiner: i64, name: &str) {
-    let invite = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let staged = call(
+        admin,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    )
+    .unwrap();
+    let invite = call(admin, json!({"op":"adopt_admission","snapshot":staged["snapshot"]}))
+        .unwrap()["issued_invitation"]
+        .clone();
     let begin = call(
         joiner,
         json!({"op":"begin_join","invitation":invite["invitation"],"checkpoint":invite["checkpoint"],"display_name":name}),

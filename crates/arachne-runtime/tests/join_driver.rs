@@ -20,6 +20,11 @@ fn bytes(value: &Value) -> Vec<u8> {
         .collect()
 }
 
+fn issue(h: i64) -> Value {
+    let staged = call(h, json!({"op":"stage_invitation","personal":false,"expires_at":0})).unwrap();
+    call(h, json!({"op":"adopt_admission","snapshot":staged["snapshot"]})).unwrap()["issued_invitation"].clone()
+}
+
 struct Owner {
     handle: i64,
     peer: Value,
@@ -35,7 +40,7 @@ fn owner(seed: u8) -> Owner {
         json!({"op":"create_workspace","display_name":"Owner","workspace_name":"Compact join"}),
     )
     .unwrap();
-    let invitation = call(handle, json!({"op":"issue_invitation"})).unwrap();
+    let invitation = issue(handle);
     let info: Value = serde_json::from_str(&describe(handle).unwrap()).unwrap();
     let dir = common::directory();
     let path = dir.path().join("owner.db");
@@ -70,7 +75,7 @@ fn async_driver_persists_selected_peer_and_exact_pending_request() {
         json!({"op":"create_workspace","display_name":"Owner","workspace_name":"Async join"}),
     )
     .unwrap();
-    let invitation = call(owner, json!({"op":"issue_invitation"})).unwrap();
+    let invitation = issue(owner);
     let owner_info: Value = serde_json::from_str(&describe(owner).unwrap()).unwrap();
     let owner_peer = bytes(&owner_info["endpoint_key"]);
     let pending = call(

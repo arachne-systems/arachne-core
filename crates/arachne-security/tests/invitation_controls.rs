@@ -94,7 +94,7 @@ fn open_event_link_is_reusable_without_admin_and_disable_survives_history() {
             .is_some()
     );
     let (helper, _) = joined(&helper, &invite, &checkpoint, 3); // Organizer need not handle this join.
-    let id = helper.invitation_controls().unwrap().1[0].key;
+    let id = helper.invitation_controls().unwrap()[0].key;
     assert!(
         helper
             .prepare_management(ManagementAction::DisableInvitation(id))
@@ -137,7 +137,7 @@ fn open_event_link_is_reusable_without_admin_and_disable_survives_history() {
         &helper.seal(&key).unwrap(),
     )
     .unwrap();
-    assert!(!restored.invitation_controls().unwrap().1[0].enabled);
+    assert!(!restored.invitation_controls().unwrap()[0].enabled);
 }
 
 #[test]
@@ -208,7 +208,7 @@ fn automatic_personal_invitation_binds_only_the_first_request() {
     let intended =
         PendingJoin::from_invitation(&token, &checkpoint, [2; 32], "Invited person").unwrap();
     let copied = PendingJoin::from_invitation(&token, &checkpoint, [3; 32], "Copied link").unwrap();
-    assert!(created.workspace.invitation_controls().unwrap().1[0].automatic());
+    assert!(created.workspace.invitation_controls().unwrap()[0].automatic());
     assert_eq!(
         created
             .workspace
@@ -221,7 +221,7 @@ fn automatic_personal_invitation_binds_only_the_first_request() {
         .workspace
         .prepare_invitation_approval(intended.admission_request().unwrap())
         .unwrap();
-    assert!(!approval.workspace.invitation_controls().unwrap().1[0].automatic());
+    assert!(!approval.workspace.invitation_controls().unwrap()[0].automatic());
     assert!(
         approval
             .workspace
@@ -240,17 +240,19 @@ fn automatic_personal_invitation_binds_only_the_first_request() {
 fn expiry_rejects_new_requests_and_roles_cannot_reset_invitation_controls() {
     let admin = Workspace::create([1; 32], "Admin").unwrap();
     assert!(admin.prepare_invitation(1, false, false).is_err());
-    let (token, checkpoint) = admin.issue_invitation().unwrap();
+    // Take a signed link, then register its key with an expiry already past.
+    let (_, token, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let id = token.key();
     let expired = admin
         .prepare_management(ManagementAction::CreateInvitation(id, 1, false))
         .unwrap();
     let pending = PendingJoin::from_invitation(&token, &checkpoint, [2; 32], "Too late").unwrap();
-    assert!(
+    assert_eq!(
         expired
             .workspace
             .prepare_admission([2; 32], pending.admission_request().unwrap())
-            .is_err()
+            .err(),
+        Some(arachne_security::INVITATION_EXPIRED)
     );
     let (fresh, token, checkpoint) = expired
         .workspace
@@ -346,4 +348,52 @@ fn request_access_approves_and_declines_each_saved_request_independently() {
             .is_err()
     );
     assert_eq!(owner.member_count(), 3);
+}
+
+/// An approved join request admits once. After removal, the same saved request
+/// must not bring the member back, even through an administrator that never
+/// saw the first admission.
+#[test]
+fn removed_member_cannot_rejoin_with_a_used_approval() {
+    for request_access in [false, true] {
+        let admin = Workspace::create([31; 32], "Admin").unwrap();
+        let (open, open_token, open_checkpoint) =
+            admin.prepare_invitation(0, false, false).unwrap();
+        let (personal, token, checkpoint) = if request_access {
+            open.workspace.prepare_request_invitation(0)
+        } else {
+            open.workspace.prepare_invitation(0, true, false)
+        }
+        .unwrap();
+        let pending =
+            PendingJoin::from_invitation(&token, &checkpoint, [32; 32], "Invited person").unwrap();
+        let request = pending.admission_request().unwrap().to_vec();
+        let approval = personal
+            .workspace
+            .prepare_invitation_approval(&request)
+            .unwrap();
+        let (admin, second) = joined(&approval.workspace, &open_token, &open_checkpoint, 33);
+        let admitted = admin.prepare_admission([32; 32], &request).unwrap();
+        let second = second
+            .prepare_admission_update(&admitted.authorization, &admitted.commit)
+            .unwrap();
+        let admin = admitted.workspace;
+        let member = pending.member().id();
+        let promotion = admin
+            .prepare_management(ManagementAction::Promote(second.member().unwrap().id()))
+            .unwrap();
+        let second = apply(&second, &promotion);
+        let removal = promotion
+            .workspace
+            .prepare_management(ManagementAction::Remove(member))
+            .unwrap();
+        let second = apply(&second, &removal);
+        assert_eq!(second.member_count(), 2);
+        assert_eq!(
+            second.prepare_admission([32; 32], &request).err(),
+            Some(arachne_security::INVITATION_DISABLED),
+            "request_access={request_access}"
+        );
+        assert!(removal.workspace.prepare_admission([32; 32], &request).is_err());
+    }
 }

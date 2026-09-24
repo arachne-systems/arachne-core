@@ -56,7 +56,18 @@ fn public_runtime_admission_path_handles_500_authenticated_joiners() {
     .unwrap();
     let dir = tempfile::tempdir().unwrap();
     enable_record_storage(owner, &dir.path().join("owner.db"), &[17; 32]).unwrap();
-    let invitation = call(owner, json!({"op":"issue_invitation"})).unwrap();
+    let staged = call(
+        owner,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    )
+    .unwrap();
+    save_candidate(owner, &bytes(&staged["snapshot"])).unwrap();
+    let invitation = call(
+        owner,
+        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+    )
+    .unwrap()["issued_invitation"]
+        .clone();
     let invitation_bytes = bytes(&invitation["invitation"]);
     let checkpoint = bytes(&invitation["checkpoint"]);
     let owner_info: Value = serde_json::from_str(&describe(owner).unwrap()).unwrap();

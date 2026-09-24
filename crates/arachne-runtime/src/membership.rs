@@ -1192,7 +1192,12 @@ pub(super) fn admit_members(
     Vec<arachne_security::Workspace>,
     Vec<[u8; 32]>,
 ) {
-    let mut owner = arachne_security::Workspace::create([seed; 32], "Coordinator").unwrap();
+    let (registered, invitation, checkpoint) =
+        arachne_security::Workspace::create([seed; 32], "Coordinator")
+            .unwrap()
+            .prepare_invitation(0, false, false)
+            .unwrap();
+    let mut owner = registered.workspace;
     let mut members = Vec::with_capacity(count as usize);
     let mut endpoints = Vec::with_capacity(count as usize);
     for i in 0..count {
@@ -1230,7 +1235,6 @@ pub(super) fn admit_members(
             seed,
             seed,
         ];
-        let (invitation, checkpoint) = owner.issue_invitation().unwrap();
         let pending = arachne_security::PendingJoin::from_invitation(
             &invitation,
             &checkpoint,
@@ -1238,13 +1242,17 @@ pub(super) fn admit_members(
             &format!("{name_prefix} {i}"),
         )
         .unwrap();
-        let prepared = owner
-            .prepare_admission(endpoint, pending.admission_request().unwrap())
-            .unwrap();
+        let request = pending.admission_request().unwrap();
+        let prepared = owner.prepare_admission(endpoint, request).unwrap();
         let mut proof = pending.join_proof().unwrap();
-        proof
-            .apply_add(&prepared.authorization, &prepared.commit)
-            .unwrap();
+        // One registered link: each joiner replays every step since its checkpoint.
+        for (authorization, commit) in prepared
+            .workspace
+            .membership_history(endpoint, request, &checkpoint)
+            .unwrap()
+        {
+            proof.apply_transition(&authorization, &commit).unwrap();
+        }
         let member = pending
             .prepare_workspace(&proof, &prepared.welcome)
             .unwrap();

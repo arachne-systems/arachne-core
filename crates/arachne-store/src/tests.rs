@@ -37,7 +37,8 @@ fn admission_records_commit_together_and_reject_mixed_restoration() {
     let scope = owner.id();
     let key = StorageKey::derive(&root).unwrap();
     let old = owner.seal(&key).unwrap();
-    let (invitation, checkpoint) = owner.issue_invitation().unwrap();
+    let (registered, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+    let owner = registered.workspace;
     let pending =
         PendingJoin::from_invitation(&invitation, &checkpoint, [2; 32], "Storage gate member")
             .unwrap();

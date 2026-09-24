@@ -32,7 +32,8 @@ pub struct AuthenticatedObject {
 fn objects_are_independent_authenticated_and_current_epoch_only() {
     use super::{PendingJoin, StorageKey};
     let admin = Workspace::create([1; 32], "Publisher").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let (registration, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let admin = registration.workspace;
     let pending = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
     let prepared = admin
         .prepare_admission([2; 32], pending.admission_request().unwrap())

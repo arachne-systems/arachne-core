@@ -516,7 +516,8 @@ fn exact_receive_evidence_is_scoped_bounded_and_non_evicting() {
 fn live_then_recovery_skips_exact_receipts_but_not_lost_keys() {
     use arachne_security::{PendingJoin, StorageKey, Workspace};
     let admin = Workspace::create([1; 32], "Publisher").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let admin = registered.workspace;
     let pending = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
     let prepared = admin
         .prepare_admission([2; 32], pending.admission_request().unwrap())

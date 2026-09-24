@@ -86,20 +86,14 @@ pub(super) fn authority(
 ) -> Result<Vec<Vec<u8>>, &'static str> {
     let bytes = &extensions.unknown(AUTHORITY).ok_or("missing authority")?.0;
     if bytes.len() < 2
-        || !matches!(bytes[0], 1 | 2)
+        || bytes[0] != 2
         || !(1..=64).contains(&bytes[1])
         || bytes.len() < 2 + usize::from(bytes[1]) * 32
     {
         return Err("invalid authority encoding");
     }
     let end = 2 + usize::from(bytes[1]) * 32;
-    if bytes[0] == 1 {
-        if bytes.len() != end {
-            return Err("invalid authority length");
-        }
-    } else {
-        super::invitation_controls::decode(&bytes[end..])?;
-    }
+    super::invitation_controls::decode(&bytes[end..])?;
     let keys: Vec<Vec<u8>> = bytes[2..end]
         .as_chunks::<32>()
         .0
@@ -312,8 +306,36 @@ impl MembershipVerifier {
         let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
             return Err("not a commit");
         };
-        if staged.queued_proposals().count() != authorizations.len()
-            || staged.group_context().extensions() != self.group.group_context().extensions()
+        let adds: Vec<_> = staged.add_proposals().collect();
+        if adds.len() != authorizations.len() {
+            return Err("admission authorizes only Add proposals");
+        }
+        // The only policy change an admission may carry is disabling the
+        // single-use approvals it consumes, inline from the committer.
+        let admitted: Vec<_> = authorizations
+            .iter()
+            .zip(&adds)
+            .map(|(auth, add)| (auth.invitation_key, add.add_proposal().key_package()))
+            .collect();
+        let policy = super::invitation_controls::consumed(
+            self.group.group_context().extensions(),
+            &admitted,
+        )?;
+        let policy_proposals = staged
+            .queued_proposals()
+            .filter(|p| matches!(p.proposal(), Proposal::GroupContextExtensions(_)))
+            .count();
+        if staged.queued_proposals().count() != authorizations.len() + usize::from(policy.is_some())
+            || policy_proposals != usize::from(policy.is_some())
+            || !staged.queued_proposals().all(|p| {
+                !matches!(p.proposal(), Proposal::GroupContextExtensions(_))
+                    || (p.sender() == &Sender::Member(actor.index)
+                        && p.proposal_or_ref_type() == ProposalOrRefType::Proposal)
+            })
+            || staged.group_context().extensions()
+                != policy
+                    .as_ref()
+                    .unwrap_or(self.group.group_context().extensions())
         {
             return Err("invitation authorizes only Adds without policy changes");
         }
@@ -322,10 +344,6 @@ impl MembershipVerifier {
                 || leaf.signature_key().as_slice() != actor.signature_key)
         {
             return Err("admission cannot replace committer identity");
-        }
-        let adds: Vec<_> = staged.add_proposals().collect();
-        if adds.len() != authorizations.len() {
-            return Err("admission authorizes only Add proposals");
         }
         let mut bindings = std::collections::BTreeSet::new();
         let admins = authority(self.group.group_context().extensions())?;
@@ -653,7 +671,7 @@ impl JoinProof {
         &self,
         key: [u8; 32],
     ) -> Result<Option<super::InvitationControl>, &'static str> {
-        let (_, controls) =
+        let controls =
             super::invitation_controls::decode(&super::invitation_controls::policy_bytes(
                 self.verifier.group.group_context().extensions(),
             )?)?;
@@ -903,7 +921,17 @@ mod tests {
         ))
         .into();
         assert!(binding(&invalid).is_err());
-        let mut admin = Workspace::create([1; 32], "Coordinator").unwrap();
+        let invite = SignatureKeyPair::new(SUITE.signature_algorithm()).unwrap();
+        let invitation_key = invite.public().try_into().unwrap();
+        let mut admin = Workspace::create([1; 32], "Coordinator")
+            .unwrap()
+            .prepare_management(crate::ManagementAction::CreateInvitation(
+                invitation_key,
+                0,
+                false,
+            ))
+            .unwrap()
+            .workspace;
         let checkpoint = admin.join_checkpoint().unwrap();
         let digest: [u8; 32] = Sha256::digest(&checkpoint).into();
         let mut proof =
@@ -934,8 +962,6 @@ mod tests {
         );
 
         let helper = Candidate::new(3);
-        let invite = SignatureKeyPair::new(SUITE.signature_algorithm()).unwrap();
-        let invitation_key = invite.public().try_into().unwrap();
         let grant_signature = admin
             ._signer
             .sign(&grant(admin.group.group_id(), &invitation_key))
@@ -963,15 +989,16 @@ mod tests {
         let commit = commit.to_bytes().unwrap();
         let mut invalid_auth = authorize(admin.group.group_id(), &helper.package);
         invalid_auth.grant_signature[0] ^= 1;
+        // Epochs start at 1: the invitation registration is epoch 1.
         assert!(proof.apply_add(&invalid_auth, &commit).is_err());
-        assert_eq!(proof.epoch(), 0);
+        assert_eq!(proof.epoch(), 1);
         let mut trailing = commit.clone();
         trailing.push(0);
         assert!(proof.apply_add(&helper_auth, &trailing).is_err());
-        assert_eq!(proof.epoch(), 0);
+        assert_eq!(proof.epoch(), 1);
         proof.apply_add(&helper_auth, &commit).unwrap();
         assert!(proof.apply_add(&helper_auth, &commit).is_err()); // replay
-        assert_eq!(proof.epoch(), 1);
+        assert_eq!(proof.epoch(), 2);
         admin.group.merge_pending_commit(&admin.provider).unwrap();
         let mut helper = helper.join(admin.id(), welcome);
         assert!(proof.matches_workspace(&helper).unwrap());
@@ -995,7 +1022,7 @@ mod tests {
         let commit = commit.to_bytes().unwrap();
         let mismatched = authorize(helper.group.group_id(), &Candidate::new(5).package);
         assert!(proof.apply_add(&mismatched, &commit).is_err());
-        assert_eq!(proof.epoch(), 1);
+        assert_eq!(proof.epoch(), 2);
         proof.apply_add(&joined_auth, &commit).unwrap();
         helper.group.merge_pending_commit(&helper.provider).unwrap();
         let mut joined = joined.join(helper.id(), welcome);
@@ -1053,8 +1080,8 @@ mod tests {
             fork_proof.apply_add(&forged, &bad_commit.to_bytes().unwrap()),
             Err("unapproved invitation")
         );
-        assert_eq!(fork_proof.epoch(), 1);
-        assert_eq!(proof.epoch(), 2);
+        assert_eq!(fork_proof.epoch(), 2);
+        assert_eq!(proof.epoch(), 3);
         assert!(proof.matches_workspace(&joined).unwrap());
     }
 }

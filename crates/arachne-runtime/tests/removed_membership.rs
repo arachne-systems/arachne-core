@@ -12,7 +12,8 @@ fn removed_membership_restore_shuts_down_runtime_and_rejects_active_fallback() {
     let info: Value = serde_json::from_str(&describe(handle).unwrap()).unwrap();
     let endpoint: [u8; 32] = serde_json::from_value(info["endpoint_key"].clone()).unwrap();
     let admin = Workspace::create([91; 32], "Admin").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let admin = registered.workspace;
     let join =
         PendingJoin::from_invitation(&invite, &checkpoint, endpoint, "Former member").unwrap();
     let admitted = admin
@@ -46,7 +47,7 @@ fn removed_membership_restore_shuts_down_runtime_and_rejects_active_fallback() {
     for request in [
         json!({"op":"create_workspace","display_name":"Do not resurrect"}),
         json!({"op":"restore_workspace","workspace":member.id(),"snapshot":old}),
-        json!({"op":"issue_invitation"}),
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
         json!({"op":"install_workspace_policy","revision":99}),
         json!({"op":"install_verified_policy","workspace":member.id(),"revision":99,"endpoints":[]}),
         json!({"op":"publish","workspace":member.id(),"revision":99,"topic":"atak/pli","payload":[1]}),

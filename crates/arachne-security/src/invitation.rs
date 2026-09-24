@@ -736,7 +736,9 @@ impl Workspace {
 
     /// Returns a secret bearer token owner and the public checkpoint it pins.
     /// Checkpoint distribution/retention is part of invitation handoff.
-    pub fn issue_invitation(&self) -> Result<(Invitation, Vec<u8>), &'static str> {
+    /// The grant is unregistered, so no workspace admits it; callers register
+    /// it through `prepare_invitation`.
+    pub(crate) fn issue_invitation(&self) -> Result<(Invitation, Vec<u8>), &'static str> {
         let checkpoint = self.join_checkpoint()?;
         let (private, public) = self
             .provider
@@ -892,7 +894,7 @@ impl Workspace {
 
     pub(super) fn prune_invitation_checkpoints(&mut self) -> Result<(), &'static str> {
         let now = super::invitation_controls::now()?;
-        let (_, controls) = self.invitation_controls()?;
+        let controls = self.invitation_controls()?;
         self.invitation_checkpoints.retain(|saved| {
             let key: [u8; 32] = saved.grant[101..133].try_into().unwrap();
             controls.iter().any(|control| {
@@ -917,7 +919,7 @@ impl Workspace {
         if self.invitation_checkpoints.is_empty() {
             return Ok(());
         }
-        let (_, controls) = self.invitation_controls()?;
+        let controls = self.invitation_controls()?;
         for saved in &self.invitation_checkpoints {
             verify_grant(&self.provider, &saved.grant)?;
             let key: [u8; 32] = saved.grant[101..133].try_into().unwrap();
@@ -964,7 +966,7 @@ impl Workspace {
         if request.workspace != self.id() {
             return Err("Join request belongs to another workspace.");
         }
-        let (_, controls) = self.invitation_controls()?;
+        let controls = self.invitation_controls()?;
         let control = controls
             .iter()
             .find(|c| c.key == request.authorization.invitation_key)
@@ -986,7 +988,7 @@ impl Workspace {
         if request.workspace != self.id() {
             return Err("Join request belongs to another workspace.");
         }
-        let (_, controls) = self.invitation_controls()?;
+        let controls = self.invitation_controls()?;
         let control = controls
             .iter()
             .find(|c| c.key == request.authorization.invitation_key)
@@ -1293,11 +1295,36 @@ impl Workspace {
         group
             .set_configuration(provider.storage(), &config)
             .map_err(|_| "admission configuration failed")?;
-        let (commit, welcome, _) = group
-            .add_members_without_update(&provider, &signer, &packages)
+        let admitted: Vec<_> = admissions
+            .iter()
+            .map(|(_, _, request)| (request.authorization.invitation_key, &request.package))
+            .collect();
+        let policy = super::invitation_controls::consumed(self.group.extensions(), &admitted)?;
+        let mut builder = group
+            .commit_builder()
+            .propose_adds(packages)
+            .force_self_update(false);
+        if let Some(policy) = policy {
+            builder = builder
+                .propose_group_context_extensions(policy)
+                .map_err(|_| "admission policy proposal failed")?;
+        }
+        let bundle = builder
+            .load_psks(provider.storage())
+            .map_err(|_| "admission preparation failed")?
+            .build(provider.rand(), provider.crypto(), &signer, |_| true)
+            .map_err(|_| "admission preparation failed")?
+            .stage_commit(&provider)
             .map_err(|_| "admission preparation failed")?;
-        let commit = commit.to_bytes().map_err(|_| "commit encoding failed")?;
-        let welcome = welcome.to_bytes().map_err(|_| "Welcome encoding failed")?;
+        let welcome = bundle
+            .to_welcome_msg()
+            .ok_or("admission preparation failed")?
+            .to_bytes()
+            .map_err(|_| "Welcome encoding failed")?;
+        let commit = bundle
+            .into_commit()
+            .to_bytes()
+            .map_err(|_| "commit encoding failed")?;
         if welcome.len() > 64 * 1024 {
             if profile {
                 eprintln!("admission_profile welcome_len={}", welcome.len());
@@ -1414,7 +1441,8 @@ fn checkpoint_request_keeps_the_bearer_secret_local_and_binds_both_endpoints() {
 fn signed_invitation_survives_pending_restart_and_offline_issuer() {
     use super::{PendingJoin, StorageKey};
     let admin = Workspace::create([1; 32], "Coordinator").unwrap();
-    let (invitation, checkpoint) = admin.issue_invitation().unwrap();
+    let (registration, invitation, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let admin = registration.workspace;
     let token = invitation.export_secret_token();
     assert_eq!(token.len(), TOKEN_SIZE);
     let invitation = Invitation::from_bytes(&token).unwrap();
@@ -1462,7 +1490,7 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
     extra.push(0);
     assert!(admin.prepare_admission([2; 32], &extra).is_err());
     let first = admin.prepare_admission([2; 32], &request).unwrap();
-    assert_eq!(admin.epoch(), 0);
+    assert_eq!(admin.epoch(), 1); // Only the invitation registration.
     assert_eq!(admin.member_count(), 1);
     assert!(
         admin
@@ -1471,25 +1499,32 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
             .is_none()
     );
     let snapshot = first.workspace.seal(&key).unwrap();
-    assert!(snapshot.starts_with(b"DFWS\x03"));
+    // The registered link gives saved history and a retained checkpoint.
+    assert!(snapshot.starts_with(b"DFWS\x05"));
     // Authenticated malformed format must fail at the bounded parser too.
     let plain = key
-        .unprotect(b"DFWS\x03", admin.id(), [1; 32], &snapshot)
+        .unprotect(b"DFWS\x05", admin.id(), [1; 32], &snapshot)
         .unwrap();
-    let count_offset = 8 + 32 + 4 + admin.member().unwrap().display_name().len();
-    for count in [0u32, MAX_ADMISSIONS as u32 + 1, u32::MAX] {
+    let history_offset = 8 + 32 + 4 + admin.member().unwrap().display_name().len() + 1;
+    let history_length = u32::from_be_bytes(
+        plain[history_offset..history_offset + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let count_offset = history_offset + 4 + history_length;
+    for count in [MAX_ADMISSIONS as u32 + 1, u32::MAX] {
         let mut invalid = plain.clone();
         invalid[count_offset..count_offset + 4].copy_from_slice(&count.to_be_bytes());
         let sealed = key
-            .protect(&admin.provider, b"DFWS\x03", admin.id(), [1; 32], &invalid)
+            .protect(&admin.provider, b"DFWS\x05", admin.id(), [1; 32], &invalid)
             .unwrap();
         assert!(Workspace::restore(&key, [1; 32], admin.id(), &sealed).is_err());
     }
     let mut invalid = plain.clone();
     let epoch_offset = count_offset + 4 + 96;
-    invalid[epoch_offset..epoch_offset + 8].copy_from_slice(&2u64.to_be_bytes());
+    invalid[epoch_offset..epoch_offset + 8].copy_from_slice(&3u64.to_be_bytes());
     let sealed = key
-        .protect(&admin.provider, b"DFWS\x03", admin.id(), [1; 32], &invalid)
+        .protect(&admin.provider, b"DFWS\x05", admin.id(), [1; 32], &invalid)
         .unwrap();
     assert!(Workspace::restore(&key, [1; 32], admin.id(), &sealed).is_err());
     let expected_commit = first.commit.clone();
@@ -1497,7 +1532,7 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
     drop(first);
     // The candidate and reply survive together; recovery does not run Add again.
     let recovered = Workspace::restore(&key, [1; 32], admin.id(), &snapshot).unwrap();
-    assert_eq!(recovered.epoch(), 1);
+    assert_eq!(recovered.epoch(), 2);
     assert_eq!(recovered.member_count(), 2);
     assert!(recovered.retained_admission([3; 32], &request).is_err());
     let mut changed_request = request.clone();
@@ -1514,7 +1549,7 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
         .unwrap();
     assert_eq!(retry.commit, expected_commit);
     assert_eq!(retry.welcome, expected_welcome);
-    assert_eq!(retry.epoch, 1);
+    assert_eq!(retry.epoch, 2);
     proof
         .apply_add(&retry.authorization, &retry.commit)
         .unwrap();
@@ -1587,12 +1622,12 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
             .err(),
         Some("invitation history unavailable")
     );
-    assert_eq!(missing.epoch(), 1);
+    assert_eq!(missing.epoch(), 2);
     assert_eq!(missing.member_count(), 2);
     let second = helper
         .prepare_admission([3; 32], newcomer.admission_request().unwrap())
         .unwrap();
-    assert_eq!(helper.epoch(), 1);
+    assert_eq!(helper.epoch(), 2);
     assert_eq!(helper.member_count(), 2);
     proof
         .apply_add(&second.authorization, &second.commit)
@@ -1639,7 +1674,7 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
     };
     assert_eq!(message.into_bytes(), b"generic fabric payload");
     let returning = Workspace::restore(&key, [1; 32], workspace_id, &admin_state).unwrap();
-    assert_eq!(returning.epoch(), 1);
+    assert_eq!(returning.epoch(), 2);
     let mut bad = second.authorization.clone();
     bad.grant_signature[0] ^= 1;
     assert!(
@@ -1654,7 +1689,7 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
             .prepare_admission_update(&second.authorization, &bad_commit)
             .is_err()
     );
-    assert_eq!(returning.epoch(), 1); // Rejection and preparation never mutate the accepted owner.
+    assert_eq!(returning.epoch(), 2); // Rejection and preparation never mutate the accepted owner.
     assert!(
         updated_admin
             .prepare_admission_update(&second.authorization, &second.commit)
@@ -1662,18 +1697,18 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
     );
     let stored_update = updated_admin.seal(&key).unwrap();
     let mut returning = Workspace::restore(&key, [1; 32], workspace_id, &stored_update).unwrap();
-    assert_eq!(returning.epoch(), 2);
+    assert_eq!(returning.epoch(), 3);
     assert_eq!(returning.member_count(), 3);
     // A restored creator must relay the helper's accepted Add, not only Adds
     // it originated. This history must not depend on retaining a Welcome reply.
     let (_, relayed) = returning
-        .membership_update_for([2; 32], 1)
+        .membership_update_for([2; 32], 2)
         .unwrap()
         .expect("restored creator retains the helper admission");
     assert_eq!(relayed, second.commit);
     assert!(
         returning
-            .membership_update_for([9; 32], 1)
+            .membership_update_for([9; 32], 2)
             .unwrap()
             .is_none()
     );
@@ -1711,7 +1746,15 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
         );
     }
     // An ordinary existing member carries its anchored authorization history forward too.
-    let (next_invite, next_checkpoint) = returning.issue_invitation().unwrap();
+    let (registration, next_invite, next_checkpoint) =
+        returning.prepare_invitation(0, false, false).unwrap();
+    let returning = registration.workspace;
+    let super::PreparedManagementUpdate::Active(helper) = helper
+        .prepare_management_update(registration.action, &registration.commit)
+        .unwrap()
+    else {
+        panic!("invitation registration removed helper")
+    };
     let fourth =
         PendingJoin::from_invitation(&next_invite, &next_checkpoint, [4; 32], "Second service")
             .unwrap();
@@ -1886,7 +1929,8 @@ fn retained_checkpoint_preflight_matches_full_verification_and_survives_restore(
 fn batch_replies_share_one_commit_and_welcome_across_copies_and_restores() {
     use super::{PendingJoin, StorageKey};
     let owner = Workspace::create([1; 32], "Organizer").unwrap();
-    let (invitation, checkpoint) = owner.issue_invitation().unwrap();
+    let (registration, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+    let owner = registration.workspace;
     let mut requests = Vec::new();
     for endpoint in 2..5u8 {
         let pending =
@@ -1945,7 +1989,9 @@ fn batch_replies_share_one_commit_and_welcome_across_copies_and_restores() {
     // The sealed snapshot is unchanged too: seal, restore, and seal again give
     // the same plaintext.
     let single = Workspace::create([1; 32], "Organizer").unwrap();
-    let (invitation, checkpoint) = single.issue_invitation().unwrap();
+    let (registration, invitation, checkpoint) =
+        single.prepare_invitation(0, false, false).unwrap();
+    let single = registration.workspace;
     let pending =
         PendingJoin::from_invitation(&invitation, &checkpoint, [2; 32], "Attendee").unwrap();
     let single = single

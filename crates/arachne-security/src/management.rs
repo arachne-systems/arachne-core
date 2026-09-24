@@ -522,8 +522,13 @@ mod tests {
     use openmls::prelude::tls_codec::Deserialize;
     use openmls_traits::OpenMlsProvider;
 
-    fn add(admin: Workspace, endpoint: u8) -> (Workspace, Workspace, crate::PreparedAdmission) {
-        let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    /// Returns the invitation registration other members must also apply.
+    fn add(
+        admin: Workspace,
+        endpoint: u8,
+    ) -> (PreparedManagement, Workspace, crate::PreparedAdmission) {
+        let (registration, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+        let admin = &registration.workspace;
         let pending =
             PendingJoin::from_invitation(&invite, &checkpoint, [endpoint; 32], "Field member")
                 .unwrap();
@@ -537,7 +542,7 @@ mod tests {
         let member = pending
             .prepare_workspace(&proof, &prepared.welcome)
             .unwrap();
-        (admin, member, prepared)
+        (registration, member, prepared)
     }
     fn pair() -> (Workspace, Workspace) {
         let (_, member, prepared) = add(Workspace::create([1; 32], "Coordinator").unwrap(), 2);
@@ -586,12 +591,13 @@ mod tests {
             admin.group.merge_pending_commit(&admin.provider).unwrap();
             assert!(verifier.matches_workspace(&admin).unwrap());
         }
-        assert_eq!(verifier.epoch(), 129);
+        assert_eq!(verifier.epoch(), 130); // Registration, admission, 128 actions.
     }
     fn extensions(owner: &Workspace, mut keys: Vec<Vec<u8>>) -> Extensions<GroupContext> {
         keys.sort();
-        let mut encoded = vec![1, keys.len() as u8];
+        let mut encoded = vec![2, keys.len() as u8];
         encoded.extend(keys.into_iter().flatten());
+        encoded.extend(crate::invitation_controls::policy_bytes(owner.group.extensions()).unwrap());
         Extensions::from_vec(
             owner
                 .group
@@ -680,6 +686,18 @@ mod tests {
         );
         accept(&mut member, ManagementAction::Promote(member_id), &commit);
         admin.group.merge_pending_commit(&admin.provider).unwrap();
+        // The invitation registration gave the creator saved history; keep it
+        // matching the raw merge so the snapshot below still restores.
+        admin.join_history = Some(
+            admin
+                .append_history(
+                    crate::MembershipAuthorization::Management(ManagementAction::Promote(
+                        member_id,
+                    )),
+                    &commit,
+                )
+                .unwrap(),
+        );
         assert!(
             member
                 .verify_management(ManagementAction::Promote(member_id), &commit)
@@ -787,7 +805,13 @@ mod tests {
     }
     fn trio() -> (Workspace, Workspace, Workspace) {
         let (admin, second) = pair();
-        let (_, third, prepared) = add(admin, 3);
+        let (registration, third, prepared) = add(admin, 3);
+        let PreparedManagementUpdate::Active(second) = second
+            .prepare_management_update(registration.action, &registration.commit)
+            .unwrap()
+        else {
+            panic!("invitation registration removed member")
+        };
         let second = second
             .prepare_admission_update(&prepared.authorization, &prepared.commit)
             .unwrap();
@@ -808,9 +832,13 @@ mod tests {
     }
     #[test]
     fn administrator_removal_excludes_keys_and_old_invites() {
-        let (mut admin, mut removed, mut survivor) = two_admins();
+        let (mut admin, removed, mut survivor) = two_admins();
         let removed_id = removed.member().unwrap().id();
-        let (invite, checkpoint) = removed.issue_invitation().unwrap();
+        let (registration, invite, checkpoint) =
+            removed.prepare_invitation(0, false, false).unwrap();
+        accept(&mut admin, registration.action, &registration.commit);
+        accept(&mut survivor, registration.action, &registration.commit);
+        let mut removed = registration.workspace;
         let pending =
             PendingJoin::from_invitation(&invite, &checkpoint, [4; 32], "Late arrival").unwrap();
         let ext = extensions(&admin, vec![admin._signer.to_public_vec()]);
@@ -952,9 +980,28 @@ mod tests {
     #[test]
     fn staged_role_change_restores_and_old_invitation_crosses_mixed_history() {
         let admin = Workspace::create([1; 32], "Coordinator").unwrap();
-        let (old_invitation, old_checkpoint) = admin.issue_invitation().unwrap();
+        let (registration, old_invitation, old_checkpoint) =
+            admin.prepare_invitation(0, false, false).unwrap();
+        let admin = registration.workspace;
+        // The helper joins through the same link, so both owners anchor at its checkpoint.
         let (mut admin, helper) = {
-            let (_, helper, prepared) = add(admin, 2);
+            let pending = PendingJoin::from_invitation(
+                &old_invitation,
+                &old_checkpoint,
+                [2; 32],
+                "Field member",
+            )
+            .unwrap();
+            let prepared = admin
+                .prepare_admission([2; 32], pending.admission_request().unwrap())
+                .unwrap();
+            let mut proof = pending.join_proof().unwrap();
+            proof
+                .apply_add(&prepared.authorization, &prepared.commit)
+                .unwrap();
+            let helper = pending
+                .prepare_workspace(&proof, &prepared.welcome)
+                .unwrap();
             (prepared.workspace, helper)
         };
         let key = StorageKey::derive(&[7; 32]).unwrap();
@@ -1034,7 +1081,7 @@ mod tests {
         let restored =
             Workspace::restore(&key, [3; 32], joined.id(), &joined.seal(&key).unwrap()).unwrap();
         assert_eq!(restored.member_count(), 3);
-        assert_eq!(restored.epoch(), 3);
+        assert_eq!(restored.epoch(), 4); // Registration, admission, promotion, admission.
         let encoded = proof.history();
         assert!(
             JoinProof::from_history(joined.id(), old_invitation.checkpoint_digest(), encoded)
@@ -1082,15 +1129,16 @@ mod tests {
         else {
             panic!("survivor removed")
         };
-        assert_eq!(admin.epoch(), 2);
-        assert_eq!(survivor.epoch(), 2);
+        // Two invitation registrations and two admissions.
+        assert_eq!(admin.epoch(), 4);
+        assert_eq!(survivor.epoch(), 4);
         let PreparedManagementUpdate::Removed(record) = removed
             .prepare_management_update(action, &prepared.commit)
             .unwrap()
         else {
             panic!("removed recipient returned active state")
         };
-        assert_eq!(record.epoch(), 3);
+        assert_eq!(record.epoch(), 5);
         let key = StorageKey::derive(&[9; 32]).unwrap();
         let sealed_removal = record.seal(&key).unwrap();
         let restored_removal = crate::RemovedMembership::restore(
@@ -1104,7 +1152,7 @@ mod tests {
         assert!(
             Workspace::restore(&key, removed.endpoint(), removed.id(), &sealed_removal).is_err()
         );
-        assert_eq!(removed.epoch(), 2);
+        assert_eq!(removed.epoch(), 4);
         let key = StorageKey::derive(&[9; 32]).unwrap();
         let restored = Workspace::restore(
             &key,
@@ -1114,7 +1162,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restored.member_count(), 2);
-        assert_eq!(restored.epoch(), 3);
+        assert_eq!(restored.epoch(), 5);
         let mut sender = prepared.workspace;
         let payload = sender
             .protect_object(b"removal", b"surviving members")

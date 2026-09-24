@@ -63,7 +63,18 @@ fn hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots() 
     enable_record_storage(handle, &path, &root).unwrap();
     let mut final_reader = None;
     for member in 1..100u8 {
-        let invite = call(handle, json!({"op":"issue_invitation"})).unwrap();
+        let staged = call(
+            handle,
+            json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+        )
+        .unwrap();
+        save_candidate(handle, &bytes(&staged["snapshot"])).unwrap();
+        let invite = call(
+            handle,
+            json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        )
+        .unwrap()["issued_invitation"]
+            .clone();
         let invitation = Invitation::from_bytes(&bytes(&invite["invitation"])).unwrap();
         let pending = PendingJoin::from_invitation(
             &invitation,
@@ -188,7 +199,8 @@ fn migration_preserves_pending_inbox_and_removal_cannot_reopen_active_state() {
         serde_json::from_str(&arachne_runtime::describe(handle).unwrap()).unwrap();
     let endpoint = serde_json::from_value(description["endpoint_key"].clone()).unwrap();
     let admin = Workspace::create([104; 32], "Administrator").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let admin = registered.workspace;
     let pending = PendingJoin::from_invitation(&invite, &checkpoint, endpoint, "Receiver").unwrap();
     let prepared = admin
         .prepare_admission(endpoint, pending.admission_request().unwrap())
@@ -289,7 +301,8 @@ fn native_pending_join_keeps_identity_until_atomic_admission_commit() {
     let path = directory.path().join("workspace.db");
     let admin = Workspace::create([142; 32], "Administrator").unwrap();
     let workspace = admin.id();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let admin = registered.workspace;
     let mut handle = create(Some(&root)).unwrap();
     let pending = call(
         handle,

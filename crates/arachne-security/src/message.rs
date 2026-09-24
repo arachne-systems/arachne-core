@@ -99,7 +99,8 @@ impl Workspace {
 #[test]
 fn application_authentication_replay_and_restart() {
     let admin = Workspace::create([1; 32], "Alex").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let (registration, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let admin = registration.workspace;
     let pending = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Jordan").unwrap();
     let prepared = admin
         .prepare_admission([2; 32], pending.admission_request().unwrap())
@@ -225,7 +226,8 @@ fn application_authentication_replay_and_restart() {
 #[test]
 fn selective_subscription_requires_bounded_ratchet_recovery() {
     let admin = Workspace::create([1; 32], "Publisher").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let (registration, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let admin = registration.workspace;
     let pending =
         PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Subscriber").unwrap();
     let prepared = admin
@@ -287,7 +289,8 @@ fn sparse_empty_control_messages_recover_skipped_topics() {
     // Candidate experiment only: ordinary MLS applications, no new crypto or
     // runtime repair protocol. The receiver never receives busy payload packets.
     let admin = Workspace::create([1; 32], "Publisher").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let (registration, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let admin = registration.workspace;
     let pending =
         PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Subscriber").unwrap();
     let prepared = admin

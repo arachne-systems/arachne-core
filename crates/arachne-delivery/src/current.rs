@@ -840,7 +840,8 @@ mod tests {
 
     fn pair() -> (Workspace, Workspace) {
         let admin = Workspace::create([1; 32], "Publisher").unwrap();
-        let (invite, checkpoint) = admin.issue_invitation().unwrap();
+        let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+        let admin = registered.workspace;
         let pending =
             PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
         let prepared = admin

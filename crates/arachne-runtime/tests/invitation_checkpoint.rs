@@ -18,6 +18,20 @@ fn endpoint(handle: i64) -> Value {
     serde_json::from_str(&describe(handle).unwrap()).unwrap()
 }
 
+fn issue_invitation(handle: i64) -> Value {
+    let staged = call(
+        handle,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    )
+    .unwrap();
+    call(
+        handle,
+        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+    )
+    .unwrap()["issued_invitation"]
+        .clone()
+}
+
 fn serve_once(handle: i64) -> Value {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -43,7 +57,7 @@ fn fetches_only_the_exact_invitation_checkpoint_over_authenticated_iroh() {
         json!({"op":"create_workspace","display_name":"Coordinator","workspace_name":"Ridge Team"}),
     )
     .unwrap();
-    let invitation = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let invitation = issue_invitation(admin);
     let admin_node = endpoint(admin);
     call(
         joiner,
@@ -88,15 +102,36 @@ fn fetches_only_the_exact_invitation_checkpoint_over_authenticated_iroh() {
         json!({"op":"adopt_admission","snapshot":renamed["snapshot"]}),
     )
     .unwrap();
-    let peer = admin_node["endpoint_key"].clone();
-    let bearer = invitation["invitation"].clone();
-    let stale = std::thread::spawn(move || {
-        call(
-            joiner,
-            json!({"op":"fetch_invitation_checkpoint","peer":peer,"invitation":bearer}),
-        )
-    });
-    assert!(stale.join().unwrap().is_err());
+    let fetch_again = || {
+        let peer = admin_node["endpoint_key"].clone();
+        let bearer = invitation["invitation"].clone();
+        std::thread::spawn(move || {
+            call(
+                joiner,
+                json!({"op":"fetch_invitation_checkpoint","peer":peer,"invitation":bearer}),
+            )
+        })
+        .join()
+        .unwrap()
+    };
+    // A registered link keeps its retained checkpoint across later changes.
+    assert_eq!(
+        fetch_again().unwrap()["checkpoint"],
+        invitation["checkpoint"]
+    );
+    // Once the link is disabled its checkpoint is gone and becomes stale.
+    let disabled = call(
+        admin,
+        json!({"op":"stage_management","action":{"kind":"disable_invitation",
+            "member":invitation["invitation_key"]}}),
+    )
+    .unwrap();
+    call(
+        admin,
+        json!({"op":"adopt_admission","snapshot":disabled["snapshot"]}),
+    )
+    .unwrap();
+    assert!(fetch_again().is_err());
 
     let outsider = create(Some(&[203; 32])).unwrap();
     let outsider_node = endpoint(outsider);
@@ -136,7 +171,7 @@ fn ordinary_member_serves_the_checkpoint_it_joined_from_after_issuer_closes() {
         json!({"op":"create_workspace","display_name":"Coordinator","workspace_name":"Event Team"}),
     )
     .unwrap();
-    let invitation = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let invitation = issue_invitation(admin);
     let pending = call(
         helper,
         json!({"op":"begin_join","display_name":"First member","invitation":invitation["invitation"],
@@ -259,7 +294,7 @@ fn existing_member_serves_a_later_invitation_after_learning_it_and_restarting() 
     )
     .unwrap()["workspace"]
         .clone();
-    let first = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let first = issue_invitation(admin);
     let pending = call(
         helper,
         json!({"op":"begin_join","display_name":"Relay member","invitation":first["invitation"],
@@ -348,9 +383,11 @@ fn existing_member_serves_a_later_invitation_after_learning_it_and_restarting() 
         )
         .is_err()
     );
+    // +1: registering the first invitation now costs an epoch before the
+    // admission that seated helper, so helper's epoch here is one higher.
     assert_eq!(
         call(helper, json!({"op":"member_roster"})).unwrap()["epoch"],
-        1
+        2
     );
     let learned = call(
         helper,

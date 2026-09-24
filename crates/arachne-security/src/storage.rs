@@ -690,7 +690,8 @@ fn twelve_member_snapshot_capacity() {
     let key = StorageKey::derive(&[201; 32]).unwrap();
     let mut owner = Workspace::create([200; 32], "Capacity publisher").unwrap();
     for member in 1..12u8 {
-        let (invite, checkpoint) = owner.issue_invitation().unwrap();
+        let (registration, invite, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+        owner = registration.workspace;
         let pending = super::PendingJoin::from_invitation(
             &invite,
             &checkpoint,

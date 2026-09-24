@@ -16,6 +16,30 @@ fn bytes(value: &Value) -> Vec<u8> {
     value.as_array().unwrap().iter().map(|byte| byte.as_u64().unwrap() as u8).collect()
 }
 
+/// Install the policy revision for the accepted epoch, as the Android host
+/// does after every commit.
+fn install_current_policy(handle: i64) {
+    let epoch = call(handle, json!({"op":"member_roster"}))["epoch"].as_u64().unwrap();
+    call(handle, json!({"op":"install_workspace_policy","revision":epoch + 1}));
+}
+
+/// Register a reusable link. Registration is a commit, so the host then
+/// installs the new epoch's policy.
+fn issue_invitation(handle: i64) -> Value {
+    let staged = call(
+        handle,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    );
+    // Hosts with native storage save the candidate first; others need not.
+    save_candidate(handle, &bytes(&staged["snapshot"])).unwrap_or(());
+    let adopted = call(
+        handle,
+        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+    );
+    install_current_policy(handle);
+    adopted["issued_invitation"].clone()
+}
+
 fn hint(from: i64, to: i64) {
     let info: Value = serde_json::from_str(&describe(to).unwrap()).unwrap();
     call(from, json!({"op":"add_address_hint","peer":info["endpoint_key"],
@@ -33,7 +57,7 @@ fn a_committed_step_reaches_a_member_by_gossip_across_the_epoch() {
     let member = create(Some(&[95; 32])).unwrap();
     let late = create(Some(&[96; 32])).unwrap();
     call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));
-    let invite = call(admin, json!({"op":"issue_invitation"}));
+    let invite = issue_invitation(admin);
     let begin = |handle, name| call(handle, json!({"op":"begin_join","invitation":invite["invitation"],
         "checkpoint":invite["checkpoint"],"display_name":name}));
     let admit = |joiner: &Value| {
@@ -51,7 +75,7 @@ fn a_committed_step_reaches_a_member_by_gossip_across_the_epoch() {
     hint(admin, member);
     hint(member, admin);
     for handle in [admin, member] {
-        call(handle, json!({"op":"install_workspace_policy","revision":2}));
+        install_current_policy(handle);
     }
     // Let the two overlays find each other before the commit.
     std::thread::sleep(Duration::from_millis(1500));
@@ -104,7 +128,7 @@ fn steps_keep_arriving_while_every_epoch_reinstalls_policy() {
     // As the Android host does at creation: the admin's overlay starts with no
     // other member (tablet HEWN then skipped every broadcast: sent 0).
     call(admin, json!({"op":"install_workspace_policy","revision":1}));
-    let invite = call(admin, json!({"op":"issue_invitation"}));
+    let invite = issue_invitation(admin);
     let begin = |handle: i64, name: &str| call(handle, json!({"op":"begin_join","invitation":invite["invitation"],
         "checkpoint":invite["checkpoint"],"display_name":name}));
     let admit = |joiner: &Value| {
@@ -122,7 +146,7 @@ fn steps_keep_arriving_while_every_epoch_reinstalls_policy() {
     call(member, json!({"op":"adopt_join","snapshot":staged["snapshot"]}));
     // As on tablets: the member knows the admin's address, not the reverse.
     hint(member, admin);
-    call(member, json!({"op":"install_workspace_policy","revision":2}));
+    install_current_policy(member);
     std::thread::sleep(Duration::from_millis(1500));
 
     // Each joiner only supplies a request; its node closes once admitted.
@@ -171,13 +195,12 @@ fn a_new_members_name_reaches_existing_members_by_gossip() {
     let member = create(Some(&[111; 32])).unwrap();
     let late = create(Some(&[112; 32])).unwrap();
     call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));
-    let invite = call(admin, json!({"op":"issue_invitation"}));
+    let invite = issue_invitation(admin);
     let join = |handle: i64, name: &str| {
-        // A fresh invitation each time: its checkpoint is the current epoch, so
-        // the joiner needs only its own commit.
-        let fresh = call(admin, json!({"op":"issue_invitation"}));
-        let pending = call(handle, json!({"op":"begin_join","invitation":fresh["invitation"],
-            "checkpoint":fresh["checkpoint"],"display_name":name}));
+        // One registered link: a later joiner replays every Add since its
+        // checkpoint. A fresh link per join would add registration steps.
+        let pending = call(handle, json!({"op":"begin_join","invitation":invite["invitation"],
+            "checkpoint":invite["checkpoint"],"display_name":name}));
         let staged = call(admin, json!({"op":"stage_admission","authenticated_endpoint":pending["endpoint"],
             "request":pending["admission_request"]}));
         let adopted = call(admin, json!({"op":"adopt_admission","snapshot":staged["snapshot"]}));
@@ -185,13 +208,14 @@ fn a_new_members_name_reaches_existing_members_by_gossip() {
         call(admin, json!({"op":"retained_admission","authenticated_endpoint":pending["endpoint"],
             "request":pending["admission_request"]}))
     };
-    let reply = join(member, "Member");
-    let staged = call(member, json!({"op":"stage_join","welcome":reply["welcome"],
-        "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}));
+    let first = join(member, "Member");
+    let first_step = json!({"commit":first["commit"],"authorization":first["authorization"]});
+    let staged = call(member, json!({"op":"stage_join","welcome":first["welcome"],
+        "commits":[first_step.clone()]}));
     call(member, json!({"op":"adopt_join","snapshot":staged["snapshot"]}));
     hint(admin, member);
     hint(member, admin);
-    call(member, json!({"op":"install_workspace_policy","revision":2}));
+    install_current_policy(member);
     std::thread::sleep(Duration::from_millis(1500));
 
     // The late member joins; the existing member takes the step by gossip.
@@ -213,7 +237,7 @@ fn a_new_members_name_reaches_existing_members_by_gossip() {
     }
     // The late member finishes joining and sends its name to the admin only.
     let staged = call(late, json!({"op":"stage_join","welcome":reply["welcome"],
-        "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}));
+        "commits":[first_step, {"commit":reply["commit"],"authorization":reply["authorization"]}]}));
     call(late, json!({"op":"adopt_join","snapshot":staged["snapshot"]}));
     hint(late, admin);
     call(late, json!({"op":"fetch_membership_update","peer":invite["peer"]}));
@@ -256,7 +280,7 @@ fn a_held_step_wakes_the_host_when_its_turn_comes() {
     let later = create(Some(&[123; 32])).unwrap();
     call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));
     call(admin, json!({"op":"install_workspace_policy","revision":1}));
-    let invite = call(admin, json!({"op":"issue_invitation"}));
+    let invite = issue_invitation(admin);
     let begin = |handle: i64, name: &str| call(handle, json!({"op":"begin_join","invitation":invite["invitation"],
         "checkpoint":invite["checkpoint"],"display_name":name}));
     let admit = |joiner: &Value| {
@@ -272,7 +296,7 @@ fn a_held_step_wakes_the_host_when_its_turn_comes() {
         "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}));
     call(member, json!({"op":"adopt_join","snapshot":staged["snapshot"]}));
     hint(member, admin);
-    call(member, json!({"op":"install_workspace_policy","revision":2}));
+    install_current_policy(member);
     std::thread::sleep(Duration::from_millis(1500));
     // Two commits: both steps reach the member; the second waits for the first.
     admit(&begin(late, "Late"));
@@ -318,7 +342,7 @@ fn a_member_that_missed_steps_catches_up_from_the_next_head() {
     let member = create(Some(&[131; 32])).unwrap();
     call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));
     call(admin, json!({"op":"install_workspace_policy","revision":1}));
-    let invite = call(admin, json!({"op":"issue_invitation"}));
+    let invite = issue_invitation(admin);
     let begin = |handle: i64, name: &str| call(handle, json!({"op":"begin_join","invitation":invite["invitation"],
         "checkpoint":invite["checkpoint"],"display_name":name}));
     let admit = |joiner: &Value| {
@@ -392,7 +416,7 @@ fn presence_of_a_newer_epoch_starts_the_range_pull() {
     let admin = create(Some(&[140; 32])).unwrap();
     let member = create(Some(&[141; 32])).unwrap();
     call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));
-    let invite = call(admin, json!({"op":"issue_invitation"}));
+    let invite = issue_invitation(admin);
     let begin = |handle: i64, name: &str| call(handle, json!({"op":"begin_join","invitation":invite["invitation"],
         "checkpoint":invite["checkpoint"],"display_name":name}));
     let admit = |joiner: &Value| {
@@ -448,7 +472,7 @@ fn a_peer_that_is_behind_is_reported_as_behind_not_as_a_conflict() {
     let admin = create(Some(&[150; 32])).unwrap();
     let member = create(Some(&[151; 32])).unwrap();
     call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));
-    let invite = call(admin, json!({"op":"issue_invitation"}));
+    let invite = issue_invitation(admin);
     let begin = |handle: i64, name: &str| call(handle, json!({"op":"begin_join","invitation":invite["invitation"],
         "checkpoint":invite["checkpoint"],"display_name":name}));
     let admit = |joiner: &Value| {
@@ -493,7 +517,7 @@ fn a_range_pull_is_answered_while_the_owner_host_never_polls() {
     let member = create(Some(&[161; 32])).unwrap();
     call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));
     call(admin, json!({"op":"install_workspace_policy","revision":1}));
-    let invite = call(admin, json!({"op":"issue_invitation"}));
+    let invite = issue_invitation(admin);
     let begin = |handle: i64, name: &str| call(handle, json!({"op":"begin_join","invitation":invite["invitation"],
         "checkpoint":invite["checkpoint"],"display_name":name}));
     let admit = |joiner: &Value| {
@@ -560,7 +584,7 @@ fn a_member_catches_up_after_a_large_admission_wave() {
     let directory = tempfile::tempdir().unwrap();
     enable_record_storage(admin, &directory.path().join("admin.db"), &[170; 32]).unwrap();
     call(admin, json!({"op":"install_workspace_policy","revision":1}));
-    let invite = call(admin, json!({"op":"issue_invitation"}));
+    let invite = issue_invitation(admin);
     let begin = |handle: i64, name: &str| call(handle, json!({"op":"begin_join","invitation":invite["invitation"],
         "checkpoint":invite["checkpoint"],"display_name":name}));
     let admit = |joiner: &Value| {

@@ -102,7 +102,8 @@ async fn main() -> Result<()> {
     let alice_key = StorageKey::derive(&alice_root.to_bytes())?;
     let bob_key = StorageKey::derive(&bob_root.to_bytes())?;
     let admin = Workspace::create(alice.id(), "Stream publisher")?;
-    let (invitation, checkpoint) = admin.issue_invitation()?;
+    let (registered, invitation, checkpoint) = admin.prepare_invitation(0, false, false)?;
+    let admin = registered.workspace;
     let pending =
         PendingJoin::from_invitation(&invitation, &checkpoint, bob.id(), "Stream subscriber")?;
     let prepared = admin.prepare_admission(bob.id(), pending.admission_request()?)?;

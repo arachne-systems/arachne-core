@@ -7,6 +7,11 @@ fn call(handle: i64, request: Value) -> Result<Value, String> {
         .map_err(|e| e.to_string())
 }
 
+fn issue(h: i64) -> Value {
+    let staged = call(h, json!({"op":"stage_invitation","personal":false,"expires_at":0})).unwrap();
+    call(h, json!({"op":"adopt_admission","snapshot":staged["snapshot"]})).unwrap()["issued_invitation"].clone()
+}
+
 #[test]
 fn management_save_adopt_old_invitation_and_removal_over_iroh() {
     let admin = create(Some(&[81; 32])).unwrap();
@@ -17,7 +22,7 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
         json!({"op":"create_workspace","display_name":"Coordinator"}),
     )
     .unwrap();
-    let invite = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let invite = issue(admin);
     let begin = |handle, name| {
         call(
             handle,
@@ -58,7 +63,13 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
     close(helper).unwrap();
     helper = create(Some(&[82; 32])).unwrap();
     call(helper, json!({"op":"restore_workspace","workspace":invite["workspace"],"snapshot":staged["snapshot"]})).unwrap();
-    assert!(call(helper, json!({"op":"issue_invitation"})).is_err());
+    assert!(
+        call(
+            helper,
+            json!({"op":"stage_invitation","personal":false,"expires_at":0})
+        )
+        .is_err()
+    );
     call(
         helper,
         json!({"op":"add_address_hint","peer":invite["peer"],
@@ -74,7 +85,13 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
         change.get("step").is_none(),
         "Do not expose a committable operation before saved adoption"
     );
-    assert!(call(admin, json!({"op":"issue_invitation"})).is_err());
+    assert!(
+        call(
+            admin,
+            json!({"op":"stage_invitation","personal":false,"expires_at":0})
+        )
+        .is_err()
+    );
     assert!(call(admin, json!({"op":"adopt_admission","snapshot":[]})).is_err());
     let adopted = call(
         admin,
@@ -145,7 +162,16 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
         json!({"op":"member_roster","profiles":saved_profiles}),
     )
     .unwrap();
-    assert!(call(helper, json!({"op":"issue_invitation"})).is_ok());
+    assert!(
+        call(
+            helper,
+            json!({"op":"stage_invitation","personal":false,"expires_at":0})
+        )
+        .is_ok()
+    );
+    // Staging only checks authorization here; discard it so it does not sit
+    // as an uncommitted candidate blocking the later management ops below.
+    call(helper, json!({"op":"discard_workspace_candidate"})).unwrap();
     let node: Value = serde_json::from_str(&describe(helper).unwrap()).unwrap();
     let helper_address = node["bound_address"]
         .as_str()
@@ -162,7 +188,7 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
         json!({"op":"add_address_hint","peer":outsider["endpoint_key"],"address":"127.0.0.1:9"}),
     )
     .unwrap();
-    let routed = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let routed = issue(admin);
     assert_eq!(
         routed["routes"],
         json!([{"peer":node["endpoint_key"],"address":helper_address}])
@@ -258,7 +284,9 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
     )
     .unwrap();
     assert_eq!(joined["members"], 3);
-    assert_eq!(joined["epoch"], 3);
+    // +1: registering the first invitation now costs an epoch before the
+    // checkpoint it pins, so the absolute epoch late lands on is one higher.
+    assert_eq!(joined["epoch"], 4);
     call(
         late,
         json!({"op":"fetch_membership_update","peer":helper_peer}),
@@ -319,7 +347,13 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
     )
     .unwrap();
     assert_eq!(removed["removed"], true);
-    assert!(call(late, json!({"op":"issue_invitation"})).is_err());
+    assert!(
+        call(
+            late,
+            json!({"op":"stage_invitation","personal":false,"expires_at":0})
+        )
+        .is_err()
+    );
     assert!(call(late, json!({"op":"adopt_admission","snapshot":[]})).is_err());
     let adopted = call(
         late,

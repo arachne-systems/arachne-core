@@ -1804,13 +1804,28 @@ impl ObjectInbox {
     }
 }
 
+/// Register an unregistered invitation and fold the registration commit into
+/// `admin`. Callers with other already-joined members must additionally apply
+/// `registered.action`/`registered.commit` via `prepare_management_update`.
+#[cfg(test)]
+fn issue_registered_invitation(
+    admin: arachne_security::Workspace,
+) -> (
+    arachne_security::Workspace,
+    arachne_security::Invitation,
+    Vec<u8>,
+) {
+    let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    (registered.workspace, invite, checkpoint)
+}
+
 #[test]
 fn current_value_survives_authenticated_delivery_bundle() {
     use arachne_routing::{Permissions, RoutingTable};
     use arachne_security::{PendingJoin, StorageKey, Workspace};
 
     let admin = Workspace::create([1; 32], "Publisher").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let (admin, invite, checkpoint) = issue_registered_invitation(admin);
     let join = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
     let prepared = admin
         .prepare_admission([2; 32], join.admission_request().unwrap())
@@ -1944,7 +1959,7 @@ fn repeated_direct_transfers_fit_storage_without_losing_pending_or_sequence() {
     use arachne_security::{PendingJoin, StorageKey, Workspace};
 
     let admin = Workspace::create([1; 32], "Publisher").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let (admin, invite, checkpoint) = issue_registered_invitation(admin);
     let join = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
     let prepared = admin
         .prepare_admission([2; 32], join.admission_request().unwrap())
@@ -2060,7 +2075,7 @@ fn deferred_streams_preserve_order_identity_and_restart() {
     use arachne_security::{PendingJoin, StorageKey, Workspace};
 
     let admin = Workspace::create([1; 32], "Publisher").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let (admin, invite, checkpoint) = issue_registered_invitation(admin);
     let join = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
     let prepared = admin
         .prepare_admission([2; 32], join.admission_request().unwrap())
@@ -2181,7 +2196,7 @@ fn permanent_rejection_is_durable_and_unblocks_the_next_object() {
     use arachne_security::{PendingJoin, StorageKey, Workspace};
 
     let admin = Workspace::create([1; 32], "Publisher").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let (admin, invite, checkpoint) = issue_registered_invitation(admin);
     let join = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
     let prepared = admin
         .prepare_admission([2; 32], join.admission_request().unwrap())
@@ -2261,7 +2276,7 @@ fn durable_pending_objects_and_bounded_topic_replay() {
         io::Write,
     };
     let admin = Workspace::create([1; 32], "Publisher").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let (admin, invite, checkpoint) = issue_registered_invitation(admin);
     let join = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
     let prepared = admin
         .prepare_admission([2; 32], join.admission_request().unwrap())
@@ -2542,7 +2557,7 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
     use arachne_security::{PendingJoin, StorageKey, Workspace};
 
     let admin = Workspace::create([1; 32], "Publisher").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let (admin, invite, checkpoint) = issue_registered_invitation(admin);
     let holder_join =
         PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Holder").unwrap();
     let prepared = admin
@@ -2557,7 +2572,17 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         .unwrap();
     let admin = prepared.workspace;
 
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    // `holder` is already a member, so the invitation registration commit
+    // must be applied to it too or it forks from `admin`.
+    let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let admin = registered.workspace;
+    let holder = match holder
+        .prepare_management_update(registered.action, &registered.commit)
+        .unwrap()
+    {
+        arachne_security::PreparedManagementUpdate::Active(workspace) => *workspace,
+        _ => panic!("member stays active"),
+    };
     let reader_join =
         PendingJoin::from_invitation(&invite, &checkpoint, [3; 32], "Reader").unwrap();
     let prepared = admin
