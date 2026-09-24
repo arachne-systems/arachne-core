@@ -1513,6 +1513,8 @@ fn list_pending_approvals(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::*;
 
     #[test]
     fn admission_packet_rejects_invalid_version_and_lengths() {
@@ -1621,6 +1623,191 @@ mod tests {
         assert_eq!(
             parse_admission_offer(b"DFAR\x01").err().map(|error| error.code()),
             Some(ErrorCode::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn admission_batch_wire_sizes_fit_transport_bounds() {
+        use arachne_security::{
+            AdmissionAssessment, MembershipAuthorization, PendingJoin, Workspace,
+        };
+
+        for count in [8, MAX_RUNTIME_ADMISSION_BATCH] {
+            let endpoint = |index: usize| {
+                let mut value = [0; 32];
+                value[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+                value
+            };
+            let mut owner = Workspace::create(endpoint(10_000), "Wire-size owner").unwrap();
+            let (registered, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+            owner = registered.workspace;
+            let mut joins = Vec::with_capacity(count);
+            let mut requests = Vec::with_capacity(count);
+            let mut validated = Vec::with_capacity(count);
+            for index in 0..count {
+                let join = PendingJoin::from_invitation(
+                    &invitation,
+                    &checkpoint,
+                    endpoint(index + 20_000),
+                    "Wire-size member",
+                )
+                .unwrap();
+                let request = join.admission_request().unwrap().to_vec();
+                let validated_request = match owner
+                    .assess_admission(endpoint(index + 20_000), &request)
+                    .unwrap()
+                {
+                    AdmissionAssessment::Ready(request) => request,
+                    _ => panic!("wire-size invitation unexpectedly needs approval"),
+                };
+                joins.push(join);
+                requests.push(request);
+                validated.push(validated_request);
+            }
+            let entries: Vec<_> = (0..count)
+                .map(|index| {
+                    (
+                        endpoint(index + 20_000),
+                        requests[index].as_slice(),
+                        &validated[index],
+                    )
+                })
+                .collect();
+            let prepared = owner.prepare_validated_admission_batch(&entries).unwrap();
+            let authorization = MembershipAuthorization::AdmissionBatch(
+                prepared
+                    .replies
+                    .iter()
+                    .map(|reply| reply.authorization.clone())
+                    .collect(),
+            );
+            let step = membership::step_json(&authorization, &prepared.commit);
+            let mut offer = b"DFMO\x01".to_vec();
+            offer.extend(prepared.workspace.id());
+            offer.extend(0_u64.to_be_bytes());
+            offer.extend(serde_json::to_vec(&step).unwrap());
+            let mut reply = serde_json::to_value(
+                retained_reply(&prepared.workspace, endpoint(20_000), &requests[0]).unwrap(),
+            )
+            .unwrap();
+            reply["commits"] = json!([step]);
+            let reply = serde_json::to_vec(&reply).unwrap();
+            println!(
+                "admission_wire_size count={count} offer_bytes={} reply_bytes={}",
+                offer.len(),
+                reply.len()
+            );
+            assert!(
+                offer.len() <= 32 * 1024,
+                "offer exceeds control request bound"
+            );
+            assert!(
+                reply.len() <= arachne_node::MAX_CONTROL_REPLY,
+                "reply exceeds control response bound"
+            );
+            owner = prepared.workspace;
+            assert_eq!(owner.member_count(), count + 1);
+            assert_eq!(joins.len(), count);
+        }
+    }
+
+    #[test]
+    #[ignore = "explicit 500-member runtime history-page capacity run"]
+    fn admission_history_pages_handle_500_member_burst() {
+        use arachne_security::{AdmissionAssessment, PendingJoin, Workspace};
+
+        let started = std::time::Instant::now();
+        let endpoint = |index: usize| {
+            let mut value = [0; 32];
+            value[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+            value
+        };
+        let mut owner = Workspace::create(endpoint(10_000), "500-member owner").unwrap();
+        let (registered, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+        owner = registered.workspace;
+        let mut joins = Vec::with_capacity(500);
+        let mut requests = Vec::with_capacity(500);
+        let mut validated = Vec::with_capacity(500);
+        for index in 0..500 {
+            let remote = endpoint(index + 20_000);
+            let join =
+                PendingJoin::from_invitation(&invitation, &checkpoint, remote, "Burst member")
+                    .unwrap();
+            let request = join.admission_request().unwrap().to_vec();
+            let validated_request = match owner.assess_admission(remote, &request).unwrap() {
+                AdmissionAssessment::Ready(request) => request,
+                _ => panic!("500-member invitation unexpectedly needs approval"),
+            };
+            joins.push(join);
+            requests.push(request);
+            validated.push(validated_request);
+        }
+
+        let mut welcome = Vec::new();
+        let mut batches = 0;
+        for start in (0..500).step_by(MAX_RUNTIME_ADMISSION_BATCH) {
+            let end = (start + MAX_RUNTIME_ADMISSION_BATCH).min(500);
+            let entries: Vec<_> = (start..end)
+                .map(|index| {
+                    (
+                        endpoint(index + 20_000),
+                        requests[index].as_slice(),
+                        &validated[index],
+                    )
+                })
+                .collect();
+            let prepared = owner.prepare_validated_admission_batch(&entries).unwrap();
+            welcome = prepared.welcome.clone();
+            owner = prepared.workspace;
+            batches += 1;
+            if batches % 8 == 0 || end == 500 {
+                eprintln!("memory members={end} {:?}", owner.memory_report());
+            }
+        }
+
+        let target = joins.last().unwrap();
+        let target_endpoint = endpoint(20_499);
+        let target_request = target.admission_request().unwrap();
+        let mut offset = 0;
+        let mut pages = 0;
+        let mut commits = Vec::new();
+        let mut page_ms = Vec::new();
+        let mut page_bytes = Vec::new();
+        loop {
+            let page_started = std::time::Instant::now();
+            let encoded = admission_reply_page(
+                &owner,
+                target_endpoint,
+                target_request,
+                Some(&checkpoint),
+                offset,
+            )
+            .unwrap();
+            page_ms.push(page_started.elapsed().as_secs_f64() * 1000.0);
+            page_bytes.push(encoded.len());
+            assert!(encoded.len() <= arachne_node::MAX_CONTROL_REPLY);
+            let page: Value = serde_json::from_slice(&encoded).unwrap();
+            commits.extend(page["commits"].as_array().unwrap().iter().cloned());
+            pages += 1;
+            if page["history_complete"].as_bool().unwrap() {
+                break;
+            }
+            offset = page["history_next"].as_u64().unwrap() as usize;
+        }
+        assert_eq!(commits.len(), batches);
+
+        let mut proof = target.join_proof().unwrap();
+        for commit in commits {
+            let step: JoinStep = serde_json::from_value(commit).unwrap();
+            proof
+                .apply_transition(&step.authorization().unwrap(), &step.commit)
+                .unwrap();
+        }
+        let joined = target.prepare_workspace(&proof, &welcome).unwrap();
+        assert_eq!(joined.member_count(), 501);
+        println!(
+            "admission_runtime_capacity members=500 batches={batches} pages={pages} elapsed_ms={} page_ms={page_ms:.1?} page_bytes={page_bytes:?}",
+            started.elapsed().as_millis()
         );
     }
 }

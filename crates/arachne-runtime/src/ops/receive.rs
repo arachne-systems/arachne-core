@@ -264,3 +264,152 @@ fn resolve(session: &mut Session, args: ResolveArgs, rejected: bool) -> Result<S
         None,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    #[test]
+    fn pending_object_query_bounds_and_gap_epoch_guard() {
+        use arachne_delivery::{
+            PublisherLog,
+            inbox::{InboxStage, ObjectInbox},
+        };
+        use arachne_routing::PublicationContext;
+        use arachne_security::{PendingJoin, StorageKey, Workspace};
+
+        let root = [103; 32];
+        let handle = create(Some(&root)).unwrap();
+        let call = |request: Value| -> Result<Value, String> {
+            serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
+                .map_err(|error| error.to_string())
+        };
+        let description: Value = serde_json::from_str(&describe(handle).unwrap()).unwrap();
+        let endpoint = serde_json::from_value(description["endpoint_key"].clone()).unwrap();
+        let mut admin = Workspace::create([104; 32], "Publisher").unwrap();
+        let (registered, invitation, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+        admin = registered.workspace;
+        let join =
+            PendingJoin::from_invitation(&invitation, &checkpoint, endpoint, "Reader").unwrap();
+        let prepared = admin
+            .prepare_admission(endpoint, join.admission_request().unwrap())
+            .unwrap();
+        let mut proof = join.join_proof().unwrap();
+        proof
+            .apply_add(&prepared.authorization, &prepared.commit)
+            .unwrap();
+        let reader = join.prepare_workspace(&proof, &prepared.welcome).unwrap();
+        let mut sender = prepared.workspace;
+        let mut inbox = ObjectInbox::new(reader.id(), reader.epoch());
+        for direct in [true, false] {
+            let context = PublicationContext {
+                workspace: reader.id(),
+                revision: 7,
+                topic: Topic::new("chat/messages").unwrap(),
+                id: [if direct { 1 } else { 2 }; 16],
+                sequence: std::num::NonZeroU64::new(2),
+            };
+            let recipients = if direct {
+                vec![reader.member().unwrap().id()]
+            } else {
+                vec![]
+            };
+            let aad = if direct {
+                context.direct_authenticated_bytes(&recipients).unwrap()
+            } else {
+                context.authenticated_bytes()
+            };
+            let object = sender
+                .protect_object(context.topic.namespace().as_bytes(), &aad, b"pending")
+                .unwrap();
+            let InboxStage::Prepared(next) = inbox
+                .stage_with_recipients(&reader, &context, &recipients, &object)
+                .unwrap()
+            else {
+                panic!("object was not staged")
+            };
+            inbox = *next;
+        }
+        let publisher =
+            PublisherLog::new(&reader).unwrap();
+        let snapshot = inbox
+            .seal(&reader, &StorageKey::derive(&root).unwrap(), &publisher)
+            .unwrap();
+        call(json!({"op":"restore_workspace","workspace":reader.id(),"snapshot":snapshot}))
+            .unwrap();
+        let pending = call(json!({"op":"poll_pending_object"})).unwrap();
+        assert_eq!(pending["id"], json!(vec![2; 16]));
+        assert_eq!(
+            call(json!({"op":"poll_pending_object","deferred":[]})).unwrap(),
+            pending
+        );
+        let scope = json!({"member":pending["member"], "revision":pending["revision"],
+            "topic":pending["topic"], "recipients":pending["recipients"]});
+        let poll = |deferred: Value| call(json!({"op":"poll_pending_object","deferred":deferred}));
+        // The group is deferred and the direct object still waits behind sequence 1.
+        assert_eq!(poll(json!([scope])).unwrap(), Value::Null);
+        assert_eq!(poll(json!(vec![scope.clone(); 64])).unwrap(), Value::Null);
+        assert_eq!(
+            poll(json!(vec![scope.clone(); 65])).unwrap_err(),
+            "too many deferred delivery streams"
+        );
+        let mut audience = scope.clone();
+        audience["recipients"] = json!((0..64u8).map(|number| [number; 32]).collect::<Vec<_>>());
+        assert_eq!(poll(json!([audience])).unwrap(), pending);
+        for (field, value) in [
+            ("revision", json!(0)),
+            ("topic", json!("")),
+            ("topic", json!("chat//messages")),
+            ("topic", json!("a".repeat(129))),
+            ("recipients", json!(vec![[1; 32], [1; 32]])),
+            ("recipients", json!(vec![[2; 32], [1; 32]])),
+            (
+                "recipients",
+                json!((0..65u8).map(|number| [number; 32]).collect::<Vec<_>>()),
+            ),
+        ] {
+            let mut invalid = scope.clone();
+            invalid[field] = value;
+            assert_eq!(
+                poll(json!([invalid])).unwrap_err(),
+                "invalid deferred delivery stream"
+            );
+        }
+        for (field, value) in [
+            ("member", json!(vec![1; 31])),
+            ("author", json!(vec![1; 32])),
+            ("revision", json!(-1)),
+            ("recipients", json!(vec![[1; 31]])),
+        ] {
+            let mut invalid = scope.clone();
+            invalid[field] = value;
+            assert!(poll(json!([invalid])).is_err());
+        }
+        assert!(poll(Value::Null).is_err());
+        assert_eq!(call(json!({"op":"poll_pending_object"})).unwrap(), pending);
+        {
+            let shared = session(handle).unwrap();
+            let mut locked = shared.lock().unwrap();
+            // Pending application objects never block a membership step (A3).
+            check_epoch_transition(locked.as_mut().unwrap()).unwrap();
+        }
+        let staged = call(
+            json!({"op":"stage_object_acknowledgement", "member":pending["member"],
+            "topic":pending["topic"], "counter":pending["counter"], "id":pending["id"]}),
+        )
+        .unwrap();
+        call(json!({"op":"adopt_reception","snapshot":staged["snapshot"]})).unwrap();
+        assert_eq!(
+            call(json!({"op":"poll_pending_object"})).unwrap(),
+            Value::Null
+        );
+        {
+            let shared = session(handle).unwrap();
+            let mut locked = shared.lock().unwrap();
+            let owner = locked.as_mut().unwrap();
+            assert_eq!(owner.delivery.inbox.as_ref().unwrap().pending_count(), 1);
+            check_epoch_transition(owner).unwrap();
+        }
+        close(handle).unwrap();
+    }
+}

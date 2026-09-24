@@ -450,3 +450,117 @@ pub(crate) fn adopt(
     value.activity = activity_view(session);
     Ok(AdoptReply::Adopted(Box::new(value)))
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    #[test]
+    fn removal_is_not_delayed_by_pending_objects_and_delivery_state_carries() {
+        use arachne_delivery::{
+            PublisherLog,
+            inbox::{InboxStage, ObjectInbox},
+        };
+        use arachne_routing::PublicationContext;
+        use arachne_security::{PendingJoin, StorageKey, Workspace};
+
+        let root = [105; 32];
+        let handle = create(Some(&root)).unwrap();
+        let call = |request: Value| -> Result<Value, String> {
+            serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
+                .map_err(|error| error.to_string())
+        };
+        let description: Value = serde_json::from_str(&describe(handle).unwrap()).unwrap();
+        let endpoint = serde_json::from_value(description["endpoint_key"].clone()).unwrap();
+        // The runtime session is the administrator; the sender is a member.
+        let admin = Workspace::create(endpoint, "Admin").unwrap();
+        let (registered, invitation, checkpoint) =
+            admin.prepare_invitation(u64::MAX, false, false).unwrap();
+        let admin = registered.workspace;
+        let join =
+            PendingJoin::from_invitation(&invitation, &checkpoint, [106; 32], "Sender").unwrap();
+        let prepared = admin
+            .prepare_admission([106; 32], join.admission_request().unwrap())
+            .unwrap();
+        let mut proof = join.join_proof().unwrap();
+        proof
+            .apply_add(&prepared.authorization, &prepared.commit)
+            .unwrap();
+        let mut sender = join.prepare_workspace(&proof, &prepared.welcome).unwrap();
+        let admin = prepared.workspace;
+        let context = PublicationContext {
+            workspace: admin.id(),
+            revision: 7,
+            topic: Topic::new("chat/messages").unwrap(),
+            id: [3; 16],
+            sequence: std::num::NonZeroU64::new(1),
+        };
+        let object = sender
+            .protect_object(b"chat", &context.authenticated_bytes(), b"still pending")
+            .unwrap();
+        let InboxStage::Prepared(inbox) = ObjectInbox::new(admin.id(), admin.epoch())
+            .stage(&admin, &context, &object)
+            .unwrap()
+        else {
+            panic!("object was not staged")
+        };
+        let publisher = PublisherLog::new(&admin).unwrap();
+        let key = StorageKey::derive(&root).unwrap();
+        let snapshot = inbox.seal(&admin, &key, &publisher).unwrap();
+        call(json!({"op":"restore_workspace","workspace":admin.id(),"snapshot":snapshot}))
+            .unwrap();
+        let pending = call(json!({"op":"poll_pending_object"})).unwrap();
+        assert_eq!(pending["payload"], json!(b"still pending"));
+
+        // The removal stages and adopts while the object is still pending.
+        let staged = call(json!({"op":"stage_management",
+            "action":{"kind":"remove","member":sender.member().unwrap().id()}}))
+        .unwrap();
+        let adopted =
+            call(json!({"op":"adopt_admission","snapshot":staged["snapshot"]})).unwrap();
+        assert_eq!(adopted["epoch"], admin.epoch() + 1);
+        assert_eq!(adopted["members"], 1);
+        // The pending object is carried into the new epoch and survives restart.
+        assert_eq!(call(json!({"op":"poll_pending_object"})).unwrap(), pending);
+        close(handle).unwrap();
+        let handle = create(Some(&root)).unwrap();
+        let call = |request: Value| -> Result<Value, String> {
+            serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
+                .map_err(|error| error.to_string())
+        };
+        call(json!({"op":"restore_workspace","workspace":admin.id(),
+            "snapshot":staged["snapshot"]}))
+        .unwrap();
+        assert_eq!(call(json!({"op":"poll_pending_object"})).unwrap(), pending);
+        let acknowledged = call(json!({"op":"stage_object_acknowledgement",
+            "member":pending["member"], "topic":pending["topic"],
+            "counter":pending["counter"], "id":pending["id"]}))
+        .unwrap();
+        call(json!({"op":"adopt_reception","snapshot":acknowledged["snapshot"]})).unwrap();
+        assert!(call(json!({"op":"poll_pending_object"})).unwrap().is_null());
+        // The removed member's objects are no longer accepted.
+        let late = PublicationContext {
+            id: [4; 16],
+            sequence: std::num::NonZeroU64::new(2),
+            ..context
+        };
+        let backdated = sender
+            .protect_object(b"chat", &late.authenticated_bytes(), b"after removal")
+            .unwrap();
+        {
+            let shared = session(handle).unwrap();
+            let guard = shared.lock().unwrap();
+            let session = guard.as_ref().unwrap();
+            assert_eq!(
+                session
+                    .delivery.inbox
+                    .as_ref()
+                    .unwrap()
+                    .stage(session.workspace.as_ref().unwrap(), &late, &backdated)
+                    .err(),
+                Some("object author not current")
+            );
+        }
+        close(handle).unwrap();
+    }
+}
