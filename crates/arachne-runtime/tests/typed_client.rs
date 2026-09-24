@@ -455,3 +455,48 @@ fn typed_client_routes_opaque_publication_and_reports_interest() {
     subscriber.close().unwrap();
     publisher.close().unwrap();
 }
+
+/// The admission ops run typed (no JSON) and report typed error codes made
+/// where the failure happens (ADR A1 step 2).
+#[test]
+fn typed_admission_ops_report_codes_and_pages() {
+    use arachne_runtime::ErrorCode;
+    let mut owner = Client::open(ClientConfig {
+        network: Network::Direct,
+        secret: Some([21; 32]),
+        transport: Default::default(),
+    })
+    .unwrap();
+    owner.create_workspace("Owner", None).unwrap();
+    let page = owner.admission_approvals(None, None).unwrap();
+    assert!(page.approvals.is_empty());
+    assert!(page.complete);
+    assert_eq!(page.next_after, None);
+    let error = owner.admission_approvals(None, Some(65)).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::InvalidInput);
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert_eq!(
+        owner.acknowledge_admission_approval([1; 32]).unwrap_err().code(),
+        ErrorCode::WrongState
+    );
+    assert_eq!(
+        owner.send_admission_reply().unwrap_err().code(),
+        ErrorCode::WrongState
+    );
+    // A candidate that is not the staged one is stale.
+    let staged = owner.stage_invitation(0).unwrap();
+    let mut other = staged.snapshot.clone();
+    *other.last_mut().unwrap() ^= 1;
+    let error = owner.adopt_invitation(&other).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::CandidateStale, "{error}");
+    assert_eq!(error.message(), "workspace snapshot does not match candidate");
+    // The wrong adopt op for this kind of candidate.
+    assert_eq!(
+        owner.adopt_join(&staged.snapshot).unwrap_err().code(),
+        ErrorCode::WrongState
+    );
+    let invitation = owner.adopt_invitation(&staged.snapshot).unwrap();
+    assert!(!invitation.invitation.is_empty());
+    assert!(!owner.poll_control().unwrap());
+    owner.close().unwrap();
+}

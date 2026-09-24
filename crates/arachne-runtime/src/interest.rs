@@ -124,7 +124,7 @@ impl Updates {
                         self.retry_at = Some(Instant::now() + RETRY_DELAY);
                     }
                     let withdrawal_observed = !job.update.subscribed && outcome.failed.is_empty();
-                    value["admission"] = report(outcome);
+                    value["admission"] = report_value(outcome);
                     if withdrawal_observed
                         && self
                             .desired

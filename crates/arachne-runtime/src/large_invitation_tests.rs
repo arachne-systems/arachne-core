@@ -110,7 +110,7 @@ fn a_joiner_redeems_an_invitation_past_three_hundred_members_over_the_runtime() 
     let checkpoint: Vec<u8> = serde_json::from_value(invitation["checkpoint"].clone()).unwrap();
     // The regime under test: the old single 64 KiB checkpoint bound, and one
     // control reply, are both too small for this checkpoint.
-    assert!(checkpoint.len() > CHECKPOINT_PAGE_BYTES, "checkpoint is only {} bytes", checkpoint.len());
+    assert!(checkpoint.len() > crate::ops::join::CHECKPOINT_PAGE_BYTES, "checkpoint is only {} bytes", checkpoint.len());
     eprintln!("B3a runtime: {members} members, checkpoint {} bytes", checkpoint.len());
 
     let joiner = create(Some(&[242; 32])).unwrap();

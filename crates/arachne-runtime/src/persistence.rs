@@ -47,10 +47,10 @@ impl NativeStore {
     }
 }
 
-pub(super) fn candidate_token() -> Result<Vec<u8>, String> {
+pub(super) fn candidate_token() -> Result<Vec<u8>, arachne_api::ApiError> {
     let mut token = vec![0; 37];
     token[..5].copy_from_slice(b"DFRC\x01");
-    getrandom::fill(&mut token[5..]).map_err(|e| e.to_string())?;
+    getrandom::fill(&mut token[5..]).map_err(|e| arachne_api::ApiError::internal(e.to_string()))?;
     Ok(token)
 }
 
@@ -124,7 +124,7 @@ fn idle(session: &Session) -> Result<(), String> {
 /// A pending join may migrate too; admission atomically replaces its records.
 /// Host route/unknown-outcome metadata remains separate and must be preserved.
 pub fn enable_record_storage(handle: i64, path: &Path, root: &[u8; 32]) -> Result<(), String> {
-    let shared = session(handle)?;
+    let shared = session(handle).map_err(errors::text)?;
     let mut guard = shared.lock().map_err(|_| "node session unavailable")?;
     let session = guard.as_mut().ok_or("node is closed")?;
     idle(session)?;
@@ -154,7 +154,7 @@ pub fn enable_record_storage(handle: i64, path: &Path, root: &[u8; 32]) -> Resul
         store,
         committed: Vec::new(),
     };
-    native.commit(records, &candidate_token()?)?;
+    native.commit(records, &candidate_token().map_err(crate::errors::text)?)?;
     session.records = Some(native);
     Ok(())
 }
@@ -163,7 +163,7 @@ pub fn enable_record_storage(handle: i64, path: &Path, root: &[u8; 32]) -> Resul
 /// This does not adopt, send, reply or release application data. Retry after a
 /// successful commit is idempotent; callers still invoke the matching adoption.
 pub fn save_candidate(handle: i64, token: &[u8]) -> Result<(), String> {
-    let shared = session(handle)?;
+    let shared = session(handle).map_err(errors::text)?;
     let mut guard = shared.lock().map_err(|_| "node session unavailable")?;
     let session = guard.as_mut().ok_or("node is closed")?;
     commit_candidate(session, token)
@@ -222,7 +222,7 @@ pub(super) fn commit_candidate(session: &mut Session, token: &[u8]) -> Result<()
 pub(super) fn commit_pending_join(session: &mut Session) -> Result<(), String> {
     let pending = session.join.pending.as_ref().ok_or("session has no pending join")?;
     let records = pending_records(session, pending)?;
-    let token = candidate_token()?;
+    let token = candidate_token().map_err(crate::errors::text)?;
     session
         .records
         .as_mut()
@@ -247,7 +247,7 @@ pub(super) fn reset_records(
             Zeroizing::new(serde_json::to_vec(activity).map_err(|error| error.to_string())?),
         ),
     ]);
-    let token = candidate_token()?;
+    let token = candidate_token().map_err(crate::errors::text)?;
     session
         .records
         .as_mut()
@@ -260,7 +260,7 @@ pub(super) fn reset_records(
 /// enabled read this after every call and persist it outside the database
 /// before releasing that call's result.
 pub fn record_freshness(handle: i64) -> Result<FreshnessAnchor, String> {
-    let shared = session(handle)?;
+    let shared = session(handle).map_err(errors::text)?;
     let guard = shared.lock().map_err(|_| "node session unavailable")?;
     let session = guard.as_ref().ok_or("node is closed")?;
     Ok(session
@@ -294,7 +294,7 @@ pub fn restore_record_storage_with_freshness(
     workspace: [u8; 32],
     expected: Option<FreshnessAnchor>,
 ) -> Result<Value, String> {
-    let shared = session(handle)?;
+    let shared = session(handle).map_err(errors::text)?;
     let mut guard = shared.lock().map_err(|_| "node session unavailable")?;
     let session = guard.as_mut().ok_or("node is closed")?;
     idle(session)?;
@@ -333,8 +333,8 @@ pub fn restore_record_storage_with_freshness(
             &bytes,
         )
         .map_err(str::to_owned)?;
-        let mut value = pending_metadata(&pending, session.node.id())?;
-        value["durable"] = json!(true);
+        let mut value = pending_metadata(&pending, session.node.id()).map_err(crate::errors::text)?;
+        value.durable = true;
         let activity = get(ACTIVITY)?
             .map(|bytes| serde_json::from_slice::<WorkspaceActivity>(&bytes).map_err(|error| error.to_string()))
             .transpose()?
@@ -345,19 +345,19 @@ pub fn restore_record_storage_with_freshness(
         if activity.phase != WorkspacePhase::Joining {
             return Err("pending store has invalid workspace activity".into());
         }
-        value["activity"] = activity.projection();
+        value.activity = Some(activity.view());
         session.activity = activity;
         session.join.lifecycle = get(JOIN_LIFECYCLE)?
             .map(|bytes| {
                 let lifecycle: JoinLifecycle =
                     serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-                lifecycle.validate()?;
+                lifecycle.validate().map_err(crate::errors::text)?;
                 Ok::<JoinLifecycle, String>(lifecycle)
             })
             .transpose()?;
         session.join.pending = Some(pending);
         session.records = Some(NativeStore { store, committed });
-        return Ok(value);
+        return serde_json::to_value(value).map_err(|error| error.to_string());
     }
     if let Some(bytes) = get(REMOVED)? {
         if store.keys(b"").count() != 2 {

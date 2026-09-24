@@ -299,7 +299,7 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
         key,
         publisher.as_ref(),
         inbox.as_ref(),
-    )?;
+    ).map_err(crate::errors::text)?;
     let value =
         json!({"workspace":candidate.id(), "snapshot":snapshot, "state":state, "durable":false});
     session.transition.staged = Some(StagedWorkspace {
@@ -473,7 +473,7 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
             key,
             Some(&publisher),
                 Some(&next),
-        )?;
+        ).map_err(crate::errors::text)?;
         let candidate = owner.provisional_copy().map_err(str::to_owned)?;
         let mut value = json!({"workspace":owner.id(), "snapshot":snapshot, "state":"awaiting_recovery_save",
             "publication_count":count, "durable":false, "accepted_progress":false});
@@ -531,7 +531,7 @@ pub(super) fn stage_direct_recovery(session: &mut Session) -> Result<Value, Stri
         key,
         Some(&publisher),
         Some(&next),
-    )?;
+    ).map_err(crate::errors::text)?;
     let candidate = owner.provisional_copy().map_err(str::to_owned)?;
     let value = json!({"workspace":owner.id(), "snapshot":snapshot,
         "state":"awaiting_recovery_save", "publication_count":count,
@@ -573,7 +573,7 @@ pub(super) fn stage_direct_miss(session: &mut Session) -> Result<Value, String> 
         key,
         Some(&publisher),
         Some(&next),
-    )?;
+    ).map_err(crate::errors::text)?;
     let candidate = owner.provisional_copy().map_err(str::to_owned)?;
     let value = json!({"workspace":owner.id(), "snapshot":snapshot,
         "state":"awaiting_recovery_save", "missing_count":missing,
@@ -666,7 +666,7 @@ pub(super) fn inbox_operation(session: &mut Session, request: Request) -> Result
         key,
         Some(&publisher),
         Some(&inbox),
-    )?;
+    ).map_err(crate::errors::text)?;
     let candidate = owner.provisional_copy().map_err(str::to_owned)?;
     let value = json!({"workspace":owner.id(), "snapshot":snapshot, "state":"awaiting_reception_save", "durable":false});
     session.transition.staged = Some(StagedWorkspace {

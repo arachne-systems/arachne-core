@@ -3,9 +3,13 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use arachne_api::{ApiError, ErrorCode};
+
+use crate::ops::{self, Op, admission, candidate, join};
 use crate::{
-    WorkspacePhase, cancel, close, create_with_options, describe,
-    enable_record_storage as enable_runtime_record_storage, execute, execute_stored,
+    Session, WorkspacePhase, cancel, close, create_with_options, describe,
+    enable_record_storage as enable_runtime_record_storage, execute_stored_with_code,
+    execute_with_code,
     record_freshness as runtime_record_freshness,
     restore_record_storage as restore_runtime_record_storage,
     restore_record_storage_with_freshness as restore_runtime_record_storage_with_freshness,
@@ -155,6 +159,8 @@ impl TransportOptions {
     }
 }
 
+/// A coarse error class. It is derived from [`Error::code`] by a fixed
+/// table (see [`ErrorKind::of`]); new code should read the code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ErrorKind {
     Closed,
@@ -166,10 +172,45 @@ pub enum ErrorKind {
     Internal,
 }
 
+impl ErrorKind {
+    /// The class of a code. This is the whole table; there is no text guess.
+    ///
+    /// | Codes                         | Kind           |
+    /// | ----------------------------- | -------------- |
+    /// | 1 closed                      | `Closed`       |
+    /// | 2 cancelled, 3 deadline       | `Cancelled`    |
+    /// | 100-199 input and state       | `InvalidInput` |
+    /// | 200-299 capacity and limits   | `Capacity`     |
+    /// | 300-399 storage, candidates   | `Storage`      |
+    /// | 400-499 transport             | `Transport`    |
+    /// | 500-699 authorization, group  | `InvalidInput` |
+    /// | 900 internal                  | `Internal`     |
+    ///
+    /// One exception: the runtime reports an unknown session handle as
+    /// `InvalidId`; for the client's own handle that means the session was
+    /// closed, so it is `Closed`.
+    pub fn of(error: &ApiError) -> Self {
+        if *error == crate::errors::unknown_handle() {
+            return ErrorKind::Closed;
+        }
+        match error.code().as_u32() {
+            1 => ErrorKind::Closed,
+            2 | 3 => ErrorKind::Cancelled,
+            100..=199 | 500..=699 => ErrorKind::InvalidInput,
+            200..=299 => ErrorKind::Capacity,
+            300..=399 => ErrorKind::Storage,
+            400..=499 => ErrorKind::Transport,
+            _ => ErrorKind::Internal,
+        }
+    }
+}
+
+/// A client error: the runtime's typed [`ApiError`] and its coarse kind.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Error {
     kind: ErrorKind,
     message: String,
+    error: ApiError,
 }
 
 impl Error {
@@ -179,6 +220,27 @@ impl Error {
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// The stable code. Programs branch on this.
+    pub fn code(&self) -> ErrorCode {
+        self.error.code()
+    }
+
+    /// The typed error from the runtime.
+    pub fn api_error(&self) -> &ApiError {
+        &self.error
+    }
+
+}
+
+impl From<ApiError> for Error {
+    fn from(error: ApiError) -> Self {
+        Self {
+            kind: ErrorKind::of(&error),
+            message: crate::errors::legacy_text(&error),
+            error,
+        }
     }
 }
 
@@ -311,13 +373,46 @@ pub struct JoinAdmissionStep {
     pub authorization: AdmissionAuthorization,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AdmissionReply {
     pub workspace: [u8; 32],
     pub epoch: u64,
     pub commit: Vec<u8>,
     pub welcome: Vec<u8>,
     pub authorization: AdmissionAuthorization,
+}
+
+/// A verified invitation checkpoint and the member that served it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvitationCheckpoint {
+    pub workspace: [u8; 32],
+    pub checkpoint: Vec<u8>,
+    pub peer: [u8; 32],
+}
+
+/// One admission request that waits for an administrator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmissionApproval {
+    pub attempt_id: [u8; 32],
+    pub endpoint: [u8; 32],
+    pub request: Vec<u8>,
+    pub display_name: Option<String>,
+    /// The invitation approves automatically once an administrator binds it.
+    pub automatic: bool,
+    /// The host was told about this request.
+    pub delivered: bool,
+    /// The administrator's UI marked it as seen.
+    pub acknowledged: bool,
+}
+
+/// One page of pending approvals.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmissionApprovalPage {
+    pub approvals: Vec<AdmissionApproval>,
+    /// No more rows after this page.
+    pub complete: bool,
+    /// Pass as `after` for the next page.
+    pub next_after: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -419,13 +514,13 @@ pub struct PeerPolicy {
     pub subscribe: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DeliveryFailure {
     pub peer: [u8; 32],
     pub error: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DeliveryReport {
     pub admitted: Vec<[u8; 32]>,
     pub queued: bool,
@@ -584,14 +679,14 @@ impl Client {
         }
         let options = config.transport.node_options(config.network)?;
         let handle = create_with_options(config.secret.as_ref(), options)
-            .map_err(|message| map_error(&message))?;
+            .map_err(legacy)?;
         Ok(Self {
             handle: Some(handle),
         })
     }
 
     pub fn endpoint(&self) -> Result<EndpointInfo> {
-        let description = describe(self.handle()?).map_err(|message| map_error(&message))?;
+        let description = describe(self.handle()?).map_err(legacy)?;
         serde_json::from_str(&description).map_err(|parse_error| {
             error(
                 ErrorKind::Internal,
@@ -682,32 +777,80 @@ impl Client {
         display_name: &str,
         peers: &[[u8; 32]],
     ) -> Result<JoinRequest> {
-        let response = self.request(json!({
-            "op": "begin_join",
-            "invitation": invitation,
-            "checkpoint": checkpoint,
-            "display_name": display_name,
-            "peers": peers,
-        }))?;
-        let raw: RawJoinRequest = serde_json::from_value(response).map_err(|parse_error| {
-            error(
-                ErrorKind::Internal,
-                format!("invalid join request: {parse_error}"),
+        let pending = self.call(Op::BeginJoin, |session| {
+            join::begin(
+                session,
+                join::BeginJoinArgs {
+                    invitation: invitation.to_vec(),
+                    checkpoint: checkpoint.to_vec(),
+                    display_name: display_name.to_owned(),
+                    peers: peers.to_vec(),
+                },
             )
         })?;
-        Ok(JoinRequest {
-            workspace: raw.workspace,
-            member: raw.member.id,
-            endpoint: raw.endpoint,
-            admission_request: raw
-                .admission_request
-                .ok_or_else(|| error(ErrorKind::InvalidInput, "invitation has no admission request"))?,
-        })
+        join_request(pending)
     }
 
     /// Advance a join restored from native record storage.
     pub fn drive_join(&self) -> Result<Value> {
-        self.request(json!({"op": "drive_join"}))
+        self.call(Op::DriveJoin, join::drive)
+    }
+
+    /// Ask one member for admission now (the host-driven path; `drive_join`
+    /// does this natively). The reply is the member's answer, passed on as
+    /// an open event (typed in ADR step 4).
+    pub fn request_admission(&self, peer: [u8; 32]) -> Result<Value> {
+        self.call(Op::RequestAdmission, |session| {
+            join::request_admission(session, join::RequestAdmissionArgs { peer })
+        })
+    }
+
+    /// Fetch and verify the current checkpoint of a compact invitation from
+    /// one of up to three members.
+    pub fn fetch_invitation_checkpoint(
+        &self,
+        invitation: &[u8],
+        peers: &[[u8; 32]],
+    ) -> Result<InvitationCheckpoint> {
+        let found = self.call(Op::FetchInvitationCheckpoint, |session| {
+            join::fetch_checkpoint(
+                session,
+                join::FetchCheckpointArgs {
+                    peer: None,
+                    peers: peers.to_vec(),
+                    invitation: invitation.to_vec(),
+                },
+            )
+        })?;
+        Ok(InvitationCheckpoint {
+            workspace: found.workspace,
+            checkpoint: found.checkpoint,
+            peer: found.peer,
+        })
+    }
+
+    /// Seal the pending join for a host without native storage.
+    pub fn seal_pending_join(&self) -> Result<WorkspaceCandidate> {
+        let sealed = self.call(Op::SealPendingJoin, join::seal_pending)?;
+        Ok(WorkspaceCandidate {
+            workspace: sealed.workspace,
+            snapshot: sealed.snapshot,
+        })
+    }
+
+    /// Restore a pending join sealed by `seal_pending_join`.
+    pub fn restore_pending_join(&self, workspace: [u8; 32], snapshot: &[u8]) -> Result<JoinRequest> {
+        stored_input(snapshot)?;
+        let pending = self.call(Op::RestorePendingJoin, |session| {
+            join::restore_pending(
+                session,
+                join::RestorePendingJoinArgs {
+                    workspace,
+                    snapshot: snapshot.to_vec(),
+                },
+            )
+        })?;
+        join_request(pending)
     }
 
     pub fn stage_admission(
@@ -715,25 +858,24 @@ impl Client {
         authenticated_endpoint: [u8; 32],
         request: &[u8],
     ) -> Result<WorkspaceCandidate> {
-        let metadata = serde_json::to_vec(&json!({
-            "op": "stage_admission",
-            "authenticated_endpoint": authenticated_endpoint,
-            "request": request,
-        }))
-        .map_err(|parse_error| error(ErrorKind::Internal, parse_error.to_string()))?;
-        let [metadata, snapshot] = execute_stored(self.handle()?, &metadata, &[])
-            .map_err(|message| map_error(&message))?;
-        parse_workspace_candidate(&metadata, snapshot, "admission")
+        let staged = self.call(Op::StageAdmission, |session| {
+            admission::stage(
+                session,
+                admission::AdmissionArgs {
+                    authenticated_endpoint,
+                    request: request.to_vec(),
+                },
+            )
+        })?;
+        Ok(WorkspaceCandidate {
+            workspace: staged.workspace,
+            snapshot: stored_output(staged.snapshot)?,
+        })
     }
 
     pub fn adopt_admission(&self, snapshot: &[u8]) -> Result<WorkspaceInfo> {
-        let [metadata, _] = execute_stored(
-            self.handle()?,
-            br#"{"op":"adopt_admission"}"#,
-            snapshot,
-        )
-        .map_err(|message| map_error(&message))?;
-        parse_workspace_info(&metadata, "admission adoption")
+        self.adopt(Op::AdoptAdmission, candidate::adopt_admission, snapshot)
+            .map(workspace_info)
     }
 
     pub fn retained_admission(
@@ -741,17 +883,67 @@ impl Client {
         authenticated_endpoint: [u8; 32],
         request: &[u8],
     ) -> Result<AdmissionReply> {
-        let response = self.request(json!({
-            "op": "retained_admission",
-            "authenticated_endpoint": authenticated_endpoint,
-            "request": request,
-        }))?;
-        serde_json::from_value(response).map_err(|parse_error| {
-            error(
-                ErrorKind::Internal,
-                format!("invalid admission reply: {parse_error}"),
+        self.call(Op::RetainedAdmission, |session| {
+            admission::retained(
+                session,
+                admission::AdmissionArgs {
+                    authenticated_endpoint,
+                    request: request.to_vec(),
+                },
             )
         })
+    }
+
+    /// Drive one owner transition with native record storage: serve one
+    /// queued control request, or stage, save and adopt the next admission
+    /// batch, then answer its requesters. The reply is an open event; it is
+    /// typed with `Event` in ADR step 4.
+    pub fn drive_workspace(&self) -> Result<Value> {
+        self.call(Op::DriveWorkspace, admission::drive_workspace)
+    }
+
+    /// One page of admission requests that wait for an administrator,
+    /// after `after` (an attempt ID), at most `limit` (1 to 64, default 64).
+    pub fn admission_approvals(
+        &self,
+        after: Option<[u8; 32]>,
+        limit: Option<usize>,
+    ) -> Result<AdmissionApprovalPage> {
+        let page = self.call(Op::ListAdmissionApprovals, |session| {
+            admission::list_approvals(session, admission::ListApprovalsArgs { after, limit })
+        })?;
+        Ok(AdmissionApprovalPage {
+            approvals: page
+                .approvals
+                .into_iter()
+                .map(|row| AdmissionApproval {
+                    attempt_id: row.attempt_id,
+                    endpoint: row.endpoint,
+                    request: row.request,
+                    display_name: row.display_name,
+                    automatic: row.automatic,
+                    delivered: row.delivered,
+                    acknowledged: row.acknowledged,
+                })
+                .collect(),
+            complete: page.complete,
+            next_after: page.next_after,
+        })
+    }
+
+    /// Mark a pending approval as seen by the administrator's UI.
+    pub fn acknowledge_admission_approval(&self, attempt_id: [u8; 32]) -> Result<()> {
+        self.call(Op::AcknowledgeAdmissionApproval, |session| {
+            admission::acknowledge_approval(session, admission::AcknowledgeApprovalArgs { attempt_id })
+        })?;
+        Ok(())
+    }
+
+    /// Answer the held admission, leave or offer exchange after its
+    /// transition is durable. `false`: the requester expired; its result
+    /// stays retained for a retry.
+    pub fn send_admission_reply(&self) -> Result<bool> {
+        Ok(self.call(Op::SendAdmissionReply, admission::send_reply)?.queued)
     }
 
     pub fn stage_join(
@@ -759,24 +951,41 @@ impl Client {
         welcome: &[u8],
         commits: &[JoinAdmissionStep],
     ) -> Result<WorkspaceCandidate> {
-        let metadata = serde_json::to_vec(&json!({
-            "op": "stage_join",
-            "commits": commits,
-        }))
-        .map_err(|parse_error| error(ErrorKind::Internal, parse_error.to_string()))?;
-        let [metadata, snapshot] = execute_stored(self.handle()?, &metadata, welcome)
-            .map_err(|message| map_error(&message))?;
-        parse_workspace_candidate(&metadata, snapshot, "join")
+        if welcome.len() > arachne_security::MAX_WELCOME {
+            return Err(Error::from(ApiError::invalid_input(
+                "request",
+                "Welcome exceeds binary input bound",
+            )));
+        }
+        let commits = commits
+            .iter()
+            .map(|step| {
+                crate::membership::JoinStep::admission(
+                    step.commit.clone(),
+                    step.authorization.invitation_key,
+                    step.authorization.grant_signature.clone(),
+                    step.authorization.redemption_signature.clone(),
+                )
+            })
+            .collect();
+        let staged = self.call(Op::StageJoin, |session| {
+            join::stage(
+                session,
+                join::StageJoinArgs {
+                    commits,
+                    welcome: welcome.to_vec(),
+                },
+            )
+        })?;
+        Ok(WorkspaceCandidate {
+            workspace: staged.workspace,
+            snapshot: stored_output(staged.snapshot)?,
+        })
     }
 
     pub fn adopt_join(&self, snapshot: &[u8]) -> Result<WorkspaceInfo> {
-        let [metadata, _] = execute_stored(
-            self.handle()?,
-            br#"{"op":"adopt_join"}"#,
-            snapshot,
-        )
-        .map_err(|message| map_error(&message))?;
-        parse_workspace_info(&metadata, "join adoption")
+        self.adopt(Op::AdoptJoin, candidate::adopt_join, snapshot)
+            .map(workspace_info)
     }
 
     /// Enable encrypted native storage for this client's workspace.
@@ -868,26 +1077,18 @@ impl Client {
             "expires_at": expires_at,
         }))
         .map_err(|parse_error| error(ErrorKind::Internal, parse_error.to_string()))?;
-        let [metadata, snapshot] = execute_stored(self.handle()?, &metadata, &[])
-            .map_err(|message| map_error(&message))?;
+        let [metadata, snapshot] = execute_stored_with_code(self.handle()?, &metadata, &[])
+            .map_err(Error::from)?;
         parse_workspace_candidate(&metadata, snapshot, "invitation")
     }
 
     /// Adopt a staged invitation registration and return its bearer link.
     pub fn adopt_invitation(&self, snapshot: &[u8]) -> Result<InvitationInfo> {
-        let [metadata, _] = execute_stored(
-            self.handle()?,
-            br#"{"op":"adopt_admission"}"#,
-            snapshot,
-        )
-        .map_err(|message| map_error(&message))?;
-        let response: Value = serde_json::from_slice(&metadata).map_err(|parse_error| {
-            error(
-                ErrorKind::Internal,
-                format!("invalid invitation adoption result: {parse_error}"),
-            )
+        let adopted = self.adopt(Op::AdoptAdmission, candidate::adopt_admission, snapshot)?;
+        let issued = adopted.issued_invitation.ok_or_else(|| {
+            error(ErrorKind::InvalidInput, "candidate did not issue an invitation")
         })?;
-        let raw: RawInvitationInfo = serde_json::from_value(response["issued_invitation"].clone())
+        let raw: RawInvitationInfo = serde_json::from_value(issued)
             .map_err(|parse_error| {
             error(
                 ErrorKind::Internal,
@@ -1004,16 +1205,19 @@ impl Client {
     }
 
     pub fn cancel(&self) -> Result<()> {
-        cancel(self.handle()?).map_err(|message| map_error(&message))
+        cancel(self.handle()?).map_err(legacy)
     }
 
     pub fn wait_for_work(&self) -> Result<bool> {
-        wait_for_work(self.handle()?).map_err(|message| map_error(&message))
+        wait_for_work(self.handle()?).map_err(legacy)
     }
 
     /// Service one queued peer-control exchange and report whether one was served.
     pub fn poll_control(&self) -> Result<bool> {
-        Ok(!self.request(json!({"op": "poll_admission"}))?.is_null())
+        let event = self.call(Op::PollAdmission, |session| {
+            admission::poll(session, admission::PollAdmissionArgs { profile: false })
+        })?;
+        Ok(!event.is_null())
     }
 
     pub fn add_address_hint(&self, peer: [u8; 32], address: &str) -> Result<()> {
@@ -1079,7 +1283,8 @@ impl Client {
         }))
         .map_err(|parse_error| error(ErrorKind::Internal, parse_error.to_string()))?;
         let [metadata, snapshot] =
-            execute_stored(self.handle()?, &request, &[]).map_err(|message| map_error(&message))?;
+            execute_stored_with_code(self.handle()?, &request, &[])
+            .map_err(Error::from)?;
         let value: Value = serde_json::from_slice(&metadata).map_err(|parse_error| {
             error(
                 ErrorKind::Internal,
@@ -1110,40 +1315,24 @@ impl Client {
     }
 
     pub fn adopt_protected_publication(&self, snapshot: &[u8]) -> Result<DeliveryReport> {
-        let [metadata, _] = execute_stored(
-            self.handle()?,
-            br#"{"op":"adopt_publication"}"#,
-            snapshot,
-        )
-        .map_err(|message| map_error(&message))?;
-        let value: Value = serde_json::from_slice(&metadata).map_err(|parse_error| {
-            error(
-                ErrorKind::Internal,
-                format!("invalid publication result: {parse_error}"),
-            )
-        })?;
-        if let Some(message) = value.get("network_error").and_then(Value::as_str) {
+        let adopted = self.adopt(Op::AdoptPublication, candidate::adopt_publication, snapshot)?;
+        let outcome = adopted
+            .publication
+            .ok_or_else(|| error(ErrorKind::Internal, "publication result has no admission"))?;
+        if let Some(message) = outcome.network_error {
             return Err(error(ErrorKind::Transport, message));
         }
-        let admission = value
-            .get("admission")
-            .ok_or_else(|| error(ErrorKind::Internal, "publication result has no admission"))?;
-        serde_json::from_value::<RawDeliveryReport>(admission.clone())
-            .map(Into::into)
-            .map_err(|parse_error| {
-                error(
-                    ErrorKind::Internal,
-                    format!("invalid publication admission: {parse_error}"),
-                )
-            })
+        outcome
+            .admission
+            .ok_or_else(|| error(ErrorKind::Internal, "publication result has no admission"))
     }
 
     /// Stage one protected incoming publication without exposing its plaintext.
     /// Save the exact snapshot before adoption whenever record storage is enabled.
     pub fn poll_protected(&self) -> Result<Option<ProtectedReceptionCandidate>> {
         let [metadata, snapshot] =
-            execute_stored(self.handle()?, br#"{"op":"poll_protected"}"#, &[])
-                .map_err(|message| map_error(&message))?;
+            execute_stored_with_code(self.handle()?, br#"{"op":"poll_protected"}"#, &[])
+            .map_err(Error::from)?;
         let value: Value = serde_json::from_slice(&metadata).map_err(|parse_error| {
             error(
                 ErrorKind::Internal,
@@ -1182,12 +1371,7 @@ impl Client {
     /// acknowledgement or rejection. A received object then waits in the
     /// durable inbox; read it with `poll_pending_object`.
     pub fn adopt_protected_reception(&self, snapshot: &[u8]) -> Result<()> {
-        execute_stored(
-            self.handle()?,
-            br#"{"op":"adopt_reception"}"#,
-            snapshot,
-        )
-        .map_err(|message| map_error(&message))?;
+        self.adopt(Op::AdoptReception, candidate::adopt_reception, snapshot)?;
         Ok(())
     }
 
@@ -1252,7 +1436,8 @@ impl Client {
         }))
         .map_err(|parse_error| error(ErrorKind::Internal, parse_error.to_string()))?;
         let [metadata, snapshot] =
-            execute_stored(self.handle()?, &request, &[]).map_err(|message| map_error(&message))?;
+            execute_stored_with_code(self.handle()?, &request, &[])
+            .map_err(Error::from)?;
         let raw: RawProtectedReceptionCandidate =
             serde_json::from_slice(&metadata).map_err(|parse_error| {
                 error(
@@ -1408,8 +1593,8 @@ impl Client {
             "retain_until": retain_until,
         }))
         .map_err(|parse_error| error(ErrorKind::Internal, parse_error.to_string()))?;
-        let [metadata, snapshot] = execute_stored(self.handle()?, &metadata, &[])
-            .map_err(|message| map_error(&message))?;
+        let [metadata, snapshot] = execute_stored_with_code(self.handle()?, &metadata, &[])
+            .map_err(Error::from)?;
         let value: Value = serde_json::from_slice(&metadata).map_err(|parse_error| {
             error(
                 ErrorKind::Internal,
@@ -1447,33 +1632,22 @@ impl Client {
     }
 
     pub fn adopt_recovery(&self, snapshot: &[u8]) -> Result<RecoveryAdoption> {
-        let [metadata, _] = execute_stored(
-            self.handle()?,
-            br#"{"op":"adopt_recovery"}"#,
-            snapshot,
-        )
-        .map_err(|message| map_error(&message))?;
-        let raw: RawRecoveryAdoption = serde_json::from_slice(&metadata).map_err(|parse_error| {
-            error(
-                ErrorKind::Internal,
-                format!("invalid recovery adoption: {parse_error}"),
-            )
-        })?;
-        let (recovered_publications, missing_publications) = match raw.state.as_str() {
-            "recovery_adopted" => (raw.publication_count, 0),
-            "direct_miss_adopted" => (0, raw.missing_count),
+        let adopted = self.adopt(Op::AdoptRecovery, candidate::adopt_recovery, snapshot)?;
+        let (recovered_publications, missing_publications) = match adopted.state {
+            Some("recovery_adopted") => (adopted.publication_count.unwrap_or(0), 0),
+            Some("direct_miss_adopted") => (0, adopted.missing_count.unwrap_or(0) as usize),
             other => {
                 return Err(error(
                     ErrorKind::Internal,
-                    format!("unknown recovery adoption: {other}"),
+                    format!("unknown recovery adoption: {other:?}"),
                 ));
             }
         };
         Ok(RecoveryAdoption {
-            workspace: raw.workspace,
-            epoch: raw.epoch,
-            member_count: raw.members,
-            durable: raw.durable,
+            workspace: adopted.workspace,
+            epoch: adopted.epoch,
+            member_count: adopted.members,
+            durable: adopted.durable,
             recovered_publications,
             missing_publications,
         })
@@ -1484,7 +1658,36 @@ impl Client {
             .handle
             .take()
             .ok_or_else(|| error(ErrorKind::Closed, "client is closed"))?;
-        close(handle).map_err(|message| map_error(&message))
+        close(handle).map_err(legacy)
+    }
+
+    /// Run one typed op on this client's session (guards and wake-ups
+    /// included; see `ops::run`).
+    fn call<T>(
+        &self,
+        op: Op,
+        body: impl FnOnce(&mut Session) -> std::result::Result<T, ApiError>,
+    ) -> Result<T> {
+        ops::run(self.handle()?, op, body).map_err(Error::from)
+    }
+
+    /// Adopt a saved candidate with the adopt op of its kind.
+    fn adopt(
+        &self,
+        op: Op,
+        adopt: fn(&mut Session, candidate::AdoptArgs) -> std::result::Result<candidate::AdoptReply, ApiError>,
+        snapshot: &[u8],
+    ) -> Result<candidate::Adopted> {
+        stored_input(snapshot)?;
+        let reply = self.call(op, |session| {
+            adopt(
+                session,
+                candidate::AdoptArgs {
+                    snapshot: snapshot.to_vec(),
+                },
+            )
+        })?;
+        reply.adopted().map_err(Error::from)
     }
 
     fn handle(&self) -> Result<i64> {
@@ -1499,7 +1702,7 @@ impl Client {
                 format!("request encoding failed: {parse_error}"),
             )
         })?;
-        let reply = execute(self.handle()?, &bytes).map_err(|message| map_error(&message))?;
+        let reply = execute_with_code(self.handle()?, &bytes).map_err(Error::from)?;
         serde_json::from_slice(&reply).map_err(|parse_error| {
             error(
                 ErrorKind::Internal,
@@ -1532,19 +1735,6 @@ struct RawWorkspaceInfo {
     members: usize,
     durable: bool,
     activity: ActivityProjection,
-}
-
-#[derive(Deserialize)]
-struct RawJoinMember {
-    id: [u8; 32],
-}
-
-#[derive(Deserialize)]
-struct RawJoinRequest {
-    workspace: [u8; 32],
-    endpoint: [u8; 32],
-    member: RawJoinMember,
-    admission_request: Option<Vec<u8>>,
 }
 
 #[derive(Deserialize)]
@@ -1640,22 +1830,50 @@ struct RawPeerRoute {
     rtt_ms: u64,
 }
 
-fn parse_workspace_info(bytes: &[u8], context: &str) -> Result<WorkspaceInfo> {
-    let raw: RawWorkspaceInfo = serde_json::from_slice(bytes).map_err(|parse_error| {
-        error(
-            ErrorKind::Internal,
-            format!("invalid {context} result: {parse_error}"),
-        )
-    })?;
-    Ok(WorkspaceInfo {
-        workspace: raw.workspace,
-        workspace_name: raw.workspace_name,
-        epoch: raw.epoch,
-        member_count: raw.members,
-        durable: raw.durable,
-        phase: raw.activity.phase,
-        reason: raw.activity.reason,
+/// The bound `execute_stored` puts on a snapshot the host passes in.
+fn stored_input(snapshot: &[u8]) -> Result<()> {
+    if snapshot.len() > crate::MAX_STORED_SNAPSHOT {
+        return Err(Error::from(ApiError::invalid_input(
+            "request",
+            "stored request exceeds limit",
+        )));
+    }
+    Ok(())
+}
+
+/// The bound `execute_stored` puts on a snapshot the runtime returns.
+fn stored_output(snapshot: Vec<u8>) -> Result<Vec<u8>> {
+    if snapshot.len() > crate::MAX_STORED_SNAPSHOT {
+        return Err(Error::from(ApiError::limit_reached(
+            "stored snapshot",
+            crate::MAX_STORED_SNAPSHOT as u64,
+            "stored response exceeds limit; close and restore",
+        )));
+    }
+    Ok(snapshot)
+}
+
+fn join_request(pending: join::PendingJoinInfo) -> Result<JoinRequest> {
+    Ok(JoinRequest {
+        workspace: pending.workspace,
+        member: pending.member.id,
+        endpoint: pending.endpoint,
+        admission_request: pending
+            .admission_request
+            .ok_or_else(|| error(ErrorKind::InvalidInput, "invitation has no admission request"))?,
     })
+}
+
+fn workspace_info(adopted: candidate::Adopted) -> WorkspaceInfo {
+    WorkspaceInfo {
+        workspace: adopted.workspace,
+        workspace_name: adopted.workspace_name,
+        epoch: adopted.epoch,
+        member_count: adopted.members,
+        durable: adopted.durable,
+        phase: adopted.activity.phase,
+        reason: adopted.activity.reason,
+    }
 }
 
 fn parse_workspace_candidate(
@@ -1796,19 +2014,6 @@ struct RawRecoveryCandidate {
     durable: bool,
 }
 
-#[derive(Deserialize)]
-struct RawRecoveryAdoption {
-    workspace: [u8; 32],
-    epoch: u64,
-    members: usize,
-    durable: bool,
-    state: String,
-    #[serde(default)]
-    publication_count: usize,
-    #[serde(default)]
-    missing_count: usize,
-}
-
 fn parse_recovery_range_status(value: Value) -> Result<RecoveryRangeStatus> {
     let state = value
         .get("state")
@@ -1914,57 +2119,54 @@ impl From<RawPublication> for Publication {
     }
 }
 
+/// An error the client itself finds (bad arguments, a reply it cannot use).
 fn error(kind: ErrorKind, message: impl Into<String>) -> Error {
+    let message = message.into();
+    let api = match kind {
+        ErrorKind::Closed => ApiError::Closed,
+        ErrorKind::InvalidInput => ApiError::invalid_input("", message.clone()),
+        ErrorKind::Capacity => ApiError::capacity_exceeded("", 0, message.clone()),
+        ErrorKind::Storage => ApiError::storage_failed(message.clone()),
+        ErrorKind::Transport => ApiError::transport_failed(None, message.clone()),
+        ErrorKind::Cancelled => ApiError::Cancelled,
+        ErrorKind::Internal => ApiError::internal(message.clone()),
+    };
     Error {
         kind,
-        message: message.into(),
+        message,
+        error: api,
     }
 }
 
-fn map_error(message: &str) -> Error {
-    let lower = message.to_ascii_lowercase();
-    let kind = if lower.contains("invalid or closed") || lower == "node is closed" {
-        ErrorKind::Closed
-    } else if lower.starts_with("transport:") {
-        // The node's own Transport error, for example a stranger refused at
-        // the handshake. The transport's reason text must not reclassify it.
-        ErrorKind::Transport
-    } else if lower.contains("limit") || lower.contains("capacity") || lower.contains("queue") {
-        ErrorKind::Capacity
-    } else if lower.contains("storage") || lower.contains("snapshot") || lower.contains("record") {
-        ErrorKind::Storage
-    } else if lower.contains("cancel") {
-        ErrorKind::Cancelled
-    } else if lower.contains("transport")
-        || lower.contains("peer")
-        || lower.contains("address")
-        || lower.contains("timeout")
-        || lower.contains("route")
-        || lower.contains("connection")
-    {
-        ErrorKind::Transport
-    } else if lower.contains("invalid")
-        || lower.contains("requires")
-        || lower.contains("must ")
-        || lower.contains("unknown")
-    {
-        ErrorKind::InvalidInput
-    } else {
-        ErrorKind::Internal
-    };
-    error(kind, message)
+/// A `String` error from a free function that has no typed twin yet.
+fn legacy(message: String) -> Error {
+    Error::from(crate::errors::legacy(message))
 }
 
-
-/// A stranger on a member's data plane is refused at the handshake and sees
-/// the node's `Transport` error, whatever words the transport's reason uses.
 #[test]
-fn a_refused_handshake_is_a_transport_error() {
-    for message in [
-        "transport: aborted by peer: connection limit for unknown endpoints",
-        "transport: the cryptographic handshake failed: stranger queue full",
-        "peer rejected operation",
-    ] {
-        assert_eq!(map_error(message).kind(), ErrorKind::Transport, "{message}");
+fn error_kind_comes_from_the_code_table() {
+    let cases = [
+        (ApiError::Closed, ErrorKind::Closed),
+        (crate::errors::unknown_handle(), ErrorKind::Closed),
+        (ApiError::Cancelled, ErrorKind::Cancelled),
+        (ApiError::DeadlineExceeded, ErrorKind::Cancelled),
+        (ApiError::invalid_input("topic", "bad"), ErrorKind::InvalidInput),
+        (ApiError::wrong_state("busy"), ErrorKind::InvalidInput),
+        (ApiError::limit_reached("sessions", 8, "node limit reached"), ErrorKind::Capacity),
+        (ApiError::candidate_stale("old"), ErrorKind::Storage),
+        (
+            crate::errors::node(arachne_node::Error::Transport(
+                "aborted by peer: connection limit for unknown endpoints".into(),
+            )),
+            ErrorKind::Transport,
+        ),
+        (ApiError::invitation_expired("late"), ErrorKind::InvalidInput),
+        (ApiError::epoch_mismatch("moved"), ErrorKind::InvalidInput),
+        (ApiError::internal("bug"), ErrorKind::Internal),
+    ];
+    for (api, kind) in cases {
+        let error = Error::from(api.clone());
+        assert_eq!(error.kind(), kind, "{api:?}");
+        assert_eq!(error.code(), api.code());
     }
 }

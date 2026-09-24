@@ -121,6 +121,26 @@ struct JoinAuthorization {
     redemption_signature: Vec<u8>,
 }
 impl JoinStep {
+    /// One admission step, as a joiner's host carries it back.
+    pub(crate) fn admission(
+        commit: Vec<u8>,
+        invitation_key: [u8; 32],
+        grant_signature: Vec<u8>,
+        redemption_signature: Vec<u8>,
+    ) -> Self {
+        Self {
+            commit,
+            authorization: Some(JoinAuthorization {
+                invitation_key,
+                grant_signature,
+                redemption_signature,
+            }),
+            admission_batch: None,
+            management: None,
+            invitation_checkpoint: None,
+        }
+    }
+
     pub(super) fn authorization(&self) -> Result<arachne_security::MembershipAuthorization, String> {
         let admission = |auth: &JoinAuthorization| {
             Ok(arachne_security::AdmissionAuthorization {
@@ -1829,7 +1849,7 @@ fn equal_epoch_needs_matching_fingerprint_and_malformed_claims_are_not_current()
 }
 
 pub(super) fn stage_update(session: &mut Session, step: JoinStep) -> Result<Value, String> {
-    check_epoch_transition(session)?;
+    check_epoch_transition(session).map_err(crate::errors::text)?;
     session.membership.staged_step_received = false;
     let authorization = step.authorization()?;
     let owner = session
@@ -1884,14 +1904,14 @@ pub(super) fn stage_update(session: &mut Session, step: JoinStep) -> Result<Valu
             return stage_removal(session, removed);
         }
     };
-    let (publisher, inbox) = super::carry_delivery(session, &prepared)?;
+    let (publisher, inbox) = super::carry_delivery(session, &prepared).map_err(crate::errors::text)?;
     let snapshot = seal_state(
         session.records.is_some(),
         &prepared,
         key,
         publisher.as_ref(),
         inbox.as_ref(),
-    )?;
+    ).map_err(crate::errors::text)?;
     let value = json!({"workspace":prepared.id(), "workspace_name":prepared.workspace_name().map_err(str::to_owned)?, "snapshot":snapshot,
             "state":"awaiting_save", "durable":false});
     session.transition.staged = Some(StagedWorkspace {
@@ -2492,7 +2512,7 @@ pub(super) fn stage_management(
     session: &mut Session,
     action: arachne_security::ManagementAction,
 ) -> Result<Value, String> {
-    check_epoch_transition(session)?;
+    check_epoch_transition(session).map_err(crate::errors::text)?;
     let prepared = session
         .workspace
         .as_ref()
@@ -2506,7 +2526,7 @@ pub(super) fn stage_prepared(
     session: &mut Session,
     prepared: arachne_security::PreparedManagement,
 ) -> Result<Value, String> {
-    let (publisher, inbox) = super::carry_delivery(session, &prepared.workspace)?;
+    let (publisher, inbox) = super::carry_delivery(session, &prepared.workspace).map_err(crate::errors::text)?;
     let snapshot = seal_state(
         session.records.is_some(),
         &prepared.workspace,
@@ -2516,7 +2536,7 @@ pub(super) fn stage_prepared(
             .ok_or("session has no protected root key")?,
         publisher.as_ref(),
         inbox.as_ref(),
-    )?;
+    ).map_err(crate::errors::text)?;
     let value = json!({"workspace":prepared.workspace.id(), "workspace_name":prepared.workspace.workspace_name().map_err(str::to_owned)?, "snapshot":snapshot, "state":"awaiting_save", "durable":false});
     session.transition.staged = Some(StagedWorkspace {
         publisher,
@@ -2584,7 +2604,7 @@ pub(super) fn receive_leave(
 }
 
 pub(super) fn leave_via_peer(session: &mut Session, peer: [u8; 32]) -> Result<Value, String> {
-    check_epoch_transition(session)?;
+    check_epoch_transition(session).map_err(crate::errors::text)?;
     let owner = session
         .workspace
         .as_ref()
@@ -2620,9 +2640,9 @@ pub(super) fn stage_removal(
     session: &mut Session,
     removed: arachne_security::RemovedMembership,
 ) -> Result<Value, String> {
-    super::transition_activity(session, super::WorkspacePhase::Leaving, None)?;
+    super::transition_activity(session, super::WorkspacePhase::Leaving, None).map_err(crate::errors::text)?;
     let snapshot = if session.records.is_some() {
-        persistence::candidate_token()?
+        persistence::candidate_token().map_err(crate::errors::text)?
     } else {
         removed
             .seal(

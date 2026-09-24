@@ -1,5 +1,6 @@
+use arachne_api::ApiError;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 /// Durable lifecycle phases projected to every adapter.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -26,6 +27,14 @@ pub struct Activity {
     pub reason: Option<String>,
 }
 
+/// The phase as adapters see it: `{"state": phase, "reason": ...}`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct ActivityView {
+    #[serde(rename = "state")]
+    pub phase: Phase,
+    pub reason: Option<String>,
+}
+
 impl Default for Activity {
     fn default() -> Self {
         Self {
@@ -36,12 +45,12 @@ impl Default for Activity {
 }
 
 impl Activity {
-    pub(super) fn transition(&mut self, next: Phase, reason: Option<&str>) -> Result<(), String> {
+    pub(super) fn transition(&mut self, next: Phase, reason: Option<&str>) -> Result<(), ApiError> {
         if self.phase != next && !legal(self.phase, next) {
-            return Err(format!(
+            return Err(ApiError::wrong_state(format!(
                 "invalid workspace activity transition: {:?} -> {:?}",
                 self.phase, next
-            ));
+            )));
         }
         let reason = reason.map(str::to_owned);
         if let Some(value) = &reason
@@ -51,7 +60,9 @@ impl Activity {
                     .bytes()
                     .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'))
         {
-            return Err("workspace activity reason is not a stable code".into());
+            return Err(ApiError::internal(
+                "workspace activity reason is not a stable code",
+            ));
         }
         self.reason = reason;
         self.phase = next;
@@ -59,7 +70,14 @@ impl Activity {
     }
 
     pub(super) fn projection(&self) -> Value {
-        json!({"state": self.phase, "reason": self.reason})
+        serde_json::to_value(self.view()).unwrap_or(Value::Null)
+    }
+
+    pub(super) fn view(&self) -> ActivityView {
+        ActivityView {
+            phase: self.phase,
+            reason: self.reason.clone(),
+        }
     }
 }
 
@@ -104,6 +122,7 @@ fn legal(from: Phase, to: Phase) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn legal_transitions_are_strict_and_idempotent() {
