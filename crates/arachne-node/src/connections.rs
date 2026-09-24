@@ -386,6 +386,21 @@ impl Connections {
             .collect()
     }
 
+    /// Remote endpoints and protocols of the open observed connections.
+    #[cfg(test)]
+    pub(super) fn live_links(&self) -> Vec<(PeerId, Vec<u8>)> {
+        self.observer
+            .0
+            .read()
+            .unwrap()
+            .live
+            .iter()
+            .filter_map(|weak| weak.upgrade())
+            .filter(|connection| connection.close_reason().is_none())
+            .map(|connection| (*connection.remote_id().as_bytes(), connection.alpn().to_vec()))
+            .collect()
+    }
+
     pub(super) fn endpoint(&self) -> Endpoint {
         self.endpoint.clone()
     }

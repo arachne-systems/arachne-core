@@ -736,6 +736,69 @@ mod tests {
         .unwrap();
     }
 
+    /// A policy that removes a member rebuilds the overlay; the old swarm's
+    /// links must close with it, and the removed member cannot link again.
+    #[tokio::test]
+    async fn removing_a_member_closes_its_gossip_link() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let bind = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+            let (a, _) = Node::bind_with_identity(bind(), &[101; 32]).await.unwrap();
+            let (b, _) = Node::bind_with_identity(bind(), &[102; 32]).await.unwrap();
+            let (c, _) = Node::bind_with_identity(bind(), &[103; 32]).await.unwrap();
+            let workspace = [104; 32];
+            let policy = BTreeMap::from([
+                (a.id(), Permissions::AllTopics),
+                (b.id(), Permissions::AllTopics),
+                (c.id(), Permissions::AllTopics),
+            ]);
+            for node in [&a, &b, &c] {
+                node.install_verified_policy(workspace, 1, policy.clone())
+                    .await
+                    .unwrap();
+            }
+            for node in [&b, &c] {
+                node.add_address_hint(a.id(), a.address()).await.unwrap();
+                a.add_address_hint(node.id(), node.address()).await.unwrap();
+            }
+            for node in [&a, &b, &c] {
+                node.enable_gossip(workspace, 1, &workspace).await.unwrap();
+            }
+            let gossip_link = |node: &Node, peer: PeerId| {
+                node.connections
+                    .live_links()
+                    .contains(&(peer, ALPN.to_vec()))
+            };
+            while !(a.live_neighbors(workspace).await.contains(&c.id()) && gossip_link(&a, c.id()))
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let current = BTreeMap::from([
+                (a.id(), Permissions::AllTopics),
+                (b.id(), Permissions::AllTopics),
+            ]);
+            a.install_verified_policy(workspace, 2, current).await.unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while gossip_link(&a, c.id()) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the removed member's gossip link stayed open"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(!a.live_neighbors(workspace).await.contains(&c.id()));
+            // The removed member still holds the old policy and dials again.
+            c.add_address_hint(a.id(), a.address()).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(!gossip_link(&a, c.id()), "the removed member linked again");
+            assert!(!a.live_neighbors(workspace).await.contains(&c.id()));
+            for node in [a, b, c] {
+                node.close().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn discovery_and_protocol_names_say_arachne() {
         assert_eq!(crate::ALPN, b"arachne/data/1");
