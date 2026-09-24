@@ -11,6 +11,9 @@ the pre-release crates in an application.
   what belongs outside Core.
 - [Integration](integration.md) — client lifecycle, network profiles,
   persistence requirements, and API gaps an adapter must account for.
+- [Delivery](delivery.md) — delivery contract per mode (group, direct,
+  current): at-least-once, duplicates, ordering, loss, recovery, retention and
+  epoch behavior.
 - [Security](security.md) — security properties, trust boundaries, host duties,
   and known limitations.
 - [Development](development.md) — repository layout, Rust commands, test
