@@ -35,6 +35,10 @@ pub const MAX_JOIN_HISTORY_STEPS: usize = HISTORY_CHUNK_STEPS * MAX_HISTORY_CHUN
 /// able to grow a pending join's memory one page at a time.
 pub const MAX_JOIN_HISTORY_BYTES: usize = MAX_HISTORY_BYTES;
 
+/// Inline join history: magic and version, checkpoint digest, u32 checkpoint
+/// length, checkpoint, then steps in the v3 step codec (`step.rs`).
+const HISTORY_VERSION: &[u8; 5] = b"DFJH\x03";
+
 /// Invitation checkpoint codec: `DFCK\x01`, u32 pin length, pin, u32 tree
 /// length, tree. The pin is signed MLS GroupInfo without the ratchet tree; an
 /// invitation pins SHA-256 of the pin only. The tree is the TLS-encoded ratchet
@@ -706,7 +710,7 @@ impl JoinProof {
             .map(|e| super::name::NameState::decode(&e.0))
             .transpose()?
             .unwrap_or_default();
-        let mut history = b"DFJH\x01".to_vec();
+        let mut history = HISTORY_VERSION.to_vec();
         history.extend(digest);
         history.extend((bytes.len() as u32).to_be_bytes());
         history.extend(bytes);
@@ -737,12 +741,16 @@ impl JoinProof {
         limit: usize,
     ) -> Result<Vec<(MembershipAuthorization, Vec<u8>)>, &'static str> {
         use super::storage::{number, take};
-        if encoded.len() > limit
-            || !(encoded.starts_with(b"DFJH\x01") || encoded.starts_with(b"DFJH\x02"))
-        {
+        if encoded.len() > limit {
             return Err("invalid join history");
         }
-        let version = encoded[4];
+        if !encoded.starts_with(HISTORY_VERSION) {
+            return Err(if encoded.starts_with(b"DFJH") {
+                super::step::FORMAT_NOT_SUPPORTED
+            } else {
+                "invalid join history"
+            });
+        }
         let mut bytes = &encoded[5..];
         take(&mut bytes, 32)?;
         let length = number(&mut bytes)?;
@@ -755,90 +763,9 @@ impl JoinProof {
             if steps.len() == MAX_JOIN_HISTORY_STEPS {
                 return Err("join history exceeds step bounds");
             }
-            steps.push(Self::read_step(&mut bytes, version == 2)?);
+            steps.push(super::step::read_step(&mut bytes)?);
         }
         Ok(steps)
-    }
-
-    fn read_step(
-        rest: &mut &[u8],
-        tagged: bool,
-    ) -> Result<(MembershipAuthorization, Vec<u8>), &'static str> {
-        use super::storage::{number, take};
-        let mut bytes = *rest;
-        let step = {
-            let tag = if tagged { take(&mut bytes, 1)?[0] } else { 0 };
-            let authorization = match tag {
-                0 => MembershipAuthorization::Admission(AdmissionAuthorization {
-                    invitation_key: take(&mut bytes, 32)?.try_into().unwrap(),
-                    grant_signature: take(&mut bytes, 64)?.try_into().unwrap(),
-                    redemption_signature: take(&mut bytes, 64)?.try_into().unwrap(),
-                }),
-                11 => {
-                    let count = u16::from_be_bytes(take(&mut bytes, 2)?.try_into().unwrap()) as usize;
-                    if count == 0 || count > super::MAX_ADMISSION_BATCH {
-                        return Err("invalid admission batch size");
-                    }
-                    MembershipAuthorization::AdmissionBatch(
-                        (0..count)
-                            .map(|_| {
-                                Ok(AdmissionAuthorization {
-                                    invitation_key: take(&mut bytes, 32)?.try_into().unwrap(),
-                                    grant_signature: take(&mut bytes, 64)?.try_into().unwrap(),
-                                    redemption_signature: take(&mut bytes, 64)?.try_into().unwrap(),
-                                })
-                            })
-                            .collect::<Result<Vec<_>, _>>()?,
-                    )
-                }
-                1..=10 => {
-                    let id = take(&mut bytes, 32)?.try_into().unwrap();
-                    MembershipAuthorization::Management(match tag {
-                        1 => super::ManagementAction::Promote(id),
-                        2 => super::ManagementAction::Demote(id),
-                        3 => super::ManagementAction::Remove(id),
-                        4 => super::ManagementAction::Leave(
-                            id,
-                            take(&mut bytes, 64)?.try_into().unwrap(),
-                        ),
-                        5 => super::ManagementAction::CreateInvitation(
-                            id,
-                            u64::from_be_bytes(take(&mut bytes, 8)?.try_into().unwrap()),
-                            match take(&mut bytes, 1)?[0] {
-                                0 => false,
-                                1 => true,
-                                _ => return Err("invalid invitation mode"),
-                            },
-                        ),
-                        6 => super::ManagementAction::DisableInvitation(id),
-                        7 => super::ManagementAction::ApproveInvitation(
-                            id,
-                            take(&mut bytes, 32)?.try_into().unwrap(),
-                        ),
-                        9 => super::ManagementAction::CreateRequestInvitation(
-                            id,
-                            u64::from_be_bytes(take(&mut bytes, 8)?.try_into().unwrap()),
-                        ),
-                        10 => super::ManagementAction::DeclineInvitationRequest(
-                            id,
-                            take(&mut bytes, 32)?.try_into().unwrap(),
-                        ),
-                        _ => super::ManagementAction::CreateAutomaticInvitation(
-                            id,
-                            u64::from_be_bytes(take(&mut bytes, 8)?.try_into().unwrap()),
-                        ),
-                    })
-                }
-                _ => return Err("unknown membership history action"),
-            };
-            let length = number(&mut bytes)?;
-            if length == 0 {
-                return Err("empty membership history commit");
-            }
-            (authorization, take(&mut bytes, length)?.to_vec())
-        };
-        *rest = bytes;
-        Ok(step)
     }
 
     pub fn from_history(
@@ -857,9 +784,6 @@ impl JoinProof {
         let length = number(&mut bytes)?;
         let checkpoint = take(&mut bytes, length)?;
         let mut proof = Self::from_trusted_checkpoint(workspace, digest, checkpoint)?;
-        if encoded[4] == 2 {
-            proof.history[4] = 2;
-        }
         for (authorization, commit) in steps {
             proof.apply_transition(&authorization, &commit)?;
         }
@@ -903,16 +827,7 @@ impl JoinProof {
             return Err("membership history exceeds bounds");
         }
         let mut history = self.history.clone();
-        if history[4] == 1 && !matches!(authorization, MembershipAuthorization::Admission(_)) {
-            let steps = Self::history_steps_with_limit(&self.history, MAX_HISTORY_BYTES)?;
-            let length = u32::from_be_bytes(history[37..41].try_into().unwrap()) as usize;
-            history.truncate(41 + length);
-            history[4] = 2;
-            for (auth, bytes) in &steps {
-                Self::write_step(&mut history, auth, bytes);
-            }
-        }
-        Self::write_step(&mut history, authorization, commit);
+        super::step::write_step(&mut history, authorization, commit)?;
         if history.len() > MAX_HISTORY_BYTES {
             return Err("membership history exceeds bounds");
         }
@@ -925,63 +840,6 @@ impl JoinProof {
     fn adopt_history(&mut self, appended: AppendedHistory) {
         self.history = appended.history;
         self.steps = appended.steps;
-    }
-
-    fn write_step(history: &mut Vec<u8>, authorization: &MembershipAuthorization, commit: &[u8]) {
-        match authorization {
-            MembershipAuthorization::Admission(auth) => {
-                if history[4] >= 2 {
-                    history.push(0);
-                }
-                history.extend(auth.invitation_key);
-                history.extend(auth.grant_signature);
-                history.extend(auth.redemption_signature);
-            }
-            MembershipAuthorization::AdmissionBatch(auths) => {
-                history.push(11);
-                history.extend((auths.len() as u16).to_be_bytes());
-                for auth in auths {
-                    history.extend(auth.invitation_key);
-                    history.extend(auth.grant_signature);
-                    history.extend(auth.redemption_signature);
-                }
-            }
-            MembershipAuthorization::Management(action) => {
-                let (tag, id) = match action {
-                    super::ManagementAction::Promote(id) => (1, id),
-                    super::ManagementAction::Demote(id) => (2, id),
-                    super::ManagementAction::Remove(id) => (3, id),
-                    super::ManagementAction::Leave(id, _) => (4, id),
-                    super::ManagementAction::CreateInvitation(id, ..) => (5, id),
-                    super::ManagementAction::CreateAutomaticInvitation(id, ..) => (8, id),
-                    super::ManagementAction::CreateRequestInvitation(id, ..) => (9, id),
-                    super::ManagementAction::DeclineInvitationRequest(id, _) => (10, id),
-                    super::ManagementAction::DisableInvitation(id) => (6, id),
-                    super::ManagementAction::ApproveInvitation(id, _) => (7, id),
-                };
-                history.push(tag);
-                history.extend(id);
-                if let super::ManagementAction::Leave(_, signature) = action {
-                    history.extend(signature);
-                }
-                if let super::ManagementAction::CreateInvitation(_, expires, personal) = action {
-                    history.extend(expires.to_be_bytes());
-                    history.push(u8::from(*personal));
-                }
-                if let super::ManagementAction::CreateAutomaticInvitation(_, expires)
-                | super::ManagementAction::CreateRequestInvitation(_, expires) = action
-                {
-                    history.extend(expires.to_be_bytes());
-                }
-                if let super::ManagementAction::ApproveInvitation(_, package)
-                | super::ManagementAction::DeclineInvitationRequest(_, package) = action
-                {
-                    history.extend(package);
-                }
-            }
-        }
-        history.extend((commit.len() as u32).to_be_bytes());
-        history.extend(commit);
     }
 
     pub(super) fn from_workspace(workspace: &Workspace) -> Result<Self, &'static str> {

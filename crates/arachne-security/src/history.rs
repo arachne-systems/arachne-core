@@ -142,6 +142,52 @@ pub(crate) mod tests {
         (owner, member)
     }
 
+    /// ADR A2 step 3: the inline history and the step records are codec v3.
+    /// Records written by version 1 or 2 are rejected with one clear error.
+    #[test]
+    fn history_and_records_are_version_three_and_older_versions_are_rejected() {
+        use crate::step::FORMAT_NOT_SUPPORTED;
+        let (owner, member) = grown(207, 3);
+        for workspace in [&owner, &member] {
+            let history = workspace.join_history.as_ref().unwrap();
+            let inline = history.inline(workspace.id()).unwrap();
+            assert_eq!(&inline[..5], b"DFJH\x03");
+            let digest: [u8; 32] = inline[5..37].try_into().unwrap();
+            crate::JoinProof::from_history(workspace.id(), digest, &inline).unwrap();
+            for old in [1, 2] {
+                let mut bytes = inline.clone();
+                bytes[4] = old;
+                assert_eq!(
+                    crate::JoinProof::from_history(workspace.id(), digest, &bytes).err(),
+                    Some(FORMAT_NOT_SUPPORTED)
+                );
+                assert_eq!(
+                    super::MembershipHistory::from_inline(&bytes).err(),
+                    Some(FORMAT_NOT_SUPPORTED)
+                );
+            }
+            let mut records = workspace.export_records().unwrap();
+            let meta = records.get_mut(&b"security/meta"[..]).unwrap();
+            assert_eq!(&meta[..5], b"DFWR\x03");
+            meta[4] = 2;
+            assert_eq!(
+                Workspace::restore_records(workspace.endpoint(), workspace.id(), &records).err(),
+                Some(FORMAT_NOT_SUPPORTED)
+            );
+            // Step records use the v3 step codec: kind tag, then class.
+            let records = workspace.export_records().unwrap();
+            for (name, value) in &records {
+                if name.starts_with(b"security/history/step/") {
+                    let class = crate::ForkClass::from_u8(value[1]).unwrap();
+                    assert!(matches!(
+                        (value[0], class),
+                        (0 | 11, crate::ForkClass::Admission) | (1..=10, _)
+                    ));
+                }
+            }
+        }
+    }
+
     /// B3b: a member restored without a join history rebuilds one from its own
     /// state. That is local state, so the wire bound for received checkpoints
     /// must not apply; past ~250 members it rejected a valid management commit

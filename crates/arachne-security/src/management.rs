@@ -1028,7 +1028,7 @@ mod tests {
                 .unwrap()
                 .inline(promoted.id())
                 .unwrap()[..5],
-            b"DFJH\x02"
+            b"DFJH\x03"
         );
         let snapshot = promoted.seal(&key).unwrap();
         let promoted = Workspace::restore(&key, [2; 32], helper.id(), &snapshot).unwrap();
@@ -1041,7 +1041,7 @@ mod tests {
             .clone();
         let bytes = records.get_mut(&history_key).unwrap();
         assert_eq!(bytes[0], 0); // Admission authorization record.
-        bytes[33] ^= 1; // Administrator grant signature; publicly verifiable.
+        bytes[34] ^= 1; // Administrator grant signature; publicly verifiable.
         assert!(Workspace::restore_records([2; 32], helper.id(), &records).is_err());
         assert!(promoted.issue_invitation().is_ok());
         admin = prepared.workspace;

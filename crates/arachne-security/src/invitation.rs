@@ -1624,7 +1624,7 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
     );
     let mut altered = encoded.to_vec();
     let checkpoint_length = u32::from_be_bytes(altered[37..41].try_into().unwrap()) as usize;
-    altered[41 + checkpoint_length + 32] ^= 1; // Administrator grant signature, not the secret-only membership MAC.
+    altered[41 + checkpoint_length + 34] ^= 1; // Administrator grant signature, not the secret-only membership MAC.
     assert!(JoinProof::from_history(admin.id(), invitation.checkpoint_digest(), &altered).is_err());
     // ADR A2 step 2: an ordinary member cannot admit. Promote the helper so
     // the link still works while the issuer is offline.

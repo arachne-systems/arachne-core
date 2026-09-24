@@ -27,6 +27,8 @@ pub use branch::{
     BranchDecision, BranchState, MAX_BRANCH_RECORD, MAX_BRANCH_SNAPSHOT, MAX_ROLLBACK_BYTES,
     PreparedBranchSwitch, ROLLBACK_EPOCHS,
 };
+mod step;
+pub use step::{FORMAT_NOT_SUPPORTED, decode_membership_step, encode_membership_step};
 mod removed;
 pub use management::{ManagementAction, PreparedManagement, PreparedManagementUpdate};
 pub use removed::{MAX_SEALED_REMOVAL, RemovedMembership};
