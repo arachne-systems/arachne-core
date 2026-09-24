@@ -6,8 +6,10 @@ use serde_json::{Value, json};
 use crate::{
     WorkspacePhase, cancel, close, create, create_lan, create_nearby, create_relay, create_wan,
     create_wan_only, describe, enable_record_storage as enable_runtime_record_storage, execute,
-    execute_stored, restore_record_storage as restore_runtime_record_storage,
-    save_candidate as save_runtime_candidate, wait_for_work,
+    execute_stored, record_freshness as runtime_record_freshness,
+    restore_record_storage as restore_runtime_record_storage,
+    restore_record_storage_with_freshness as restore_runtime_record_storage_with_freshness,
+    save_candidate as save_runtime_candidate, wait_for_work, FreshnessAnchor,
 };
 #[cfg(feature = "tor")]
 use crate::create_tor;
@@ -681,6 +683,31 @@ impl Client {
         workspace: [u8; 32],
     ) -> Result<Value> {
         restore_runtime_record_storage(self.handle()?, path, root, workspace)
+            .map_err(|message| error(ErrorKind::Storage, message))
+    }
+
+    /// Restore, rejecting a store that does not match the host's saved anchor.
+    pub fn restore_record_storage_with_freshness(
+        &self,
+        path: &Path,
+        root: &[u8; 32],
+        workspace: [u8; 32],
+        expected: Option<FreshnessAnchor>,
+    ) -> Result<Value> {
+        restore_runtime_record_storage_with_freshness(
+            self.handle()?,
+            path,
+            root,
+            workspace,
+            expected,
+        )
+        .map_err(|message| error(ErrorKind::Storage, message))
+    }
+
+    /// Anchor after the latest native commit. With record storage enabled, read
+    /// it after every call and save it outside the database.
+    pub fn record_freshness(&self) -> Result<FreshnessAnchor> {
+        runtime_record_freshness(self.handle()?)
             .map_err(|message| error(ErrorKind::Storage, message))
     }
 

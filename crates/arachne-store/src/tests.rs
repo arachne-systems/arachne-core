@@ -250,3 +250,18 @@ fn external_freshness_anchor_rejects_a_valid_rolled_back_store() {
     assert!(rolled_back.verify_freshness(current).is_err());
     assert!(rolled_back.verify_freshness(anchor).is_ok());
 }
+
+#[test]
+fn freshness_anchor_has_a_fixed_byte_encoding() {
+    let anchor = FreshnessAnchor {
+        revision: 0x0102_0304_0506_0708,
+        digest: [9; 32],
+    };
+    let bytes = anchor.to_bytes();
+    assert_eq!(bytes.len(), FreshnessAnchor::ENCODED_LEN);
+    assert_eq!(bytes[..8], [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(bytes[8..], [9; 32]);
+    assert_eq!(FreshnessAnchor::from_bytes(&bytes).unwrap(), anchor);
+    assert!(FreshnessAnchor::from_bytes(&bytes[..39]).is_err());
+    assert!(FreshnessAnchor::from_bytes(&[0; 41]).is_err());
+}

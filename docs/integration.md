@@ -84,6 +84,22 @@ lower-level native record-storage functions for enabling, saving, and restoring
 runtime state. Neither path removes the host's obligation to protect its root
 key and storage directory. See [Security](security.md#local-persistence).
 
+Rollback detection needs a freshness anchor that the host keeps outside the
+database:
+
+- While record storage is enabled, call `record_freshness` (or
+  `Client::record_freshness`) after every call that can commit. This includes
+  `enable_record_storage`, `save_candidate`, and `execute` operations, because
+  the lifecycle driver also commits. Persist the anchor before you release that
+  call's result. For FFI, `FreshnessAnchor::to_bytes` gives 40 bytes: the
+  big-endian revision, then the digest. `FreshnessAnchor::from_bytes` reads
+  them back.
+- Restore with `restore_record_storage_with_freshness(..., Some(anchor))`. The
+  store must match the anchor exactly. An older store and a newer store are
+  both rejected before any record is read, and the session stays empty.
+- `restore_record_storage` and an anchor of `None` keep the old behavior. They
+  do not detect a rollback.
+
 `Client::create_workspace` currently creates in-session state and reports
 `durable: false`. The typed `Client` does not expose the complete native
 record-storage setup/restore lifecycle or a durable initial workspace-creation

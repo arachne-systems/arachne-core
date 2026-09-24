@@ -55,7 +55,11 @@ pub use client::{
     RecoveryRangeRequest, RecoveryRangeStatus, RecoveryStage, Result as ClientResult, RouteHint,
     RouteKind, WorkspaceCandidate, WorkspaceInfo, WorkspaceMetrics, WorkspaceState,
 };
-pub use persistence::{enable_record_storage, restore_record_storage, save_candidate};
+pub use arachne_store::FreshnessAnchor;
+pub use persistence::{
+    enable_record_storage, record_freshness, restore_record_storage,
+    restore_record_storage_with_freshness, save_candidate,
+};
 pub use workspace_activity::{Activity as WorkspaceActivity, Phase as WorkspacePhase};
 
 enum WorkspaceTransition {

@@ -72,6 +72,21 @@ An attacker who can replace the entire database and its only freshness value
 can roll both back together. Key loss also means stored state cannot be
 recovered by Core.
 
+The runtime exposes the anchor through `record_freshness` and checks it in
+`restore_record_storage_with_freshness`. The check is exact equality, not
+"at least this revision". Two stores for the same workspace and root share one
+key, so an old file from an earlier lineage can have a higher revision and
+still authenticate. A rollback that is accepted replays MLS state and reuses
+sender counters, which reuses AES-GCM nonces. Exact equality has a cost:
+
+- If the process stops after a commit but before the host saves the new
+  anchor, the current database no longer matches. Restore fails closed, and
+  the host must decide how to recover.
+- Some `execute` operations commit and send in one call. The host cannot save
+  the anchor between that commit and the send. A crash in that window,
+  followed by a rollback to the saved anchor, is not detected.
+- A restore without an anchor does not detect rollback.
+
 For staged workspace, membership, publication, and recovery operations, persist
 the exact candidate before adoption. If a write result is uncertain, close and
 restore from the last committed state before retrying. This prevents the host

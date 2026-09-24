@@ -1,7 +1,8 @@
 //! One real runtime owner; admission requests/Welcome validation are local.
 //! This proves storage lifecycle, not a hundred-endpoint network topology.
 use arachne_runtime::{
-    close, create, enable_record_storage, execute, restore_record_storage, save_candidate,
+    FreshnessAnchor, close, create, enable_record_storage, execute, record_freshness,
+    restore_record_storage, restore_record_storage_with_freshness, save_candidate,
 };
 use arachne_security::{AdmissionAuthorization, Invitation, PendingJoin};
 use serde_json::{Value, json};
@@ -30,6 +31,62 @@ fn save(handle: i64, staged: &Value, op: &str) -> Value {
     save_candidate(handle, &token).unwrap();
     call(handle, json!({"op":op,"snapshot":token})).unwrap()
 }
+#[test]
+fn restore_with_freshness_anchor_rejects_a_rolled_back_database() {
+    let directory = common::directory();
+    let path = directory.path().join("workspace.db");
+    let old = directory.path().join("workspace-old.db");
+    let root = [93; 32];
+    let mut handle = create(Some(&root)).unwrap();
+    let created = call(
+        handle,
+        json!({"op":"create_workspace","display_name":"Owner"}),
+    )
+    .unwrap();
+    let workspace: [u8; 32] = serde_json::from_value(created["workspace"].clone()).unwrap();
+    assert!(record_freshness(handle).is_err());
+    enable_record_storage(handle, &path, &root).unwrap();
+    let enabled = record_freshness(handle).unwrap();
+    close(handle).unwrap();
+    // The attacker's copy: an authentic, older database.
+    std::fs::copy(&path, &old).unwrap();
+
+    handle = create(Some(&root)).unwrap();
+    restore_record_storage_with_freshness(handle, &path, &root, workspace, Some(enabled)).unwrap();
+    call(handle, json!({"op":"install_workspace_policy","revision":1})).unwrap();
+    let staged = call(
+        handle,
+        json!({"op":"stage_network_publication","workspace":workspace,"revision":1,
+            "topic":"streams/opaque","id":vec![1;16],"payload":[1]}),
+    )
+    .unwrap();
+    let token = bytes(&staged["snapshot"]);
+    save_candidate(handle, &token).unwrap();
+    // The host saves the new anchor before the publication can leave.
+    let latest = record_freshness(handle).unwrap();
+    assert!(latest.revision > enabled.revision);
+    assert_eq!(FreshnessAnchor::from_bytes(&latest.to_bytes()).unwrap(), latest);
+    call(handle, json!({"op":"adopt_publication","snapshot":token})).unwrap();
+    close(handle).unwrap();
+
+    // Whole-database rollback: restoring would replay the sender counter.
+    std::fs::copy(&old, &path).unwrap();
+    handle = create(Some(&root)).unwrap();
+    let rejected =
+        restore_record_storage_with_freshness(handle, &path, &root, workspace, Some(latest))
+            .unwrap_err();
+    assert!(rejected.contains("freshness"), "{rejected}");
+    // Rejection leaves the session empty; the matching anchor still restores.
+    assert!(record_freshness(handle).is_err());
+    restore_record_storage_with_freshness(handle, &path, &root, workspace, Some(enabled)).unwrap();
+    close(handle).unwrap();
+    // Callers that supply no anchor keep today's behavior.
+    handle = create(Some(&root)).unwrap();
+    restore_record_storage(handle, &path, &root, workspace).unwrap();
+    close(handle).unwrap();
+    directory.close().unwrap();
+}
+
 #[test]
 #[cfg(unix)]
 fn runtime_test_directories_are_private_unique_and_cleaned_on_drop() {

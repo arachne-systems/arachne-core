@@ -1,7 +1,7 @@
 //! Native persistence owns secrets; callers exchange only candidate tokens.
 use super::*;
 use arachne_security::{SecurityRecords, Workspace};
-use arachne_store::Store;
+use arachne_store::{FreshnessAnchor, Store};
 use std::path::Path;
 use zeroize::Zeroizing;
 
@@ -280,13 +280,44 @@ pub(super) fn reset_records(
         .commit(records, &token)
 }
 
+/// Freshness anchor of the attached native store after its latest commit.
+/// Commits also happen inside `execute` operations, so while record storage is
+/// enabled read this after every call and persist it outside the database
+/// before releasing that call's result.
+pub fn record_freshness(handle: i64) -> Result<FreshnessAnchor, String> {
+    let shared = session(handle)?;
+    let guard = shared.lock().map_err(|_| "node session unavailable")?;
+    let session = guard.as_ref().ok_or("node is closed")?;
+    Ok(session
+        .records
+        .as_ref()
+        .ok_or("native record storage not enabled")?
+        .store
+        .freshness())
+}
+
 /// Restore only the authoritative native store into an empty endpoint session.
 /// Failure must not trigger legacy fallback. Removal consumes the session.
+/// Without an anchor this cannot detect a whole-database rollback; prefer
+/// `restore_record_storage_with_freshness`.
 pub fn restore_record_storage(
     handle: i64,
     path: &Path,
     root: &[u8; 32],
     workspace: [u8; 32],
+) -> Result<Value, String> {
+    restore_record_storage_with_freshness(handle, path, root, workspace, None)
+}
+
+/// Restore as `restore_record_storage`, first requiring the store to match the
+/// last anchor the host saved from `record_freshness`. Any difference, older or
+/// newer, is rejected before any record is read and leaves the session empty.
+pub fn restore_record_storage_with_freshness(
+    handle: i64,
+    path: &Path,
+    root: &[u8; 32],
+    workspace: [u8; 32],
+    expected: Option<FreshnessAnchor>,
 ) -> Result<Value, String> {
     let shared = session(handle)?;
     let mut guard = shared.lock().map_err(|_| "node session unavailable")?;
@@ -298,6 +329,11 @@ pub fn restore_record_storage(
     // An absent authoritative store must never become a new empty database.
     std::fs::metadata(path).map_err(|e| e.to_string())?;
     let store = Store::open(path, root, workspace).map_err(|e| e.to_string())?;
+    // Before any record is read: a rolled-back store would replay MLS state
+    // and reuse sender counters (AES-GCM nonces).
+    if let Some(expected) = expected {
+        store.verify_freshness(expected).map_err(|e| e.to_string())?;
+    }
     let get = |name: &[u8]| store.get(name).map_err(|e| e.to_string());
     let committed = get(TOKEN)?.ok_or("missing native commit token")?.to_vec();
     if committed.len() != 37 || !committed.starts_with(b"DFRC\x01") {

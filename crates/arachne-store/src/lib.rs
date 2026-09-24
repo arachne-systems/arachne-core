@@ -32,6 +32,28 @@ pub struct FreshnessAnchor {
     pub digest: [u8; 32],
 }
 
+impl FreshnessAnchor {
+    /// Big-endian revision followed by the digest; stable for host storage and FFI.
+    pub const ENCODED_LEN: usize = 40;
+
+    pub fn to_bytes(&self) -> [u8; Self::ENCODED_LEN] {
+        let mut bytes = [0; Self::ENCODED_LEN];
+        bytes[..8].copy_from_slice(&self.revision.to_be_bytes());
+        bytes[8..].copy_from_slice(&self.digest);
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != Self::ENCODED_LEN {
+            return Err("invalid freshness anchor length".into());
+        }
+        Ok(Self {
+            revision: u64::from_be_bytes(bytes[..8].try_into()?),
+            digest: bytes[8..].try_into()?,
+        })
+    }
+}
+
 /// One exclusive local owner. Reopen authenticates every retained record before
 /// exposing state. Whole-store rollback requires an external anchor to detect.
 pub struct Store {

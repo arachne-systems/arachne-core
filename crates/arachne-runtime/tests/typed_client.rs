@@ -254,6 +254,40 @@ fn typed_client_rejects_wrong_publication_workspace_before_staging() {
 }
 
 #[test]
+fn typed_client_restores_only_with_matching_freshness_anchor() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("workspace.db");
+    let root = [19; 32];
+    let mut client = Client::open(ClientConfig {
+        network: Network::Direct,
+        secret: Some(root),
+    })
+    .unwrap();
+    let workspace = client.create_workspace("Owner", None).unwrap();
+    assert_eq!(client.record_freshness().unwrap_err().kind(), ErrorKind::Storage);
+    client.enable_record_storage(&path, &root).unwrap();
+    let anchor = client.record_freshness().unwrap();
+    client.close().unwrap();
+
+    let mut stale = anchor;
+    stale.revision += 1;
+    let mut client = Client::open(ClientConfig {
+        network: Network::Direct,
+        secret: Some(root),
+    })
+    .unwrap();
+    let rejected = client
+        .restore_record_storage_with_freshness(&path, &root, workspace.workspace, Some(stale))
+        .unwrap_err();
+    assert_eq!(rejected.kind(), ErrorKind::Storage);
+    client
+        .restore_record_storage_with_freshness(&path, &root, workspace.workspace, Some(anchor))
+        .unwrap();
+    assert_eq!(client.record_freshness().unwrap(), anchor);
+    client.close().unwrap();
+}
+
+#[test]
 fn typed_client_exposes_workspace_roster_and_profile_projection() {
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
