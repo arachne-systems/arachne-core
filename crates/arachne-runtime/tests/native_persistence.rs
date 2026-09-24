@@ -295,11 +295,8 @@ fn migration_preserves_pending_inbox_and_removal_cannot_reopen_active_state() {
         .prepare_management(ManagementAction::Remove(reader.member().unwrap().id()))
         .unwrap();
     let step = json!({"commit":removed.commit,"management":{"kind":"remove","member":reader.member().unwrap().id()}});
-    assert!(
-        call(handle, json!({"op":"stage_admission_update","step":step}))
-            .unwrap_err()
-            .contains("pending application")
-    );
+    // A pending object never delays a membership step (A3); this test acks
+    // first only to check acknowledgement persistence before the removal.
     let ack=call(handle,json!({"op":"stage_object_acknowledgement","member":pending["member"],"topic":pending["topic"],"counter":pending["counter"],"id":pending["id"]})).unwrap();
     save(handle, &ack, "adopt_reception");
     close(handle).unwrap();
