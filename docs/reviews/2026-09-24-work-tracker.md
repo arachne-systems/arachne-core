@@ -12,11 +12,11 @@ test is red → green and the crate tests pass.
 - [ ] **B3a** Joiners cannot receive an invitation above 241 members (64 KiB wire checkpoint carries the full ratchet tree). Needs a smaller joiner checkpoint (wire change).
 - [ ] **B3b** A member restored with `join_history == None` still uses the inline bound and can reject a valid management commit above ~250 members.
 - [ ] **B4** Invitation controls fill at 221 rows and are never pruned.
-- [ ] **B5** `stage_protected_publication` does not send `workspace`; a mismatch leaves the session stuck.
-- [ ] **B6** `create_endpoint` holds the global `REGISTRY` lock during bind (up to 10 s).
-- [ ] **B7** Automatic recovery never shrinks the range; large payloads can never catch up.
-- [ ] **B8** The latest-value index never prunes and fills for good.
-- [ ] **B9** The freshness anchor is not wired into restore (rollback → state replay, SFrame counter reuse).
+- [x] **B5** (`7dc9201`, workspace tests 387 pass / 0 fail) `stage_protected_publication` does not send `workspace`; a mismatch leaves the session stuck.
+- [x] **B6** (`3236e4f`, workspace tests 387 pass / 0 fail) `create_endpoint` holds the global `REGISTRY` lock during bind (up to 10 s).
+- [x] **B7** (`7984237`, workspace tests 387 pass / 0 fail) Automatic recovery never shrinks the range; large payloads can never catch up.
+- [x] **B8** (`c142361`, workspace tests 387 pass / 0 fail) The latest-value index never prunes and fills for good.
+- [x] **B9** (`71f8cfa`, workspace tests 387 pass / 0 fail) The freshness anchor is not wired into restore (rollback → state replay, SFrame counter reuse).
 
 ## SDK bugs (arachne-sdk repo — owned by the SDK agent, not this branch)
 
@@ -44,8 +44,15 @@ and a different Core pin. Core work that each plan step depends on:
 - [ ] **A4** Owned `Context`, event stream, `wait_for_work(timeout)`, `close(&self)`, suspend/resume.
 - [ ] **A5** One persistence mode behind a `Storage` trait; schema versions and migrations.
 - [ ] **A6** Delivery spec; per-author quotas; bitmap dedup; remove the legacy receive stack.
-- [ ] **A7** Gate the data plane at handshake; fix metadata leaks; relay config; `Link` trait.
+- [x] **A7** (`fix/a7-network`, merged)
+  - [ ] A7r: runtime wiring — members-only gossip tag key, revision window in runtime checks and `real_node_lifecycle` test, one-behind `Message.revision`, `NodeOptions` into `create_endpoint`, stranger error kind Gate the data plane at handshake; fix metadata leaks; relay config; `Link` trait.
 - [ ] **A8** Per-app or per-topic isolation.
-- [ ] **A9** Version ranges; renamed forks with own versions; SPDX license field.
+- [x] **A9** Version ranges; renamed forks with own versions; SPDX license field. (`fix/a9-supply-chain`, merged into `integrate/wave1`)
+  - [ ] A9a: ~40 `.rs` comments cite ADR 0008/0009/0010 that live only in `arachne-development`. Replace with inline rationale.
+  - [x] A9b (`fix/a9b-tor`; torut replaced, deny clean): `tor` feature pulls `torut` → `ed25519-dalek 1.0.1` / `curve25519-dalek 3.2.0` (RUSTSEC-2022-0093, RUSTSEC-2024-0344).
+  - [ ] A9c: behind latest: sha2 0.11, aes-gcm 0.11, hkdf 0.13, sframe 2.0, rusqlite 0.40; getrandom 0.2 vs 0.4 split.
+  - [x] A9d (`334ab7f`): in-file change notices in fork sources; stale `release = false` in `release-plz.toml`.
+  - [x] A9f (`8fcf5f8`, live Tor SAFECOOKIE passed): Tor control client uses plain COOKIE auth; add SAFECOOKIE. Full `tor_transport` node test not run (no Tor network reach here).
+  - [ ] A9e (owner approval): publish `arachne-bao-tree`, then blobs, gossip, node, runtime; decide on yanking old fork versions.
 - [ ] **A10** Split `arachne-runtime/src/lib.rs` by subsystem; test through the typed Client.
 - [ ] Fix stale docs (`docs/integration.md` gaps list, missing ADR 0008/0009).
