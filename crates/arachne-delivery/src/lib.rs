@@ -3,7 +3,6 @@
 pub mod catalog;
 pub mod current;
 pub mod inbox;
-pub mod receive;
 pub mod wire;
 
 use arachne_routing::{PublicationContext, Topic};
@@ -11,8 +10,7 @@ use arachne_security::{MAX_APPLICATION_CIPHERTEXT, MAX_RECOVERY_PACKETS, Recover
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-const MAGIC: &[u8] = b"DFRL\x01";
-const SEQUENCED_MAGIC: &[u8] = b"DFRL\x02";
+const MAGIC: &[u8] = b"DFRL\x03";
 pub const MAX_TOPICS: usize = 64;
 pub const MAX_PACKETS_PER_TOPIC: usize = 32;
 pub const MAX_RETAINED_BYTES: usize = 512 * 1024;
@@ -127,17 +125,6 @@ impl PublisherLog {
         self.head
     }
 
-    /// Produce one authenticated host record. Caller owns atomic save/readback
-    /// before adopting this index and owner or releasing their publications.
-    pub fn seal(
-        &self,
-        owner: &arachne_security::Workspace,
-        key: &arachne_security::StorageKey,
-    ) -> Result<Vec<u8>, &'static str> {
-        self.validate_owner(owner)?;
-        owner.seal_with_attachment(key, &self.snapshot())
-    }
-
     fn validate_owner(&self, owner: &arachne_security::Workspace) -> Result<(), &'static str> {
         if owner.id() != self.workspace
             || owner.epoch() != self.epoch
@@ -146,26 +133,6 @@ impl PublisherLog {
             return Err("publisher index does not match security owner");
         }
         Ok(())
-    }
-
-    pub fn restore_sealed(
-        key: &arachne_security::StorageKey,
-        endpoint: [u8; 32],
-        workspace: [u8; 32],
-        sealed: &[u8],
-    ) -> Result<(arachne_security::Workspace, Self), &'static str> {
-        let (owner, attachment) =
-            arachne_security::Workspace::restore_with_attachment(key, endpoint, workspace, sealed)?;
-        let log = Self::restore(
-            owner.id(),
-            owner
-                .member()
-                .ok_or("publisher requires member identity")?
-                .id(),
-            owner.epoch(),
-            &attachment,
-        )?;
-        Ok((owner, log))
     }
 
     /// New publications only. Retransmit existing ciphertext without appending.
@@ -196,10 +163,7 @@ impl PublisherLog {
             .head
             .checked_add(1)
             .ok_or("publisher sequence exhausted")?;
-        if context
-            .sequence
-            .is_some_and(|number| number.get() != sequence)
-        {
+        if context.sequence.map(|number| number.get()) != Some(sequence) {
             return Err("authenticated sequence does not match publisher index");
         }
         let topic = context.topic.clone();
@@ -335,12 +299,7 @@ impl PublisherLog {
     /// Encoding contains ciphertext plus sensitive metadata. Authenticate/encrypt
     /// the complete host record, including the paired security snapshot, at rest.
     pub fn snapshot(&self) -> Vec<u8> {
-        let sequenced = self
-            .topics
-            .values()
-            .flat_map(|h| &h.records)
-            .any(|r| r.context.sequence.is_some());
-        let mut bytes = if sequenced { SEQUENCED_MAGIC } else { MAGIC }.to_vec();
+        let mut bytes = MAGIC.to_vec();
         bytes.extend(self.workspace);
         bytes.extend(self.author);
         bytes.extend(self.epoch.to_be_bytes());
@@ -353,9 +312,6 @@ impl PublisherLog {
             bytes.extend((history.records.len() as u16).to_be_bytes());
             for record in &history.records {
                 bytes.extend(record.sequence.to_be_bytes());
-                if sequenced {
-                    bytes.push(u8::from(record.context.sequence.is_some()));
-                }
                 bytes.extend(record.context.revision.to_be_bytes());
                 bytes.extend(record.context.id);
                 bytes.extend((record.ciphertext.len() as u32).to_be_bytes());
@@ -378,8 +334,7 @@ impl PublisherLog {
             return Err("retention snapshot exceeds bounds");
         }
         let mut input = bytes;
-        let magic = take(&mut input, 5)?;
-        if (magic != MAGIC && magic != SEQUENCED_MAGIC)
+        if take(&mut input, 5)? != MAGIC
             || take(&mut input, 32)? != workspace
             || take(&mut input, 32)? != author
             || number64(&mut input)? != epoch
@@ -425,17 +380,8 @@ impl PublisherLog {
             let mut last = evicted_through;
             for _ in 0..count {
                 let sequence = number64(&mut input)?;
-                let authenticated_sequence = if magic == SEQUENCED_MAGIC {
-                    match take(&mut input, 1)?[0] {
-                        0 => None,
-                        1 => Some(
-                            std::num::NonZeroU64::new(sequence).ok_or("zero publisher sequence")?,
-                        ),
-                        _ => return Err("invalid sequence marker"),
-                    }
-                } else {
-                    None
-                };
+                let authenticated_sequence =
+                    Some(std::num::NonZeroU64::new(sequence).ok_or("zero publisher sequence")?);
                 let revision = number64(&mut input)?;
                 let id = take(&mut input, 16)?.try_into().unwrap();
                 let length = u32::from_be_bytes(take(&mut input, 4)?.try_into().unwrap()) as usize;
@@ -541,8 +487,9 @@ fn number16(bytes: &mut &[u8]) -> Result<usize, &'static str> {
 #[test]
 fn retention_watermarks_scope_and_snapshot_bounds() {
     let mut log = PublisherLog::new([1; 32], [2; 32], 3);
+    // Publications are appended in id order, so the id is also the sequence.
     let context = |topic: &str, id: u128| PublicationContext {
-        sequence: None,
+        sequence: std::num::NonZeroU64::new(id as u64),
         workspace: [1; 32],
         revision: 7,
         topic: Topic::new(topic).unwrap(),
@@ -604,10 +551,17 @@ fn retention_watermarks_scope_and_snapshot_bounds() {
     assert!(restored.select(0, restored.head(), &quiet).is_err());
     let mut many = PublisherLog::new([1; 32], [2; 32], 3);
     for id in 0..MAX_TOPICS {
-        many.append(context(&format!("topic/{id:02}"), id as u128), vec![1])
+        many.append(context(&format!("topic/{id:02}"), id as u128 + 1), vec![1])
             .unwrap();
     }
-    assert!(many.append(context("overflow", 999), vec![1]).is_err());
+    assert_eq!(
+        many.append(context("overflow", MAX_TOPICS as u128 + 1), vec![1]),
+        Err("retention topic limit")
+    );
+    // An unsequenced (legacy) publication is never retained.
+    let mut unsequenced = context("topic/00", MAX_TOPICS as u128 + 1);
+    unsequenced.sequence = None;
+    assert!(many.append(unsequenced, vec![1]).is_err());
     let all = many.topics.keys().cloned().collect();
     assert_eq!(
         many.select(0, many.head(), &all).err(),
@@ -623,8 +577,8 @@ fn retention_watermarks_scope_and_snapshot_bounds() {
 }
 
 #[test]
-fn restored_index_builds_offer_for_selected_real_mls_packets() {
-    use arachne_security::{PendingJoin, StorageKey, Workspace};
+fn restored_index_builds_offer_for_selected_real_objects() {
+    use arachne_security::{PendingJoin, Workspace};
     let admin = Workspace::create([1; 32], "Publisher").unwrap();
     let (invite, checkpoint) = admin.issue_invitation().unwrap();
     let pending = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
@@ -635,40 +589,36 @@ fn restored_index_builds_offer_for_selected_real_mls_packets() {
     proof
         .apply_add(&prepared.authorization, &prepared.commit)
         .unwrap();
-    let mut receiver = pending
+    let receiver = pending
         .prepare_workspace(&proof, &prepared.welcome)
         .unwrap();
     let mut sender = prepared.workspace;
-    let key = StorageKey::derive(&[9; 32]).unwrap();
     let mut log = PublisherLog::new(sender.id(), sender.member().unwrap().id(), sender.epoch());
-    let mut pair = log.seal(&sender, &key).unwrap();
     for id in 1..=52u128 {
         let topic = if id == 1 || id == 52 { "quiet" } else { "busy" };
         let context = PublicationContext {
-            sequence: None,
+            sequence: std::num::NonZeroU64::new(id as u64),
             workspace: sender.id(),
             revision: 7,
             topic: Topic::new(topic).unwrap(),
             id: id.to_be_bytes(),
         };
         let packet = sender
-            .protect_application(&context.authenticated_bytes(), &id.to_be_bytes())
+            .protect_object(
+                context.topic.namespace().as_bytes(),
+                &context.authenticated_bytes(),
+                &id.to_be_bytes(),
+            )
             .unwrap();
         log.append(context, packet).unwrap();
-        // Authenticated combined record in RAM, not yet a disk transaction.
-        pair = log.seal(&sender, &key).unwrap();
     }
-    let (sender, log) = PublisherLog::restore_sealed(&key, [1; 32], sender.id(), &pair).unwrap();
-    let mut damaged = pair.clone();
-    *damaged.last_mut().unwrap() ^= 1;
-    assert!(PublisherLog::restore_sealed(&key, [1; 32], sender.id(), &damaged).is_err());
-    let wrong = PublisherLog::new(sender.id(), [99; 32], sender.epoch());
-    assert!(wrong.seal(&sender, &key).is_err());
-    // Even authenticated attachments must be checked against the restored owner.
-    let mismatch = sender
-        .seal_with_attachment(&key, &wrong.snapshot())
-        .unwrap();
-    assert!(PublisherLog::restore_sealed(&key, [1; 32], sender.id(), &mismatch).is_err());
+    let log = PublisherLog::restore(
+        sender.id(),
+        sender.member().unwrap().id(),
+        sender.epoch(),
+        &log.snapshot(),
+    )
+    .unwrap();
     let topics = BTreeSet::from([Topic::new("quiet").unwrap()]);
     let mut policy = arachne_routing::RoutingTable::default();
     let owner_access = arachne_routing::Permissions::Selected {
@@ -845,7 +795,7 @@ fn restored_index_builds_offer_for_selected_real_mls_packets() {
         large
             .append(
                 PublicationContext {
-                    sequence: None,
+                    sequence: std::num::NonZeroU64::new(id as u64),
                     workspace: sender.id(),
                     revision: 7,
                     topic: Topic::new("quiet").unwrap(),
@@ -886,34 +836,21 @@ fn restored_index_builds_offer_for_selected_real_mls_packets() {
         .collect();
     verified.verify_packets(&packets).unwrap();
     assert!(verified.verify_packets(&packets[1..]).is_err());
-    let receiver_key = StorageKey::derive(&[8; 32]).unwrap();
-    let mut candidate = Workspace::restore(
-        &receiver_key,
-        [2; 32],
-        receiver.id(),
-        &receiver.seal(&receiver_key).unwrap(),
-    )
-    .unwrap();
-    for ((context, packet), id) in packets.iter().zip([1u128, 52]) {
-        let message = candidate.unprotect_application(context, packet).unwrap();
-        verified.verify_origin(&message).unwrap();
-        wire_proof.verify_origin(&message).unwrap();
-        assert_eq!(message.payload, id.to_be_bytes());
+    // Objects carry no ratchet state: any number of decryptions is side-effect
+    // free; delivery dedup is the inbox's job.
+    for _ in 0..2 {
+        for ((context, packet), id) in packets.iter().zip([1u128, 52]) {
+            let message = receiver
+                .unprotect_object(b"quiet", context, packet)
+                .unwrap()
+                .message;
+            verified.verify_origin(&message).unwrap();
+            wire_proof.verify_origin(&message).unwrap();
+            assert_eq!(message.payload, id.to_be_bytes());
+        }
     }
     drop(verified);
     drop(wire_proof);
-    receiver = Workspace::restore(
-        &receiver_key,
-        [2; 32],
-        receiver.id(),
-        &candidate.seal(&receiver_key).unwrap(),
-    )
-    .unwrap();
-    assert!(
-        receiver
-            .unprotect_application(packets[0].0, packets[0].1)
-            .is_err()
-    );
     policy
         .install_verified_policy(
             sender.id(),
@@ -961,45 +898,3 @@ fn restored_index_builds_offer_for_selected_real_mls_packets() {
     );
 }
 
-#[test]
-fn publisher_order_migrates_without_inventing_legacy_authentication() {
-    let mut log = PublisherLog::new([1; 32], [2; 32], 3);
-    let mut context = PublicationContext {
-        workspace: [1; 32],
-        revision: 1,
-        topic: Topic::new("sample").unwrap(),
-        id: [1; 16],
-        sequence: None,
-    };
-    let old_aad = context.authenticated_bytes();
-    log.append(context.clone(), vec![1]).unwrap();
-    let legacy = log.snapshot();
-    assert_eq!(&legacy[..5], MAGIC);
-    let mut log = PublisherLog::restore([1; 32], [2; 32], 3, &legacy).unwrap();
-    context.id = [2; 16];
-    context.sequence = std::num::NonZeroU64::new(3);
-    assert_eq!(
-        log.append(context.clone(), vec![2]),
-        Err("authenticated sequence does not match publisher index")
-    );
-    assert_eq!(log.snapshot(), legacy);
-    context.sequence = std::num::NonZeroU64::new(2);
-    log.append(context, vec![2]).unwrap();
-    let mixed = log.snapshot();
-    assert_eq!(&mixed[..5], SEQUENCED_MAGIC);
-    let restored = PublisherLog::restore([1; 32], [2; 32], 3, &mixed).unwrap();
-    assert_eq!(restored.snapshot(), mixed);
-    let range = restored
-        .select(0, 2, &BTreeSet::from([Topic::new("sample").unwrap()]))
-        .unwrap();
-    assert_eq!(range.records()[0].context.sequence, None);
-    assert_eq!(range.records()[0].context.authenticated_bytes(), old_aad);
-    assert_eq!(range.records()[1].context.sequence.unwrap().get(), 2);
-    // Header 87, topic length/name 7, watermark/count 10, sequence 8.
-    let mut invalid = mixed.clone();
-    invalid[112] = 2;
-    assert!(PublisherLog::restore([1; 32], [2; 32], 3, &invalid).is_err());
-    let mut truncated = mixed;
-    truncated.pop();
-    assert!(PublisherLog::restore([1; 32], [2; 32], 3, &truncated).is_err());
-}

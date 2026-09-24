@@ -160,8 +160,6 @@ fn hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots() 
             println!("runtime reopened members={}", member + 1);
         }
     }
-    let enabled = call(handle, json!({"op":"enable_object_delivery"})).unwrap();
-    save(handle, &enabled, "adopt_reception");
     call(
         handle,
         json!({"op":"install_workspace_policy","revision":100}),

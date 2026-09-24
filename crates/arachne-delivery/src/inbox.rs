@@ -4,8 +4,6 @@ use super::*;
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8] = b"DFOI\x01";
-const LEGACY_CACHE_MAGIC: &[u8] = b"DFIC\x01";
-const CURRENT_CACHE_MAGIC: &[u8] = b"DFIC\x02";
 const CACHE_MAGIC: &[u8] = b"DFIC\x03";
 const MAX_STREAMS: usize = 4096;
 const WINDOW: usize = MAX_PACKETS_PER_TOPIC;
@@ -167,8 +165,6 @@ pub struct ObjectInbox {
     progress: Vec<SelectionProgress>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     current_progress: Vec<CurrentProgress>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    legacy_receive_snapshot: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     direct: Vec<DirectStream>,
 }
@@ -183,8 +179,6 @@ struct Snapshot {
     progress: Vec<SelectionProgress>,
     #[serde(default)]
     current_progress: Vec<CurrentProgress>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    legacy_receive_snapshot: Option<Vec<u8>>,
     #[serde(default)]
     direct: Vec<DirectStream>,
 }
@@ -280,24 +274,8 @@ impl ObjectInbox {
             current: None,
             progress: Vec::new(),
             current_progress: Vec::new(),
-            legacy_receive_snapshot: None,
             direct: Vec::new(),
         }
-    }
-
-    /// Preserve pre-object receive evidence during an explicit host cutover.
-    /// This does not make legacy MLS ciphertext independently recoverable.
-    pub fn with_legacy_receipts(&self, received: Option<&crate::receive::ReceiveJournal>) -> Self {
-        let mut next = self.clone();
-        next.legacy_receive_snapshot = received.map(|r| r.snapshot());
-        next
-    }
-
-    pub fn legacy_receipts(&self) -> Result<Option<crate::receive::ReceiveJournal>, &'static str> {
-        self.legacy_receive_snapshot
-            .as_ref()
-            .map(|bytes| crate::receive::ReceiveJournal::restore(self.workspace, self.epoch, bytes))
-            .transpose()
     }
 
     pub fn recovery_progress(&self, author: [u8; 32], topics: &BTreeSet<Topic>) -> u64 {
@@ -1555,13 +1533,9 @@ impl ObjectInbox {
             owner.epoch(),
             take(&mut bytes, length)?,
         )?;
-        let (json, ranges, retained_current_views, current) = if bytes.starts_with(CACHE_MAGIC)
-            || bytes.starts_with(CURRENT_CACHE_MAGIC)
-            || bytes.starts_with(LEGACY_CACHE_MAGIC)
-        {
-            let has_current =
-                bytes.starts_with(CACHE_MAGIC) || bytes.starts_with(CURRENT_CACHE_MAGIC);
-            let has_retained_current = bytes.starts_with(CACHE_MAGIC);
+        let (json, ranges, retained_current_views, current) = if bytes.starts_with(CACHE_MAGIC) {
+            let has_current = true;
+            let has_retained_current = true;
             let mut input = &bytes[5..];
             let length = u32::from_be_bytes(take(&mut input, 4)?.try_into().unwrap()) as usize;
             let json = take(&mut input, length)?;
@@ -1648,7 +1622,7 @@ impl ObjectInbox {
             }
             (json, ranges, retained_current_views, current)
         } else {
-            (bytes, Vec::new(), Vec::new(), None)
+            return Err("unsupported object inbox snapshot");
         };
         let parsed: Snapshot =
             serde_json::from_slice(json).map_err(|_| "invalid inbox snapshot")?;
@@ -1661,11 +1635,9 @@ impl ObjectInbox {
             current,
             progress: parsed.progress,
             current_progress: parsed.current_progress,
-            legacy_receive_snapshot: parsed.legacy_receive_snapshot,
             direct: parsed.direct,
         };
         inbox.validate_owner(owner)?;
-        inbox.legacy_receipts()?;
         for range in &inbox.retained_ranges {
             let query = RangeQuery::from_wire(&range.query)?;
             if query.workspace != owner.id()

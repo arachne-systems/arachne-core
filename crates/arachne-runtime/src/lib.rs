@@ -50,8 +50,7 @@ pub use client::{
     InvitationInfo, JoinAdmissionStep, JoinRequest, MemberInfo, MemberKind,
     MembershipGossipMetrics, MemberRoster, Network, PeerPolicy, PeerRoute, Presence, Publication,
     PublicationCandidate, PublicationCurrent, ProtectedReceptionCandidate,
-    ReceivedProtectedPublication,
-    RecoveredPublication, RecoveryAdoption, RecoveryCandidate, RecoveryRangeReady,
+    ReceivedProtectedPublication, RecoveryAdoption, RecoveryCandidate, RecoveryRangeReady,
     RecoveryRangeRequest, RecoveryRangeStatus, RecoveryStage, Result as ClientResult, RouteHint,
     RouteKind, WorkspaceCandidate, WorkspaceInfo, WorkspaceMetrics, WorkspaceState,
 };
@@ -63,22 +62,11 @@ pub use persistence::{
 pub use workspace_activity::{Activity as WorkspaceActivity, Phase as WorkspacePhase};
 
 enum WorkspaceTransition {
-    Recovery(
-        Vec<(
-            arachne_routing::PublicationContext,
-            arachne_security::ApplicationMessage,
-        )>,
-    ),
     RoutedPublication(
         arachne_routing::PublicationContext,
         arachne_node::DeliveryClass,
         Vec<u8>,
         Vec<[u8; 32]>,
-        Vec<[u8; 32]>,
-    ),
-    RoutedReception(
-        arachne_routing::PublicationContext,
-        arachne_security::ApplicationMessage,
         Vec<[u8; 32]>,
     ),
     Inbox,
@@ -104,8 +92,6 @@ enum WorkspaceTransition {
         Vec<u8>,
     ),
     Join,
-    Publication(Vec<u8>),
-    Reception(arachne_security::ApplicationMessage),
 }
 
 /// Durable Iroh-only routing state for one pending admission. A selected peer
@@ -161,7 +147,6 @@ impl JoinLifecycle {
 
 struct StagedWorkspace {
     publisher: Option<arachne_delivery::PublisherLog>,
-    received: Option<arachne_delivery::receive::ReceiveJournal>,
     inbox: Option<arachne_delivery::inbox::ObjectInbox>,
     transition: WorkspaceTransition,
     workspace: arachne_security::Workspace,
@@ -327,12 +312,7 @@ struct Session {
     direct_range: Option<PendingDirectRange>,
     ready_direct_range: Option<ReadyDirectRange>,
     direct_miss: Option<arachne_delivery::wire::DirectRangeQuery>,
-    recovered: VecDeque<(
-        arachne_routing::PublicationContext,
-        arachne_security::ApplicationMessage,
-    )>,
     publisher: Option<arachne_delivery::PublisherLog>,
-    received: Option<arachne_delivery::receive::ReceiveJournal>,
     inbox: Option<arachne_delivery::inbox::ObjectInbox>,
     inbound_admission: Option<arachne_node::ControlRequest>,
     admission_queue: arachne_security::AdmissionQueue,
@@ -673,9 +653,7 @@ fn create_endpoint(
             direct_range: None,
             ready_direct_range: None,
             direct_miss: None,
-            recovered: VecDeque::new(),
             publisher: None,
-            received: None,
             inbox: None,
             inbound_admission: None,
             admission_queue: arachne_security::AdmissionQueue::new(),
@@ -721,6 +699,23 @@ fn create_endpoint(
 /// The one place a workspace becomes the committed one. Callers have already
 /// saved and adopted it; publishing here is what lets inquiries see it.
 fn commit_workspace(session: &mut Session, workspace: arachne_security::Workspace) {
+    // Object delivery is the only receive path: an active member always has
+    // an inbox and a publisher log.
+    if let Some(member) = workspace.member() {
+        if session.inbox.is_none() {
+            session.inbox = Some(arachne_delivery::inbox::ObjectInbox::new(
+                workspace.id(),
+                workspace.epoch(),
+            ));
+        }
+        if session.publisher.is_none() {
+            session.publisher = Some(arachne_delivery::PublisherLog::new(
+                workspace.id(),
+                member.id(),
+                workspace.epoch(),
+            ));
+        }
+    }
     let workspace = Arc::new(workspace);
     session
         .committed
@@ -990,7 +985,6 @@ enum Request {
         #[serde(default)]
         snapshot: Vec<u8>,
     },
-    PollRecoveredPublication {},
     CancelRecoveryRange {},
     PollRecoveryCutoff {},
     DiscoverRecoveryCutoff {
@@ -1041,7 +1035,6 @@ enum Request {
         #[serde(default)]
         bulk: bool,
     },
-    EnableObjectDelivery {},
     PollPendingObject {
         #[serde(default)]
         deferred: Vec<arachne_delivery::inbox::DeferredDeliveryStream>,
@@ -1068,17 +1061,9 @@ enum Request {
         address: Option<String>,
         payload: Vec<u8>,
     },
-    StagePublication {
-        context: Vec<u8>,
-        payload: Vec<u8>,
-    },
     AdoptPublication {
         #[serde(default)]
         snapshot: Vec<u8>,
-    },
-    StageReception {
-        context: Vec<u8>,
-        ciphertext: Vec<u8>,
     },
     AdoptReception {
         #[serde(default)]
@@ -1404,27 +1389,15 @@ fn seal_state(
     workspace: &arachne_security::Workspace,
     key: &arachne_security::StorageKey,
     publisher: Option<&arachne_delivery::PublisherLog>,
-    received: Option<&arachne_delivery::receive::ReceiveJournal>,
     inbox: Option<&arachne_delivery::inbox::ObjectInbox>,
 ) -> Result<Vec<u8>, String> {
     if native {
         return persistence::candidate_token();
     }
-    if let Some(inbox) = inbox {
-        return inbox
-            .with_legacy_receipts(received)
-            .seal(
-                workspace,
-                key,
-                publisher.ok_or("object inbox requires publisher state")?,
-            )
-            .map_err(str::to_owned);
-    }
-    match (publisher, received) {
-        (Some(log), Some(received)) => log.seal_with_receipts(workspace, key, received),
-        (Some(log), None) => log.seal(workspace, key),
+    match (inbox, publisher) {
+        (Some(inbox), Some(publisher)) => inbox.seal(workspace, key, publisher),
         (None, None) => workspace.seal(key),
-        (None, Some(_)) => return Err("receive journal requires publisher state".into()),
+        _ => return Err("object inbox and publisher state go together".into()),
     }
     .map_err(str::to_owned)
 }
@@ -1443,9 +1416,6 @@ fn check_epoch_transition(session: &mut Session) -> Result<(), String> {
                 "pending application delivery must be acknowledged before membership update".into(),
             );
         }
-    }
-    if !session.recovered.is_empty() {
-        return Err("recovery must finish or cancel before membership update".into());
     }
     // Background discovery/download has accepted no application work. A new
     // epoch invalidates its query anyway; cancel it instead of making normal
@@ -1510,11 +1480,10 @@ fn stage_admission_workspace(
         .storage_key
         .as_ref()
         .ok_or("session has no protected root key")?;
-    let snapshot = seal_state(session.records.is_some(), &workspace, key, None, None, None)?;
+    let snapshot = seal_state(session.records.is_some(), &workspace, key, None, None)?;
     let value = json!({"workspace": workspace.id(), "snapshot": snapshot, "state":"awaiting_save", "durable":false,
         "admissions": admission_count});
     session.staged_workspace = Some(StagedWorkspace {
-        received: None,
         inbox: None,
         publisher: None, // New epoch; this prototype retains current-epoch history only.
         transition: WorkspaceTransition::Admission,
@@ -2718,9 +2687,7 @@ fn reset_workspace(session: &mut Session) -> Result<Value, String> {
     session.direct_range = None;
     session.ready_direct_range = None;
     session.direct_miss = None;
-    session.recovered.clear();
     session.publisher = None;
-    session.received = None;
     session.inbox = None;
     session.inbound_admission = None;
     session.admission_queue = arachne_security::AdmissionQueue::new();
@@ -3265,7 +3232,7 @@ fn execute_in_session(
             "admission_in_flight":session.queued_admission_in_flight.len(),
             "approval_pending":session.pending_approvals.len(),
             "activity":activity_value(session),
-            "pending_objects":session.inbox.as_ref().map(|inbox| inbox.pending_count()).unwrap_or(0) + session.recovered.len(),
+            "pending_objects":session.inbox.as_ref().map(|inbox| inbox.pending_count()).unwrap_or(0),
             "repair_jobs":usize::from(session.cutoff.is_some()) + usize::from(session.range.is_some() || session.ready_range.is_some())
                 + usize::from(session.direct_range.is_some() || session.ready_direct_range.is_some())
                 + usize::from(session.current_view.is_some() || session.ready_current_view.is_some()),
@@ -3444,9 +3411,6 @@ fn execute_in_session(
         *ended = Some(guard.take().ok_or("node is closed")?);
         return Ok(value);
     }
-    if !session.recovered.is_empty() && !matches!(request, Request::PollRecoveredPublication {}) {
-        return Err("drain adopted recovery publications before another operation".into());
-    }
     if session.staged_workspace.is_some()
         && !matches!(
             request,
@@ -3477,19 +3441,6 @@ fn execute_in_session(
         )
     {
         return Err("received admission awaits adoption or reply; close to recover".into());
-    }
-    // Recovery and live applications share the receiver ratchets. Leave queued
-    // traffic untouched until the requested range is resolved or cancelled.
-    if session.inbox.is_none()
-        && (session.cutoff.is_some() || session.range.is_some() || session.ready_range.is_some())
-    {
-        match request {
-            Request::PollProtected {} => return Ok(Value::Null),
-            Request::StageReception { .. } => {
-                return Err("recovery must finish before live reception".into());
-            }
-            _ => (),
-        }
     }
     if let Request::Resource { request } = request {
         return resources::execute(session, request);
@@ -3538,8 +3489,7 @@ fn execute_in_session(
         membership::poll(session, request)?
     } else if matches!(
         request,
-        Request::EnableObjectDelivery {}
-            | Request::PollPendingObject { .. }
+        Request::PollPendingObject { .. }
             | Request::StageObjectAcknowledgement { .. }
             | Request::StageObjectRejection { .. }
     ) {
@@ -3549,72 +3499,8 @@ fn execute_in_session(
         Request::StageNetworkPublication { .. } | Request::PollProtected {}
     ) {
         protected::stage(session, request)?
-    } else if matches!(
-        request,
-        Request::StagePublication { .. } | Request::StageReception { .. }
-    ) {
-        if session.inbox.is_some() {
-            return Err("raw MLS applications disabled after object cutover".into());
-        }
-        let original = session
-            .workspace
-            .as_ref()
-            .ok_or("session has no workspace")?;
-        let key = session
-            .storage_key
-            .as_ref()
-            .ok_or("session has no protected root key")?;
-        let mut candidate = original.provisional_copy().map_err(str::to_owned)?;
-        let (transition, state) = match request {
-            Request::StagePublication { context, payload } => (
-                WorkspaceTransition::Publication(
-                    candidate
-                        .protect_application(&context, &payload)
-                        .map_err(str::to_owned)?,
-                ),
-                "awaiting_publication_save",
-            ),
-            Request::StageReception {
-                context,
-                ciphertext,
-            } => (
-                WorkspaceTransition::Reception(
-                    candidate
-                        .unprotect_application(&context, &ciphertext)
-                        .map_err(str::to_owned)?,
-                ),
-                "awaiting_reception_save",
-            ),
-            _ => unreachable!(),
-        };
-        let snapshot = seal_state(
-            session.records.is_some(),
-            &candidate,
-            key,
-            session.publisher.as_ref(),
-            session.received.as_ref(),
-            session.inbox.as_ref(),
-        )?;
-        let value = json!({"workspace":candidate.id(), "snapshot":snapshot, "state":state, "durable":false});
-        session.staged_workspace = Some(StagedWorkspace {
-            publisher: session.publisher.clone(),
-            received: session.received.clone(),
-            inbox: session.inbox.clone(),
-            transition,
-            workspace: candidate,
-            snapshot,
-        });
-        value
     } else if let Request::StageRecoveryRange { retain_until } = request {
         protected::stage_recovery(session, retain_until)?
-    } else if matches!(request, Request::PollRecoveredPublication {}) {
-        match session.recovered.pop_front() {
-            Some((context, message)) => json!({"workspace":context.workspace,
-                "revision":context.revision, "topic":context.topic.as_str(), "id":context.id,
-                "sequence":context.sequence.map(|n| n.get()),
-                "payload":message.payload, "member":message.member, "endpoint":message.endpoint}),
-            None => Value::Null,
-        }
     } else if let Request::FetchRecoveryRange {
         peer,
         author,
@@ -4354,13 +4240,11 @@ fn execute_in_session(
             owner,
             key,
             Some(&publisher),
-            session.received.as_ref(),
             Some(&inbox),
         )?;
         let candidate = owner.provisional_copy().map_err(str::to_owned)?;
         session.staged_workspace = Some(StagedWorkspace {
             publisher: Some(publisher),
-            received: session.received.clone(),
             inbox: Some(inbox),
             transition: WorkspaceTransition::CurrentView {
                 cut,
@@ -4487,16 +4371,7 @@ fn execute_in_session(
                 let accepted_through = session
                     .inbox
                     .as_ref()
-                    .map_or_else(
-                        || {
-                            session
-                                .received
-                                .as_ref()
-                                .and_then(|received| received.progress(query.author, &query.topics))
-                        },
-                        |inbox| Some(inbox.recovery_progress(query.author, &query.topics)),
-                    )
-                    .unwrap_or(0);
+                    .map_or(0, |inbox| inbox.recovery_progress(query.author, &query.topics));
                 json!({"state":"recovery_cutoff_observed", "workspace":owner.id(),
                 "author":query.author, "peer":pending.peer, "epoch":owner.epoch(), "revision":query.policy_revision,
                 "topics":query.topics.iter().map(|t|t.as_str()).collect::<Vec<_>>(),
@@ -5116,12 +4991,11 @@ fn execute_in_session(
         let workspace = pending
             .prepare_workspace(&proof, &welcome)
             .map_err(str::to_owned)?;
-        let snapshot = seal_state(session.records.is_some(), &workspace, key, None, None, None)?;
+        let snapshot = seal_state(session.records.is_some(), &workspace, key, None, None)?;
         let value = json!({"workspace":workspace.id(), "workspace_name":workspace.workspace_name().map_err(str::to_owned)?, "snapshot":snapshot, "state":"awaiting_join_save", "durable":false});
         session.staged_workspace = Some(StagedWorkspace {
             publisher: None,
-            received: None,
-            inbox: None,
+                inbox: None,
             transition: WorkspaceTransition::Join,
             workspace,
             snapshot,
@@ -5166,7 +5040,6 @@ fn execute_in_session(
                 .as_ref()
                 .ok_or("session has no protected root key")?,
             session.publisher.as_ref(),
-            session.received.as_ref(),
             session.inbox.as_ref(),
         )?;
         let mut value = json!({"workspace":workspace.id(),"workspace_name":workspace.workspace_name().map_err(str::to_owned)?,
@@ -5181,7 +5054,6 @@ fn execute_in_session(
         }
         session.staged_workspace = Some(StagedWorkspace {
             publisher: session.publisher.clone(),
-            received: session.received.clone(),
             inbox: session.inbox.clone(),
             transition: WorkspaceTransition::WorkspaceName,
             workspace,
@@ -5299,8 +5171,7 @@ fn execute_in_session(
             ) | (Request::AdoptJoin { .. }, WorkspaceTransition::Join)
                 | (
                     Request::AdoptRecovery { .. },
-                    WorkspaceTransition::Recovery(_)
-                        | WorkspaceTransition::InboxRecovery { .. }
+                    WorkspaceTransition::InboxRecovery { .. }
                         | WorkspaceTransition::DirectMiss { .. }
                 )
                 | (
@@ -5309,14 +5180,11 @@ fn execute_in_session(
                 )
                 | (
                     Request::AdoptPublication { .. },
-                    WorkspaceTransition::Publication(_)
-                        | WorkspaceTransition::RoutedPublication(..)
+                    WorkspaceTransition::RoutedPublication(..)
                 )
                 | (
                     Request::AdoptReception { .. },
-                    WorkspaceTransition::Reception(_)
-                        | WorkspaceTransition::RoutedReception(..)
-                        | WorkspaceTransition::Inbox
+                    WorkspaceTransition::Inbox
                         | WorkspaceTransition::InboxRejected
                 )
         );
@@ -5344,7 +5212,6 @@ fn execute_in_session(
             "workspace_name_missing_history":staged.workspace.workspace_name_missing_history().map_err(str::to_owned)?,
             "members":staged.workspace.member_count(), "durable":session.records.is_some()});
         session.publisher = staged.publisher;
-        session.received = staged.received;
         session.inbox = staged.inbox;
         if matches!(&staged.transition, WorkspaceTransition::Join) {
             transition_activity(session, WorkspacePhase::Synchronizing, None)?;
@@ -5376,13 +5243,6 @@ fn execute_in_session(
                 value["cut"] = json!(cut);
                 value["pending"] = json!(pending);
                 value["stale"] = json!(stale);
-            }
-            WorkspaceTransition::Recovery(publications) => {
-                value["state"] = json!("recovery_adopted");
-                value["publication_count"] = json!(publications.len());
-                // ponytail: bounded volatile handoff; a durable application outbox
-                // is required before claiming delivery across save/callback crashes.
-                session.recovered = publications.into();
             }
             WorkspaceTransition::RoutedPublication(
                 context,
@@ -5434,18 +5294,6 @@ fn execute_in_session(
                         value["network_error"] =
                             json!("publication deadline exceeded; outcome may be partial")
                     }
-                }
-            }
-            WorkspaceTransition::RoutedReception(context, message, recipients) => {
-                value["revision"] = json!(context.revision);
-                value["topic"] = json!(context.topic.as_str());
-                value["id"] = json!(context.id);
-                value["sequence"] = json!(context.sequence.map(|n| n.get()));
-                value["payload"] = json!(message.payload);
-                value["member"] = json!(message.member);
-                value["endpoint"] = json!(message.endpoint);
-                if !recipients.is_empty() {
-                    value["recipients"] = json!(recipients);
                 }
             }
             WorkspaceTransition::Management(action, commit) => {
@@ -5508,12 +5356,6 @@ fn execute_in_session(
                 session.join_lifecycle = None;
                 session.join_history_prefix.clear();
                 transition_activity(session, WorkspacePhase::Active, None)?;
-            }
-            WorkspaceTransition::Publication(ciphertext) => value["ciphertext"] = json!(ciphertext),
-            WorkspaceTransition::Reception(message) => {
-                value["payload"] = json!(message.payload);
-                value["member"] = json!(message.member);
-                value["endpoint"] = json!(message.endpoint);
             }
         }
         if joined && session.inbound_admission.is_some() {
@@ -5684,7 +5526,6 @@ fn execute_in_session(
             workspace,
             key,
             session.publisher.as_ref(),
-            session.received.as_ref(),
             session.inbox.as_ref(),
         )?;
         json!({"workspace": workspace.id(), "snapshot": snapshot})
@@ -5717,47 +5558,19 @@ fn execute_in_session(
             *ended = Some(guard.take().ok_or("node is closed")?);
             return Ok(value);
         }
-        let (restored, publisher, received, inbox) = if snapshot.starts_with(b"DFWB\x01") {
-            let (_, attachment) = arachne_security::Workspace::restore_with_attachment(
+        let (restored, publisher, inbox) = if snapshot.starts_with(b"DFWB\x01") {
+            let (owner, log, inbox) = arachne_delivery::inbox::ObjectInbox::restore(
                 key,
                 session.node.id(),
                 workspace,
                 &snapshot,
             )
             .map_err(str::to_owned)?;
-            if attachment.starts_with(b"DFOI\x01") {
-                let (owner, log, inbox) = arachne_delivery::inbox::ObjectInbox::restore(
-                    key,
-                    session.node.id(),
-                    workspace,
-                    &snapshot,
-                )
-                .map_err(str::to_owned)?;
-                let received = inbox.legacy_receipts().map_err(str::to_owned)?;
-                (owner, Some(log), received, Some(inbox))
-            } else {
-                let (owner, log, received) = arachne_delivery::PublisherLog::restore_with_receipts(
-                    key,
-                    session.node.id(),
-                    workspace,
-                    &snapshot,
-                )
-                .map_err(str::to_owned)?;
-                let (_, attachment) = arachne_security::Workspace::restore_with_attachment(
-                    key,
-                    session.node.id(),
-                    workspace,
-                    &snapshot,
-                )
-                .map_err(str::to_owned)?;
-                let received = attachment.starts_with(b"DFDL\x01").then_some(received);
-                (owner, Some(log), received, None)
-            }
+            (owner, Some(log), Some(inbox))
         } else {
             (
                 arachne_security::Workspace::restore(key, session.node.id(), workspace, &snapshot)
                     .map_err(str::to_owned)?,
-                None,
                 None,
                 None,
             )
@@ -5767,7 +5580,6 @@ fn execute_in_session(
             "workspace_name_missing_history":restored.workspace_name_missing_history().map_err(str::to_owned)?,
             "members": restored.member_count(), "member": member_metadata(&restored), "durable": false});
         session.publisher = publisher;
-        session.received = received;
         session.inbox = inbox;
         commit_workspace(session, restored);
         let mut value = value;
@@ -5967,9 +5779,7 @@ fn execute_in_session(
                     | Request::ControlExchange { .. }
                     | Request::StageNetworkPublication { .. }
                     | Request::PollProtected {}
-                    | Request::StagePublication { .. }
                     | Request::AdoptPublication { .. }
-                    | Request::StageReception { .. }
                     | Request::AdoptReception { .. }
                     | Request::AdoptRecovery { .. }
                     | Request::JoinViaPeer { .. }
@@ -5991,7 +5801,6 @@ fn execute_in_session(
                     | Request::StageCurrentView {}
                     | Request::AdoptCurrentView { .. }
                     | Request::CancelCurrentView {}
-                    | Request::PollRecoveredPublication {}
                     | Request::CancelRecoveryRange {}
                     | Request::PollAdmission { .. }
                     | Request::DriveWorkspace {}
@@ -6032,7 +5841,6 @@ fn execute_in_session(
                     | Request::RestorePendingJoin { .. }
                     | Request::CreateWorkspace { .. }
                     | Request::SealWorkspace {}
-                    | Request::EnableObjectDelivery {}
                     | Request::PollPendingObject { .. }
                     | Request::StageObjectAcknowledgement { .. }
                     | Request::StageObjectRejection { .. }
@@ -6501,6 +6309,23 @@ mod tests {
             serde_json::from_slice(&execute(handle, &serde_json::to_vec(&value).unwrap())?)
                 .map_err(|e| e.to_string())
         };
+        // Read the next pending inbox object and durably acknowledge it.
+        let take_pending = |handle| -> Value {
+            let pending = call(handle, json!({"op":"poll_pending_object"})).unwrap();
+            assert!(!pending.is_null(), "expected a pending object");
+            let staged = call(
+                handle,
+                json!({"op":"stage_object_acknowledgement", "member":pending["member"],
+                "topic":pending["topic"], "counter":pending["counter"], "id":pending["id"]}),
+            )
+            .unwrap();
+            call(
+                handle,
+                json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
+            )
+            .unwrap();
+            pending
+        };
         assert_eq!(
             call(a, json!({"op":"network_change"})).unwrap(),
             json!({"notified":true})
@@ -6781,31 +6606,33 @@ mod tests {
             (record.context.clone(), record.ciphertext.clone())
         };
         tampered_context.sequence = std::num::NonZeroU64::new(2);
-        assert!(
-            call(
-                joiner,
-                json!({"op":"stage_reception",
-            "context":tampered_context.authenticated_bytes(), "ciphertext":ciphertext})
-            )
-            .is_err()
-        );
-        tampered_context.sequence = None;
-        assert!(
-            call(
-                joiner,
-                json!({"op":"stage_reception",
-            "context":tampered_context.authenticated_bytes(), "ciphertext":ciphertext})
-            )
-            .is_err()
-        );
+        {
+            let shared = session(joiner).unwrap();
+            let guard = shared.lock().unwrap();
+            let owner = guard.as_ref().unwrap().workspace.as_ref().unwrap();
+            assert!(
+                owner
+                    .unprotect_object(
+                        b"streams",
+                        &tampered_context.authenticated_bytes(),
+                        &ciphertext
+                    )
+                    .is_err()
+            );
+        }
+        // The raw MLS application ops are gone; objects are the only path.
+        for op in ["stage_publication", "stage_reception", "enable_object_delivery"] {
+            assert!(call(joiner, json!({"op":op})).is_err());
+        }
         let network_received = call(joiner, json!({"op":"poll_protected"})).unwrap();
         assert!(network_received.get("payload").is_none());
         assert_eq!(network_received["state"], "awaiting_reception_save");
-        let delivered_network = call(
+        call(
             joiner,
             json!({"op":"adopt_reception","snapshot":network_received["snapshot"]}),
         )
         .unwrap();
+        let delivered_network = take_pending(joiner);
         assert_eq!(delivered_network["payload"], json!([0, 255, 77]));
         assert_eq!(delivered_network["sequence"], 1);
         assert_eq!(delivered_network["id"], json!(vec![10; 16]));
@@ -6835,57 +6662,15 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(5));
         };
-        let reverse_delivered = call(
+        call(
             admin,
             json!({"op":"adopt_reception","snapshot":incoming["snapshot"]}),
         )
         .unwrap();
+        let reverse_delivered = take_pending(admin);
         assert_eq!(reverse_delivered["payload"], json!([9]));
         assert_eq!(reverse_delivered["member"], pending["member"]["id"]);
-        let context = b"workspace/topic/publication".to_vec();
-        let publication = json!({"op":"stage_publication","context":context,"payload":[0,255,42]});
-        let staged = call(admin, publication.clone()).unwrap();
-        assert_eq!(staged["state"], "awaiting_publication_save");
-        assert!(staged.get("ciphertext").is_none() && staged.get("payload").is_none());
-        assert!(call(admin, publication.clone()).is_err());
-        assert!(call(admin, json!({"op":"seal_workspace"})).is_err());
-        assert!(
-            call(
-                admin,
-                json!({"op":"adopt_reception","snapshot":staged["snapshot"]})
-            )
-            .is_err()
-        );
-        assert!(
-            call(
-                admin,
-                json!({"op":"adopt_publication","snapshot":saved["snapshot"]})
-            )
-            .is_err()
-        );
-        let released = call(
-            admin,
-            json!({"op":"adopt_publication","snapshot":staged["snapshot"]}),
-        )
-        .unwrap();
-        assert!(released.get("ciphertext").is_some());
-        assert!(
-            call(
-                admin,
-                json!({"op":"adopt_publication","snapshot":staged["snapshot"]})
-            )
-            .is_err()
-        );
         assert!(call(admin, json!({"op":"publish","workspace":created["workspace"],"revision":1,"topic":"sample","payload":[1]})).is_err());
-        let reception =
-            json!({"op":"stage_reception","context":context,"ciphertext":released["ciphertext"]});
-        let mut wrong = reception.clone();
-        wrong["context"] = json!([1]);
-        assert!(call(joiner, wrong).is_err());
-        // Rejection mutated only a disposable candidate, not the active receiver.
-        let received = call(joiner, reception.clone()).unwrap();
-        assert_eq!(received["state"], "awaiting_reception_save");
-        assert!(received.get("payload").is_none() && received.get("member").is_none());
         assert!(call(joiner, json!({"op":"poll"})).is_err());
         assert!(
             call(
@@ -6894,17 +6679,20 @@ mod tests {
             )
             .is_err()
         );
-        let delivered = call(
-            joiner,
-            json!({"op":"adopt_reception","snapshot":received["snapshot"]}),
-        )
-        .unwrap();
-        assert_eq!(delivered["payload"], json!([0, 255, 42]));
-        assert_eq!(delivered["member"], created["member"]["id"]);
+        let [_, received] = execute_stored(joiner, br#"{"op":"seal_workspace"}"#, &[]).unwrap();
         close(joiner).unwrap();
         let joiner = create(Some(&[42; 32])).unwrap();
-        call(joiner, json!({"op":"restore_workspace","workspace":created["workspace"],"snapshot":received["snapshot"]})).unwrap();
-        assert!(call(joiner, reception).is_err());
+        execute_stored(
+            joiner,
+            &serde_json::to_vec(
+                &json!({"op":"restore_workspace","workspace":created["workspace"]}),
+            )
+            .unwrap(),
+            &received,
+        )
+        .unwrap();
+        // The acknowledged object stays acknowledged after restore.
+        assert!(call(joiner, json!({"op":"poll_pending_object"})).unwrap().is_null());
         // Simulate process ownership loss after candidate persistence but before
         // adoption. No filesystem/power-loss claim: the record is held in RAM.
         let request = serde_json::to_vec(&json!({"op":"stage_network_publication","revision":17,"topic":"streams/sample","id":vec![12;16],"payload":[7]})).unwrap();
@@ -7480,75 +7268,41 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(
-            call(joiner, json!({"op":"poll_protected"}))
-                .unwrap()
-                .is_null(),
-            "live reception must wait for pending recovery"
-        );
-        assert_eq!(
-            call(
-                joiner,
-                json!({"op":"stage_reception", "context":[], "ciphertext":[]})
-            )
-            .unwrap_err(),
-            "recovery must finish before live reception"
-        );
-
         poll_recovery();
         assert_eq!(poll_range(joiner).unwrap()["packet_count"], 7);
-        assert_eq!(
-            call(joiner, json!({"op":"poll_recovered_publication"})).unwrap(),
-            Value::Null
-        );
-        assert!(
-            call(joiner, json!({"op":"poll_protected"}))
-                .unwrap()
-                .is_null(),
-            "live reception must wait for ready recovery"
-        );
         let [metadata, recovery_snapshot] =
             execute_stored(joiner, br#"{"op":"stage_recovery_range"}"#, &[]).unwrap();
         let metadata: Value = serde_json::from_slice(&metadata).unwrap();
         assert_eq!(metadata["state"], "awaiting_recovery_save");
         assert_eq!(metadata["publication_count"], 7);
         assert!(metadata.get("payload").is_none() && metadata.get("snapshot").is_none());
-        assert!(call(joiner, json!({"op":"poll_recovered_publication"})).is_err());
         assert!(
             execute_stored(joiner, br#"{"op":"adopt_reception"}"#, &recovery_snapshot).is_err()
         );
         let mut corrupt = recovery_snapshot.clone();
         *corrupt.last_mut().unwrap() ^= 1;
         assert!(execute_stored(joiner, br#"{"op":"adopt_recovery"}"#, &corrupt).is_err());
-        {
-            let shared = session(joiner).unwrap();
-            let guard = shared.lock().unwrap();
-            assert!(guard.as_ref().unwrap().received.is_none());
-        }
         let adopted =
             execute_stored(joiner, br#"{"op":"adopt_recovery"}"#, &recovery_snapshot).unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&adopted[0]).unwrap()["publication_count"],
             7
         );
-        assert!(call(joiner, json!({"op":"seal_workspace"})).is_err());
+        // Recovered objects wait in the durable inbox like live ones.
         for id in 90..97 {
-            let recovered = call(joiner, json!({"op":"poll_recovered_publication"})).unwrap();
+            let recovered = take_pending(joiner);
             assert_eq!(recovered["payload"], json!([id]));
             assert_eq!(recovered["id"], json!(vec![id; 16]));
             assert_eq!(recovered["topic"], "streams/other");
         }
-        assert_eq!(
-            call(joiner, json!({"op":"poll_recovered_publication"})).unwrap(),
-            Value::Null
-        );
+        assert!(call(joiner, json!({"op":"poll_pending_object"})).unwrap().is_null());
         assert!(execute_stored(joiner, br#"{"op":"adopt_recovery"}"#, &recovery_snapshot).is_err());
         call(joiner, recover.clone()).unwrap();
         poll_recovery();
         poll_range(joiner).unwrap();
         assert_eq!(
             call(joiner, json!({"op":"stage_recovery_range"})).unwrap()["state"],
-            "recovery_already_covered"
+            "recovery_no_new_objects"
         );
         // Ordinary outgoing traffic must preserve the newly adopted receive state.
         let outgoing = call(
@@ -7564,36 +7318,24 @@ mod tests {
         .unwrap();
         let live = poll_result(joiner, "poll_protected").unwrap();
         assert!(live.get("payload").is_none());
-        let live = call(
+        call(
             joiner,
             json!({"op":"adopt_reception", "snapshot":live["snapshot"]}),
         )
         .unwrap();
-        assert_eq!(live["payload"], json!([8]));
+        assert_eq!(take_pending(joiner)["payload"], json!([8]));
+        // The live object was already received: recovery finds nothing new.
         let mut continuation = recover;
         continuation["after"] = json!(head);
         continuation["through"] = json!(head + 1);
         call(joiner, continuation).unwrap();
         poll_recovery();
         poll_range(joiner).unwrap();
-        let [metadata, snapshot] =
-            execute_stored(joiner, br#"{"op":"stage_recovery_range"}"#, &[]).unwrap();
-        let metadata: Value = serde_json::from_slice(&metadata).unwrap();
-        assert_eq!(metadata["publication_count"], 0);
-        assert_eq!(metadata["already_received"], 1);
-        execute_stored(joiner, br#"{"op":"adopt_recovery"}"#, &snapshot).unwrap();
+        assert_eq!(
+            call(joiner, json!({"op":"stage_recovery_range"})).unwrap()["state"],
+            "recovery_no_new_objects"
+        );
         let [_, durable] = execute_stored(joiner, br#"{"op":"seal_workspace"}"#, &[]).unwrap();
-        let journal_before = {
-            let shared = session(joiner).unwrap();
-            let guard = shared.lock().unwrap();
-            guard
-                .as_ref()
-                .unwrap()
-                .received
-                .as_ref()
-                .unwrap()
-                .snapshot()
-        };
         let mut pending_on_close = discover_request;
         pending_on_close["revision"] = json!(19);
         pending_on_close["topics"] = json!(["streams/other"]);
@@ -7625,50 +7367,15 @@ mod tests {
             let shared = session(restored).unwrap();
             let guard = shared.lock().unwrap();
             let session = guard.as_ref().unwrap();
-            assert_eq!(
-                session.received.as_ref().unwrap().snapshot(),
-                journal_before
-            );
-            let selection = BTreeSet::from([Topic::new("streams/other").unwrap()]);
-            let author = session
-                .workspace
-                .as_ref()
-                .unwrap()
-                .member_id_for_endpoint(peer)
-                .unwrap();
-            assert_eq!(
-                session
-                    .received
-                    .as_ref()
-                    .unwrap()
-                    .progress(author, &selection),
-                Some(head + 1)
-            );
             assert!(session.publisher.as_ref().unwrap().head() > 0);
+            assert_eq!(session.inbox.as_ref().unwrap().pending_count(), 0);
         }
-        assert_eq!(
-            call(restored, json!({"op":"poll_recovered_publication"})).unwrap(),
-            Value::Null
-        );
-        // Compose signed-object delivery with real native/Iroh lifecycle. Keep
-        // legacy receipts and publisher history; do not reset saved workspaces.
-        for handle in [admin, restored] {
-            let staged = call(handle, json!({"op":"enable_object_delivery"})).unwrap();
-            assert!(staged.get("payload").is_none());
-            assert!(call(handle, json!({"op":"poll_pending_object"})).is_err());
-            call(
-                handle,
-                json!({"op":"adopt_reception", "snapshot":staged["snapshot"]}),
-            )
-            .unwrap();
-            if handle == admin {
-                call(
-                handle,
-                json!({"op":"install_member_policy", "revision":20,"topics":["streams/objects"]}),
-            )
-            .unwrap();
-            }
-        }
+        assert!(call(restored, json!({"op":"poll_pending_object"})).unwrap().is_null());
+        call(
+            admin,
+            json!({"op":"install_member_policy", "revision":20,"topics":["streams/objects"]}),
+        )
+        .unwrap();
         let send_object = |number: u8| {
             let staged = call(
                 admin,
@@ -7743,21 +7450,7 @@ mod tests {
             call(restored, json!({"op":"poll_pending_object"})).unwrap(),
             pending
         );
-        {
-            let shared = session(restored).unwrap();
-            let guard = shared.lock().unwrap();
-            assert_eq!(
-                guard
-                    .as_ref()
-                    .unwrap()
-                    .received
-                    .as_ref()
-                    .unwrap()
-                    .snapshot(),
-                journal_before
-            );
-        }
-        let ack = |handle, pending: &Value| {
+        let ack =|handle, pending: &Value| {
             let request = json!({"op":"stage_object_acknowledgement", "member":pending["member"],
                 "topic":pending["topic"], "id":pending["id"], "counter":pending["counter"]});
             let mut wrong = request.clone();

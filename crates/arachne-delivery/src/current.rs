@@ -911,7 +911,11 @@ mod tests {
                 sequence: NonZeroU64::new(sequence),
             };
             let ciphertext = publisher
-                .protect_application(&context.authenticated_bytes(), payload)
+                .protect_object(
+                    context.topic.namespace().as_bytes(),
+                    &context.authenticated_bytes(),
+                    payload,
+                )
                 .unwrap();
             CurrentValue {
                 replacement_key: [key; 32],
@@ -1033,7 +1037,11 @@ mod tests {
                 sequence: NonZeroU64::new(sequence),
             };
             let ciphertext = publisher
-                .protect_application(&context.authenticated_bytes(), payload)
+                .protect_object(
+                    context.topic.namespace().as_bytes(),
+                    &context.authenticated_bytes(),
+                    payload,
+                )
                 .unwrap();
             let packet = context.packet(&ciphertext).unwrap();
             (context, packet)
@@ -1070,7 +1078,11 @@ mod tests {
             sequence: NonZeroU64::new(1),
         };
         let revision_eight_object = publisher
-            .protect_application(&revision_eight.authenticated_bytes(), b"new policy")
+            .protect_object(
+                revision_eight.topic.namespace().as_bytes(),
+                &revision_eight.authenticated_bytes(),
+                b"new policy",
+            )
             .unwrap();
         // Revision 8 supersedes revision 7, which serve() can no longer authorize.
         let mut superseded = index.clone();
@@ -1191,7 +1203,11 @@ mod tests {
                 sequence: NonZeroU64::new(sequence),
             };
             let ciphertext = publisher
-                .protect_application(&context.authenticated_bytes(), b"value")
+                .protect_object(
+                    context.topic.namespace().as_bytes(),
+                    &context.authenticated_bytes(),
+                    b"value",
+                )
                 .unwrap();
             let packet = context.packet(&ciphertext).unwrap();
             index.insert(

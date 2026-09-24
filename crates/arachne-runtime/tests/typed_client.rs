@@ -1,6 +1,6 @@
 use arachne_runtime::{
     Client, ClientConfig, ErrorKind, JoinAdmissionStep, MemberKind, Network, PeerPolicy, Presence,
-    RecoveredPublication, RecoveryRangeRequest, RecoveryRangeStatus, WorkspacePhase,
+    ReceivedProtectedPublication, RecoveryRangeRequest, RecoveryRangeStatus, WorkspacePhase,
 };
 use std::time::{Duration, Instant};
 
@@ -62,8 +62,8 @@ fn typed_client_exposes_recovery_result_without_vendor_types() {
     .unwrap();
     client.create_workspace("Owner", None).unwrap();
 
-    let recovered: Option<RecoveredPublication> = client.poll_recovered_publication().unwrap();
-    assert!(recovered.is_none());
+    let pending: Option<ReceivedProtectedPublication> = client.poll_pending_object().unwrap();
+    assert!(pending.is_none());
     client.close().unwrap();
 }
 
@@ -201,19 +201,17 @@ fn typed_clients_recover_an_opaque_publication() {
     let adoption = reader.adopt_recovery(&staged.snapshot).unwrap();
     assert_eq!(adoption.recovered_publications, 1);
 
-    let recovered = loop {
-        if let Some(publication) = reader.poll_recovered_publication().unwrap() {
-            break publication;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "typed recovery publication did not arrive"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    };
+    // Recovered objects wait in the durable inbox until acknowledged.
+    let recovered = reader.poll_pending_object().unwrap().unwrap();
     assert_eq!(recovered.workspace, workspace.workspace);
     assert_eq!(recovered.topic, "streams/example");
     assert_eq!(recovered.payload, payload);
+    assert_eq!(reader.poll_pending_object().unwrap(), Some(recovered.clone()));
+    let acknowledged = reader.stage_object_acknowledgement(&recovered).unwrap();
+    reader
+        .adopt_protected_reception(&acknowledged.snapshot)
+        .unwrap();
+    assert_eq!(reader.poll_pending_object().unwrap(), None);
 
     reader.close().unwrap();
     owner.close().unwrap();

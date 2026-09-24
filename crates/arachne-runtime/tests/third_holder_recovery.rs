@@ -125,11 +125,6 @@ fn retained_replay_delivers_events_current_values_and_deletions() {
     let invite = call(author, json!({"op":"issue_invitation"}));
     add(author, reader, &invite, vec![], "Reader");
     for handle in [author, reader] {
-        let staged = call(handle, json!({"op":"enable_object_delivery"}));
-        call(
-            handle,
-            json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
-        );
         call(
             handle,
             json!({"op":"install_workspace_policy","revision":2}),
@@ -238,11 +233,6 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
         }
     }
     for handle in [author, stale_holder, fresh_holder, reader] {
-        let staged = call(handle, json!({"op":"enable_object_delivery"}));
-        call(
-            handle,
-            json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
-        );
         call(
             handle,
             json!({"op":"install_workspace_policy","revision":4}),
@@ -474,11 +464,6 @@ fn intended_recipient_recovers_private_tail_from_restarted_holder() {
         );
     }
     for handle in [author, holder, reader, observer] {
-        let staged = call(handle, json!({"op":"enable_object_delivery"}));
-        call(
-            handle,
-            json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
-        );
         call(
             handle,
             json!({"op":"install_workspace_policy","revision":4}),
@@ -672,11 +657,6 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
         );
     }
     for handle in [author, holder, reader, empty_holder] {
-        let staged = call(handle, json!({"op":"enable_object_delivery"}));
-        call(
-            handle,
-            json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
-        );
         call(
             handle,
             json!({"op":"install_workspace_policy","revision":4}),
@@ -944,11 +924,6 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     call(
         reader,
         json!({"op":"adopt_admission","snapshot":accepted["snapshot"]}),
-    );
-    let enabled = call(reader, json!({"op":"enable_object_delivery"}));
-    call(
-        reader,
-        json!({"op":"adopt_reception","snapshot":enabled["snapshot"]}),
     );
     call(
         reader,

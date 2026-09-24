@@ -11,8 +11,6 @@ const JOIN_LIFECYCLE: &[u8] = b"runtime/join-lifecycle";
 const ACTIVITY: &[u8] = b"runtime/activity";
 const RESET: &[u8] = b"runtime/reset";
 const REMOVED: &[u8] = b"runtime/removed";
-const PUBLISHER: &[u8] = b"delivery/publisher";
-const RECEIVED: &[u8] = b"delivery/received";
 const INBOX: &[u8] = b"delivery/inbox";
 
 pub(super) struct NativeStore {
@@ -59,7 +57,6 @@ pub(super) fn candidate_token() -> Result<Vec<u8>, String> {
 fn active_records(
     owner: &Workspace,
     publisher: Option<&arachne_delivery::PublisherLog>,
-    received: Option<&arachne_delivery::receive::ReceiveJournal>,
     inbox: Option<&arachne_delivery::inbox::ObjectInbox>,
     activity: &WorkspaceActivity,
 ) -> Result<SecurityRecords, String> {
@@ -68,38 +65,19 @@ fn active_records(
         ACTIVITY.to_vec(),
         Zeroizing::new(serde_json::to_vec(activity).map_err(|error| error.to_string())?),
     );
-    if let Some(inbox) = inbox {
-        records.insert(
-            INBOX.to_vec(),
-            Zeroizing::new(
-                inbox
-                    .with_legacy_receipts(received)
-                    .snapshot_with_publisher(owner, publisher.ok_or("inbox requires publisher")?)
-                    .map_err(str::to_owned)?,
-            ),
-        );
-    } else {
-        if let Some(publisher) = publisher {
-            let snapshot = publisher.snapshot();
-            // Validate the same owner binding as legacy sealed persistence.
-            arachne_delivery::PublisherLog::restore(
-                owner.id(),
-                owner.member().ok_or("member required")?.id(),
-                owner.epoch(),
-                &snapshot,
-            )
-            .map_err(str::to_owned)?;
-            records.insert(PUBLISHER.to_vec(), Zeroizing::new(snapshot));
+    match (inbox, publisher) {
+        (Some(inbox), Some(publisher)) => {
+            records.insert(
+                INBOX.to_vec(),
+                Zeroizing::new(
+                    inbox
+                        .snapshot_with_publisher(owner, publisher)
+                        .map_err(str::to_owned)?,
+                ),
+            );
         }
-        if let Some(received) = received {
-            if publisher.is_none() {
-                return Err("receive journal requires publisher".into());
-            }
-            let snapshot = received.snapshot();
-            arachne_delivery::receive::ReceiveJournal::restore(owner.id(), owner.epoch(), &snapshot)
-                .map_err(str::to_owned)?;
-            records.insert(RECEIVED.to_vec(), Zeroizing::new(snapshot));
-        }
+        (None, None) => {}
+        _ => return Err("object inbox and publisher state go together".into()),
     }
     Ok(records)
 }
@@ -133,7 +111,6 @@ fn idle(session: &Session) -> Result<(), String> {
         || session.ready_current_view.is_some()
         || session.range.is_some()
         || session.ready_range.is_some()
-        || !session.recovered.is_empty()
     {
         return Err("record storage requires an idle session".into());
     }
@@ -160,7 +137,6 @@ pub fn enable_record_storage(handle: i64, path: &Path, root: &[u8; 32]) -> Resul
             active_records(
                 owner,
                 session.publisher.as_ref(),
-                session.received.as_ref(),
                 session.inbox.as_ref(),
                 &session.activity,
             )?,
@@ -212,7 +188,6 @@ pub(super) fn commit_candidate(session: &mut Session, token: &[u8]) -> Result<()
         active_records(
             &staged.workspace,
             staged.publisher.as_ref(),
-            staged.received.as_ref(),
             staged.inbox.as_ref(),
             &activity,
         )?
@@ -408,7 +383,7 @@ pub fn restore_record_storage_with_freshness(
     }
     for name in store.keys(b"") {
         if !name.starts_with(b"security/")
-            && ![TOKEN, PUBLISHER, RECEIVED, INBOX, ACTIVITY].contains(&name)
+            && ![TOKEN, INBOX, ACTIVITY].contains(&name)
         {
             return Err("unknown native runtime record".into());
         }
@@ -419,37 +394,14 @@ pub fn restore_record_storage_with_freshness(
         .collect::<Result<_, String>>()?;
     let owner = Workspace::restore_records(session.node.id(), workspace, &security)
         .map_err(str::to_owned)?;
-    let (publisher, received, inbox) = if let Some(bytes) = get(INBOX)? {
-        if get(PUBLISHER)?.is_some() || get(RECEIVED)?.is_some() {
-            return Err("mixed delivery records".into());
+    let (publisher, inbox) = match get(INBOX)? {
+        Some(bytes) => {
+            let (publisher, inbox) =
+                arachne_delivery::inbox::ObjectInbox::restore_snapshot(&owner, &bytes)
+                    .map_err(str::to_owned)?;
+            (Some(publisher), Some(inbox))
         }
-        let (publisher, inbox) =
-            arachne_delivery::inbox::ObjectInbox::restore_snapshot(&owner, &bytes)
-                .map_err(str::to_owned)?;
-        let received = inbox.legacy_receipts().map_err(str::to_owned)?;
-        (Some(publisher), received, Some(inbox))
-    } else {
-        let publisher = get(PUBLISHER)?
-            .map(|bytes| {
-                arachne_delivery::PublisherLog::restore(
-                    workspace,
-                    owner.member().ok_or("member required")?.id(),
-                    owner.epoch(),
-                    &bytes,
-                )
-            })
-            .transpose()
-            .map_err(str::to_owned)?;
-        let received = get(RECEIVED)?
-            .map(|bytes| {
-                arachne_delivery::receive::ReceiveJournal::restore(workspace, owner.epoch(), &bytes)
-            })
-            .transpose()
-            .map_err(str::to_owned)?;
-        if received.is_some() && publisher.is_none() {
-            return Err("receive journal requires publisher".into());
-        }
-        (publisher, received, None)
+        None => (None, None),
     };
     let value = json!({"workspace":workspace,"workspace_name":owner.workspace_name().map_err(str::to_owned)?,"epoch":owner.epoch(),"members":owner.member_count(),
         "member":member_metadata(&owner),"durable":true});
@@ -467,7 +419,6 @@ pub fn restore_record_storage_with_freshness(
     value["activity"] = activity.projection();
     session.activity = activity;
     session.publisher = publisher;
-    session.received = received;
     session.inbox = inbox;
     commit_workspace(session, owner);
     session.records = Some(NativeStore { store, committed });
