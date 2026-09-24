@@ -299,3 +299,30 @@ needs A3.
   mitigation.
 - **External commit to rejoin after a deep fork.** A removed member has the same old state as an
   honest member, so it could add itself back. Admin re-add is used instead.
+
+## Corrections found during implementation (steps 1 and 7, `b995fba`, `624c658`)
+
+These corrections replace the text above where they conflict.
+
+1. **Settlement.** Epoch E settles when every member of E reports E+1 or later. A report of E
+   alone does not prove that the member merged the commit out of E. (Section 4 said "E or later".)
+2. **Removed members** never report E+1, so an epoch whose commit removes a member settles only by
+   the window.
+3. **The real window** is smaller than 64 epochs when snapshots are large: 16 MiB holds about 24
+   snapshots of bundle size (~656 KiB). Document the real window in `docs/security.md` (step 13).
+   Test T7 holds only for small snapshots.
+4. **Commit bytes** for the fork key are exactly the commit bytes stored in history. Every node
+   must hash the same bytes.
+5. **Never trust a peer's key.** Recompute the fork key from the verified step before a switch.
+   A `BranchReply` can claim any class.
+6. **Bind snapshots to epochs.** After unsealing a snapshot, check `epoch() == fork_epoch`.
+7. **Keep the `DFBR` branch record inside the sealed workspace store.** The record is not
+   authenticated by itself; only the snapshots in it are sealed.
+8. **`fork_key` takes only an authorization already verified against that commit**, or a history
+   tag could relabel a Promote as a Removal.
+9. **Workspace-name records** are not MLS commits and have no class. Give them one if they ever
+   become membership steps.
+
+API note: `BranchState` uses `first_unsettled` (= `settled_epoch + 1`). `prepare_branch_switch`
+takes no steps; unseal and replay belong to the wiring (step 8). The switched state keeps the
+snapshot at the fork epoch F, so replay retains from F+1.

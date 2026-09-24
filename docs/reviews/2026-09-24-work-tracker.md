@@ -38,8 +38,10 @@ and a different Core pin. Core work that each plan step depends on:
 
 ## Architecture work (needs design first)
 
-- [ ] **A1** One typed, versioned contract; stable error codes; `#[non_exhaustive]`; consider UniFFI.
-- [ ] **A2** Commit-ordering authority. **Decision open:** sequencer admin vs deterministic tie-break (recommended).
+- [ ] **A1** — step 1 done (`arachne-api`, `71cc9db`); UniFFI spike running.
+  Original: One typed, versioned contract; stable error codes; `#[non_exhaustive]`; consider UniFFI.
+- [ ] **A2** — steps 1, 7 done (`b995fba`, `624c658`); ADR corrected. Wiring steps 2–6, 8–13 open.
+  Original: Commit-ordering authority. **Decision open:** sequencer admin vs deterministic tie-break (recommended).
 - [ ] **A3** Decouple delivery and routing from the exact epoch and policy revision.
 - [ ] **A4** Owned `Context`, event stream, `wait_for_work(timeout)`, `close(&self)`, suspend/resume.
 - [ ] **A5** One persistence mode behind a `Storage` trait; schema versions and migrations.
