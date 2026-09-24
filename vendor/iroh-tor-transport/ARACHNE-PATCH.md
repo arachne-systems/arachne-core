@@ -43,12 +43,26 @@ iroh `SecretKey`, and the Tor key blob is only a SHA-512 expansion.
    - `PROTOCOLINFO 1`, parsed for `AUTH METHODS=` and an optional
      `COOKIEFILE=` QuotedString (backslash and C octal escapes). Unknown
      methods are ignored (torut rejected the whole reply).
-   - `AUTHENTICATE`: the same choice as torut's `make_auth_data`: `NULL` if
-     offered; otherwise, if `SAFECOOKIE` or `COOKIE` is offered with a cookie
-     file, the first 32 bytes of the file as plain `COOKIE` auth (upper-case
-     hex). If no method works without a password, `build()` still skips
-     `AUTHENTICATE`, as upstream did. `SAFECOOKIE` challenge-response and
-     `HASHEDPASSWORD` are not implemented (torut did not do them either).
+   - `AUTHENTICATE`: `NULL` if offered. Otherwise, if Tor gives a cookie
+     file, `SAFECOOKIE` if offered, else plain `COOKIE` (the cookie as
+     upper-case hex). The cookie file must be exactly 32 bytes, or
+     `build()` fails with `AuthMethod`. If no method works without a
+     password, `build()` still skips `AUTHENTICATE`, as upstream did.
+     `HASHEDPASSWORD` is not implemented.
+   - **`SAFECOOKIE` (not in torut, which sent plain `COOKIE` also when only
+     `SAFECOOKIE` was offered):** control-spec 3.24. A 32-byte client nonce
+     from `getrandom`, `AUTHCHALLENGE SAFECOOKIE <hex nonce>`, then the
+     one-line reply `AUTHCHALLENGE SERVERHASH=<64 hex> SERVERNONCE=<64 hex>`
+     is parsed (both fields once, no other fields, hex in either case).
+     `SERVERHASH` must equal HMAC-SHA256 with key
+     `"Tor safe cookie authentication server-to-controller hash"` over
+     `cookie || client nonce || server nonce`; the compare is constant time
+     (`hmac` `verify_slice`). On a mismatch the client fails closed with
+     `ControlError::Protocol` and sends no `AUTHENTICATE`. Otherwise it sends
+     `AUTHENTICATE <hex HMAC-SHA256>` with key
+     `"Tor safe cookie authentication controller-to-server hash"` over the
+     same message. This proves that the control port is the Tor that wrote
+     the cookie before the cookie-derived secret is sent.
    - `ADD_ONION ED25519-V3:<blob> Flags=DiscardPK Port=<port>,<addr> ` with
      the trailing space, byte-for-byte what torut sent. The `ServiceID=` of
      the reply is returned.
@@ -92,6 +106,16 @@ iroh `SecretKey`, and the Tor key blob is only a SHA-512 expansion.
   rejection, reply parser bounds and errors, QuotedString decoding, auth
   selection, and an ignored live-Tor test that requires Tor's `ServiceID` to
   equal the derived address.
+- `SAFECOOKIE` tests against a scripted fake control stream: the expected
+  HMACs come from an HMAC-SHA256 written out with plain SHA-256 in the test
+  (checked against RFC 4231 case 2) and a vector pinned from Python's `hmac`
+  module; the happy path; `SERVERHASH` mismatches (flipped bit, reflected
+  client hash, wrong cookie, swapped nonces) fail with no `AUTHENTICATE`
+  sent; malformed `AUTHCHALLENGE` replies fail with no `AUTHENTICATE` sent;
+  `SAFECOOKIE` is preferred over `COOKIE` end to end with a random nonce;
+  cookie files of 0, 31, 33 and 4096 bytes are rejected. The live test was
+  run against Tor 0.4.9.11 with `CookieAuthentication 1`
+  (`AUTH METHODS=COOKIE,SAFECOOKIE`) and passed through `SAFECOOKIE`.
 - Before torut was removed, a temporary test module ran torut and the new
   code side by side (RFC seeds, edge seeds and 64 random keys) and required
   identical expanded keys, public keys, onion addresses, and `PROTOCOLINFO`,
@@ -109,7 +133,9 @@ iroh `SecretKey`, and the Tor key blob is only a SHA-512 expansion.
   `description`, keyword `arachne` added and `networking` dropped (crates.io
   allows five), new `repository`, `homepage`, `documentation`,
   `publish = ["crates-io"]` and `exclude = ["Cargo.toml.orig"]` fields.
-  Dependencies: `torut` removed, `sha3 = "0.11.0"` added. The `echo` test
+  Dependencies: `torut` removed, `sha3 = "0.11.0"` added, and for
+  `SAFECOOKIE` `hmac = "0.12"` and `getrandom = "0.4"` added (both already
+  in the workspace lock; no new crates). The `echo` test
   target is removed. `Cargo.toml.orig` is the unchanged upstream original.
 - `README.md`: a fork banner at the top.
 - `ARACHNE-PATCH.md` (this file) is added.

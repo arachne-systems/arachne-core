@@ -272,6 +272,8 @@ dependencies = [
  "bytes",
  "clap",
  "data-encoding",
+ "getrandom 0.4.3",
+ "hmac 0.12.1",
  "iroh",
  "iroh-base",
  "n0-error",
