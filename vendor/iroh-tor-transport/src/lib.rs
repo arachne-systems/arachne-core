@@ -3,6 +3,9 @@
 //! This crate provides utilities for creating Tor hidden services that can be used
 //! as a custom transport for iroh networking.
 
+mod control;
+mod onion;
+
 use std::{collections::HashMap, future::Future, io, num::NonZeroUsize, pin::Pin, sync::Arc};
 
 use bytes::Bytes;

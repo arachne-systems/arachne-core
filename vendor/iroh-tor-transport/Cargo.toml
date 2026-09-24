@@ -84,6 +84,9 @@ version = "1.0"
 [dependencies.sha2]
 version = "0.10"
 
+[dependencies.sha3]
+version = "0.11.0"
+
 [dependencies.tokio]
 version = "1"
 features = ["full"]

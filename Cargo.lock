@@ -279,6 +279,7 @@ dependencies = [
  "n0-watcher",
  "noq-udp",
  "sha2 0.10.9",
+ "sha3 0.11.0",
  "tokio",
  "tokio-socks",
  "tokio-test",

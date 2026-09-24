@@ -1,5 +1,6 @@
 //! Internal tests for packet protocol and sender.
 
+mod torut_equivalence;
 mod user_transport;
 
 use std::{
