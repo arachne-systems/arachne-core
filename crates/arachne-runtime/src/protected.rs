@@ -11,6 +11,16 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
         .storage_key
         .as_ref()
         .ok_or("session has no protected root key")?;
+    if let Request::StageNetworkPublication {
+        workspace: Some(workspace),
+        ..
+    } = &request
+    {
+        // Reject before anything is staged so the session stays usable.
+        if *workspace != owner.id() {
+            return Err("invalid publication workspace for this session".into());
+        }
+    }
     let incoming = if matches!(request, Request::PollProtected {}) {
         // Bounded drain of local echoes. ATAK already owns its own outgoing
         // event; MLS cannot decrypt its own sent application ciphertext.
@@ -41,6 +51,7 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
     let mut inbox = session.inbox.clone();
     let (transition, state) = match request {
         Request::StageNetworkPublication {
+            workspace: _,
             revision,
             topic,
             id,

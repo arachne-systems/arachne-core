@@ -911,6 +911,7 @@ impl Client {
     ) -> Result<PublicationCandidate> {
         let request = serde_json::to_vec(&json!({
             "op": "stage_network_publication",
+            "workspace": workspace,
             "revision": revision,
             "topic": topic,
             "id": id,

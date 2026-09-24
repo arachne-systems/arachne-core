@@ -220,6 +220,40 @@ fn typed_clients_recover_an_opaque_publication() {
 }
 
 #[test]
+fn typed_client_rejects_wrong_publication_workspace_before_staging() {
+    let mut client = Client::open(ClientConfig {
+        network: Network::Direct,
+        secret: Some([18; 32]),
+    })
+    .unwrap();
+    let workspace = client.create_workspace("Owner", None).unwrap();
+    let revision = workspace.epoch + 1;
+    client.install_workspace_policy(revision).unwrap();
+
+    let mut other = workspace.workspace;
+    other[0] ^= 1;
+    let rejected = client
+        .stage_protected_publication(other, revision, "streams/example", [1; 16], vec![1])
+        .unwrap_err();
+    assert_eq!(rejected.kind(), ErrorKind::InvalidInput, "{rejected}");
+
+    // Nothing was staged: the session still accepts ordinary operations.
+    client.member_roster().unwrap();
+    let staged = client
+        .stage_protected_publication(
+            workspace.workspace,
+            revision,
+            "streams/example",
+            [2; 16],
+            vec![2],
+        )
+        .unwrap();
+    assert_eq!(staged.workspace, workspace.workspace);
+    client.adopt_protected_publication(&staged.snapshot).unwrap();
+    client.close().unwrap();
+}
+
+#[test]
 fn typed_client_exposes_workspace_roster_and_profile_projection() {
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,

@@ -980,6 +980,9 @@ enum Request {
         peer: [u8; 32],
     },
     StageNetworkPublication {
+        /// When present, must name the session workspace; checked before staging.
+        #[serde(default)]
+        workspace: Option<[u8; 32]>,
         revision: u64,
         topic: String,
         id: [u8; 16],
