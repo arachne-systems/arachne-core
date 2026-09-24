@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use arachne_api::{ApiError, ErrorCode};
 
@@ -9,7 +9,7 @@ use crate::ops::{self, Op, admission, candidate, invitation, join, management, p
 use crate::persistence;
 use crate::{
     FreshnessAnchor, Session, WorkspacePhase, cancel, close, create_with_options, describe,
-    execute_stored_with_code, execute_with_code, wait_for_work,
+    wait_for_work,
 };
 
 /// Address discovery and transport selection for a typed runtime client.
@@ -1885,81 +1885,57 @@ impl Client {
         &self,
         request: RecoveryRangeRequest,
     ) -> Result<RecoveryRangeStatus> {
-        let response = self.request(json!({
-            "op": "fetch_recovery_range",
-            "peer": request.peer,
-            "author": request.author,
-            "revision": request.revision,
-            "topics": request.topics,
-            "after": request.after,
-            "through": request.through,
-        }))?;
-        parse_recovery_range_status(response)
+        let status = self.call(Op::FetchRecoveryRange, |session| {
+            ops::recovery::fetch_range(
+                session,
+                ops::recovery::FetchRangeArgs {
+                    peer: request.peer,
+                    author: request.author,
+                    revision: request.revision,
+                    topics: request.topics,
+                    after: request.after,
+                    through: request.through,
+                },
+            )
+        })?;
+        Ok(range_status(status))
     }
 
     pub fn poll_recovery_range(&self) -> Result<Option<RecoveryRangeStatus>> {
-        let response = self.request(json!({"op": "poll_recovery_range"}))?;
-        if response.is_null() {
-            return Ok(None);
-        }
-        parse_recovery_range_status(response).map(Some)
+        Ok(self
+            .call(Op::PollRecoveryRange, ops::recovery::poll_range)?
+            .map(range_status))
     }
 
     pub fn cancel_recovery_range(&self) -> Result<()> {
-        match parse_recovery_range_status(self.request(json!({
-            "op": "cancel_recovery_range"
-        }))?)? {
-            RecoveryRangeStatus::Cancelled => Ok(()),
-            _ => Err(error(
-                ErrorKind::Internal,
-                "invalid recovery cancellation response",
-            )),
-        }
+        self.call(Op::CancelRecoveryRange, ops::recovery::cancel_range)?;
+        Ok(())
     }
 
     /// `retain_until` is Unix seconds (UTC) by this node's clock; 0 keeps no
     /// copy for third-party recovery.
     pub fn stage_recovery_range(&self, retain_until: u64) -> Result<RecoveryStage> {
-        let metadata = serde_json::to_vec(&json!({
-            "op": "stage_recovery_range",
-            "retain_until": retain_until,
-        }))
-        .map_err(|parse_error| error(ErrorKind::Internal, parse_error.to_string()))?;
-        let [metadata, snapshot] = execute_stored_with_code(self.handle()?, &metadata, &[])
-            .map_err(Error::from)?;
-        let value: Value = serde_json::from_slice(&metadata).map_err(|parse_error| {
-            error(
-                ErrorKind::Internal,
-                format!("invalid recovery stage: {parse_error}"),
-            )
+        let staged = self.call(Op::StageRecoveryRange, |session| {
+            ops::recovery::stage_range(session, ops::recovery::StageRangeArgs { retain_until })
         })?;
-        let state = value
-            .get("state")
-            .and_then(Value::as_str)
-            .ok_or_else(|| error(ErrorKind::Internal, "recovery stage has no state"))?;
-        match state {
-            "awaiting_recovery_save" => {
-                let raw: RawRecoveryCandidate =
-                    serde_json::from_value(value).map_err(|parse_error| {
-                        error(
-                            ErrorKind::Internal,
-                            format!("invalid recovery candidate: {parse_error}"),
-                        )
-                    })?;
+        match staged {
+            ops::recovery::RecoveryStaged::Candidate(candidate) => {
                 Ok(RecoveryStage::Candidate(RecoveryCandidate {
-                    workspace: raw.workspace,
-                    snapshot,
-                    publication_count: raw.publication_count,
-                    durable: raw.durable,
+                    workspace: candidate.workspace,
+                    snapshot: stored_output(candidate.snapshot)?,
+                    publication_count: candidate.publication_count.unwrap_or(0),
+                    durable: candidate.durable,
                 }))
             }
-            "recovery_already_covered" => Ok(RecoveryStage::AlreadyCovered),
-            "recovery_no_new_objects" => Ok(RecoveryStage::NoNewObjects),
-            "recovery_awaiting_application" => Ok(RecoveryStage::AwaitingApplication),
-            other => Err(error(
-                ErrorKind::Internal,
-                format!("unknown recovery stage: {other}"),
-            )),
+            ops::recovery::RecoveryStaged::Nothing(nothing) => match nothing.state {
+                "recovery_already_covered" => Ok(RecoveryStage::AlreadyCovered),
+                "recovery_no_new_objects" => Ok(RecoveryStage::NoNewObjects),
+                "recovery_awaiting_application" => Ok(RecoveryStage::AwaitingApplication),
+                other => Err(error(
+                    ErrorKind::Internal,
+                    format!("unknown recovery stage: {other}"),
+                )),
+            },
         }
     }
 
@@ -2027,21 +2003,6 @@ impl Client {
             .ok_or_else(|| error(ErrorKind::Closed, "client is closed"))
     }
 
-    fn request(&self, request: Value) -> Result<Value> {
-        let bytes = serde_json::to_vec(&request).map_err(|parse_error| {
-            error(
-                ErrorKind::Internal,
-                format!("request encoding failed: {parse_error}"),
-            )
-        })?;
-        let reply = execute_with_code(self.handle()?, &bytes).map_err(Error::from)?;
-        serde_json::from_slice(&reply).map_err(|parse_error| {
-            error(
-                ErrorKind::Internal,
-                format!("response decoding failed: {parse_error}"),
-            )
-        })
-    }
 }
 
 impl Drop for Client {
@@ -2101,6 +2062,49 @@ fn join_request(pending: join::PendingJoinInfo) -> Result<JoinRequest> {
             .admission_request
             .ok_or_else(|| error(ErrorKind::InvalidInput, "invitation has no admission request"))?,
     })
+}
+
+fn range_status(status: ops::recovery::RangeStatus) -> RecoveryRangeStatus {
+    use ops::recovery::RangeStatus as S;
+    match status {
+        S::RecoveryRangePending {
+            candidate_count,
+            automatic_source,
+            ..
+        } => RecoveryRangeStatus::Pending {
+            candidate_count,
+            automatic_source,
+        },
+        S::RecoveryRangeReady(ready) => RecoveryRangeStatus::Ready(RecoveryRangeReady {
+            workspace: ready.workspace,
+            author: ready.author,
+            peer: ready.peer,
+            epoch: ready.epoch,
+            revision: ready.revision,
+            after: ready.after,
+            through: ready.through,
+            packet_count: ready.packet_count,
+            retained_bytes: ready.retained_bytes,
+            automatic_source: ready.automatic_source,
+            attempted: ready.attempted,
+        }),
+        // The runtime only waits for a source when it looks automatically.
+        S::RecoverySourceWaiting { .. } => RecoveryRangeStatus::SourceWaiting {
+            automatic_source: true,
+        },
+        S::RecoverySourceUnavailable {
+            attempted,
+            reason,
+            automatic_source,
+            ..
+        } => RecoveryRangeStatus::SourceUnavailable {
+            attempted,
+            reason,
+            automatic_source,
+        },
+        S::RecoveryRangeRejected { reason, .. } => RecoveryRangeStatus::Rejected { reason },
+        S::RecoveryRangeCancelled { .. } => RecoveryRangeStatus::Cancelled,
+    }
 }
 
 fn opened_info(opened: ops::workspace::WorkspaceOpened) -> WorkspaceInfo {
@@ -2186,119 +2190,6 @@ struct RawPublication {
     sender: [u8; 32],
     topic: String,
     payload: Vec<u8>,
-}
-
-#[derive(Deserialize)]
-struct RawRecoveryRangePending {
-    candidate_count: usize,
-    automatic_source: bool,
-}
-
-#[derive(Deserialize)]
-struct RawRecoveryRangeReady {
-    workspace: [u8; 32],
-    author: [u8; 32],
-    peer: [u8; 32],
-    epoch: u64,
-    revision: u64,
-    after: u64,
-    through: u64,
-    packet_count: usize,
-    retained_bytes: usize,
-    automatic_source: bool,
-    #[serde(default)]
-    attempted: Option<usize>,
-}
-
-#[derive(Deserialize)]
-struct RawRecoverySourceUnavailable {
-    attempted: usize,
-    reason: String,
-    automatic_source: bool,
-}
-
-#[derive(Deserialize)]
-struct RawRecoveryCandidate {
-    workspace: [u8; 32],
-    #[serde(default)]
-    publication_count: usize,
-    durable: bool,
-}
-
-fn parse_recovery_range_status(value: Value) -> Result<RecoveryRangeStatus> {
-    let state = value
-        .get("state")
-        .and_then(Value::as_str)
-        .ok_or_else(|| error(ErrorKind::Internal, "recovery range has no state"))?;
-    match state {
-        "recovery_range_pending" => {
-            let raw: RawRecoveryRangePending =
-                serde_json::from_value(value).map_err(|parse_error| {
-                    error(
-                        ErrorKind::Internal,
-                        format!("invalid recovery range status: {parse_error}"),
-                    )
-                })?;
-            Ok(RecoveryRangeStatus::Pending {
-                candidate_count: raw.candidate_count,
-                automatic_source: raw.automatic_source,
-            })
-        }
-        "recovery_range_ready" => {
-            let raw: RawRecoveryRangeReady =
-                serde_json::from_value(value).map_err(|parse_error| {
-                    error(
-                        ErrorKind::Internal,
-                        format!("invalid recovery range: {parse_error}"),
-                    )
-                })?;
-            Ok(RecoveryRangeStatus::Ready(RecoveryRangeReady {
-                workspace: raw.workspace,
-                author: raw.author,
-                peer: raw.peer,
-                epoch: raw.epoch,
-                revision: raw.revision,
-                after: raw.after,
-                through: raw.through,
-                packet_count: raw.packet_count,
-                retained_bytes: raw.retained_bytes,
-                automatic_source: raw.automatic_source,
-                attempted: raw.attempted,
-            }))
-        }
-        "recovery_source_waiting" => Ok(RecoveryRangeStatus::SourceWaiting {
-            automatic_source: value
-                .get("automatic_source")
-                .and_then(Value::as_bool)
-                .unwrap_or(true),
-        }),
-        "recovery_source_unavailable" => {
-            let raw: RawRecoverySourceUnavailable =
-                serde_json::from_value(value).map_err(|parse_error| {
-                    error(
-                        ErrorKind::Internal,
-                        format!("invalid recovery source status: {parse_error}"),
-                    )
-                })?;
-            Ok(RecoveryRangeStatus::SourceUnavailable {
-                attempted: raw.attempted,
-                reason: raw.reason,
-                automatic_source: raw.automatic_source,
-            })
-        }
-        "recovery_range_rejected" => Ok(RecoveryRangeStatus::Rejected {
-            reason: value
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("recovery range rejected")
-                .to_owned(),
-        }),
-        "recovery_range_cancelled" => Ok(RecoveryRangeStatus::Cancelled),
-        other => Err(error(
-            ErrorKind::Internal,
-            format!("unknown recovery range state: {other}"),
-        )),
-    }
 }
 
 impl From<RawDeliveryReport> for DeliveryReport {

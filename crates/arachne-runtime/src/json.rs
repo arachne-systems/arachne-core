@@ -14,9 +14,8 @@ use serde_json::Value;
 use crate::errors;
 use crate::ops::candidate::{self, AdoptArgs};
 use crate::ops::{self, Op, admission, debug, invitation, join, management, membership, nearby, policy, publication,
-    receive, workspace,
+    receive, recovery, workspace,
 };
-use crate::legacy_dispatch;
 
 /// Maximum JSON request or metadata size in bytes.
 pub const MAX_REQUEST: usize = 128 * 1024;
@@ -43,52 +42,20 @@ pub(crate) enum Request {
     OfferMembershipUpdate(membership::OfferArgs),
     OfferStagedMembershipUpdate(membership::OfferStagedArgs),
     PollMembershipOffer {},
-    FetchRecoveryRange {
-        #[serde(default)]
-        peer: Option<[u8; 32]>,
-        #[serde(default)]
-        author: Option<[u8; 32]>,
-        revision: u64,
-        topics: Vec<String>,
-        #[serde(default)]
-        after: Option<u64>,
-        #[serde(default)]
-        through: Option<u64>,
-    },
+    FetchRecoveryRange(recovery::FetchRangeArgs),
     PollRecoveryRange {},
     NextDirectGap {},
-    FetchDirectRecovery {
-        author: [u8; 32],
-        revision: u64,
-        topic: String,
-        recipients: Vec<[u8; 32]>,
-        after: u64,
-        through: u64,
-    },
+    FetchDirectRecovery(recovery::FetchDirectArgs),
     PollDirectRecovery {},
     StageDirectRecovery {},
     StageDirectMiss {},
     CancelDirectRecovery {},
-    StageRecoveryRange {
-        #[serde(default)]
-        retain_until: u64,
-    },
+    StageRecoveryRange(recovery::StageRangeArgs),
     AdoptRecovery(AdoptArgs),
     CancelRecoveryRange {},
     PollRecoveryCutoff {},
-    DiscoverRecoveryCutoff {
-        peer: [u8; 32],
-        revision: u64,
-        topics: Vec<String>,
-    },
-    FetchCurrentView {
-        #[serde(default)]
-        peer: Option<[u8; 32]>,
-        authority: [u8; 32],
-        revision: u64,
-        topic: String,
-        selector: [u8; 32],
-    },
+    DiscoverRecoveryCutoff(recovery::CutoffArgs),
+    FetchCurrentView(recovery::FetchCurrentViewArgs),
     PollCurrentView {},
     StageCurrentView {},
     AdoptCurrentView(AdoptArgs),
@@ -349,7 +316,22 @@ pub(crate) fn dispatch(session: &mut crate::Session, request: Request) -> Result
         Request::PollPendingObject(args) => reply(receive::poll_pending(session, args)?),
         Request::StageObjectAcknowledgement(args) => reply(receive::acknowledge(session, args)?),
         Request::StageObjectRejection(args) => reply(receive::reject(session, args)?),
-        request => legacy_dispatch(session, request).map_err(errors::legacy),
+        Request::FetchRecoveryRange(args) => reply(recovery::fetch_range(session, args)?),
+        Request::PollRecoveryRange {} => reply(recovery::poll_range(session)?),
+        Request::CancelRecoveryRange {} => reply(recovery::cancel_range(session)?),
+        Request::StageRecoveryRange(args) => reply(recovery::stage_range(session, args)?),
+        Request::NextDirectGap {} => reply(recovery::next_direct_gap(session)?),
+        Request::FetchDirectRecovery(args) => reply(recovery::fetch_direct(session, args)?),
+        Request::PollDirectRecovery {} => reply(recovery::poll_direct(session)?),
+        Request::CancelDirectRecovery {} => reply(recovery::cancel_direct(session)?),
+        Request::StageDirectRecovery {} => reply(recovery::stage_direct(session)?),
+        Request::StageDirectMiss {} => reply(recovery::stage_direct_miss(session)?),
+        Request::FetchCurrentView(args) => reply(recovery::fetch_current_view(session, args)?),
+        Request::PollCurrentView {} => reply(recovery::poll_current_view(session)?),
+        Request::StageCurrentView {} => reply(recovery::stage_current_view(session)?),
+        Request::CancelCurrentView {} => reply(recovery::cancel_current_view(session)?),
+        Request::DiscoverRecoveryCutoff(args) => reply(recovery::discover_cutoff(session, args)?),
+        Request::PollRecoveryCutoff {} => reply(recovery::poll_cutoff(session)?),
     }
 }
 
