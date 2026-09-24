@@ -9,9 +9,9 @@ test is red → green and the crate tests pass.
   Decision: remove the legacy mode entirely. No legacy workspaces, no compatibility path.
 - [x] **B2** (`b192cef`; approvals single-use, consumed by the admission commit) A removed member can rejoin with the old approved request.
 - [x] **B3** (`fix/sec-mgmt-bound` d226107) Receivers reject management commits above ~250 members (64 KiB inline bound).
-- [ ] **B3a** Joiners cannot receive an invitation above 241 members (64 KiB wire checkpoint carries the full ratchet tree). Needs a smaller joiner checkpoint (wire change).
-- [ ] **B3b** A member restored with `join_history == None` still uses the inline bound and can reject a valid management commit above ~250 members.
-- [ ] **B3c** Management commits (link registration, Remove, Promote) are capped at 64 KiB (`bootstrap` `MAX_BYTES`). At ~82 B/member (the update path encrypts to every unmerged batch-added leaf), registration fails above ~785 members (769 = 64,006 B; 897 fails). Raising the cap alone fails: commits also travel as JSON history steps in one 128 KiB control reply, and DFMO offers are 32 KiB. Options: page history steps as binary; merge unmerged leaves (member SelfUpdate, A2 step 5) so the update path shrinks.
+- [x] **B3a** (`82f35c5`, `778dc1c`; checkpoint = tree-less pin + tree bound by tree hash, paged fetch; runtime join at 641 members over real Iroh passes; joiner limit now set by B3c) Joiners cannot receive an invitation above 241 members (64 KiB wire checkpoint carries the full ratchet tree). Needs a smaller joiner checkpoint (wire change).
+- [x] **B3b** (`85ba181`; own history rebuilt under the local 8 MiB bound) A member restored with `join_history == None` still uses the inline bound and can reject a valid management commit above ~250 members.
+- [ ] **B3c** (in `feat/a2-security-wiring` analysis) Management commits (link registration, Remove, Promote) are capped at 64 KiB (`bootstrap` `MAX_BYTES`). At ~82 B/member (the update path encrypts to every unmerged batch-added leaf), registration fails above ~785 members (769 = 64,006 B; 897 fails). Raising the cap alone fails: commits also travel as JSON history steps in one 128 KiB control reply, and DFMO offers are 32 KiB. Options: page history steps as binary; merge unmerged leaves (member SelfUpdate, A2 step 5) so the update path shrinks.
 - [x] **B4** (`b192cef`; disabled rows pruned; 221 *active* links remains the cap, with a clear error) Invitation controls fill at 221 rows and are never pruned.
 - [x] **B5** (`7dc9201`, workspace tests 387 pass / 0 fail) `stage_protected_publication` does not send `workspace`; a mismatch leaves the session stuck.
 - [x] **B6** (`3236e4f`, workspace tests 387 pass / 0 fail) `create_endpoint` holds the global `REGISTRY` lock during bind (up to 10 s).
@@ -38,6 +38,14 @@ and a different Core pin. Core work that each plan step depends on:
 | 3. Candidate safety through Rust and the C boundary | A5 (typed candidate handles that carry their kind, one persistence mode), B5 |
 | 4. Distinct ID types, error categories through the C ABI | A1: core must emit real error codes first; today `ErrorKind` is a substring guess |
 | 5. End-to-end flow through the AAR, then ATAK host | B9 (freshness anchor), A4 (suspend/resume, `wait_for_work(timeout)`) |
+
+## SDK-facing notes from core changes
+
+- B3a: a host that passes the checkpoint inline in `begin_join` JSON hits the 128 KiB request cap near 120 members. SDK must use the compact path (invitation link + peers).
+- B3a: only the issuer, or a member whose join history starts at that checkpoint, can answer a join (narrower failover).
+- A3: ops removed `stage_publication`, `stage_reception`, `enable_object_delivery`, `poll_recovered_publication`; added `poll_pending_object`, `stage_object_acknowledgement`, `stage_object_rejection`.
+- B1: `issue_invitation` removed; use `stage_invitation` + `adopt_invitation`.
+- A7r: `ClientConfig` gains relay, public lookup and timeouts.
 
 ## Architecture work (needs design first)
 
