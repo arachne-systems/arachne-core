@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use arachne_api::{ApiError, ErrorCode};
 
-use crate::ops::{self, Op, admission, candidate, join, publication, receive};
+use crate::ops::{self, Op, admission, candidate, invitation, join, management, publication, receive};
 use crate::{
     Session, WorkspacePhase, cancel, close, create_with_options, describe,
     enable_record_storage as enable_runtime_record_storage, execute_stored_with_code,
@@ -322,13 +322,13 @@ pub struct MemberRoster {
     pub profiles_retained: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RouteHint {
     pub peer: [u8; 32],
     pub address: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct InvitationInfo {
     pub workspace: [u8; 32],
     pub workspace_name: Option<String>,
@@ -380,6 +380,52 @@ pub struct AdmissionReply {
     pub commit: Vec<u8>,
     pub welcome: Vec<u8>,
     pub authorization: AdmissionAuthorization,
+}
+
+/// The kind of invitation link to register.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvitationKind {
+    /// Anyone with the link may join until it expires or is disabled.
+    Reusable,
+    /// One person; an administrator approves the first join request.
+    Personal,
+    /// One person; the first join request is approved automatically.
+    PersonalAutomatic,
+    /// One person asks for access; an administrator approves or declines.
+    RequestAccess,
+}
+
+/// An administrator action on a member or an invitation link.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemberAction {
+    Promote([u8; 32]),
+    Demote([u8; 32]),
+    Remove([u8; 32]),
+    DisableInvitation([u8; 32]),
+}
+
+/// One registered invitation link and its controls.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvitationControl {
+    pub number: usize,
+    pub key: [u8; 32],
+    pub expires_at: u64,
+    pub enabled: bool,
+    pub personal: bool,
+    pub automatic: bool,
+    pub request_access: bool,
+    pub approved: bool,
+}
+
+/// This member's removal, adopted. The session has ended.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemovedMembership {
+    pub workspace: [u8; 32],
+    pub epoch: u64,
+    pub member: [u8; 32],
+    pub commit_digest: [u8; 32],
 }
 
 /// A verified invitation checkpoint and the member that served it.
@@ -1037,12 +1083,8 @@ impl Client {
     }
 
     pub fn member_roster(&self) -> Result<MemberRoster> {
-        let response = self.request(json!({"op": "member_roster"}))?;
-        let raw: RawMemberRoster = serde_json::from_value(response).map_err(|parse_error| {
-            error(
-                ErrorKind::Internal,
-                format!("invalid member roster: {parse_error}"),
-            )
+        let raw = self.call(Op::MemberRoster, |session| {
+            management::member_roster(session, management::RosterArgs::default())
         })?;
         let members = raw
             .members
@@ -1064,22 +1106,169 @@ impl Client {
     /// Mark this session's signed workspace profile as a service.
     /// This grants no membership or publication rights.
     pub fn use_service_profile(&self) -> Result<()> {
-        self.request(json!({"op": "use_service_profile"}))?;
+        self.call(Op::UseServiceProfile, management::use_service_profile)?;
         Ok(())
     }
 
     /// Register a reusable invitation link in shared policy. The link is
     /// released only by `adopt_invitation`, after the candidate is saved.
     pub fn stage_invitation(&self, expires_at: u64) -> Result<WorkspaceCandidate> {
-        let metadata = serde_json::to_vec(&json!({
-            "op": "stage_invitation",
-            "personal": false,
-            "expires_at": expires_at,
-        }))
-        .map_err(|parse_error| error(ErrorKind::Internal, parse_error.to_string()))?;
-        let [metadata, snapshot] = execute_stored_with_code(self.handle()?, &metadata, &[])
-            .map_err(Error::from)?;
-        parse_workspace_candidate(&metadata, snapshot, "invitation")
+        self.stage_invitation_of(expires_at, InvitationKind::Reusable)
+    }
+
+    /// Register an invitation link of `kind`. Adopt it with
+    /// `adopt_invitation` after the candidate is saved.
+    pub fn stage_invitation_of(
+        &self,
+        expires_at: u64,
+        kind: InvitationKind,
+    ) -> Result<WorkspaceCandidate> {
+        let (personal, automatic, request_access) = match kind {
+            InvitationKind::Reusable => (false, false, false),
+            InvitationKind::Personal => (true, false, false),
+            InvitationKind::PersonalAutomatic => (true, true, false),
+            InvitationKind::RequestAccess => (true, false, true),
+        };
+        let staged = self.call(Op::StageInvitation, |session| {
+            invitation::stage(
+                session,
+                invitation::StageInvitationArgs {
+                    expires_at,
+                    personal,
+                    automatic,
+                    request_access,
+                },
+            )
+        })?;
+        candidate_of(staged)
+    }
+
+    /// Approve (bind) a personal invitation for one join request. Adopt the
+    /// candidate with `adopt_admission`.
+    pub fn stage_invitation_approval(
+        &self,
+        request: &[u8],
+        attempt_id: Option<[u8; 32]>,
+    ) -> Result<WorkspaceCandidate> {
+        let staged = self.call(Op::StageInvitationApproval, |session| {
+            invitation::stage_approval(
+                session,
+                invitation::DecisionArgs {
+                    request: request.to_vec(),
+                    attempt_id,
+                },
+            )
+        })?;
+        candidate_of(staged)
+    }
+
+    /// Decline a personal invitation request. Adopt the candidate with
+    /// `adopt_admission`.
+    pub fn stage_invitation_decline(
+        &self,
+        request: &[u8],
+        attempt_id: Option<[u8; 32]>,
+    ) -> Result<WorkspaceCandidate> {
+        let staged = self.call(Op::StageInvitationDecline, |session| {
+            invitation::stage_decline(
+                session,
+                invitation::DecisionArgs {
+                    request: request.to_vec(),
+                    attempt_id,
+                },
+            )
+        })?;
+        candidate_of(staged)
+    }
+
+    /// The registered invitation links, numbered for people.
+    pub fn invitation_controls(&self) -> Result<Vec<InvitationControl>> {
+        let reply = self.call(Op::InvitationControls, invitation::controls)?;
+        Ok(reply
+            .invitations
+            .into_iter()
+            .map(|row| InvitationControl {
+                number: row.number,
+                key: row.key,
+                expires_at: row.expires_at,
+                enabled: row.enabled,
+                personal: row.personal,
+                automatic: row.automatic,
+                request_access: row.request_access,
+                approved: row.approved,
+            })
+            .collect())
+    }
+
+    /// Stage an administrator action. Adopt it with `adopt_admission`.
+    pub fn stage_management(&self, action: MemberAction) -> Result<WorkspaceCandidate> {
+        use crate::membership::WireManagement;
+        let action = match action {
+            MemberAction::Promote(member) => WireManagement::Promote(member),
+            MemberAction::Demote(member) => WireManagement::Demote(member),
+            MemberAction::Remove(member) => WireManagement::Remove(member),
+            MemberAction::DisableInvitation(key) => WireManagement::DisableInvitation(key),
+        };
+        let staged = self.call(Op::StageManagement, |session| {
+            management::stage(session, management::ManagementArgs { action })
+        })?;
+        candidate_of(staged)
+    }
+
+    /// Rename the workspace. Adopt the candidate with `adopt_admission`.
+    pub fn stage_workspace_name(&self, workspace_name: &str) -> Result<WorkspaceCandidate> {
+        let staged = self.call(Op::StageWorkspaceName, |session| {
+            management::stage_workspace_name(
+                session,
+                management::WorkspaceNameArgs {
+                    workspace_name: workspace_name.to_owned(),
+                },
+            )
+        })?;
+        candidate_of(staged)
+    }
+
+    /// Leave through another member, who commits the departure. Adopt the
+    /// staged removal with `adopt_removal`; that ends the session.
+    pub fn leave_via_peer(&self, peer: [u8; 32]) -> Result<WorkspaceCandidate> {
+        let staged = self.call(Op::LeaveViaPeer, |session| {
+            management::leave_via_peer(session, management::PeerArgs { peer })
+        })?;
+        change_candidate(staged)
+    }
+
+    /// The last member leaves alone. Adopt with `adopt_removal`.
+    pub fn stage_solo_leave(&self) -> Result<WorkspaceCandidate> {
+        let staged = self.call(Op::StageSoloLeave, management::stage_solo_leave)?;
+        Ok(WorkspaceCandidate {
+            workspace: staged.workspace,
+            snapshot: stored_output(staged.snapshot)?,
+        })
+    }
+
+    /// Adopt a saved removal of this member. The session ends: later calls
+    /// give `Closed`.
+    pub fn adopt_removal(&self, snapshot: &[u8]) -> Result<RemovedMembership> {
+        stored_input(snapshot)?;
+        let reply = self.call(Op::AdoptAdmission, |session| {
+            candidate::adopt_admission(
+                session,
+                candidate::AdoptArgs {
+                    snapshot: snapshot.to_vec(),
+                },
+            )
+        })?;
+        match reply {
+            candidate::AdoptReply::Removed(removed) => Ok(RemovedMembership {
+                workspace: removed.workspace,
+                epoch: removed.epoch,
+                member: removed.member.id,
+                commit_digest: removed.commit_digest,
+            }),
+            candidate::AdoptReply::Adopted(_) => Err(Error::from(ApiError::wrong_state(
+                "the candidate was not a removal",
+            ))),
+        }
     }
 
     /// Adopt a staged invitation registration and return its bearer link.
@@ -1088,31 +1277,7 @@ impl Client {
         let issued = adopted.issued_invitation.ok_or_else(|| {
             error(ErrorKind::InvalidInput, "candidate did not issue an invitation")
         })?;
-        let raw: RawInvitationInfo = serde_json::from_value(issued)
-            .map_err(|parse_error| {
-            error(
-                ErrorKind::Internal,
-                format!("invalid invitation: {parse_error}"),
-            )
-        })?;
-        Ok(InvitationInfo {
-            workspace: raw.workspace,
-            workspace_name: raw.workspace_name,
-            invitation: raw.invitation,
-            invitation_key: raw.invitation_key,
-            checkpoint: raw.checkpoint,
-            peer: raw.peer,
-            bootstrap_peers: raw.bootstrap_peers,
-            address: raw.address,
-            routes: raw
-                .routes
-                .into_iter()
-                .map(|route| RouteHint {
-                    peer: route.peer,
-                    address: route.address,
-                })
-                .collect(),
-        })
+        Ok(issued)
     }
 
     pub fn inspect_invitation(
@@ -1120,18 +1285,15 @@ impl Client {
         invitation: &[u8],
         checkpoint: &[u8],
     ) -> Result<InvitationDetails> {
-        let response = self.request(json!({
-            "op": "inspect_invitation",
-            "invitation": invitation,
-            "checkpoint": checkpoint,
-        }))?;
-        let raw: RawInvitationDetails =
-            serde_json::from_value(response).map_err(|parse_error| {
-                error(
-                    ErrorKind::Internal,
-                    format!("invalid invitation details: {parse_error}"),
-                )
-            })?;
+        let raw = self.call(Op::InspectInvitation, |session| {
+            invitation::inspect(
+                session,
+                invitation::InspectArgs {
+                    invitation: invitation.to_vec(),
+                    checkpoint: checkpoint.to_vec(),
+                },
+            )
+        })?;
         Ok(InvitationDetails {
             workspace: raw.workspace,
             invitation_key: raw.invitation_key,
@@ -1683,70 +1845,6 @@ struct RawWorkspaceInfo {
 }
 
 #[derive(Deserialize)]
-struct RawWorkspaceCandidate {
-    workspace: [u8; 32],
-}
-
-#[derive(Deserialize)]
-struct RawMemberRoster {
-    workspace: [u8; 32],
-    workspace_name: Option<String>,
-    workspace_name_revision: u64,
-    workspace_name_head: [u8; 32],
-    epoch: u64,
-    members: Vec<RawMemberInfo>,
-    #[serde(default)]
-    profiles: Vec<Vec<u8>>,
-    profiles_retained: Option<bool>,
-}
-
-#[derive(Deserialize)]
-struct RawMemberInfo {
-    id: [u8; 32],
-    endpoint: [u8; 32],
-    administrator: bool,
-    #[serde(rename = "self")]
-    self_member: bool,
-    display_name: Option<String>,
-    kind: String,
-    presence: String,
-    last_contact_age_ms: Option<u64>,
-    presence_fresh_for_ms: Option<u64>,
-}
-
-#[derive(Deserialize)]
-struct RawInvitationInfo {
-    workspace: [u8; 32],
-    workspace_name: Option<String>,
-    invitation: Vec<u8>,
-    invitation_key: [u8; 32],
-    checkpoint: Vec<u8>,
-    peer: [u8; 32],
-    #[serde(default)]
-    bootstrap_peers: Vec<[u8; 32]>,
-    address: String,
-    #[serde(default)]
-    routes: Vec<RawRouteHint>,
-}
-
-#[derive(Deserialize)]
-struct RawInvitationDetails {
-    workspace: [u8; 32],
-    invitation_key: [u8; 32],
-    workspace_name: Option<String>,
-    epoch: u64,
-    personal_invitation: bool,
-    automatic_approval: bool,
-    expires_at: u64,
-}
-
-#[derive(Deserialize)]
-struct RawRouteHint {
-    peer: [u8; 32],
-    address: String,
-}
-
-#[derive(Deserialize)]
 struct RawWorkspaceMetrics {
     workspace: [u8; 32],
     activity: ActivityProjection,
@@ -1798,6 +1896,23 @@ fn stored_output(snapshot: Vec<u8>) -> Result<Vec<u8>> {
     Ok(snapshot)
 }
 
+fn candidate_of(staged: management::StagedCandidate) -> Result<WorkspaceCandidate> {
+    Ok(WorkspaceCandidate {
+        workspace: staged.workspace,
+        snapshot: stored_output(staged.snapshot)?,
+    })
+}
+
+fn change_candidate(staged: management::StagedChange) -> Result<WorkspaceCandidate> {
+    match staged {
+        management::StagedChange::Candidate(candidate) => candidate_of(candidate),
+        management::StagedChange::Removal(removal) => Ok(WorkspaceCandidate {
+            workspace: removal.workspace,
+            snapshot: stored_output(removal.snapshot)?,
+        }),
+    }
+}
+
 fn join_request(pending: join::PendingJoinInfo) -> Result<JoinRequest> {
     Ok(JoinRequest {
         workspace: pending.workspace,
@@ -1821,33 +1936,16 @@ fn workspace_info(adopted: candidate::Adopted) -> WorkspaceInfo {
     }
 }
 
-fn parse_workspace_candidate(
-    metadata: &[u8],
-    snapshot: Vec<u8>,
-    context: &str,
-) -> Result<WorkspaceCandidate> {
-    let raw: RawWorkspaceCandidate = serde_json::from_slice(metadata).map_err(|parse_error| {
-        error(
-            ErrorKind::Internal,
-            format!("invalid {context} candidate: {parse_error}"),
-        )
-    })?;
-    Ok(WorkspaceCandidate {
-        workspace: raw.workspace,
-        snapshot,
-    })
-}
-
-impl TryFrom<RawMemberInfo> for MemberInfo {
+impl TryFrom<crate::membership::RosterMember> for MemberInfo {
     type Error = Error;
 
-    fn try_from(value: RawMemberInfo) -> Result<Self> {
-        let kind = match value.kind.as_str() {
+    fn try_from(value: crate::membership::RosterMember) -> Result<Self> {
+        let kind = match value.kind {
             "person" => MemberKind::Person,
             "service" => MemberKind::Service,
             _ => return Err(error(ErrorKind::Internal, "invalid member kind")),
         };
-        let presence = match value.presence.as_str() {
+        let presence = match value.presence {
             "self" => Presence::SelfMember,
             "unknown" => Presence::Unknown,
             "reachable" => Presence::Reachable,

@@ -500,3 +500,51 @@ fn typed_admission_ops_report_codes_and_pages() {
     assert!(!owner.poll_control().unwrap());
     owner.close().unwrap();
 }
+
+/// Management, invitation and workspace-name ops, typed end to end.
+#[test]
+fn typed_management_invitation_and_name_ops() {
+    use arachne_runtime::{ErrorCode, InvitationKind, MemberAction};
+    let mut owner = Client::open(ClientConfig {
+        network: Network::Direct,
+        secret: Some([22; 32]),
+        transport: Default::default(),
+    })
+    .unwrap();
+    let workspace = owner.create_workspace("Owner", Some("Team")).unwrap();
+
+    let renamed = owner.stage_workspace_name("Field Team").unwrap();
+    assert_eq!(renamed.workspace, workspace.workspace);
+    let adopted = owner.adopt_admission(&renamed.snapshot).unwrap();
+    assert_eq!(adopted.workspace_name.as_deref(), Some("Field Team"));
+
+    let personal = owner
+        .stage_invitation_of(0, InvitationKind::Personal)
+        .unwrap();
+    let link = owner.adopt_invitation(&personal.snapshot).unwrap();
+    let controls = owner.invitation_controls().unwrap();
+    assert_eq!(controls.len(), 1);
+    assert!(controls[0].personal);
+    assert_eq!(controls[0].key, link.invitation_key);
+    let details = owner
+        .inspect_invitation(&link.invitation, &link.checkpoint)
+        .unwrap();
+    assert!(details.personal);
+
+    let disabled = owner
+        .stage_management(MemberAction::DisableInvitation(link.invitation_key))
+        .unwrap();
+    owner.adopt_admission(&disabled.snapshot).unwrap();
+    assert!(!owner.invitation_controls().unwrap()[0].enabled);
+
+    // A management action on a stranger is refused with a code.
+    let error = owner.stage_management(MemberAction::Promote([9; 32])).unwrap_err();
+    assert_ne!(error.code(), ErrorCode::Internal, "{error}");
+
+    // The last member leaves alone; adopting the removal ends the session.
+    let leave = owner.stage_solo_leave().unwrap();
+    let removed = owner.adopt_removal(&leave.snapshot).unwrap();
+    assert_eq!(removed.workspace, workspace.workspace);
+    assert_eq!(owner.member_roster().unwrap_err().code(), ErrorCode::Closed);
+    let _ = owner.close();
+}

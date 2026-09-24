@@ -300,7 +300,7 @@ fn reconcile_seen(session: &mut Session) -> Result<Option<[u8; 32]>, String> {
         })
         .map(|(peer, _)| *peer);
     if let Some(peer) = sync_peer {
-        super::membership::start_query_if_needed(session, peer)?;
+        super::membership::start_query_if_needed(session, peer).map_err(crate::errors::text)?;
     }
     Ok(sync_peer)
 }

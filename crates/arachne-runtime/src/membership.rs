@@ -1,6 +1,9 @@
 //! Bounded next-membership-transition retrieval over authenticated peer control requests.
 //! Replies contain no Welcome, bearer invitation or private group state.
 use super::*;
+use crate::errors::{self, security};
+use crate::ops::management::{StagedCandidate, StagedChange, StagedRemoval};
+use arachne_api::{ApiError, ErrorCode};
 pub(crate) mod wire;
 pub(super) use wire::encode_reply;
 
@@ -62,7 +65,7 @@ pub(super) enum WireManagement {
     },
 }
 impl WireManagement {
-    pub(super) fn action(&self) -> Result<arachne_security::ManagementAction, String> {
+    pub(super) fn action(&self) -> Result<arachne_security::ManagementAction, ApiError> {
         Ok(match self {
             Self::Promote(id) => arachne_security::ManagementAction::Promote(*id),
             Self::Demote(id) => arachne_security::ManagementAction::Demote(*id),
@@ -92,7 +95,7 @@ impl WireManagement {
                 signature
                     .as_slice()
                     .try_into()
-                    .map_err(|_| "invalid leave signature length")?,
+                    .map_err(|_| ApiError::invalid_input("step", "invalid leave signature length"))?,
             ),
         })
     }
@@ -141,7 +144,7 @@ impl JoinStep {
         }
     }
 
-    pub(super) fn authorization(&self) -> Result<arachne_security::MembershipAuthorization, String> {
+    pub(super) fn authorization(&self) -> Result<arachne_security::MembershipAuthorization, ApiError> {
         let admission = |auth: &JoinAuthorization| {
             Ok(arachne_security::AdmissionAuthorization {
                 invitation_key: auth.invitation_key,
@@ -149,12 +152,12 @@ impl JoinStep {
                     .grant_signature
                     .clone()
                     .try_into()
-                    .map_err(|_| "invalid grant signature length")?,
+                    .map_err(|_| ApiError::invalid_input("step", "invalid grant signature length"))?,
                 redemption_signature: auth
                     .redemption_signature
                     .clone()
                     .try_into()
-                    .map_err(|_| "invalid redemption signature length")?,
+                    .map_err(|_| ApiError::invalid_input("step", "invalid redemption signature length"))?,
             })
         };
         match (&self.authorization, &self.admission_batch, &self.management) {
@@ -163,13 +166,13 @@ impl JoinStep {
             )),
             (None, Some(auths), None) if !auths.is_empty() => {
                 Ok(arachne_security::MembershipAuthorization::AdmissionBatch(
-                    auths.iter().map(admission).collect::<Result<_, String>>()?,
+                    auths.iter().map(admission).collect::<Result<_, ApiError>>()?,
                 ))
             }
             (None, None, Some(action)) => Ok(arachne_security::MembershipAuthorization::Management(
                 action.action()?,
             )),
-            _ => Err("membership step requires exactly one authorization kind".into()),
+            _ => Err(ApiError::invalid_input("step", "membership step requires exactly one authorization kind")),
         }
     }
 }
@@ -341,11 +344,11 @@ fn merge_profiles_with_budget(
     session: &mut Session,
     profiles: &[Vec<u8>],
     budget: usize,
-) -> Result<bool, String> {
+) -> Result<bool, ApiError> {
     let owner = session
         .workspace
         .as_ref()
-        .ok_or("session has no workspace")?;
+        .ok_or_else(errors::no_workspace)?;
     merge_into(
         owner,
         &mut lock_profiles(&session.membership.profiles),
@@ -397,13 +400,13 @@ fn merge_into(
     set: &mut ProfileSet,
     profiles: &[Vec<u8>],
     budget: usize,
-) -> Result<bool, String> {
+) -> Result<bool, ApiError> {
     if profiles.len() > MAX_REQUEST_PROFILES
         || profiles
             .iter()
             .any(|p| p.len() > arachne_security::MAX_MEMBER_PROFILE)
     {
-        return Err("member profile cache exceeds bounds".into());
+        return Err(ApiError::invalid_input("profiles", "member profile cache exceeds bounds"));
     }
     let state = (owner.epoch(), owner.epoch_fingerprint());
     // An answer in progress may hold a view older than the last commit.
@@ -419,8 +422,8 @@ fn merge_into(
     } else {
         owner.sign_member_profile()
     }
-    .map_err(str::to_owned)?;
-    let own_id = owner.member().ok_or("member profile required")?.id();
+    .map_err(security(ErrorCode::InvalidInput))?;
+    let own_id = owner.member().ok_or_else(|| ApiError::wrong_state("member profile required"))?.id();
 
     // Verify and de-duplicate the incoming batch. Unverifiable profiles are
     // dropped here, same as before -- that is not a bound rejection.
@@ -460,8 +463,38 @@ fn merge_into(
     Ok(overflowed)
 }
 
-pub(super) fn roster(session: &mut Session, profiles: &[Vec<u8>]) -> Result<Value, String> {
+pub(super) fn roster(session: &mut Session, profiles: &[Vec<u8>]) -> Result<RosterReply, ApiError> {
     roster_with_budget(session, profiles, MAX_PROFILE_SET_BYTES)
+}
+
+/// One member as the roster shows it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct RosterMember {
+    pub id: [u8; 32],
+    pub endpoint: [u8; 32],
+    pub administrator: bool,
+    #[serde(rename = "self")]
+    pub self_member: bool,
+    pub display_name: Option<String>,
+    pub last_contact_age_ms: Option<u64>,
+    pub presence_fresh_for_ms: Option<u64>,
+    pub kind: &'static str,
+    pub presence: &'static str,
+}
+
+/// The member roster with retained signed names.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct RosterReply {
+    pub workspace: [u8; 32],
+    pub workspace_name: Option<String>,
+    pub workspace_name_revision: u64,
+    pub workspace_name_head: [u8; 32],
+    pub epoch: u64,
+    pub members: Vec<RosterMember>,
+    pub profiles: Vec<Vec<u8>>,
+    /// `Some(false)`: the byte budget dropped at least one incoming profile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profiles_retained: Option<bool>,
 }
 
 /// Budget-parameterized for the same reason as `merge_profiles_with_budget`.
@@ -469,17 +502,20 @@ fn roster_with_budget(
     session: &mut Session,
     profiles: &[Vec<u8>],
     budget: usize,
-) -> Result<Value, String> {
+) -> Result<RosterReply, ApiError> {
     let overflowed = merge_profiles_with_budget(session, profiles, budget)?;
     let owner = session
         .workspace
         .as_ref()
-        .ok_or("session has no workspace")?;
-    let own_id = owner.member().ok_or("member profile required")?.id();
+        .ok_or_else(errors::no_workspace)?;
+    let own_id = owner
+        .member()
+        .ok_or_else(|| ApiError::wrong_state("member profile required"))?
+        .id();
     let set = lock_profiles(&session.membership.profiles);
     let members = owner
         .member_roster()
-        .map_err(str::to_owned)?
+        .map_err(security(ErrorCode::Internal))?
         .into_iter()
         .map(|member| {
             let now = std::time::Instant::now();
@@ -490,32 +526,66 @@ fn roster_with_budget(
                 .retained
                 .get(&member.id)
                 .and_then(|bytes| owner.verify_member_profile(bytes).ok());
-            let name = profile
-                .as_ref()
-                .map(|profile| profile.display_name().to_owned());
-            json!({"id":member.id,"endpoint":member.endpoint,"administrator":member.administrator,
-            "self":member.id == own_id,"display_name":name,
-            "last_contact_age_ms":contact_age.map(|age| age.as_millis().min(u64::MAX as u128) as u64),
-            "presence_fresh_for_ms":contact_age.map(|age| presence::fresh_for(age).as_millis() as u64),
-            "kind":if profile.as_ref().is_some_and(|profile| profile.is_service()) { "service" } else { "person" },
-            "presence": if member.id == own_id { "self" } else {
-                presence::status(&session.presence, member.endpoint, now)
-            }})
+            RosterMember {
+                id: member.id,
+                endpoint: member.endpoint,
+                administrator: member.administrator,
+                self_member: member.id == own_id,
+                display_name: profile
+                    .as_ref()
+                    .map(|profile| profile.display_name().to_owned()),
+                last_contact_age_ms: contact_age
+                    .map(|age| age.as_millis().min(u64::MAX as u128) as u64),
+                presence_fresh_for_ms: contact_age
+                    .map(|age| presence::fresh_for(age).as_millis() as u64),
+                kind: if profile.as_ref().is_some_and(|profile| profile.is_service()) {
+                    "service"
+                } else {
+                    "person"
+                },
+                presence: if member.id == own_id {
+                    "self"
+                } else {
+                    presence::status(&session.presence, member.endpoint, now)
+                },
+            }
         })
         .collect::<Vec<_>>();
-    let mut result = json!({"workspace":owner.id(),"workspace_name":owner.workspace_name().map_err(str::to_owned)?,
-        "workspace_name_revision":owner.workspace_name_revision().map_err(str::to_owned)?,
-        "workspace_name_head":owner.workspace_name_head().map_err(str::to_owned)?,"epoch":owner.epoch(),"members":members,
-        "profiles":set.retained.values().collect::<Vec<_>>()});
     // Distinguishable, non-silent signal that the byte budget dropped at
     // least one incoming profile this call -- never an Err (FUT-37 kickback
     // #1): a full retention budget must not fail a membership-control
     // operation, and member_roster is reachable from the same control-adjacent
     // paths (PollMembershipUpdate, open/refresh), not just presentation.
-    if overflowed {
-        result["profiles_retained"] = json!(false);
-    }
-    Ok(result)
+    Ok(RosterReply {
+        workspace: owner.id(),
+        workspace_name: owner
+            .workspace_name()
+            .map_err(security(ErrorCode::Internal))?,
+        workspace_name_revision: owner
+            .workspace_name_revision()
+            .map_err(security(ErrorCode::Internal))?,
+        workspace_name_head: owner
+            .workspace_name_head()
+            .map_err(security(ErrorCode::Internal))?,
+        epoch: owner.epoch(),
+        members,
+        profiles: set.retained.values().cloned().collect(),
+        profiles_retained: overflowed.then_some(false),
+    })
+}
+
+#[cfg(test)]
+fn roster_value(session: &mut Session, profiles: &[Vec<u8>]) -> Result<Value, ApiError> {
+    Ok(serde_json::to_value(roster(session, profiles)?).unwrap())
+}
+
+#[cfg(test)]
+fn roster_with_budget_value(
+    session: &mut Session,
+    profiles: &[Vec<u8>],
+    budget: usize,
+) -> Result<Value, ApiError> {
+    Ok(serde_json::to_value(roster_with_budget(session, profiles, budget)?).unwrap())
 }
 
 fn profiles_digest(owner: &arachne_security::Workspace, set: &ProfileSet) -> [u8; 32] {
@@ -679,9 +749,9 @@ pub(super) fn answer_query(
     result
 }
 
-fn agreement(owner: &arachne_security::Workspace, value: &Value) -> Result<&'static str, String> {
+fn agreement(owner: &arachne_security::Workspace, value: &Value) -> Result<&'static str, ApiError> {
     if value["epoch"] != owner.epoch() {
-        return Err("current membership reply has a different epoch".into());
+        return Err(ApiError::epoch_mismatch("current membership reply has a different epoch"));
     }
     let fingerprint = value
         .get("epoch_fingerprint")
@@ -735,7 +805,7 @@ pub(super) fn choose_membership_peer(
     })
 }
 
-pub(super) fn poll(session: &mut Session, request: Request) -> Result<Value, String> {
+pub(super) fn poll(session: &mut Session, request: Request) -> Result<Value, ApiError> {
     poll_with_budget(session, request, MAX_PROFILE_SET_BYTES)
 }
 
@@ -745,7 +815,7 @@ pub(super) fn poll(session: &mut Session, request: Request) -> Result<Value, Str
 pub(super) fn start_query_if_needed(
     session: &mut Session,
     peer: [u8; 32],
-) -> Result<bool, String> {
+) -> Result<bool, ApiError> {
     if session.membership.update.is_some() {
         return Ok(false);
     }
@@ -765,29 +835,29 @@ fn start_query(
     peer: [u8; 32],
     replace_pending: bool,
     budget: usize,
-) -> Result<(), String> {
+) -> Result<(), ApiError> {
     let owner = session
         .workspace
         .as_ref()
-        .ok_or("session has no workspace")?;
+        .ok_or_else(errors::no_workspace)?;
     if session.membership.update.is_some() && !replace_pending {
-        return Err("membership query already pending".into());
+        return Err(ApiError::wrong_state("membership query already pending"));
     }
     if peer == session.node.id() || owner.member_id_for_endpoint(peer).is_err() {
-        return Err("membership query requires another admitted peer".into());
+        return Err(ApiError::invalid_input("peer", "membership query requires another admitted peer"));
     }
     drop(session.membership.update.take());
     let basis = StateBasis {
         epoch: owner.epoch(),
         fingerprint: owner.epoch_fingerprint(),
-        name_head: owner.workspace_name_head().map_err(str::to_owned)?,
+        name_head: owner.workspace_name_head().map_err(security(ErrorCode::Internal))?,
     };
     let workspace = owner.id();
     merge_profiles_with_budget(session, &[], budget)?;
     let owner = session
         .workspace
         .as_deref()
-        .ok_or("session has no workspace")?;
+        .ok_or_else(errors::no_workspace)?;
     let mut set = lock_profiles(&session.membership.profiles);
     let digest = profiles_digest(owner, &set);
     let profiles = if session.membership.peer_profile_summaries.get(&peer) == Some(&digest) {
@@ -804,7 +874,7 @@ fn start_query(
             profiles.first().map_or(&[], Vec::as_slice),
             profiles.get(1).map_or(&[], Vec::as_slice),
         ],
-    })?;
+    }).map_err(crate::errors::legacy)?;
     // The reply is an outbound event, so it does not enqueue a control
     // request locally. Wake the existing host drain when it completes.
     let request = session.node.request_control(peer, &query);
@@ -829,15 +899,15 @@ fn queue_membership_offer(
     authorization: arachne_security::MembershipAuthorization,
     commit: Vec<u8>,
     requires_adoption: bool,
-) -> Result<Value, String> {
+) -> Result<Value, ApiError> {
     if session.membership.offer.is_some() {
-        return Err("membership offer already pending".into());
+        return Err(ApiError::wrong_state("membership offer already pending"));
     }
     let packet = {
         let owner = session
             .workspace
             .as_ref()
-            .ok_or("session has no workspace")?;
+            .ok_or_else(errors::no_workspace)?;
         let mut packet = b"DFMO\x01".to_vec();
         packet.extend(owner.id());
         packet.extend(after.to_be_bytes());
@@ -847,10 +917,10 @@ fn queue_membership_offer(
                 &authorization,
                 &commit,
             ))
-            .map_err(|e| e.to_string())?,
+            .map_err(errors::encode)?,
         );
         if packet.len() > 32 * 1024 {
-            return Err("membership offer exceeds control bound".into());
+            return Err(ApiError::limit_reached("control request", 32 * 1024, "membership offer exceeds control bound"));
         }
         packet
     };
@@ -873,11 +943,11 @@ fn poll_with_budget(
     session: &mut Session,
     request: Request,
     budget: usize,
-) -> Result<Value, String> {
+) -> Result<Value, ApiError> {
     let owner = session
         .workspace
         .as_ref()
-        .ok_or("session has no workspace")?;
+        .ok_or_else(errors::no_workspace)?;
     match request {
         Request::NextMembershipPeer { after } => {
             let now = std::time::Instant::now();
@@ -886,7 +956,7 @@ fn poll_with_budget(
             });
             let mut peers = owner
                 .member_roster()
-                .map_err(str::to_owned)?
+                .map_err(security(ErrorCode::Internal))?
                 .into_iter()
                 .filter(|member| member.endpoint != session.node.id())
                 .map(|member| PeerChoice {
@@ -905,19 +975,19 @@ fn poll_with_budget(
                 .as_ref()
                 .map(|peer| owner.member_id_for_endpoint(*peer))
                 .transpose()
-                .map_err(str::to_owned)?;
+                .map_err(security(ErrorCode::InvalidInput))?;
             Ok(json!({"peer":peer,"member":member,"epoch":owner.epoch()}))
         }
         Request::OfferMembershipUpdate { peer, after } => {
             if session.membership.offer.is_some() {
-                return Err("membership offer already pending".into());
+                return Err(ApiError::wrong_state("membership offer already pending"));
             }
             if peer == session.node.id() || owner.member_id_for_endpoint(peer).is_err() {
-                return Err("membership offer requires another admitted peer".into());
+                return Err(ApiError::invalid_input("peer", "membership offer requires another admitted peer"));
             }
             let Some((authorization, commit)) = owner
                 .membership_update_for(peer, after)
-                .map_err(str::to_owned)?
+                .map_err(security(ErrorCode::InvalidInput))?
             else {
                 return Ok(json!({"state":"membership_offer_unavailable","next_after":0}));
             };
@@ -928,19 +998,19 @@ fn poll_with_budget(
                 let owner = session
                     .workspace
                     .as_ref()
-                    .ok_or("session has no workspace")?;
+                    .ok_or_else(errors::no_workspace)?;
                 if peer == session.node.id() || owner.member_id_for_endpoint(peer).is_err() {
-                    return Err("membership offer requires another admitted peer".into());
+                    return Err(ApiError::invalid_input("peer", "membership offer requires another admitted peer"));
                 }
                 let staged = session
                     .transition.staged
                     .as_ref()
-                    .ok_or("workspace candidate is not staged")?;
+                    .ok_or_else(|| ApiError::wrong_state("workspace candidate is not staged"))?;
                 let WorkspaceTransition::Management(action, commit) = &staged.transition else {
-                    return Err("staged membership offer requires a management transition".into());
+                    return Err(ApiError::wrong_state("staged membership offer requires a management transition"));
                 };
                 if !matches!(action, arachne_security::ManagementAction::Promote(_)) {
-                    return Err("staged membership offer only supports administrator promotion".into());
+                    return Err(ApiError::unsupported("staged membership offer only supports administrator promotion"));
                 }
                 (owner.epoch(), *action, commit.clone())
             };
@@ -967,13 +1037,13 @@ fn poll_with_budget(
             let bytes = session
                 .runtime
                 .block_on(&mut pending.task)
-                .map_err(|_| "membership offer task failed")?
-                .map_err(|e| e.to_string())?;
+                .map_err(|_| ApiError::internal("membership offer task failed"))?
+                .map_err(errors::node)?;
             if requires_adoption && bytes.as_slice() != [1] {
-                return Err("membership peer rejected the staged administrator handoff".into());
+                return Err(ApiError::not_authorized("membership peer rejected the staged administrator handoff"));
             }
             if !matches!(bytes.as_slice(), [0] | [1]) {
-                return Err("invalid membership offer acknowledgment".into());
+                return Err(ApiError::transport_failed(None, "invalid membership offer acknowledgment"));
             }
             let next = pending
                 .query
@@ -1002,8 +1072,8 @@ fn poll_with_budget(
             let bytes = match session
                 .runtime
                 .block_on(&mut pending.task)
-                .map_err(|_| "membership query task failed".to_owned())
-                .and_then(|reply| reply.map_err(|e| e.to_string()))
+                .map_err(|_| ApiError::internal("membership query task failed"))
+                .and_then(|reply| reply.map_err(errors::node))
             {
                 Ok(bytes) => bytes,
                 Err(_error) => {
@@ -1024,12 +1094,12 @@ fn poll_with_budget(
             session.membership.peer_failures.remove(&pending.peer);
             if owner.epoch() != pending.query.epoch
                 || owner.epoch_fingerprint() != pending.query.fingerprint
-                || owner.workspace_name_head().map_err(str::to_owned)? != pending.query.name_head
+                || owner.workspace_name_head().map_err(security(ErrorCode::Internal))? != pending.query.name_head
                 || owner.member_id_for_endpoint(pending.peer).is_err()
             {
                 return Ok(json!({"state":"membership_update_stale"}));
             }
-            let mut value = wire::decode_reply(&bytes)?;
+            let mut value = wire::decode_reply(&bytes).map_err(crate::errors::legacy)?;
             if value["state"] == "membership_denied" {
                 return Ok(value);
             }
@@ -1044,7 +1114,7 @@ fn poll_with_budget(
                     )
                 )
             {
-                return Err("membership reply does not match query".into());
+                return Err(ApiError::transport_failed(None, "membership reply does not match query"));
             }
             let membership_head = value["epoch"].as_u64();
             if value["state"] == "membership_current" {
@@ -1058,7 +1128,7 @@ fn poll_with_budget(
             }
             if let Some(profiles) = value.get("profiles") {
                 let profiles: Vec<Vec<u8>> = serde_json::from_value(profiles.clone())
-                    .map_err(|_| "invalid member profiles")?;
+                    .map_err(|_| ApiError::transport_failed(None, "invalid member profiles"))?;
                 // A full retention budget must never fail PollMembershipUpdate
                 // (FUT-37 kickback #1): the membership transition already
                 // decoded into `value` is real and must still be returned.
@@ -1070,7 +1140,7 @@ fn poll_with_budget(
             }
             if let Some(digest) = value.get("profiles_digest") {
                 let digest = serde_json::from_value(digest.clone())
-                    .map_err(|_| "invalid profiles summary")?;
+                    .map_err(|_| ApiError::transport_failed(None, "invalid profiles summary"))?;
                 // Only a peer's comparison hint, never authority for a profile.
                 if !session.membership.peer_profile_summaries.contains_key(&pending.peer)
                     && session.membership.peer_profile_summaries.len() >= MAX_PEER_PROFILE_SUMMARIES
@@ -1083,7 +1153,7 @@ fn poll_with_budget(
                 let owner = session
                     .workspace
                     .as_deref()
-                    .ok_or("session has no workspace")?;
+                    .ok_or_else(errors::no_workspace)?;
                 let ours = profiles_digest(owner, &lock_profiles(&session.membership.profiles));
                 if ours != digest && session.membership.profiles_walked.get(&pending.peer) != Some(&digest) {
                     start_profile_pull(session, pending.peer, None, digest);
@@ -1093,19 +1163,19 @@ fn poll_with_budget(
                 && let Some(head) = value.get("name_head")
             {
                 let head: [u8; 32] = serde_json::from_value(head.clone())
-                    .map_err(|_| "invalid workspace name head")?;
+                    .map_err(|_| ApiError::transport_failed(None, "invalid workspace name head"))?;
                 let owner = session
                     .workspace
                     .as_ref()
-                    .ok_or("session has no workspace")?;
-                if head != owner.workspace_name_head().map_err(str::to_owned)? {
+                    .ok_or_else(errors::no_workspace)?;
+                if head != owner.workspace_name_head().map_err(security(ErrorCode::Internal))? {
                     let mut rejected_record = None;
                     let mut rejection_reason = None;
                     if let Some(record) = value.get("name_record") {
                         let record: Vec<u8> = serde_json::from_value(record.clone())
-                            .map_err(|_| "invalid workspace name record")?;
+                            .map_err(|_| ApiError::transport_failed(None, "invalid workspace name record"))?;
                         if record.len() > arachne_security::MAX_WORKSPACE_NAME_RECORD {
-                            return Err("workspace name record exceeds bound".into());
+                            return Err(ApiError::limit_reached("workspace name record", arachne_security::MAX_WORKSPACE_NAME_RECORD as u64, "workspace name record exceeds bound"));
                         }
                         match owner.prepare_workspace_name_update(&record) {
                             Ok(_) => {
@@ -1119,7 +1189,7 @@ fn poll_with_budget(
                             }
                         }
                     }
-                    let ours = owner.workspace_name_revision().map_err(str::to_owned)?;
+                    let ours = owner.workspace_name_revision().map_err(security(ErrorCode::Internal))?;
                     let remote_revision = value["name_revision"].as_u64();
                     if remote_revision.is_some_and(|revision| revision < ours) {
                         return Ok(json!({
@@ -1127,9 +1197,9 @@ fn poll_with_budget(
                             "peer":pending.peer,
                             "name_revision":value["name_revision"],
                             "local_name_revision":ours,
-                            "local_workspace_name":owner.workspace_name().map_err(str::to_owned)?,
+                            "local_workspace_name":owner.workspace_name().map_err(security(ErrorCode::Internal))?,
                             "name_head":head,
-                            "local_name_head":owner.workspace_name_head().map_err(str::to_owned)?,
+                            "local_name_head":owner.workspace_name_head().map_err(security(ErrorCode::Internal))?,
                             "name_update_rejected":rejection_reason,
                         }));
                     }
@@ -1139,17 +1209,17 @@ fn poll_with_budget(
                             "peer":pending.peer,
                             "name_revision":value["name_revision"],
                             "local_name_revision":ours,
-                            "local_workspace_name":owner.workspace_name().map_err(str::to_owned)?,
+                            "local_workspace_name":owner.workspace_name().map_err(security(ErrorCode::Internal))?,
                             "name_head":head,
-                            "local_name_head":owner.workspace_name_head().map_err(str::to_owned)?,
+                            "local_name_head":owner.workspace_name_head().map_err(security(ErrorCode::Internal))?,
                             "name_update_rejected":rejection_reason,
                         }));
                     }
                     if let Some(checkpoint) = value.get("name_checkpoint") {
                         let checkpoint: Vec<u8> = serde_json::from_value(checkpoint.clone())
-                            .map_err(|_| "invalid workspace name checkpoint")?;
+                            .map_err(|_| ApiError::transport_failed(None, "invalid workspace name checkpoint"))?;
                         if checkpoint.len() > arachne_security::MAX_WORKSPACE_NAME_CHECKPOINT {
-                            return Err("workspace name checkpoint exceeds bound".into());
+                            return Err(ApiError::limit_reached("workspace name checkpoint", arachne_security::MAX_WORKSPACE_NAME_CHECKPOINT as u64, "workspace name checkpoint exceeds bound"));
                         }
                         return Ok(json!({"state":"workspace_name_checkpoint_available",
                             "name_checkpoint":checkpoint,"peer":pending.peer}));
@@ -1162,7 +1232,7 @@ fn poll_with_budget(
                     // A peer behind this accepted chain can learn from our next poll response.
                     if owner
                         .next_workspace_name(head)
-                        .map_err(str::to_owned)?
+                        .map_err(security(ErrorCode::Internal))?
                         .is_none()
                     {
                         return Ok(
@@ -1343,8 +1413,8 @@ fn member_roster_retains_profiles_for_100_admitted_members() {
     // Two calls of <= MAX_REQUEST_PROFILES each: this is the same wire chunk
     // bound Kotlin's WorkspaceMembers.kt publishes against (REQUEST_PROFILE_LIMIT
     // = 64); retention must grow across these calls, not just within one.
-    roster(session, &profiles[..64]).unwrap();
-    let reply2 = roster(session, &profiles[64..]).unwrap();
+    roster_value(session, &profiles[..64]).unwrap();
+    let reply2 = roster_value(session, &profiles[64..]).unwrap();
 
     let owner = session.workspace.as_ref().unwrap();
     let own_id = owner.member().unwrap().id();
@@ -1381,7 +1451,7 @@ fn member_roster_retains_profiles_for_100_admitted_members() {
     // AC: a profile that a genuine bound rejects (per-profile size) still
     // produces a distinguishable, non-Ok signal -- never a silent Ok.
     let oversized = vec![0u8; arachne_security::MAX_MEMBER_PROFILE + 1];
-    assert!(roster(session, &[oversized]).is_err());
+    assert!(roster_value(session, &[oversized]).is_err());
 }
 
 // FUT-37 PR #102 kickback #1: a full retention *byte budget* is presentation
@@ -1419,13 +1489,13 @@ fn budget_pressure_never_fails_member_roster_or_poll_membership_update() {
     // member_roster (host API / the "open"/refresh surface): must succeed
     // and signal overflow, never Err, once the budget can't hold every
     // profile it's handed.
-    let reply1 = roster_with_budget(session, &profiles[..1], tiny_budget).unwrap();
+    let reply1 = roster_with_budget_value(session, &profiles[..1], tiny_budget).unwrap();
     assert_eq!(
         reply1.get("profiles_retained"),
         None,
         "the first profile alone must fit the budget"
     );
-    let reply2 = roster_with_budget(session, &profiles[1..2], tiny_budget).unwrap();
+    let reply2 = roster_with_budget_value(session, &profiles[1..2], tiny_budget).unwrap();
     assert_eq!(
         reply2["profiles_retained"],
         json!(false),
@@ -1524,7 +1594,7 @@ fn gossiped_names_from_a_join_wave_survive_until_their_steps_land() {
     // The later steps land: this node now holds the latest committed state.
     super::commit_workspace(&mut session, owner);
     stage_gossiped_step(&mut session).unwrap();
-    let roster = roster(&mut session, &[]).unwrap();
+    let roster = roster_value(&mut session, &[]).unwrap();
     let named = roster["members"]
         .as_array()
         .unwrap()
@@ -1582,7 +1652,7 @@ fn missing_names_come_back_from_one_peer_in_pages() {
     let answerer_endpoint = [16; 32]; // admit_members creates the owner at [seed; 32]
     let mut answerer = bare_test_session(owner.clone());
     for chunk in profiles.chunks(MAX_REQUEST_PROFILES) {
-        roster(&mut answerer, chunk).unwrap();
+        roster_value(&mut answerer, chunk).unwrap();
     }
     // The newest member holds the latest state but no other member's name.
     let requester_endpoint = *endpoints.last().unwrap();
@@ -1664,7 +1734,7 @@ fn missing_names_come_back_from_one_peer_in_pages() {
         requester.membership.profile_pull.as_mut().unwrap().task = task;
         stage_gossiped_step(&mut requester).unwrap();
     }
-    let roster = roster(&mut requester, &[]).unwrap();
+    let roster = roster_value(&mut requester, &[]).unwrap();
     let named = roster["members"]
         .as_array()
         .unwrap()
@@ -1848,48 +1918,51 @@ fn equal_epoch_needs_matching_fingerprint_and_malformed_claims_are_not_current()
     assert!(agreement(&owner, &response).is_err());
 }
 
-pub(super) fn stage_update(session: &mut Session, step: JoinStep) -> Result<Value, String> {
-    check_epoch_transition(session).map_err(crate::errors::text)?;
+pub(super) fn stage_update(
+    session: &mut Session,
+    step: JoinStep,
+) -> Result<StagedChange, ApiError> {
+    check_epoch_transition(session)?;
     session.membership.staged_step_received = false;
     let authorization = step.authorization()?;
     let owner = session
         .workspace
         .as_ref()
-        .ok_or("session has no workspace")?;
+        .ok_or_else(errors::no_workspace)?;
     let invitation_checkpoint = step.invitation_checkpoint;
     let prepared = match authorization {
         arachne_security::MembershipAuthorization::Admission(auth) => {
             if invitation_checkpoint.is_some() {
-                return Err("admission update cannot carry an invitation checkpoint".into());
+                return Err(ApiError::invalid_input("step", "admission update cannot carry an invitation checkpoint"));
             }
             arachne_security::PreparedManagementUpdate::Active(Box::new(
                 owner
                     .prepare_admission_update(&auth, &step.commit)
-                    .map_err(str::to_owned)?,
+                    .map_err(security(ErrorCode::InvalidInput))?,
             ))
         }
         arachne_security::MembershipAuthorization::AdmissionBatch(auths) => {
             if invitation_checkpoint.is_some() {
-                return Err("admission update cannot carry an invitation checkpoint".into());
+                return Err(ApiError::invalid_input("step", "admission update cannot carry an invitation checkpoint"));
             }
             arachne_security::PreparedManagementUpdate::Active(Box::new(
                 owner
                     .prepare_admission_batch_update(&auths, &step.commit)
-                    .map_err(str::to_owned)?,
+                    .map_err(security(ErrorCode::InvalidInput))?,
             ))
         }
         arachne_security::MembershipAuthorization::Management(action) => {
             let mut prepared = owner
                 .prepare_management_update(action, &step.commit)
-                .map_err(str::to_owned)?;
+                .map_err(security(ErrorCode::InvalidInput))?;
             if let Some(checkpoint) = invitation_checkpoint {
                 let arachne_security::PreparedManagementUpdate::Active(workspace) = &mut prepared
                 else {
-                    return Err("removal cannot carry an invitation checkpoint".into());
+                    return Err(ApiError::invalid_input("step", "removal cannot carry an invitation checkpoint"));
                 };
                 workspace
                     .retain_invitation_checkpoint(action, &checkpoint.grant, &checkpoint.checkpoint)
-                    .map_err(str::to_owned)?;
+                    .map_err(security(ErrorCode::InvalidInput))?;
             }
             prepared
         }
@@ -1897,23 +1970,28 @@ pub(super) fn stage_update(session: &mut Session, step: JoinStep) -> Result<Valu
     let key = session
         .storage_key
         .as_ref()
-        .ok_or("session has no protected root key")?;
+        .ok_or_else(errors::no_root_key)?;
     let prepared = match prepared {
         arachne_security::PreparedManagementUpdate::Active(workspace) => *workspace,
         arachne_security::PreparedManagementUpdate::Removed(removed) => {
-            return stage_removal(session, removed);
+            return stage_removal(session, removed).map(StagedChange::Removal);
         }
     };
-    let (publisher, inbox) = super::carry_delivery(session, &prepared).map_err(crate::errors::text)?;
+    let (publisher, inbox) = super::carry_delivery(session, &prepared)?;
     let snapshot = seal_state(
         session.records.is_some(),
         &prepared,
         key,
         publisher.as_ref(),
         inbox.as_ref(),
-    ).map_err(crate::errors::text)?;
-    let value = json!({"workspace":prepared.id(), "workspace_name":prepared.workspace_name().map_err(str::to_owned)?, "snapshot":snapshot,
-            "state":"awaiting_save", "durable":false});
+    )?;
+    let value = StagedCandidate::new(
+        prepared.id(),
+        prepared
+            .workspace_name()
+            .map_err(security(ErrorCode::Internal))?,
+        snapshot.clone(),
+    );
     session.transition.staged = Some(StagedWorkspace {
         publisher,
         inbox,
@@ -1922,7 +2000,7 @@ pub(super) fn stage_update(session: &mut Session, step: JoinStep) -> Result<Valu
         snapshot,
     });
     session.membership.staged_step_received = true;
-    Ok(value)
+    Ok(StagedChange::Candidate(value))
 }
 
 /// Head announcement: workspace, epoch, committing member's endpoint.
@@ -2130,7 +2208,7 @@ pub(super) fn announce_head(session: &mut Session) {
 /// Stage the next gossiped membership step that extends this node's epoch,
 /// if any. Steps from further ahead wait, bounded, until their turn. The step
 /// is verified exactly as a pulled one; the gossip sender grants nothing.
-pub(super) fn stage_gossiped_step(session: &mut Session) -> Result<Option<Value>, String> {
+pub(super) fn stage_gossiped_step(session: &mut Session) -> Result<Option<Value>, ApiError> {
     let Some(epoch) = session.workspace.as_ref().map(|owner| owner.epoch()) else {
         return Ok(None);
     };
@@ -2176,7 +2254,7 @@ pub(super) fn stage_gossiped_step(session: &mut Session) -> Result<Option<Value>
     let Ok(step) = serde_json::from_slice::<JoinStep>(&bytes) else {
         return Ok(None);
     };
-    match stage_update(session, step) {
+    match stage_update(session, step).and_then(|change| serde_json::to_value(change).map_err(errors::encode)) {
         Ok(mut value) => {
             // No requester waits on this step: the host saves and adopts
             // without sending a reply.
@@ -2495,49 +2573,56 @@ pub(super) fn range_reply(
 
 /// Accept a carrier's signed next transition, not the carrier as membership authority.
 /// Responses reveal no roster, fingerprint, current epoch, Welcome or invitation.
-pub(super) fn receive_offer(session: &mut Session, packet: &[u8]) -> Result<Value, String> {
+pub(super) fn receive_offer(session: &mut Session, packet: &[u8]) -> Result<Value, ApiError> {
     if packet.len() <= 45 || packet.len() > 32 * 1024 || !packet.starts_with(b"DFMO\x01") {
-        return Err("invalid membership offer".into());
+        return Err(ApiError::invalid_input("offer", "invalid membership offer"));
     }
-    let owner = session.workspace.as_ref().ok_or("no workspace")?;
+    let owner = session.workspace.as_ref().ok_or_else(|| ApiError::wrong_state("no workspace"))?;
     if packet[5..37] != owner.id() || packet[37..45] != owner.epoch().to_be_bytes() {
-        return Err("membership offer does not extend current epoch".into());
+        return Err(ApiError::epoch_mismatch("membership offer does not extend current epoch"));
     }
     let step: JoinStep =
-        serde_json::from_slice(&packet[45..]).map_err(|_| "invalid offered transition")?;
-    stage_update(session, step)
+        serde_json::from_slice(&packet[45..]).map_err(|_| ApiError::invalid_input("offer", "invalid offered transition"))?;
+    serde_json::to_value(stage_update(session, step)?).map_err(errors::encode)
 }
 
 pub(super) fn stage_management(
     session: &mut Session,
     action: arachne_security::ManagementAction,
-) -> Result<Value, String> {
-    check_epoch_transition(session).map_err(crate::errors::text)?;
+) -> Result<StagedCandidate, ApiError> {
+    check_epoch_transition(session)?;
     let prepared = session
         .workspace
         .as_ref()
-        .ok_or("session has no workspace")?
+        .ok_or_else(errors::no_workspace)?
         .prepare_management(action)
-        .map_err(str::to_owned)?;
+        .map_err(security(ErrorCode::InvalidInput))?;
     stage_prepared(session, prepared)
 }
 
 pub(super) fn stage_prepared(
     session: &mut Session,
     prepared: arachne_security::PreparedManagement,
-) -> Result<Value, String> {
-    let (publisher, inbox) = super::carry_delivery(session, &prepared.workspace).map_err(crate::errors::text)?;
+) -> Result<StagedCandidate, ApiError> {
+    let (publisher, inbox) = super::carry_delivery(session, &prepared.workspace)?;
     let snapshot = seal_state(
         session.records.is_some(),
         &prepared.workspace,
         session
             .storage_key
             .as_ref()
-            .ok_or("session has no protected root key")?,
+            .ok_or_else(errors::no_root_key)?,
         publisher.as_ref(),
         inbox.as_ref(),
-    ).map_err(crate::errors::text)?;
-    let value = json!({"workspace":prepared.workspace.id(), "workspace_name":prepared.workspace.workspace_name().map_err(str::to_owned)?, "snapshot":snapshot, "state":"awaiting_save", "durable":false});
+    )?;
+    let value = StagedCandidate::new(
+        prepared.workspace.id(),
+        prepared
+            .workspace
+            .workspace_name()
+            .map_err(security(ErrorCode::Internal))?,
+        snapshot.clone(),
+    );
     session.transition.staged = Some(StagedWorkspace {
         publisher,
         inbox,
@@ -2550,15 +2635,15 @@ pub(super) fn stage_prepared(
 
 const LEAVE: &[u8; 5] = b"DFLV\x01";
 
-fn leave_parts(bytes: &[u8]) -> Result<(u64, arachne_security::ManagementAction), String> {
+fn leave_parts(bytes: &[u8]) -> Result<(u64, arachne_security::ManagementAction), ApiError> {
     if bytes.len() <= 13 || bytes.len() > 2048 || !bytes.starts_with(LEAVE) {
-        return Err("invalid leave request".into());
+        return Err(ApiError::invalid_input("request", "invalid leave request"));
     }
     let wire: WireManagement =
-        serde_json::from_slice(&bytes[13..]).map_err(|_| "invalid leave request")?;
+        serde_json::from_slice(&bytes[13..]).map_err(|_| ApiError::invalid_input("request", "invalid leave request"))?;
     let action = wire.action()?;
     if !matches!(action, arachne_security::ManagementAction::Leave(..)) {
-        return Err("expected self-authorized leave".into());
+        return Err(ApiError::invalid_input("request", "expected self-authorized leave"));
     }
     Ok((u64::from_be_bytes(bytes[5..13].try_into().unwrap()), action))
 }
@@ -2567,52 +2652,55 @@ pub(super) fn leave_reply(
     owner: &arachne_security::Workspace,
     peer: [u8; 32],
     bytes: &[u8],
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, ApiError> {
     let (epoch, action) = leave_parts(bytes)?;
     let (auth, commit) = owner
         .membership_update_for(peer, epoch)
-        .map_err(str::to_owned)?
-        .ok_or("leave outcome unavailable")?;
+        .map_err(security(ErrorCode::InvalidInput))?
+        .ok_or_else(|| ApiError::wrong_state("leave outcome unavailable"))?;
     if !matches!(&auth, arachne_security::MembershipAuthorization::Management(accepted) if *accepted == action)
     {
-        return Err("leave outcome does not match request".into());
+        return Err(ApiError::invalid_input("request", "leave outcome does not match request"));
     }
-    serde_json::to_vec(&step_json(&auth, &commit)).map_err(|e| e.to_string())
+    serde_json::to_vec(&step_json(&auth, &commit)).map_err(errors::encode)
 }
 
 pub(super) fn receive_leave(
     session: &mut Session,
     peer: [u8; 32],
     bytes: &[u8],
-) -> Result<Value, String> {
+) -> Result<Value, ApiError> {
     let (epoch, action) = leave_parts(bytes)?;
     let owner = session
         .workspace
         .as_ref()
-        .ok_or("session has no workspace")?;
+        .ok_or_else(errors::no_workspace)?;
     if leave_reply(owner, peer, bytes).is_ok() {
         return Ok(json!({"state":"reply_ready","leaving":true}));
     }
     if owner.epoch() != epoch
-        || owner.member_id_for_endpoint(peer).map_err(str::to_owned)? != action.target()
+        || owner.member_id_for_endpoint(peer).map_err(security(ErrorCode::NotMember))? != action.target()
     {
-        return Err("leave requester does not match member or epoch".into());
+        return Err(ApiError::not_authorized("leave requester does not match member or epoch"));
     }
-    let mut value = stage_management(session, action)?;
-    value["leaving"] = json!(true);
-    Ok(value)
+    let mut staged = stage_management(session, action)?;
+    staged.leaving = Some(true);
+    serde_json::to_value(staged).map_err(errors::encode)
 }
 
-pub(super) fn leave_via_peer(session: &mut Session, peer: [u8; 32]) -> Result<Value, String> {
-    check_epoch_transition(session).map_err(crate::errors::text)?;
+pub(super) fn leave_via_peer(
+    session: &mut Session,
+    peer: [u8; 32],
+) -> Result<StagedChange, ApiError> {
+    check_epoch_transition(session)?;
     let owner = session
         .workspace
         .as_ref()
-        .ok_or("session has no workspace")?;
+        .ok_or_else(errors::no_workspace)?;
     if peer == owner.endpoint() || owner.member_id_for_endpoint(peer).is_err() {
-        return Err("leave requires another admitted peer".into());
+        return Err(ApiError::invalid_input("peer", "leave requires another admitted peer"));
     }
-    let action = owner.leave_action().map_err(str::to_owned)?;
+    let action = owner.leave_action().map_err(security(ErrorCode::WrongState))?;
     let arachne_security::ManagementAction::Leave(id, signature) = action else {
         unreachable!()
     };
@@ -2623,15 +2711,23 @@ pub(super) fn leave_via_peer(session: &mut Session, peer: [u8; 32]) -> Result<Va
             id,
             signature: signature.to_vec(),
         })
-        .map_err(|e| e.to_string())?,
+        .map_err(errors::encode)?,
     );
-    let bytes = session.runtime.block_on(session.node.request_control(peer, &packet)).map_err(|_| "Couldn't finish leaving. Resume this workspace and try again when another member is reachable.")?;
-    let step: JoinStep = serde_json::from_slice(&bytes).map_err(
-        |_| "The other member couldn't accept the departure. Synchronize and try again.",
-    )?;
+    let bytes = session.runtime.block_on(session.node.request_control(peer, &packet)).map_err(|_| {
+        ApiError::peer_unreachable(
+            Some(arachne_api::EndpointId::from_bytes(peer)),
+            "Couldn't finish leaving. Resume this workspace and try again when another member is reachable.",
+        )
+    })?;
+    let step: JoinStep = serde_json::from_slice(&bytes).map_err(|_| {
+        ApiError::transport_failed(
+            Some(arachne_api::EndpointId::from_bytes(peer)),
+            "The other member couldn't accept the departure. Synchronize and try again.",
+        )
+    })?;
     if !matches!(step.authorization()?, arachne_security::MembershipAuthorization::Management(accepted) if accepted == action)
     {
-        return Err("leave reply does not match request".into());
+        return Err(ApiError::transport_failed(Some(arachne_api::EndpointId::from_bytes(peer)), "leave reply does not match request"));
     }
     stage_update(session, step)
 }
@@ -2639,22 +2735,28 @@ pub(super) fn leave_via_peer(session: &mut Session, peer: [u8; 32]) -> Result<Va
 pub(super) fn stage_removal(
     session: &mut Session,
     removed: arachne_security::RemovedMembership,
-) -> Result<Value, String> {
-    super::transition_activity(session, super::WorkspacePhase::Leaving, None).map_err(crate::errors::text)?;
+) -> Result<StagedRemoval, ApiError> {
+    super::transition_activity(session, super::WorkspacePhase::Leaving, None)?;
     let snapshot = if session.records.is_some() {
-        persistence::candidate_token().map_err(crate::errors::text)?
+        persistence::candidate_token()?
     } else {
         removed
             .seal(
                 session
                     .storage_key
                     .as_ref()
-                    .ok_or("session has no protected root key")?,
+                    .ok_or_else(errors::no_root_key)?,
             )
-            .map_err(str::to_owned)?
+            .map_err(security(ErrorCode::InvalidInput))?
     };
-    let mut value = json!({"workspace":removed.workspace_id(), "snapshot":snapshot, "state":"awaiting_save", "removed":true, "durable":false});
-    value["activity"] = super::activity_value(session);
+    let value = StagedRemoval {
+        workspace: removed.workspace_id(),
+        snapshot: snapshot.clone(),
+        state: "awaiting_save",
+        removed: true,
+        durable: false,
+        activity: crate::session::activity_view(session),
+    };
     session.transition.removal = Some((removed, snapshot));
     Ok(value)
 }

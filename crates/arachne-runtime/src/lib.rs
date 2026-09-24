@@ -28,7 +28,7 @@ mod ops;
 mod session;
 use ops::admission::{
     ADMISSION_HISTORY_PAGE_REQUEST, admission_packet, admission_reply_page,
-    parse_admission_history_page_packet, pending_approval_id, pinned_checkpoint,
+    parse_admission_history_page_packet, pinned_checkpoint,
 };
 #[cfg(test)]
 use ops::admission::retained_reply;
@@ -77,7 +77,8 @@ mod work_signal;
 mod workspace_activity;
 pub use arachne_api::{ApiError, ErrorCode};
 pub use client::{
-    AdmissionApproval, AdmissionApprovalPage, AdmissionAuthorization, InvitationCheckpoint, AdmissionReply, Client, ClientConfig, ConnectivityReport,
+    AdmissionApproval, AdmissionApprovalPage, AdmissionAuthorization, InvitationCheckpoint,
+    InvitationControl, InvitationKind, MemberAction, RemovedMembership, AdmissionReply, Client, ClientConfig, ConnectivityReport,
     ConnectionCapacityMetrics, ControlTimingMetrics, DeliveryFailure, DeliveryReport,
     DurationSummary, EndpointInfo, Error, ErrorKind, InterestObservation, InvitationDetails,
     InvitationInfo, JoinAdmissionStep, JoinRequest, MemberInfo, MemberKind,
@@ -908,7 +909,8 @@ async fn install_gossip_policy(
     Ok(())
 }
 
-use membership::{JoinStep, WireManagement};
+#[cfg(test)]
+use membership::JoinStep;
 
 fn report(value: AdmissionReport) -> DeliveryReport {
     DeliveryReport {
@@ -928,55 +930,6 @@ fn report(value: AdmissionReport) -> DeliveryReport {
 /// `report` as a JSON value, for replies that are still JSON.
 fn report_value(value: AdmissionReport) -> Value {
     serde_json::to_value(report(value)).unwrap_or(Value::Null)
-}
-
-fn invitation_envelope(
-    session: &Session,
-    invitation: &arachne_security::Invitation,
-    checkpoint: Vec<u8>,
-) -> Result<Value, String> {
-    let owner = session
-        .workspace
-        .as_ref()
-        .ok_or("session has no workspace")?;
-    let mut members = owner.member_endpoints().map_err(str::to_owned)?;
-    members.sort_unstable();
-    let bootstrap_peers = std::iter::once(session.node.id())
-        .chain(
-            members
-                .iter()
-                .copied()
-                .filter(|peer| *peer != session.node.id()),
-        )
-        .take(3)
-        .collect::<Vec<_>>();
-    let mut routes = Vec::new();
-    for peer in members {
-        if peer != session.node.id()
-            && let Some(address) = session.runtime.block_on(session.node.address_hint(peer))
-            && address.is_ipv4()
-            && !address.ip().is_unspecified()
-        {
-            routes.push(json!({"peer":peer,"address":address.to_string()}));
-            if routes.len() == 7 {
-                break;
-            }
-        }
-    }
-    Ok(
-        json!({"workspace": owner.id(), "workspace_name":owner.workspace_name().map_err(str::to_owned)?, "invitation": invitation.export_secret_token().as_slice(), "invitation_key": invitation.key(), "checkpoint": checkpoint, "peer":session.node.id(), "bootstrap_peers":bootstrap_peers, "address":session.node.address().to_string(), "routes":routes}),
-    )
-}
-
-fn inspected_invitation(invitation: &[u8], checkpoint: &[u8]) -> Result<Value, String> {
-    let invitation = arachne_security::Invitation::from_bytes(invitation).map_err(str::to_owned)?;
-    let proof = invitation.join_proof(checkpoint).map_err(str::to_owned)?;
-    let control = proof
-        .invitation_control(invitation.key())
-        .map_err(str::to_owned)?;
-    Ok(
-        json!({"workspace":invitation.workspace_id(),"invitation_key":invitation.key(),"workspace_name":proof.workspace_name().map_err(str::to_owned)?,"epoch":proof.epoch(), "personal_invitation":control.as_ref().is_some_and(|c| c.personal), "automatic_approval":control.as_ref().is_some_and(|c| c.automatic()), "expires_at":control.map_or(0, |c| c.expires_at)}),
-    )
 }
 
 fn member_metadata(workspace: &arachne_security::Workspace) -> Value {
@@ -1385,7 +1338,7 @@ pub(crate) fn legacy_dispatch(session: &mut Session, request: Request) -> Result
             | Request::OfferStagedMembershipUpdate { .. }
             | Request::PollMembershipOffer {}
     ) {
-        membership::poll(session, request)?
+        membership::poll(session, request).map_err(crate::errors::text)?
     } else if let Request::StageRecoveryRange { retain_until } = request {
         protected::stage_recovery(session, retain_until)?
     } else if let Request::FetchRecoveryRange {
@@ -2266,149 +2219,6 @@ pub(crate) fn legacy_dispatch(session: &mut Session, request: Request) -> Result
             }
             None => json!({"state":"recovery_cutoff_denied", "accepted_progress":false}),
         }
-    } else if let Request::MemberRoster { profiles } = request {
-        membership::roster(session, &profiles)?
-    } else if matches!(request, Request::UseServiceProfile {}) {
-        membership::lock_profiles(&session.membership.profiles).service = true;
-        json!({"state":"service_profile"})
-    } else if matches!(
-        request,
-        Request::StageWorkspaceName { .. }
-            | Request::StageWorkspaceNameUpdate { .. }
-            | Request::StageWorkspaceNameCheckpoint { .. }
-    ) {
-        let owner = session
-            .workspace
-            .as_ref()
-            .ok_or("session has no workspace")?;
-        let (workspace, missing) = match request {
-            Request::StageWorkspaceName { workspace_name } => owner
-                .prepare_workspace_name(&workspace_name)
-                .map(|p| (p.workspace, None)),
-            Request::StageWorkspaceNameUpdate { name_record } => owner
-                .prepare_workspace_name_update(&name_record)
-                .map(|workspace| (workspace, None)),
-            Request::StageWorkspaceNameCheckpoint { name_checkpoint } => owner
-                .prepare_workspace_name_checkpoint(&name_checkpoint)
-                .map(|prepared| (prepared.workspace, Some(prepared.missing))),
-            _ => unreachable!(),
-        }
-        .map_err(str::to_owned)?;
-        let snapshot = seal_state(
-            session.records.is_some(),
-            &workspace,
-            session
-                .storage_key
-                .as_ref()
-                .ok_or("session has no protected root key")?,
-            session.delivery.publisher.as_ref(),
-            session.delivery.inbox.as_ref(),
-        ).map_err(crate::errors::text)?;
-        let mut value = json!({"workspace":workspace.id(),"workspace_name":workspace.workspace_name().map_err(str::to_owned)?,
-            "snapshot":snapshot,"state":"awaiting_save","durable":false});
-        if let Some(missing) = missing {
-            value["name_history_missing_added"] = json!(missing);
-            value["name_history_missing"] = json!(
-                workspace
-                    .workspace_name_missing_history()
-                    .map_err(str::to_owned)?
-            );
-        }
-        session.transition.staged = Some(StagedWorkspace {
-            publisher: session.delivery.publisher.clone(),
-            inbox: session.delivery.inbox.clone(),
-            transition: WorkspaceTransition::WorkspaceName,
-            workspace,
-            snapshot,
-        });
-        value
-    } else if let Request::StageInvitation {
-        expires_at,
-        personal,
-        automatic,
-        request_access,
-    } = request
-    {
-        check_epoch_transition(session).map_err(crate::errors::text)?;
-        let owner = session
-            .workspace
-            .as_ref()
-            .ok_or("session has no workspace")?;
-        if request_access && (!personal || automatic) {
-            return Err("invalid request-access mode".into());
-        }
-        let (prepared, invitation, checkpoint) = if request_access {
-            owner.prepare_request_invitation(expires_at)
-        } else {
-            owner.prepare_invitation(expires_at, personal, automatic)
-        }
-        .map_err(str::to_owned)?;
-        let action = prepared.action;
-        let commit = prepared.commit.clone();
-        let value = membership::stage_prepared(session, prepared)?;
-        session.transition.staged.as_mut().unwrap().transition =
-            WorkspaceTransition::Invitation(Box::new(invitation), checkpoint, action, commit);
-        value
-    } else if let Request::StageInvitationApproval {
-        request,
-        attempt_id,
-    } = request
-    {
-        check_epoch_transition(session).map_err(crate::errors::text)?;
-        let pending_id = pending_approval_id(session, &request, attempt_id).map_err(crate::errors::text)?;
-        let prepared = session
-            .workspace
-            .as_ref()
-            .ok_or("session has no workspace")?
-            .prepare_invitation_approval(&request)
-            .map_err(str::to_owned)?;
-        let value = membership::stage_prepared(session, prepared)?;
-        session.admission.staged_approval_id = pending_id;
-        value
-    } else if let Request::StageInvitationDecline {
-        request,
-        attempt_id,
-    } = request
-    {
-        check_epoch_transition(session).map_err(crate::errors::text)?;
-        let pending_id = pending_approval_id(session, &request, attempt_id).map_err(crate::errors::text)?;
-        let prepared = session
-            .workspace
-            .as_ref()
-            .ok_or("session has no workspace")?
-            .prepare_invitation_decline(&request)
-            .map_err(str::to_owned)?;
-        let value = membership::stage_prepared(session, prepared)?;
-        session.admission.staged_approval_id = pending_id;
-        value
-    } else if matches!(request, Request::InvitationControls {}) {
-        let owner = session
-            .workspace
-            .as_ref()
-            .ok_or("session has no workspace")?;
-        let controls = owner.invitation_controls().map_err(str::to_owned)?;
-        json!({"invitations":controls.iter().filter(|c| !c.is_request_decision(&controls)).enumerate().map(|(i,c)| json!({"number":i+1,"key":c.key,"expires_at":c.expires_at,"enabled":c.enabled,"personal":c.personal,"automatic":c.automatic(),"request_access":c.request_access(),"approved":c.approved()})).collect::<Vec<_>>()})
-    } else if let Request::StageManagement { action } = request {
-        membership::stage_management(session, action.action()?)?
-    } else if let Request::LeaveViaPeer { peer } = request {
-        membership::leave_via_peer(session, peer)?
-    } else if matches!(request, Request::StageSoloLeave {}) {
-        check_epoch_transition(session).map_err(crate::errors::text)?;
-        let ended = session
-            .workspace
-            .as_ref()
-            .ok_or("session has no workspace")?
-            .prepare_solo_leave()
-            .map_err(str::to_owned)?;
-        membership::stage_removal(session, ended)?
-    } else if let Request::StageAdmissionUpdate { step } = request {
-        membership::stage_update(session, step)?
-    } else if let Request::InspectInvitation {
-        invitation,
-        checkpoint,
-    } = request
-    {
-        inspected_invitation(&invitation, &checkpoint)?
     } else if let Request::CreateWorkspace {
         display_name,
         workspace_name,
@@ -2710,7 +2520,6 @@ pub(crate) fn legacy_dispatch(session: &mut Session, request: Request) -> Result
     };
     Ok(value)
 }
-
 
 #[cfg(test)]
 mod large_invitation_tests;

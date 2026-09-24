@@ -12,7 +12,7 @@ use crate::client::{AdmissionAuthorization, AdmissionReply};
 use crate::errors::{self, security};
 use crate::json::Request;
 use crate::membership::{self, JoinStep};
-use crate::ops::{self, Op, candidate};
+use crate::ops::{self, Op, candidate, management};
 use crate::session::{activity_value, carry_delivery, check_epoch_transition, seal_state};
 use crate::{
     MAX_RUNTIME_ADMISSION_BATCH, NEARBY_IDENTITY, NEARBY_INVITATION, NEARBY_WORKSPACE,
@@ -205,7 +205,7 @@ pub(crate) fn poll(session: &mut Session, args: PollAdmissionArgs) -> Result<Val
     // A membership step received by gossip moves this member to the next
     // epoch before anything else is staged.
     if !admission_busy
-        && let Some(staged) = membership::stage_gossiped_step(session).map_err(errors::legacy)?
+        && let Some(staged) = membership::stage_gossiped_step(session)?
     {
         return Ok(staged);
     }
@@ -504,22 +504,28 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
                 state.as_deref(),
                 Some("workspace_name_update_available" | "workspace_name_checkpoint_available")
             ) {
-                let request = if state.as_deref() == Some("workspace_name_update_available") {
-                    Request::StageWorkspaceNameUpdate {
-                        name_record: serde_json::from_value(membership["name_record"].clone())
-                            .map_err(|_| ApiError::internal("workspace name record is invalid"))?,
-                    }
-                } else {
-                    Request::StageWorkspaceNameCheckpoint {
-                        name_checkpoint: serde_json::from_value(
-                            membership["name_checkpoint"].clone(),
+                let staged_name = if state.as_deref() == Some("workspace_name_update_available") {
+                    let name_record = serde_json::from_value(membership["name_record"].clone())
+                        .map_err(|_| ApiError::internal("workspace name record is invalid"))?;
+                    ops::nested(live_mut(session)?, Op::StageWorkspaceNameUpdate, |session| {
+                        management::stage_workspace_name_update(
+                            session,
+                            management::WorkspaceNameUpdateArgs { name_record },
                         )
-                        .map_err(|_| ApiError::internal("workspace name checkpoint is invalid"))?,
-                    }
+                    })?
+                } else {
+                    let name_checkpoint =
+                        serde_json::from_value(membership["name_checkpoint"].clone()).map_err(
+                            |_| ApiError::internal("workspace name checkpoint is invalid"),
+                        )?;
+                    ops::nested(live_mut(session)?, Op::StageWorkspaceNameCheckpoint, |session| {
+                        management::stage_workspace_name_checkpoint(
+                            session,
+                            management::WorkspaceNameCheckpointArgs { name_checkpoint },
+                        )
+                    })?
                 };
-                let staged_name = nested_json(session, request)?;
-                let snapshot: Vec<u8> = serde_json::from_value(staged_name["snapshot"].clone())
-                    .map_err(|_| ApiError::internal("workspace name snapshot is invalid"))?;
+                let snapshot = staged_name.snapshot;
                 persistence::commit_candidate(live_mut(session)?, &snapshot)
                     .map_err(errors::legacy)?;
                 let mut committed = adopt_admission_value(session, snapshot)?;
@@ -788,7 +794,7 @@ pub(crate) fn send_inbound_admission_reply(session: &mut Session) -> Result<Repl
         .ok_or_else(errors::no_workspace)?;
     let reply = if incoming.payload().starts_with(b"DFLV") {
         membership::leave_reply(workspace, incoming.peer(), incoming.payload())
-            .map_err(errors::legacy)?
+            ?
     } else if incoming.payload().starts_with(b"DFMO")
         || incoming.payload().starts_with(ADMISSION_RESULT_OFFER)
     {

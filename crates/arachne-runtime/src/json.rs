@@ -13,8 +13,8 @@ use serde_json::Value;
 
 use crate::errors;
 use crate::ops::candidate::{self, AdoptArgs};
-use crate::ops::{self, Op, admission, join, publication, receive};
-use crate::{JoinStep, WireManagement, legacy_dispatch, resources};
+use crate::ops::{self, Op, admission, invitation, join, management, publication, receive};
+use crate::{legacy_dispatch, resources};
 
 /// Maximum JSON request or metadata size in bytes.
 pub const MAX_REQUEST: usize = 128 * 1024;
@@ -151,53 +151,20 @@ pub(crate) enum Request {
     AdoptJoin(AdoptArgs),
     // Trusted host seam only: endpoint must come from authenticated transport.
     StageAdmission(admission::AdmissionArgs),
-    MemberRoster {
-        #[serde(default)]
-        profiles: Vec<Vec<u8>>,
-    },
+    MemberRoster(management::RosterArgs),
     UseServiceProfile {},
-    LeaveViaPeer {
-        peer: [u8; 32],
-    },
+    LeaveViaPeer(management::PeerArgs),
     StageSoloLeave {},
-    StageManagement {
-        action: WireManagement,
-    },
-    StageInvitation {
-        expires_at: u64,
-        personal: bool,
-        #[serde(default)]
-        automatic: bool,
-        #[serde(default)]
-        request_access: bool,
-    },
-    StageInvitationApproval {
-        request: Vec<u8>,
-        #[serde(default)]
-        attempt_id: Option<[u8; 32]>,
-    },
-    StageInvitationDecline {
-        request: Vec<u8>,
-        #[serde(default)]
-        attempt_id: Option<[u8; 32]>,
-    },
+    StageManagement(management::ManagementArgs),
+    StageInvitation(invitation::StageInvitationArgs),
+    StageInvitationApproval(invitation::DecisionArgs),
+    StageInvitationDecline(invitation::DecisionArgs),
     InvitationControls {},
-    StageWorkspaceName {
-        workspace_name: String,
-    },
-    StageWorkspaceNameUpdate {
-        name_record: Vec<u8>,
-    },
-    StageWorkspaceNameCheckpoint {
-        name_checkpoint: Vec<u8>,
-    },
-    InspectInvitation {
-        invitation: Vec<u8>,
-        checkpoint: Vec<u8>,
-    },
-    StageAdmissionUpdate {
-        step: JoinStep,
-    },
+    StageWorkspaceName(management::WorkspaceNameArgs),
+    StageWorkspaceNameUpdate(management::WorkspaceNameUpdateArgs),
+    StageWorkspaceNameCheckpoint(management::WorkspaceNameCheckpointArgs),
+    InspectInvitation(invitation::InspectArgs),
+    StageAdmissionUpdate(management::AdmissionUpdateArgs),
     AdoptAdmission(AdoptArgs),
     RetainedAdmission(admission::AdmissionArgs),
     BeginJoin(join::BeginJoinArgs),
@@ -395,6 +362,26 @@ pub(crate) fn dispatch(session: &mut crate::Session, request: Request) -> Result
         Request::AdoptReception(args) => reply(candidate::adopt_reception(session, args)?),
         Request::AdoptRecovery(args) => reply(candidate::adopt_recovery(session, args)?),
         Request::AdoptCurrentView(args) => reply(candidate::adopt_current_view(session, args)?),
+        Request::MemberRoster(args) => reply(management::member_roster(session, args)?),
+        Request::UseServiceProfile {} => reply(management::use_service_profile(session)?),
+        Request::StageManagement(args) => reply(management::stage(session, args)?),
+        Request::LeaveViaPeer(args) => reply(management::leave_via_peer(session, args)?),
+        Request::StageSoloLeave {} => reply(management::stage_solo_leave(session)?),
+        Request::StageAdmissionUpdate(args) => {
+            reply(management::stage_admission_update(session, args)?)
+        }
+        Request::StageWorkspaceName(args) => reply(management::stage_workspace_name(session, args)?),
+        Request::StageWorkspaceNameUpdate(args) => {
+            reply(management::stage_workspace_name_update(session, args)?)
+        }
+        Request::StageWorkspaceNameCheckpoint(args) => {
+            reply(management::stage_workspace_name_checkpoint(session, args)?)
+        }
+        Request::StageInvitation(args) => reply(invitation::stage(session, args)?),
+        Request::StageInvitationApproval(args) => reply(invitation::stage_approval(session, args)?),
+        Request::StageInvitationDecline(args) => reply(invitation::stage_decline(session, args)?),
+        Request::InvitationControls {} => reply(invitation::controls(session)?),
+        Request::InspectInvitation(args) => reply(invitation::inspect(session, args)?),
         Request::StageNetworkPublication(args) => reply(publication::stage(session, args)?),
         Request::PollProtected {} => reply(receive::poll_protected(session)?),
         Request::PollPendingObject(args) => reply(receive::poll_pending(session, args)?),
@@ -543,9 +530,9 @@ pub fn inspect_invitation(request: &[u8]) -> Result<Vec<u8>, String> {
     }
     let request: InvitationInspection =
         serde_json::from_slice(request).map_err(|e| e.to_string())?;
-    serde_json::to_vec(&crate::inspected_invitation(
-        &request.invitation,
-        &request.checkpoint,
-    )?)
+    serde_json::to_vec(
+        &invitation::inspected_invitation(&request.invitation, &request.checkpoint)
+            .map_err(errors::text)?,
+    )
     .map_err(|e| e.to_string())
 }

@@ -322,7 +322,7 @@ pub(crate) fn stage(session: &mut Session, args: StageJoinArgs) -> Result<Staged
         .join_proof()
         .map_err(security(ErrorCode::InvitationInvalid))?;
     let authorization =
-        |step: &JoinStep| step.authorization().map_err(|reason| ApiError::invalid_input("commits", reason));
+        |step: &JoinStep| step.authorization();
     // Replay the rolled-over prefix from the pinned checkpoint before the
     // chunk the host carried back. Nothing is accepted on the strength of
     // having been fetched earlier: a truncated or tampered prefix fails

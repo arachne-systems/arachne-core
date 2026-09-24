@@ -13,7 +13,8 @@ use crate::errors::{self, security};
 use crate::ops::admission::{admission_reply_page, queue_admission_push, send_inbound_admission_reply};
 use crate::session::{activity_view, commit_workspace, transition_activity};
 use crate::workspace_activity::ActivityView;
-use crate::{Session, WorkspacePhase, WorkspaceTransition, invitation_envelope, membership, report};
+use crate::ops::invitation::invitation_envelope;
+use crate::{Session, WorkspacePhase, WorkspaceTransition, membership, report};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -114,7 +115,7 @@ pub(crate) struct Adopted {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub step: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub issued_invitation: Option<Value>,
+    pub issued_invitation: Option<crate::client::InvitationInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub results_delivered: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -360,15 +361,14 @@ pub(crate) fn adopt(
             ));
         }
         WorkspaceTransition::Invitation(invitation, checkpoint, action, commit) => {
-            let issued =
-                invitation_envelope(session, &invitation, checkpoint).map_err(errors::legacy)?;
+            let issued = invitation_envelope(session, &invitation, checkpoint)?;
             let mut step = membership::step_json(
                 &arachne_security::MembershipAuthorization::Management(action),
                 &commit,
             );
             step["invitation_checkpoint"] = json!({
                 "grant": invitation.public_grant(),
-                "checkpoint": issued["checkpoint"],
+                "checkpoint": issued.checkpoint,
             });
             value.issued_invitation = Some(issued);
             value.step = Some(step);
