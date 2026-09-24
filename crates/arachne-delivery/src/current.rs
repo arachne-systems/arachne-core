@@ -876,13 +876,13 @@ mod tests {
     use std::num::NonZeroU64;
 
     fn pair() -> (Workspace, Workspace) {
-        let admin = Workspace::create([1; 32], "Publisher").unwrap();
+        let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
         let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
         let admin = registered.workspace;
         let pending =
-            PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+            PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
         let prepared = admin
-            .prepare_admission([2; 32], pending.admission_request().unwrap())
+            .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
             .unwrap();
         let mut proof = pending.join_proof().unwrap();
         proof
@@ -1146,12 +1146,12 @@ mod tests {
                 publisher.id(),
                 7,
                 BTreeMap::from([
-                    ([1; 32], Permissions::AllTopics),
-                    ([2; 32], Permissions::AllTopics),
+                    (crate::test_endpoint(1), Permissions::AllTopics),
+                    (crate::test_endpoint(2), Permissions::AllTopics),
                 ]),
             )
             .unwrap();
-        let served = index.serve(&publisher, &policy, [2; 32], &query).unwrap();
+        let served = index.serve(&publisher, &policy, crate::test_endpoint(2), &query).unwrap();
         assert_eq!(
             verify_wire_reply(&reader, &query, &served)
                 .unwrap()

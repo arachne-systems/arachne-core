@@ -51,116 +51,19 @@ fn read_auth(bytes: &mut &[u8]) -> Result<AdmissionAuthorization, &'static str> 
         redemption_signature: take(bytes, 64)?.try_into().unwrap(),
     })
 }
+/// Record format version. Step records use the shared v3 step codec.
+const VERSION: &[u8; 5] = b"DFWR\x03";
 fn step(auth: &MembershipAuthorization, commit: &[u8]) -> Result<Zeroizing<Vec<u8>>, &'static str> {
     let mut bytes = Zeroizing::new(Vec::new());
-    match auth {
-        MembershipAuthorization::Admission(auth) => {
-            bytes.push(0);
-            put_auth(&mut bytes, auth);
-        }
-        MembershipAuthorization::AdmissionBatch(auths) => {
-            if auths.is_empty() || auths.len() > super::MAX_ADMISSION_BATCH {
-                return Err("invalid admission batch size");
-            }
-            bytes.push(11);
-            bytes.extend((auths.len() as u16).to_be_bytes());
-            for auth in auths {
-                put_auth(&mut bytes, auth);
-            }
-        }
-        MembershipAuthorization::Management(action) => {
-            let (tag, id) = match action {
-                super::ManagementAction::Promote(id) => (1, id),
-                super::ManagementAction::Demote(id) => (2, id),
-                super::ManagementAction::Remove(id) => (3, id),
-                super::ManagementAction::Leave(id, _) => (4, id),
-                super::ManagementAction::CreateInvitation(id, ..) => (5, id),
-                super::ManagementAction::CreateAutomaticInvitation(id, ..) => (8, id),
-                super::ManagementAction::CreateRequestInvitation(id, ..) => (9, id),
-                super::ManagementAction::DeclineInvitationRequest(id, _) => (10, id),
-                super::ManagementAction::DisableInvitation(id) => (6, id),
-                super::ManagementAction::ApproveInvitation(id, _) => (7, id),
-            };
-            bytes.push(tag);
-            bytes.extend(id);
-            if let super::ManagementAction::Leave(_, signature) = action {
-                bytes.extend(signature);
-            }
-            if let super::ManagementAction::CreateInvitation(_, expires, personal) = action {
-                bytes.extend(expires.to_be_bytes());
-                bytes.push(u8::from(*personal));
-            }
-            if let super::ManagementAction::CreateAutomaticInvitation(_, expires)
-            | super::ManagementAction::CreateRequestInvitation(_, expires) = action
-            {
-                bytes.extend(expires.to_be_bytes());
-            }
-            if let super::ManagementAction::ApproveInvitation(_, package)
-            | super::ManagementAction::DeclineInvitationRequest(_, package) = action
-            {
-                bytes.extend(package);
-            }
-        }
-    }
-    blob(&mut bytes, commit)?;
+    super::step::write_step(&mut bytes, auth, commit)?;
     Ok(bytes)
 }
 fn read_step(mut bytes: &[u8]) -> Result<(MembershipAuthorization, Vec<u8>), &'static str> {
-    let auth = match take(&mut bytes, 1)?[0] {
-        0 => MembershipAuthorization::Admission(read_auth(&mut bytes)?),
-        11 => {
-            let count = u16::from_be_bytes(take(&mut bytes, 2)?.try_into().unwrap()) as usize;
-            if count == 0 || count > super::MAX_ADMISSION_BATCH {
-                return Err("invalid admission batch size");
-            }
-            MembershipAuthorization::AdmissionBatch(
-                (0..count)
-                    .map(|_| read_auth(&mut bytes))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
-        }
-        tag @ 1..=10 => {
-            let id = take(&mut bytes, 32)?.try_into().unwrap();
-            MembershipAuthorization::Management(match tag {
-                1 => super::ManagementAction::Promote(id),
-                2 => super::ManagementAction::Demote(id),
-                3 => super::ManagementAction::Remove(id),
-                4 => super::ManagementAction::Leave(id, take(&mut bytes, 64)?.try_into().unwrap()),
-                5 => super::ManagementAction::CreateInvitation(
-                    id,
-                    u64::from_be_bytes(take(&mut bytes, 8)?.try_into().unwrap()),
-                    match take(&mut bytes, 1)?[0] {
-                        0 => false,
-                        1 => true,
-                        _ => return Err("invalid invitation mode"),
-                    },
-                ),
-                6 => super::ManagementAction::DisableInvitation(id),
-                7 => super::ManagementAction::ApproveInvitation(
-                    id,
-                    take(&mut bytes, 32)?.try_into().unwrap(),
-                ),
-                9 => super::ManagementAction::CreateRequestInvitation(
-                    id,
-                    u64::from_be_bytes(take(&mut bytes, 8)?.try_into().unwrap()),
-                ),
-                10 => super::ManagementAction::DeclineInvitationRequest(
-                    id,
-                    take(&mut bytes, 32)?.try_into().unwrap(),
-                ),
-                _ => super::ManagementAction::CreateAutomaticInvitation(
-                    id,
-                    u64::from_be_bytes(take(&mut bytes, 8)?.try_into().unwrap()),
-                ),
-            })
-        }
-        _ => return Err("unknown membership history action"),
-    };
-    let commit = read_blob(&mut bytes)?;
-    if commit.is_empty() || !bytes.is_empty() {
+    let step = super::step::read_step(&mut bytes)?;
+    if !bytes.is_empty() {
         return Err("invalid membership record");
     }
-    Ok((auth, commit))
+    Ok(step)
 }
 
 impl Workspace {
@@ -175,7 +78,7 @@ impl Workspace {
             .values
             .read()
             .map_err(|_| "storage unavailable")?;
-        let mut meta = Zeroizing::new(b"DFWR\x02".to_vec());
+        let mut meta = Zeroizing::new(VERSION.to_vec());
         meta.extend(self.id);
         meta.extend(self.endpoint);
         meta.extend(self.epoch().to_be_bytes());
@@ -239,7 +142,10 @@ impl Workspace {
             .ok_or("security metadata missing")?
             .as_slice();
         let version = take(&mut meta, 5)?;
-        if !matches!(version, b"DFWR\x01" | b"DFWR\x02")
+        if version != VERSION && version.starts_with(b"DFWR") {
+            return Err(super::step::FORMAT_NOT_SUPPORTED);
+        }
+        if version != VERSION
             || take(&mut meta, 32)? != id
             || take(&mut meta, 32)? != endpoint
         {
@@ -258,11 +164,7 @@ impl Workspace {
             1 => Some(read_count(&mut meta)?),
             _ => return Err("invalid stored history flag"),
         };
-        let invitation_checkpoint_count = if version == b"DFWR\x02" {
-            read_count(&mut meta)?
-        } else {
-            0
-        };
+        let invitation_checkpoint_count = read_count(&mut meta)?;
         if invitation_checkpoint_count > super::invitation::MAX_RETAINED_CHECKPOINTS {
             return Err("invalid invitation checkpoint count");
         }
