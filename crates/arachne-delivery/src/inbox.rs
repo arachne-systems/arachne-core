@@ -4,7 +4,8 @@ use super::*;
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8] = b"DFOI\x02";
-const CACHE_MAGIC: &[u8] = b"DFIC\x04";
+/// Binary inbox state (A6f). Earlier versions are rejected.
+const CACHE_MAGIC: &[u8] = b"DFIC\x05";
 /// Replay windows: one per (author, epoch) that sent to this member.
 const MAX_REPLAY_WINDOWS: usize = 4096;
 /// Accepted counters tracked above one replay floor. An author's counter is
@@ -13,11 +14,19 @@ const MAX_REPLAY_WINDOWS: usize = 4096;
 /// full, the floor moves up to the oldest entry and older unseen counters are
 /// given up as lost.
 pub const REPLAY_ENTRIES: usize = 1024;
-const MAX_PENDING_OBJECTS: usize = 4096;
+const MAX_PENDING_OBJECTS: usize = 512;
 /// Pending payload bytes one author may hold in this inbox.
-pub const MAX_PENDING_BYTES_PER_AUTHOR: usize = 64 * 1024;
+pub const MAX_PENDING_BYTES_PER_AUTHOR: usize = 32 * 1024;
 /// Pending payload bytes of all authors together.
-pub const MAX_PENDING_BYTES: usize = 256 * 1024;
+pub const MAX_PENDING_BYTES: usize = 96 * 1024;
+/// Encoded bound of the inbox. With `PUBLISHER_BUDGET` it fits one workspace
+/// attachment: saving never evicts publisher history to make room, and the
+/// operation that would grow the inbox past it fails instead.
+pub const INBOX_BUDGET: usize =
+    arachne_security::MAX_WORKSPACE_ATTACHMENT - 9 - crate::PUBLISHER_BUDGET;
+/// Retained third-party proofs (ranges and current views) together. The one
+/// that expires first gives way.
+const MAX_RETAINED_PROOF_BYTES: usize = wire::MAX_REPLY_BYTES + 4 * 1024;
 /// Recently accepted publication ids kept for cross-epoch dedup.
 pub const RECENT_IDS: usize = 256;
 const MAX_RETAINED_RANGES: usize = 4;
@@ -28,7 +37,7 @@ const MAX_DIRECT_STREAMS: usize = 256;
 const DIRECT_WINDOW: usize = MAX_PACKETS_PER_TOPIC;
 // Recovery copies are optional; pending application objects and replay floors
 // are not. Bound encoded copies across all audiences, not just packet counts.
-const MAX_DIRECT_RETAINED_BYTES: usize = 128 * 1024;
+const MAX_DIRECT_RETAINED_BYTES: usize = 32 * 1024;
 
 /// Dedup for one author's sender counters in one epoch. Separate from pending
 /// storage: acknowledging an object never reopens its counter.
@@ -1759,6 +1768,7 @@ impl ObjectInbox {
             });
         }
         next.retained_ranges.sort_by(|a, b| a.query.cmp(&b.query));
+        next.trim_proofs()?;
         next.snapshot()?;
         Ok(next)
     }
@@ -1794,8 +1804,17 @@ impl ObjectInbox {
             view.reply = reply.to_vec();
             view.expires_at = expires_at;
         } else {
+            // Same rule as retained ranges: the view that expires first
+            // gives way.
             if next.retained_current_views.len() == MAX_RETAINED_CURRENT_VIEWS {
-                return Err("retained current-view capacity exhausted");
+                let oldest = next
+                    .retained_current_views
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, view)| view.expires_at)
+                    .map(|(index, _)| index)
+                    .unwrap();
+                next.retained_current_views.remove(oldest);
             }
             next.retained_current_views.push(RetainedCurrentView {
                 query: encoded,
@@ -1805,8 +1824,53 @@ impl ObjectInbox {
         }
         next.retained_current_views
             .sort_by(|a, b| a.query.cmp(&b.query));
+        next.trim_proofs()?;
         next.snapshot()?;
         Ok(next)
+    }
+
+    /// Keep retained proofs inside their byte budget: the proof (range or
+    /// current view) that expires first is evicted.
+    fn trim_proofs(&mut self) -> Result<(), &'static str> {
+        loop {
+            let bytes: usize = self
+                .retained_ranges
+                .iter()
+                .map(|range| range.query.len() + range.reply.len() + 16)
+                .chain(
+                    self.retained_current_views
+                        .iter()
+                        .map(|view| view.query.len() + view.reply.len() + 16),
+                )
+                .sum();
+            if bytes <= MAX_RETAINED_PROOF_BYTES {
+                return Ok(());
+            }
+            let range = self
+                .retained_ranges
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, range)| range.expires_at)
+                .map(|(index, range)| (range.expires_at, index));
+            let view = self
+                .retained_current_views
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, view)| view.expires_at)
+                .map(|(index, view)| (view.expires_at, index));
+            match (range, view) {
+                (Some(range), Some(view)) if view.0 < range.0 => {
+                    self.retained_current_views.remove(view.1);
+                }
+                (Some(range), _) => {
+                    self.retained_ranges.remove(range.1);
+                }
+                (None, Some(view)) => {
+                    self.retained_current_views.remove(view.1);
+                }
+                (None, None) => return Err("retained proof exceeds budget"),
+            }
+        }
     }
 
     /// Serve only a still-current exact proof to a currently authorized reader.
@@ -1928,7 +1992,7 @@ impl ObjectInbox {
             .unwrap_or_default();
         bytes.extend((current.len() as u32).to_be_bytes());
         bytes.extend(current);
-        if bytes.len() > arachne_security::MAX_WORKSPACE_ATTACHMENT {
+        if bytes.len() > INBOX_BUDGET {
             return Err("inbox byte capacity exhausted");
         }
         Ok(bytes)
@@ -1955,19 +2019,14 @@ impl ObjectInbox {
         self.validate_owner(owner)?;
         publisher.validate_owner(owner)?;
         let inbox = self.snapshot()?;
-        // Inbox receipts and pending objects take precedence over optional
-        // publisher history. Snapshot eviction keeps the signed head and each
-        // topic's unavailable-history watermark, never claiming empty coverage.
-        let mut retained = publisher.clone();
-        let log = loop {
-            let log = retained.snapshot();
-            if 9 + log.len() + inbox.len() <= arachne_security::MAX_WORKSPACE_ATTACHMENT {
-                break log;
-            }
-            if !retained.evict_oldest() {
-                return Err("combined object delivery state exceeds bound");
-            }
-        };
+        // Each part has its own budget, and the budgets fit the attachment:
+        // saving never evicts publisher history to make room for the inbox.
+        let log = publisher.snapshot();
+        if log.len() > crate::PUBLISHER_BUDGET
+            || 9 + log.len() + inbox.len() > arachne_security::MAX_WORKSPACE_ATTACHMENT
+        {
+            return Err("combined object delivery state exceeds bound");
+        }
         let mut bytes = MAGIC.to_vec();
         bytes.extend((log.len() as u32).to_be_bytes());
         bytes.extend(log);

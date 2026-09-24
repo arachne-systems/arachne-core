@@ -4,9 +4,9 @@
 use super::*;
 
 const MAGIC: &[u8] = b"DFPL\x01";
-/// Encoded bound for all retained epochs together.
-pub const MAX_PUBLISHER_SNAPSHOT: usize =
-    MAX_RETAINED_BYTES + (arachne_security::RECEIVE_EPOCHS as usize + 1) * 32 * 1024;
+/// Encoded bound of the whole publisher log. Together with `INBOX_BUDGET`
+/// it fits one workspace attachment, so saving never evicts either.
+pub const PUBLISHER_BUDGET: usize = 192 * 1024;
 /// Endpoints admitted after one epoch, per retained epoch. A batch admits at
 /// most 128; the window holds at most `RECEIVE_EPOCHS` later epochs.
 const MAX_JOINED_AFTER: usize = 128 * arachne_security::RECEIVE_EPOCHS as usize;
@@ -87,10 +87,6 @@ impl PublisherLog {
         Ok(())
     }
 
-    fn bytes(&self) -> usize {
-        self.epochs.iter().map(|retained| retained.log.bytes).sum()
-    }
-
     /// New publications in the current epoch only.
     pub fn append(
         &mut self,
@@ -103,9 +99,17 @@ impl PublisherLog {
             .ok_or("empty publisher log")?
             .log
             .append(context, ciphertext)?;
-        // One budget for all epochs: older epochs give way first.
-        while self.bytes() > MAX_RETAINED_BYTES && self.evict_oldest() {}
+        // One encoded budget for all epochs: older records give way first.
+        self.fit_budget();
         Ok(sequence)
+    }
+
+    fn fit_budget(&mut self) {
+        while self.snapshot().len() > PUBLISHER_BUDGET && self.evict_oldest() {}
+        // Only metadata is left over budget: drop whole old epochs.
+        while self.snapshot().len() > PUBLISHER_BUDGET && self.epochs.len() > 1 {
+            self.epochs.remove(0);
+        }
     }
 
     /// Evict the oldest record of the oldest epoch that has one. Watermarks
@@ -146,20 +150,22 @@ impl PublisherLog {
             .collect();
         for retained in &mut epochs {
             retained.joined_after.extend(added.iter().copied());
-            if retained.joined_after.len() > MAX_JOINED_AFTER {
-                return Err("too many members joined inside the receive window");
-            }
         }
+        // A membership step is never refused for history's sake: an epoch
+        // with too many later joins is dropped (its history is unavailable).
+        epochs.retain(|retained| retained.joined_after.len() <= MAX_JOINED_AFTER);
         epochs.push(Retained {
             fingerprint: next.epoch_fingerprint(),
             joined_after: BTreeSet::new(),
             log: EpochLog::new(self.workspace, self.author, next.epoch()),
         });
-        Ok(Self {
+        let mut advanced = Self {
             workspace: self.workspace,
             author: self.author,
             epochs,
-        })
+        };
+        advanced.fit_budget();
+        Ok(advanced)
     }
 
     /// Current-epoch selection. See `EpochLog::select`.
@@ -245,7 +251,7 @@ impl PublisherLog {
     /// Validates the codec and binds the current epoch to the restored owner's
     /// epoch and branch fingerprint.
     pub fn restore(owner: &arachne_security::Workspace, bytes: &[u8]) -> Result<Self, &'static str> {
-        if bytes.len() > MAX_PUBLISHER_SNAPSHOT {
+        if bytes.len() > PUBLISHER_BUDGET {
             return Err("publisher snapshot exceeds bounds");
         }
         let author = owner.member().ok_or("publisher requires member identity")?.id();
@@ -301,9 +307,6 @@ impl PublisherLog {
             author,
             epochs,
         };
-        if log.bytes() > MAX_RETAINED_BYTES {
-            return Err("retained bytes exceed limit");
-        }
         log.validate_owner(owner)?;
         Ok(log)
     }

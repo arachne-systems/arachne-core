@@ -263,6 +263,54 @@ fn per_author_quota_and_binary_pending_storage() {
 }
 
 #[test]
+fn publisher_history_never_shrinks_to_make_room_for_inbox_state() {
+    let (mut a, mut b, _, _) = admit(Workspace::create([1; 32], "A").unwrap(), [2; 32], "B");
+    let mut a_log = PublisherLog::new(&a).unwrap();
+    let payload = vec![7; arachne_security::MAX_APPLICATION_PAYLOAD];
+    for id in 0..40u8 {
+        let context = context(a.id(), a_log.head() + 1, id);
+        let object = a
+            .protect_object(b"chat", &context.authenticated_bytes(), &payload)
+            .unwrap();
+        a_log.append(context, object).unwrap();
+    }
+    assert!(a_log.snapshot().len() <= arachne_delivery::PUBLISHER_BUDGET);
+    // B sends A many direct objects; A keeps recovery copies of them.
+    let mut a_inbox = ObjectInbox::new(a.id(), a.epoch());
+    let audience = [a.member().unwrap().id()];
+    let topic = Topic::new("chat/direct").unwrap();
+    for id in 0..16u8 {
+        let context = PublicationContext {
+            workspace: b.id(),
+            revision: REVISION,
+            topic: topic.clone(),
+            id: [100 + id; 16],
+            sequence: std::num::NonZeroU64::new(u64::from(id) + 1),
+        };
+        let object = b
+            .protect_object(
+                b"chat",
+                &context.direct_authenticated_bytes(&audience).unwrap(),
+                &payload,
+            )
+            .unwrap();
+        let InboxStage::Prepared(next) = a_inbox
+            .stage_with_recipients(&a, &context, &audience, &object)
+            .unwrap()
+        else {
+            panic!("direct object was not new")
+        };
+        (a_inbox, _) = acknowledge(&next, &a);
+    }
+    // Saving never evicts publisher history silently: what is restored is
+    // exactly what was retained.
+    let bytes = a_inbox.snapshot_with_publisher(&a, &a_log).unwrap();
+    let (restored_log, _) = ObjectInbox::restore_snapshot(&a, &bytes).unwrap();
+    assert_eq!(restored_log.snapshot(), a_log.snapshot());
+    let _ = &mut b;
+}
+
+#[test]
 fn members_at_different_epochs_exchange_data_after_a_partition_heals() {
     // A and B share an epoch.
     let (mut a, mut b, _, _) = admit(Workspace::create([1; 32], "A").unwrap(), [2; 32], "B");

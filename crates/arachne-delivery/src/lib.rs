@@ -5,7 +5,7 @@ pub mod current;
 pub mod inbox;
 mod publisher;
 pub mod wire;
-pub use publisher::{MAX_PUBLISHER_SNAPSHOT, PublisherLog};
+pub use publisher::{PUBLISHER_BUDGET, PublisherLog};
 
 use arachne_routing::{PublicationContext, Topic};
 use arachne_security::{MAX_APPLICATION_CIPHERTEXT, MAX_RECOVERY_PACKETS, RecoveryRequest};
