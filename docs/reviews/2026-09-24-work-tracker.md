@@ -42,13 +42,19 @@ and a different Core pin. Core work that each plan step depends on:
   Original: One typed, versioned contract; stable error codes; `#[non_exhaustive]`; consider UniFFI.
 - [ ] **A2** — steps 1, 7 done (`b995fba`, `624c658`); ADR corrected. Wiring steps 2–6, 8–13 open.
   Original: Commit-ordering authority. **Decision open:** sequencer admin vs deterministic tie-break (recommended).
-- [ ] **A3** Decouple delivery and routing from the exact epoch and policy revision.
+- [x] **A3** (`fix/a3-delivery-epochs`, merging)
+  - [ ] A3f: runtime recovery ops (`fetch_recovery_range`, `discover_recovery_cutoff`) still ask for the current epoch only; wire the 4-epoch window.
+  - [ ] A3g: check that a large workspace plus a full attachment fits the store's 1 MiB record limit.
+  - [ ] A3h: drop unused `serde_json` in `arachne-delivery`; run `cargo fmt` workspace-wide once branches settle.
+  Original: Decouple delivery and routing from the exact epoch and policy revision.
 - [ ] **A4** Owned `Context`, event stream, `wait_for_work(timeout)`, `close(&self)`, suspend/resume.
 - [ ] **A5** One persistence mode behind a `Storage` trait; schema versions and migrations.
-- [ ] **A6** Delivery spec; per-author quotas; bitmap dedup; remove the legacy receive stack.
+- [x] **A6** (`fix/a3-delivery-epochs`; `docs/delivery.md`)
+  Original: Delivery spec; per-author quotas; bitmap dedup; remove the legacy receive stack.
 - [x] **A7** (`fix/a7-network`, merged)
   - [x] A7r (`79adbe4`, merged): runtime wiring — members-only gossip tag key, revision window in runtime checks and `real_node_lifecycle` test, one-behind `Message.revision`, `NodeOptions` into `create_endpoint`, stranger error kind Gate the data plane at handshake; fix metadata leaks; relay config; `Link` trait.
-- [ ] **A8** Per-app or per-topic isolation.
+- [x] **A8** (`1b481ca`; per-namespace object key + namespace in AAD; true isolation still needs separate groups, documented)
+  Original: Per-app or per-topic isolation.
 - [x] **A9** Version ranges; renamed forks with own versions; SPDX license field. (`fix/a9-supply-chain`, merged into `integrate/wave1`)
   - [ ] A9a: ~40 `.rs` comments cite ADR 0008/0009/0010 that live only in `arachne-development`. Replace with inline rationale.
   - [x] A9b (`fix/a9b-tor`; torut replaced, deny clean): `tor` feature pulls `torut` → `ed25519-dalek 1.0.1` / `curve25519-dalek 3.2.0` (RUSTSEC-2022-0093, RUSTSEC-2024-0344).
