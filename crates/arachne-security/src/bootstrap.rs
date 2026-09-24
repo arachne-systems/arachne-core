@@ -188,6 +188,15 @@ impl MembershipVerifier {
         Self::from_checkpoint_within(workspace, digest, bytes, MAX_BYTES)
     }
 
+    /// See [`JoinProof::from_local_checkpoint`]: own accepted state only.
+    pub(super) fn from_local_checkpoint(
+        workspace: [u8; 32],
+        digest: [u8; 32],
+        bytes: &[u8],
+    ) -> Result<Self, &'static str> {
+        Self::from_checkpoint_within(workspace, digest, bytes, MAX_LOCAL_STATE_BYTES)
+    }
+
     fn from_checkpoint_within(
         workspace: [u8; 32],
         digest: [u8; 32],
@@ -494,7 +503,27 @@ impl JoinProof {
         if bytes.len() > MAX_BYTES - 41 {
             return Err("checkpoint exceeds inline history bounds");
         }
-        let verifier = MembershipVerifier::from_trusted_checkpoint(workspace, digest, bytes)?;
+        Self::from_checkpoint_within(workspace, digest, bytes, MAX_BYTES)
+    }
+
+    /// A checkpoint this device holds as its own accepted state (a saved join
+    /// history, or one rebuilt from its own group). It never came from a peer
+    /// in this call, so the local-state bound applies, not the wire bound.
+    pub(super) fn from_local_checkpoint(
+        workspace: [u8; 32],
+        digest: [u8; 32],
+        bytes: &[u8],
+    ) -> Result<Self, &'static str> {
+        Self::from_checkpoint_within(workspace, digest, bytes, MAX_LOCAL_STATE_BYTES)
+    }
+
+    fn from_checkpoint_within(
+        workspace: [u8; 32],
+        digest: [u8; 32],
+        bytes: &[u8],
+        limit: usize,
+    ) -> Result<Self, &'static str> {
+        let verifier = MembershipVerifier::from_checkpoint_within(workspace, digest, bytes, limit)?;
         let message =
             MlsMessageIn::tls_deserialize_exact(bytes).map_err(|_| "invalid checkpoint")?;
         let MlsMessageBodyIn::GroupInfo(info) = message.extract() else {
@@ -792,7 +821,7 @@ impl JoinProof {
             .map_err(|_| "group comparison export failed")?
             .to_bytes()
             .map_err(|_| "group comparison encoding failed")?;
-        Self::from_trusted_checkpoint(workspace.id(), Sha256::digest(&bytes).into(), &bytes)
+        Self::from_local_checkpoint(workspace.id(), Sha256::digest(&bytes).into(), &bytes)
     }
 
     pub fn apply_management(

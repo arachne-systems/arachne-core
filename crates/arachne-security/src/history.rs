@@ -25,7 +25,7 @@ impl MembershipHistory {
     }
 
     pub fn verifier(&self, workspace: [u8; 32]) -> Result<MembershipVerifier, &'static str> {
-        MembershipVerifier::from_trusted_checkpoint(
+        MembershipVerifier::from_local_checkpoint(
             workspace,
             Sha256::digest(&self.checkpoint).into(),
             &self.checkpoint,
@@ -46,7 +46,7 @@ impl MembershipHistory {
     /// Compatibility serialization only. This budget must not limit the owner
     /// or the incremental record store; an oversized legacy export fails closed.
     pub fn inline(&self, workspace: [u8; 32]) -> Result<Vec<u8>, &'static str> {
-        let mut proof = JoinProof::from_trusted_checkpoint(
+        let mut proof = JoinProof::from_local_checkpoint(
             workspace,
             Sha256::digest(&self.checkpoint).into(),
             &self.checkpoint,
@@ -72,5 +72,110 @@ impl Workspace {
         };
         history.steps.push((authorization, commit.to_vec()));
         Ok(history)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use crate::{
+        AdmissionAssessment, MAX_ADMISSION_BATCH, ManagementAction, MembershipAuthorization,
+        PendingJoin, PreparedManagementUpdate, Workspace,
+    };
+
+    pub(crate) fn endpoint(index: usize) -> [u8; 32] {
+        let mut value = [0; 32];
+        value[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+        value[8..16].copy_from_slice(&(!(index as u64)).to_be_bytes());
+        value
+    }
+
+    /// An owner and one early member, both grown to at least `size` members
+    /// through batch admissions from one early invitation.
+    pub(crate) fn grown(seed: u8, size: usize) -> (Workspace, Workspace) {
+        let owner = Workspace::create([seed; 32], "Large workspace owner").unwrap();
+        let (registration, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+        let mut owner = registration.workspace;
+        let joiner = |index: usize| {
+            PendingJoin::from_invitation(&invitation, &checkpoint, endpoint(index), "Member").unwrap()
+        };
+        let early = joiner(0);
+        let request = early.admission_request().unwrap().to_vec();
+        let AdmissionAssessment::Ready(validated) = owner.assess_admission(endpoint(0), &request).unwrap() else {
+            panic!("open invitation needs no approval");
+        };
+        let prepared = owner
+            .prepare_validated_admission_batch(&[(endpoint(0), request.as_slice(), &validated)])
+            .unwrap();
+        let mut proof = early.join_proof().unwrap();
+        proof
+            .apply_transition(
+                &MembershipAuthorization::Admission(prepared.replies[0].authorization.clone()),
+                &prepared.commit,
+            )
+            .unwrap();
+        let mut member = early.prepare_workspace(&proof, &prepared.welcome).unwrap();
+        owner = prepared.workspace;
+        let mut next = 1;
+        while owner.member_count() < size {
+            let range = next..(next + MAX_ADMISSION_BATCH);
+            let joins: Vec<_> = range.clone().map(joiner).collect();
+            let requests: Vec<_> = joins.iter().map(|join| join.admission_request().unwrap().to_vec()).collect();
+            let validated: Vec<_> = range
+                .clone()
+                .zip(&requests)
+                .map(|(index, request)| match owner.assess_admission(endpoint(index), request).unwrap() {
+                    AdmissionAssessment::Ready(validated) => validated,
+                    _ => panic!("open invitation needs no approval"),
+                })
+                .collect();
+            let entries: Vec<_> = range
+                .clone()
+                .zip(requests.iter().zip(&validated))
+                .map(|(index, (request, validated))| (endpoint(index), request.as_slice(), validated))
+                .collect();
+            let prepared = owner.prepare_validated_admission_batch(&entries).unwrap();
+            let authorizations: Vec<_> =
+                prepared.replies.iter().map(|reply| reply.authorization.clone()).collect();
+            member = member.prepare_admission_batch_update(&authorizations, &prepared.commit).unwrap();
+            owner = prepared.workspace;
+            next = range.end;
+        }
+        (owner, member)
+    }
+
+    /// B3b: a member restored without a join history rebuilds one from its own
+    /// state. That is local state, so the wire bound for received checkpoints
+    /// must not apply; past ~250 members it rejected a valid management commit
+    /// the administrator had already adopted (a fork).
+    #[test]
+    fn a_member_restored_without_join_history_accepts_management_past_three_hundred_members() {
+        let (owner, mut member) = grown(206, 310);
+        member.join_history = None;
+        let records = member.export_records().unwrap();
+        let restored = Workspace::restore_records(endpoint(0), member.id(), &records).unwrap();
+        assert!(restored.join_history.is_none());
+        let own_id = restored.member().unwrap().id();
+        let target = owner
+            .member_roster()
+            .unwrap()
+            .into_iter()
+            .find(|m| !m.administrator && m.id != own_id)
+            .unwrap()
+            .id;
+        let action = ManagementAction::Remove(target);
+        let prepared = owner.prepare_management(action).unwrap();
+        let PreparedManagementUpdate::Active(updated) = restored
+            .prepare_management_update(action, &prepared.commit)
+            .unwrap_or_else(|error| {
+                panic!("restored member at {} members rejected management: {error}", restored.member_count())
+            })
+        else {
+            panic!("removal of another member removed this member")
+        };
+        assert_eq!(updated.epoch(), prepared.workspace.epoch());
+        // The rebuilt history is local state; it must also persist and restore.
+        let records = updated.export_records().unwrap();
+        let again = Workspace::restore_records(endpoint(0), updated.id(), &records).unwrap();
+        assert_eq!(again.epoch(), prepared.workspace.epoch());
     }
 }
