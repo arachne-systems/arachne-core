@@ -1,0 +1,20 @@
+[package]
+name = "arachne-uniffi-spike"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Throwaway spike (ADR A1/A4 step 7): prove UniFFI 0.31 bindings for Kotlin, Swift, Python and Go. Not production."
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "arachne_uniffi_spike"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+
+[dependencies]
+arachne-api = { path = "../arachne-api", features = ["uniffi"] }
+uniffi = { version = "=0.31.2", features = ["cli"] }

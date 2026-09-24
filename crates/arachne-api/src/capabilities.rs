@@ -5,6 +5,7 @@ use crate::{API_VERSION, Network};
 /// An optional runtime feature that a host can test for.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum Feature {
     ResourceTransfer,
@@ -17,6 +18,7 @@ pub enum Feature {
 /// `Limits` (step 3), because `Limits` is defined there.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Capabilities {
     pub api_version: u32,
     pub networks: Vec<Network>,

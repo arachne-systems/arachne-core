@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 /// `API_VERSION`.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
     AdmissionRequest,

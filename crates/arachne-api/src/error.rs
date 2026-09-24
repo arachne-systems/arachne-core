@@ -31,6 +31,7 @@ use crate::ids::EndpointId;
 #[non_exhaustive]
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ErrorCode {
     Closed = 1,
     Cancelled = 2,
@@ -171,9 +172,9 @@ impl<'de> Deserialize<'de> for ErrorCode {
 /// Make it where the failure happens. Do not guess it from message text.
 /// Variants that carry a `code` take a code from their range: `Storage` takes
 /// 3xx, `Transport` 4xx, `Authorization` 5xx, and `State` takes 102, 103 or 6xx.
-// TODO(ADR A1/A4 step 7): `cfg_attr(feature = "uniffi", derive(uniffi::Error))`.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Error))]
 #[serde(tag = "error", rename_all = "snake_case")]
 pub enum ApiError {
     #[error("closed")]
@@ -222,6 +223,41 @@ impl ApiError {
             Self::Internal { .. } => ErrorCode::Internal,
         }
     }
+}
+
+/// Foreign methods. UniFFI lowers an enum by variant index, not by its
+/// discriminant, so foreign code reads the stable number through `number()`.
+#[cfg(feature = "uniffi")]
+#[uniffi::export]
+impl ErrorCode {
+    /// The stable number of this code (same as [`ErrorCode::as_u32`]).
+    pub fn number(&self) -> u32 {
+        self.as_u32()
+    }
+}
+
+#[cfg(feature = "uniffi")]
+#[uniffi::export]
+impl ApiError {
+    /// The stable code. Foreign name for [`ApiError::code`].
+    #[uniffi::method(name = "code")]
+    pub fn foreign_code(&self) -> ErrorCode {
+        self.code()
+    }
+}
+
+/// The stable code of an error, as a free function.
+///
+/// Spike finding: UniFFI methods on an error enum do not reach every
+/// language. uniffi-bindgen-go 0.7.1 emits no methods on error types, and in
+/// Python the `code` field of `Storage`/`Transport`/`Authorization`/`State`
+/// hides the `code()` method. A free function works in all four languages.
+/// It is not named `error_code`: in Go that becomes `func ErrorCode`, which
+/// clashes with `type ErrorCode` in the same package.
+#[cfg(feature = "uniffi")]
+#[uniffi::export]
+pub fn api_error_code(error: &ApiError) -> ErrorCode {
+    error.code()
 }
 
 #[cfg(test)]

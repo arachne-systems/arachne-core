@@ -122,6 +122,14 @@ macro_rules! byte_id {
             }
         }
 
+        // Foreign code sees each ID as a lowercase hex string. Lifting a
+        // foreign string validates it with `from_hex`.
+        #[cfg(feature = "uniffi")]
+        uniffi::custom_type!($name, String, {
+            lower: |id| id.to_string(),
+            try_lift: |text| Ok($name::from_hex(&text)?),
+        });
+
         impl<'de> Deserialize<'de> for $name {
             fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
                 let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;

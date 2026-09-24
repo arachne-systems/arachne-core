@@ -1,0 +1,9 @@
+# Kotlin: every generated object is `AutoCloseable`, and its `close()` frees
+# the native handle. An exported Rust `close` clashes with it ("conflicting
+# overloads"), so Kotlin gets the name `shutdown`. Other languages keep `close`.
+[bindings.kotlin.rename]
+"SpikeClient.close" = "shutdown"
+
+# Go: generated packages import each other by this module path.
+[bindings.go]
+go_mod = "arachne.spike/gen"

@@ -12,15 +12,16 @@ keywords = ["api-bindings", "p2p", "networking"]
 documentation = "https://docs.rs/arachne-api"
 publish = ["crates-io"]
 
-# TODO(ADR A1/A4 step 7): add an optional `uniffi` feature (UniFFI `=0.31.x`)
-# with `cfg_attr(feature = "uniffi", derive(uniffi::Record/Enum/Error))` on the
-# public types and `uniffi::setup_scaffolding!()` in lib.rs. Spike
-# `#[non_exhaustive]` on `uniffi::Enum`/`uniffi::Error` first.
+# ADR A1/A4 step 7 (spike/a1-uniffi): optional UniFFI derives. Pinned to the
+# UniFFI minor that uniffi-bindgen-go v0.7.1 supports (0.31). See
+# docs/reviews/spike-a1-uniffi.md.
 [features]
+uniffi = ["dep:uniffi"]
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
+uniffi = { version = "=0.31.2", optional = true }
 
 [dev-dependencies]
 serde_json = "1.0.151"

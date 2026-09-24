@@ -11,8 +11,11 @@
 //! code or public field increments [`API_VERSION`]. Foreign bindings must keep
 //! a default branch.
 //!
-//! TODO(ADR step 7): optional `uniffi` feature with `cfg_attr` derives and
-//! `uniffi::setup_scaffolding!()`.
+//! With the `uniffi` feature the public types derive UniFFI metadata (ADR
+//! step 7). The feature is off by default, so core stays free of UniFFI.
+
+#[cfg(feature = "uniffi")]
+uniffi::setup_scaffolding!();
 
 mod capabilities;
 mod error;
