@@ -1,3 +1,4 @@
+// Modified by Arachne Systems from iroh-tor-transport 0.1.0; see ARACHNE-PATCH.md.
 //! Tor hidden service utilities for iroh.
 //!
 //! This crate provides utilities for creating Tor hidden services that can be used
@@ -6,7 +7,7 @@
 mod control;
 mod onion;
 
-use std::{collections::HashMap, future::Future, io, num::NonZeroUsize, pin::Pin, sync::Arc};
+use std::{collections::HashMap, future::Future, io, num::NonZeroUsize, sync::Arc};
 
 use bytes::Bytes;
 use iroh::{
@@ -22,16 +23,17 @@ use iroh_base::CustomAddr;
 use n0_error::{e, stack_error};
 use n0_future::{boxed::BoxFuture, stream};
 use n0_watcher::Watchable;
-use sha2::{Digest, Sha512};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
     sync::Mutex,
 };
 use tokio_socks::tcp::Socks5Stream;
-use torut::{
-    control::{AuthenticatedConn, ConnError, UnauthenticatedConn},
-    onion::{OnionAddressV3, TorPublicKeyV3, TorSecretKeyV3},
+
+pub use crate::control::ControlError;
+use crate::{
+    control::TorControl,
+    onion::{ExpandedSecretKey, OnionAddressV3},
 };
 
 /// Errors that can occur when building a Tor transport.
@@ -54,7 +56,7 @@ pub enum BuildError {
     #[error("Failed to load Tor protocol info")]
     ProtocolInfo {
         #[error(std_err)]
-        source: ConnError,
+        source: ControlError,
     },
     /// Failed to determine Tor auth method.
     #[error("Failed to determine Tor auth method")]
@@ -66,35 +68,27 @@ pub enum BuildError {
     #[error("Failed to authenticate with Tor")]
     Auth {
         #[error(std_err)]
-        source: ConnError,
+        source: ControlError,
     },
     /// Failed to create hidden service.
     #[error("Failed to create hidden service")]
     CreateOnion {
         #[error(std_err)]
-        source: ConnError,
+        source: ControlError,
     },
 }
 
 /// Convert an iroh SecretKey to a Tor v3 secret key.
-fn iroh_to_tor_secret_key(key: &SecretKey) -> TorSecretKeyV3 {
-    let seed = key.to_bytes();
-    let hash = Sha512::digest(seed);
-    let mut expanded_bytes: [u8; 64] = hash.into();
-    expanded_bytes[0] &= 248;
-    expanded_bytes[31] &= 63;
-    expanded_bytes[31] |= 64;
-    TorSecretKeyV3::from(expanded_bytes)
+fn iroh_to_tor_secret_key(key: &SecretKey) -> ExpandedSecretKey {
+    ExpandedSecretKey::from_seed(&key.to_bytes())
 }
 
 /// Get the onion address for an iroh `EndpointId` (public key only).
 ///
-/// Returns `None` if the public key bytes are invalid for Tor (should not happen
-/// with valid iroh keys since they use the same curve).
+/// Always `Some`: an `EndpointId` is already a validated Ed25519 public key,
+/// which is what torut checked here.
 pub(crate) fn onion_address_from_endpoint(endpoint: EndpointId) -> Option<OnionAddressV3> {
-    let bytes = endpoint.as_bytes();
-    let tor_public = TorPublicKeyV3::from_bytes(bytes).ok()?;
-    Some(tor_public.get_onion_address())
+    Some(OnionAddressV3::from_public_key(endpoint.as_bytes()))
 }
 
 /// A packet carried over the Tor stream transport.
@@ -340,15 +334,6 @@ const DEFAULT_SOCKS_PORT: u16 = 9050;
 const DEFAULT_CONTROL_PORT: u16 = 9051;
 const DEFAULT_ONION_PORT: u16 = 9999;
 
-/// Type alias for the async event handler function.
-type EventHandler = Box<
-    dyn Fn(
-            torut::control::AsyncEvent<'static>,
-        ) -> Pin<Box<dyn Future<Output = Result<(), ConnError>> + Send>>
-        + Send
-        + Sync,
->;
-
 /// Builder for [`TorCustomTransport`].
 ///
 /// # Defaults
@@ -433,39 +418,48 @@ impl TorCustomTransportBuilder {
         let stream = TcpStream::connect(&control_addr)
             .await
             .map_err(|err| e!(BuildError::ControlConnect, err))?;
-        let mut conn = UnauthenticatedConn::new(stream);
+        let mut conn = TorControl::new(stream);
         let auth_data = conn
-            .load_protocol_info()
+            .protocol_info()
             .await
             .map_err(|err| e!(BuildError::ProtocolInfo, err))?;
         let auth_method = auth_data
-            .make_auth_data()
+            .auth_data()
+            .await
             .map_err(|err| e!(BuildError::AuthMethod, err))?;
         if let Some(auth) = auth_method {
             conn.authenticate(&auth)
                 .await
                 .map_err(|err| e!(BuildError::Auth, err))?;
         }
-        let mut conn: AuthenticatedConn<TcpStream, EventHandler> = conn.into_authenticated().await;
 
         // Create the hidden service
         let tor_key = iroh_to_tor_secret_key(&secret_key);
-        let onion_addr = tor_key.public().get_onion_address();
-        let listeners = [(self.onion_port, local_addr)];
+        let onion_addr = OnionAddressV3::from_public_key(local_id.as_bytes());
         match conn
-            .add_onion_v3(&tor_key, false, false, false, None, &mut listeners.iter())
+            .add_onion_v3(&tor_key, self.onion_port, local_addr)
             .await
         {
-            Ok(()) => {}
-            Err(ConnError::InvalidResponseCode(552)) => {
+            Ok(Some(service_id))
+                if OnionAddressV3::from_service_id(&service_id) != Some(onion_addr) =>
+            {
+                // Tor derived a different address from the key than the one
+                // peers derive from our EndpointId: nobody could reach us.
+                return Err(e!(
+                    BuildError::CreateOnion,
+                    ControlError::Protocol("Tor reported a different onion address")
+                ));
+            }
+            Ok(_) => {}
+            Err(ControlError::Status { code: 552, .. }) => {
                 // Service already exists, that's fine
             }
             Err(err) => return Err(e!(BuildError::CreateOnion, err)),
         }
 
         tracing::info!(
-            "Hidden service created: {}.onion:{}",
-            onion_addr.get_address_without_dot_onion(),
+            "Hidden service created: {}:{}",
+            onion_addr,
             self.onion_port
         );
 
@@ -484,7 +478,7 @@ impl TorCustomTransportBuilder {
                 let onion = onion_address_from_endpoint(endpoint).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "invalid endpoint id")
                 })?;
-                let onion_addr = format!("{}.onion", onion.get_address_without_dot_onion());
+                let onion_addr = onion.to_string();
                 let stream = Socks5Stream::connect(socks_addr, (onion_addr.as_str(), onion_port))
                     .await
                     .map_err(io::Error::other)?;
@@ -525,7 +519,7 @@ pub struct TorCustomTransport {
     /// The hidden service is removed when this connection is dropped.
     /// Wrapped in Arc so it can be shared with TorCustomEndpoint.
     #[allow(dead_code)]
-    control_conn: Option<Arc<AuthenticatedConn<TcpStream, EventHandler>>>,
+    control_conn: Option<Arc<TorControl<TcpStream>>>,
 }
 
 impl TorCustomTransport {

@@ -111,3 +111,93 @@ impl fmt::Debug for OnionAddressV3 {
         write!(f, "OnionAddressV3({})", self.service_id())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use data_encoding::HEXLOWER;
+
+    use super::*;
+
+    fn hex32(hex: &str) -> [u8; 32] {
+        HEXLOWER.decode(hex.as_bytes()).unwrap().try_into().unwrap()
+    }
+
+    /// RFC 8032 section 7.1 TEST 1 and TEST 2. The public keys are the RFC's;
+    /// torut 0.2.1 derived the same public keys from the expanded keys
+    /// (ed25519-dalek 1). Key blobs and onion addresses are torut's output,
+    /// captured before torut was removed.
+    const VECTORS: [(&str, &str, &str, &str); 2] = [
+        (
+            "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+            "MHyDhk8oM8tCei7xwAoBPP3/J2jZgMCjpSDwBpBN6U+bTwr+KAt0aneGhOdUQlAgV7dHOgPwj5b1o46Sh+Afjw==",
+            "25njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid",
+        ),
+        (
+            "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+            "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+            "aL2e11iC1SgVqXWFyvR5Cn9sazt/ghxeJZoksC5QLlFFZoSCkdrK8iXMY96zSNoxjiwuF7ALgWD5zmv6BHKRHQ==",
+            "hvabpq7iioevvevxbktu2g36xsojqlgpf3cjndgazvk7ckxumygcmyyd",
+        ),
+    ];
+
+    #[test]
+    fn key_blob_and_address_match_torut_vectors() {
+        for (seed, public, blob, service_id) in VECTORS {
+            let seed = hex32(seed);
+            assert_eq!(
+                iroh::SecretKey::from_bytes(&seed).public().as_bytes(),
+                &hex32(public)
+            );
+            let key = ExpandedSecretKey::from_seed(&seed);
+            assert_eq!(key.key_blob(), blob);
+            let address = OnionAddressV3::from_public_key(&hex32(public));
+            assert_eq!(address.service_id(), service_id);
+            assert_eq!(address.to_string(), format!("{service_id}.onion"));
+            assert_eq!(OnionAddressV3::from_service_id(service_id), Some(address));
+        }
+    }
+
+    #[test]
+    fn expanded_key_is_clamped_sha512_of_seed() {
+        let key = ExpandedSecretKey::from_seed(&[7u8; 32]);
+        let hash: [u8; 64] = Sha512::digest([7u8; 32]).into();
+        let bytes = key.as_bytes();
+        assert_eq!(bytes[0] & 7, 0);
+        assert_eq!(bytes[31] & 0xc0, 0x40);
+        assert_eq!(bytes[1..31], hash[1..31]);
+        assert_eq!(bytes[32..], hash[32..]);
+        assert_eq!(BASE64.decode(key.key_blob().as_bytes()).unwrap(), bytes);
+        assert_eq!(format!("{key:?}"), "ExpandedSecretKey(****)");
+    }
+
+    /// Address from torut's own tests.
+    #[test]
+    fn parses_and_round_trips_torut_test_address() {
+        let id = "p53lf57qovyuvwsc6xnrppyply3vtqm7l6pcobkmyqsiofyeznfu5uqd";
+        let address = OnionAddressV3::from_service_id(id).unwrap();
+        assert_eq!(address.to_string(), format!("{id}.onion"));
+        assert_eq!(
+            OnionAddressV3::from_service_id(&id.to_ascii_uppercase()),
+            Some(address)
+        );
+    }
+
+    #[test]
+    fn rejects_bad_service_ids() {
+        let id = "p53lf57qovyuvwsc6xnrppyply3vtqm7l6pcobkmyqsiofyeznfu5uqd";
+        // Wrong length, not base32, bad checksum, bad version.
+        assert_eq!(OnionAddressV3::from_service_id(&id[1..]), None);
+        assert_eq!(OnionAddressV3::from_service_id(&id.replace('p', "1")), None);
+        let mut raw = BASE32_NOPAD
+            .decode(id.to_ascii_uppercase().as_bytes())
+            .unwrap();
+        raw[32] ^= 1;
+        let bad_checksum = BASE32_NOPAD.encode(&raw).to_ascii_lowercase();
+        assert_eq!(OnionAddressV3::from_service_id(&bad_checksum), None);
+        raw[32] ^= 1;
+        raw[34] = 2;
+        let bad_version = BASE32_NOPAD.encode(&raw).to_ascii_lowercase();
+        assert_eq!(OnionAddressV3::from_service_id(&bad_version), None);
+    }
+}

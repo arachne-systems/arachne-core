@@ -1,6 +1,6 @@
+// Modified by Arachne Systems from iroh-tor-transport 0.1.0; see ARACHNE-PATCH.md.
 //! Internal tests for packet protocol and sender.
 
-mod torut_equivalence;
 mod user_transport;
 
 use std::{
@@ -25,9 +25,8 @@ use crate::{
 };
 
 /// Get the onion address for an iroh SecretKey (test helper).
-fn onion_address(key: &SecretKey) -> torut::onion::OnionAddressV3 {
-    let tor_key = iroh_to_tor_secret_key(key);
-    tor_key.public().get_onion_address()
+fn onion_address(key: &SecretKey) -> crate::onion::OnionAddressV3 {
+    crate::onion::OnionAddressV3::from_public_key(key.public().as_bytes())
 }
 
 #[tokio::test]
@@ -136,18 +135,24 @@ async fn test_sender_reuses_connection() -> Result<()> {
 
 #[test]
 fn test_key_conversion() {
-    // Generate an iroh key
-    let iroh_key = SecretKey::generate();
-
-    // Convert to tor key
+    // RFC 8032 section 7.1 TEST 1 seed. Upstream compared the public key that
+    // torut derived from the expanded key with iroh's; with torut gone, the
+    // expected key blob is pinned to torut 0.2.1's output for this seed.
+    let seed: [u8; 32] = data_encoding::HEXLOWER
+        .decode(b"9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let iroh_key = SecretKey::from_bytes(&seed);
     let tor_key = iroh_to_tor_secret_key(&iroh_key);
-
-    // The public keys should match
-    let iroh_public = iroh_key.public();
-    let tor_public = tor_key.public();
-
-    // iroh public key is 32 bytes, tor public key is also 32 bytes
-    assert_eq!(iroh_public.as_bytes(), tor_public.as_bytes());
+    assert_eq!(
+        tor_key.key_blob(),
+        "MHyDhk8oM8tCei7xwAoBPP3/J2jZgMCjpSDwBpBN6U+bTwr+KAt0aneGhOdUQlAgV7dHOgPwj5b1o46Sh+Afjw=="
+    );
+    assert_eq!(
+        onion_address(&iroh_key).to_string(),
+        "25njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid.onion"
+    );
 }
 
 #[test]

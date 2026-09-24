@@ -480,6 +480,111 @@ mod tests {
         }
     }
 
+    /// Fake Tor: for each canned reply, read one request line and answer it.
+    /// Returns every byte the client sent.
+    async fn fake_tor(server: tokio::io::DuplexStream, replies: Vec<String>) -> Vec<u8> {
+        let mut reader = BufReader::new(server);
+        let mut transcript = Vec::new();
+        for reply in replies {
+            let mut line = Vec::new();
+            reader.read_until(b'\n', &mut line).await.unwrap();
+            transcript.extend_from_slice(&line);
+            reader.get_mut().write_all(reply.as_bytes()).await.unwrap();
+        }
+        transcript
+    }
+
+    /// Wire bytes pinned to what torut 0.2.1 sent for the same inputs
+    /// (RFC 8032 TEST 1 seed), captured before torut was removed.
+    #[tokio::test]
+    async fn add_onion_sends_torut_bytes() {
+        let seed: [u8; 32] = data_encoding::HEXLOWER
+            .decode(b"9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let (client, server) = duplex(4096);
+        let server = tokio::spawn(fake_tor(
+            server,
+            vec!["250-ServiceID=25njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid\r\n250 OK\r\n".into()],
+        ));
+        let service_id = TorControl::new(client)
+            .add_onion_v3(
+                &ExpandedSecretKey::from_seed(&seed),
+                9999,
+                "127.0.0.1:43210".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service_id.as_deref(),
+            Some("25njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid")
+        );
+        assert_eq!(
+            String::from_utf8(server.await.unwrap()).unwrap(),
+            "ADD_ONION ED25519-V3:MHyDhk8oM8tCei7xwAoBPP3/J2jZgMCjpSDwBpBN6U+bTwr+KAt0aneGhOdUQlAgV7dHOgPwj5b1o46Sh+Afjw== Flags=DiscardPK Port=9999,127.0.0.1:43210 \r\n"
+        );
+
+        // 552: the service already exists on this Tor instance.
+        let (client, server) = duplex(4096);
+        let server = tokio::spawn(fake_tor(server, vec!["552 Onion address collision\r\n".into()]));
+        let err = TorControl::new(client)
+            .add_onion_v3(&ExpandedSecretKey::from_seed(&seed), 9999, "127.0.0.1:1".parse().unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ControlError::Status { code: 552, .. }), "{err:?}");
+        server.await.unwrap();
+    }
+
+    /// The full handshake, pinned to torut 0.2.1's bytes for each auth case.
+    #[tokio::test]
+    async fn handshake_sends_torut_bytes() {
+        let cookie_path = temp_cookie("handshake", 32);
+        let quoted = format!("\"{}\"", cookie_path.display());
+        let info = |auth: &str| {
+            format!("250-PROTOCOLINFO 1\r\n250-{auth}\r\n250-VERSION Tor=\"0.4.8.10\"\r\n250 OK\r\n")
+        };
+        let cookie_hex = "A5".repeat(32);
+        let cases = [
+            (vec![info("AUTH METHODS=NULL"), "250 OK\r\n".into()], "AUTHENTICATE\r\n".to_string()),
+            (
+                vec![
+                    info(&format!("AUTH METHODS=COOKIE,SAFECOOKIE COOKIEFILE={quoted}")),
+                    "250 OK\r\n".into(),
+                ],
+                format!("AUTHENTICATE {cookie_hex}\r\n"),
+            ),
+            (
+                vec![info(&format!("AUTH METHODS=SAFECOOKIE COOKIEFILE={quoted}")), "250 OK\r\n".into()],
+                format!("AUTHENTICATE {cookie_hex}\r\n"),
+            ),
+            (vec![info("AUTH METHODS=HASHEDPASSWORD")], String::new()),
+        ];
+        for (replies, expected_auth) in cases {
+            let (client, server) = duplex(4096);
+            let server = tokio::spawn(fake_tor(server, replies));
+            let mut conn = TorControl::new(client);
+            let info = conn.protocol_info().await.unwrap();
+            if let Some(auth) = info.auth_data().await.unwrap() {
+                conn.authenticate(&auth).await.unwrap();
+            }
+            assert_eq!(
+                String::from_utf8(server.await.unwrap()).unwrap(),
+                format!("PROTOCOLINFO 1\r\n{expected_auth}")
+            );
+        }
+
+        // A rejected AUTHENTICATE is an error.
+        let (client, server) = duplex(4096);
+        let server = tokio::spawn(fake_tor(server, vec!["515 Authentication failed\r\n".into()]));
+        let err = TorControl::new(client)
+            .authenticate(&AuthData::Null)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ControlError::Status { code: 515, .. }), "{err:?}");
+        server.await.unwrap();
+    }
+
     fn temp_cookie(name: &str, len: usize) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("arachne-tor-control-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

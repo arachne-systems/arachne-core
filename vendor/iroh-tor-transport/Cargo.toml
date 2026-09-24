@@ -48,10 +48,6 @@ path = "src/lib.rs"
 name = "echo"
 path = "examples/echo.rs"
 
-[[test]]
-name = "echo"
-path = "tests/echo.rs"
-
 [dependencies.bytes]
 version = "1"
 
@@ -93,9 +89,6 @@ features = ["full"]
 
 [dependencies.tokio-socks]
 version = "0.5"
-
-[dependencies.torut]
-version = "0.2"
 
 [dependencies.tracing]
 version = "0.1"

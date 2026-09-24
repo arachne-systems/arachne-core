@@ -12,12 +12,6 @@ all-features = true
 unmaintained = "all"
 yanked = "deny"
 ignore = [
-    # `tor` feature only: arachne-node/tor -> iroh-tor-transport 0.1.0 ->
-    # torut 0.2.1 -> ed25519-dalek 1.0.1 / curve25519-dalek 3.2.0. Not in the
-    # default graph. Blocked on an upstream torut/iroh-tor-transport update.
-    # Re-check before `tor` is offered to users.
-    { id = "RUSTSEC-2022-0093", reason = "tor feature only (torut -> ed25519-dalek 1.0.1); no upstream fix in iroh-tor-transport 0.1" },
-    { id = "RUSTSEC-2024-0344", reason = "tor feature only (torut -> curve25519-dalek 3.2.0); no upstream fix in iroh-tor-transport 0.1" },
     # Unmaintained, not a vulnerability. Only through the vendored
     # arachne-iroh-blobs default `tickets` feature (iroh-tickets -> postcard
     # default -> heapless 0.7). arachne-node disables that feature, so the
@@ -49,8 +43,8 @@ allow = [
 confidence-threshold = 0.9
 
 [bans]
-# Duplicate versions are common in this graph (iroh, openmls and the Tor stack
-# each pin their own crypto generations). Warn in general; deny below for the
+# Duplicate versions are common in this graph (iroh and openmls each pin their
+# own crypto generations). Warn in general; deny below for the
 # crypto crates that Arachne calls directly.
 multiple-versions = "warn"
 wildcards = "deny"
@@ -82,10 +76,8 @@ deny = [
 # Existing duplicates of the crates above. Each skip names one exact version,
 # so a new third copy still fails.
 skip = [
-    { crate = "sha2@0.9.9", reason = "tor feature only: torut -> ed25519-dalek 1.0.1" },
     { crate = "sha2@0.11.0", reason = "iroh 1.2 (ed25519-dalek 3) and openmls_rust_crypto -> hpke-rs-rust-crypto; Arachne stays on 0.10 until an intentional bump" },
     { crate = "hkdf@0.13.0", reason = "openmls_rust_crypto -> hpke-rs-rust-crypto; Arachne uses 0.12" },
-    { crate = "hmac@0.11.0", reason = "tor feature only: iroh-tor-transport -> torut" },
     { crate = "hmac@0.13.0", reason = "openmls_rust_crypto -> hpke-rs-rust-crypto (via hkdf 0.13)" },
 ]
 
