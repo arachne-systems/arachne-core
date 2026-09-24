@@ -18,6 +18,9 @@ pub use name::{
 };
 mod profile;
 pub use profile::{MAX_MEMBER_PROFILE, MemberIdentity};
+// ADR A2: commit fork choice and branch retention. Not wired yet.
+mod fork;
+pub use fork::{FORK_KEY_BYTES, ForkClass, ForkKey, fork_key, winner};
 mod removed;
 pub use management::{ManagementAction, PreparedManagement, PreparedManagementUpdate};
 pub use removed::{MAX_SEALED_REMOVAL, RemovedMembership};
