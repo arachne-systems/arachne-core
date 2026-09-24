@@ -315,16 +315,19 @@ pub(crate) struct Admission {
 
 impl EndpointHooks for Admission {
     async fn after_handshake<'a>(&'a self, connection: &'a Connection) -> AfterHandshakeOutcome {
-        let member = self.members.contains(connection.remote_id().as_bytes());
-        // Outgoing data dials go only to endpoints routing selected.
-        if !member && connection.alpn() == crate::ALPN && connection.side() == Side::Server {
+        // Only who reaches this device is a stranger: its own calls (a
+        // joiner calling an owner) never use the stranger share. Outgoing
+        // data dials go only to endpoints routing selected.
+        let stranger = connection.side() == Side::Server
+            && !self.members.contains(connection.remote_id().as_bytes());
+        if stranger && connection.alpn() == crate::ALPN {
             tracing::info!(target: "data_fabric_transport", remote = %connection.remote_id().fmt_short(), "DATA_HANDSHAKE_REJECTED_STRANGER");
             return AfterHandshakeOutcome::Reject {
                 error_code: 403u32.into(),
                 reason: b"not a workspace member".to_vec(),
             };
         }
-        self.budget.admit(connection, !member).await
+        self.budget.admit(connection, stranger).await
     }
 }
 
@@ -571,6 +574,55 @@ mod tests {
                 "the member's idle link was closed for a stranger"
             );
             server.close().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The stranger share limits who reaches this device, not whom it
+    /// calls: a joiner's own calls to endpoints it has no policy for must
+    /// not use it up.
+    #[tokio::test]
+    async fn outgoing_calls_never_take_the_stranger_share() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let (client, _) = crate::Node::bind_with_profile(
+                "127.0.0.1:0".parse().unwrap(),
+                None,
+                NetworkProfile::Direct,
+                ConnectionBudget::new([4, 2], [4, 4]),
+            )
+            .await
+            .unwrap();
+            let bind = || crate::Node::bind("127.0.0.1:0".parse().unwrap());
+            let (mut first, _) = bind().await.unwrap();
+            let (mut second, _) = bind().await.unwrap();
+            for server in [&first, &second] {
+                client
+                    .add_address_hint(server.id(), server.address())
+                    .await
+                    .unwrap();
+            }
+            let held = tokio::spawn(client.request_control(first.id(), b"held"));
+            let request = loop {
+                if let Some(request) = first.poll_control() {
+                    break request;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            let other = tokio::spawn(client.request_control(second.id(), b"other"));
+            tokio::time::timeout(Duration::from_secs(5), serve_one(&mut second))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("an outgoing call was refused by the caller's own stranger share")
+                });
+            assert_eq!(
+                other.await.unwrap().unwrap(),
+                vec![1],
+                "an outgoing call was refused by the caller's own stranger share"
+            );
+            request.respond(vec![7]).unwrap();
+            assert_eq!(held.await.unwrap().unwrap(), vec![7]);
+            client.close().await;
         })
         .await
         .unwrap();
