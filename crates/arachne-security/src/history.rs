@@ -210,7 +210,7 @@ pub(crate) mod tests {
         let action = ManagementAction::Remove(target);
         let prepared = owner.prepare_management(action).unwrap();
         let PreparedManagementUpdate::Active(updated) = restored
-            .prepare_management_update(action, &prepared.commit)
+            .prepare_step_update(&prepared.authorization, &prepared.commit)
             .unwrap_or_else(|error| {
                 panic!("restored member at {} members rejected management: {error}", restored.member_count())
             })

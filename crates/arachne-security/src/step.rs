@@ -44,6 +44,17 @@ fn u64_be(bytes: &mut &[u8]) -> Result<u64, &'static str> {
     Ok(u64::from_be_bytes(array(bytes)?))
 }
 
+/// Kind tags of revocation steps: 2 Demote, 3 Remove, 4 Leave,
+/// 6 DisableInvitation. Each carries an `OrderStep`.
+fn revocation_tag(kind: super::RevocationKind) -> u8 {
+    match kind {
+        super::RevocationKind::Demote => 2,
+        super::RevocationKind::Remove => 3,
+        super::RevocationKind::Leave => 4,
+        super::RevocationKind::DisableInvitation => 6,
+    }
+}
+
 /// Append one step.
 pub(super) fn write_step(
     out: &mut Vec<u8>,
@@ -69,23 +80,27 @@ pub(super) fn write_step(
                 put_auth(out, auth);
             }
         }
+        MembershipAuthorization::Revocation(step) => {
+            out.extend([revocation_tag(step.order.kind), class]);
+            super::order::write_order_step(out, step)?;
+        }
         MembershipAuthorization::Management(action) => {
             let (tag, id) = match action {
                 ManagementAction::Promote(id) => (1, id),
-                ManagementAction::Demote(id) => (2, id),
-                ManagementAction::Remove(id) => (3, id),
-                ManagementAction::Leave(id, _) => (4, id),
                 ManagementAction::CreateInvitation(id, ..) => (5, id),
-                ManagementAction::DisableInvitation(id) => (6, id),
                 ManagementAction::ApproveInvitation(id, _) => (7, id),
                 ManagementAction::CreateAutomaticInvitation(id, ..) => (8, id),
                 ManagementAction::CreateRequestInvitation(id, ..) => (9, id),
                 ManagementAction::DeclineInvitationRequest(id, _) => (10, id),
+                ManagementAction::Remove(_)
+                | ManagementAction::Demote(_)
+                | ManagementAction::DisableInvitation(_) => {
+                    return Err("revocation requires a signed order");
+                }
             };
             out.extend([tag, class]);
             out.extend(id);
             match action {
-                ManagementAction::Leave(_, signature) => out.extend(signature),
                 ManagementAction::CreateInvitation(_, expires, personal) => {
                     out.extend(expires.to_be_bytes());
                     out.push(u8::from(*personal));
@@ -96,10 +111,7 @@ pub(super) fn write_step(
                 }
                 ManagementAction::ApproveInvitation(_, package)
                 | ManagementAction::DeclineInvitationRequest(_, package) => out.extend(package),
-                ManagementAction::Promote(_)
-                | ManagementAction::Demote(_)
-                | ManagementAction::Remove(_)
-                | ManagementAction::DisableInvitation(_) => {}
+                _ => {}
             }
         }
     }
@@ -128,13 +140,17 @@ pub(super) fn read_step(
                     .collect::<Result<Vec<_>, _>>()?,
             )
         }
-        1..=10 => {
+        2 | 3 | 4 | 6 => {
+            let step = super::order::read_order_step(&mut bytes)?;
+            if revocation_tag(step.order.kind) != tag {
+                return Err("membership step class does not match its action");
+            }
+            MembershipAuthorization::Revocation(step)
+        }
+        1 | 5 | 7..=10 => {
             let id = array(&mut bytes)?;
             MembershipAuthorization::Management(match tag {
                 1 => ManagementAction::Promote(id),
-                2 => ManagementAction::Demote(id),
-                3 => ManagementAction::Remove(id),
-                4 => ManagementAction::Leave(id, array(&mut bytes)?),
                 5 => ManagementAction::CreateInvitation(
                     id,
                     u64_be(&mut bytes)?,
@@ -144,7 +160,6 @@ pub(super) fn read_step(
                         _ => return Err("invalid invitation mode"),
                     },
                 ),
-                6 => ManagementAction::DisableInvitation(id),
                 7 => ManagementAction::ApproveInvitation(id, array(&mut bytes)?),
                 8 => ManagementAction::CreateAutomaticInvitation(id, u64_be(&mut bytes)?),
                 9 => ManagementAction::CreateRequestInvitation(id, u64_be(&mut bytes)?),
@@ -211,13 +226,40 @@ mod tests {
             MembershipAuthorization::Admission(admission(1)),
             MembershipAuthorization::AdmissionBatch(vec![admission(1), admission(9)]),
         ];
+        for kind in [
+            crate::RevocationKind::Remove,
+            crate::RevocationKind::Leave,
+            crate::RevocationKind::Demote,
+            crate::RevocationKind::DisableInvitation,
+        ] {
+            let order = crate::RevocationOrder {
+                kind,
+                target: id,
+                issuer: [8; 32],
+                anchor_epoch: 9,
+                anchor_context: [10; 32],
+                signature: [11; 64],
+            };
+            all.push(MembershipAuthorization::Revocation(crate::OrderStep::new(
+                order.clone(),
+            )));
+            all.push(MembershipAuthorization::Revocation(
+                crate::OrderStep::with_proof(
+                    order,
+                    crate::AnchorProof {
+                        checkpoint: b"checkpoint".to_vec(),
+                        winning: vec![(
+                            MembershipAuthorization::Admission(admission(3)),
+                            b"w".to_vec(),
+                        )],
+                        losing: vec![],
+                    },
+                ),
+            ));
+        }
         for action in [
             ManagementAction::Promote(id),
-            ManagementAction::Demote(id),
-            ManagementAction::Remove(id),
-            ManagementAction::Leave(id, [5; 64]),
             ManagementAction::CreateInvitation(id, 77, true),
-            ManagementAction::DisableInvitation(id),
             ManagementAction::ApproveInvitation(id, [6; 32]),
             ManagementAction::CreateAutomaticInvitation(id, 78),
             ManagementAction::CreateRequestInvitation(id, 79),
@@ -253,7 +295,19 @@ mod tests {
 
     #[test]
     fn a_relabelled_class_or_old_version_is_rejected() {
-        let remove = MembershipAuthorization::Management(ManagementAction::Remove([4; 32]));
+        // A class 0/1 intent without its signed order is not representable.
+        assert_eq!(
+            encode_membership_step(
+                &MembershipAuthorization::Management(ManagementAction::Remove([4; 32])),
+                b"c"
+            )
+            .err(),
+            Some("revocation requires a signed order")
+        );
+        let remove = every_authorization()
+            .into_iter()
+            .find(|a| a.removed_member().is_some())
+            .unwrap();
         let mut bytes = encode_membership_step(&remove, b"c").unwrap();
         // Claim the Management class for a Remove.
         bytes[6] = ForkClass::Management.to_u8();

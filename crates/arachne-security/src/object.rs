@@ -239,7 +239,7 @@ fn recent_epochs_stay_readable_for_receive_only_then_expire() {
     let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     reader = active(
         reader
-            .prepare_management_update(registered.action, &registered.commit)
+            .prepare_step_update(&registered.authorization, &registered.commit)
             .unwrap(),
     );
     admin = registered.workspace;
@@ -281,7 +281,7 @@ fn recent_epochs_stay_readable_for_receive_only_then_expire() {
         .unwrap();
     reader = active(
         reader
-            .prepare_management_update(promote.action, &promote.commit)
+            .prepare_step_update(&promote.authorization, &promote.commit)
             .unwrap(),
     );
     admin = promote.workspace;
@@ -294,7 +294,7 @@ fn recent_epochs_stay_readable_for_receive_only_then_expire() {
         let (control, _, _) = admin.prepare_invitation(u64::MAX, false, false).unwrap();
         reader = active(
             reader
-                .prepare_management_update(control.action, &control.commit)
+                .prepare_step_update(&control.authorization, &control.commit)
                 .unwrap(),
         );
         admin = control.workspace;

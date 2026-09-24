@@ -394,11 +394,11 @@ fn an_existing_member_accepts_management_past_three_hundred_members() {
         .id;
     let action = arachne_security::ManagementAction::Remove(target);
     let prepared = owner.prepare_management(action).unwrap();
-    member.verify_management(action, &prepared.commit).unwrap_or_else(|error| {
+    member.verify_step(&prepared.authorization, &prepared.commit).unwrap_or_else(|error| {
         panic!("member at {} members rejected the management commit: {error}", member.member_count())
     });
     let arachne_security::PreparedManagementUpdate::Active(member) =
-        member.prepare_management_update(action, &prepared.commit).unwrap()
+        member.prepare_step_update(&prepared.authorization, &prepared.commit).unwrap()
     else {
         panic!("removal of another member removed this member")
     };

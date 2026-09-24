@@ -147,6 +147,18 @@ fn encode_checkpoint(
     Ok(bytes)
 }
 
+/// Public checkpoint of a member's state for an anchor proof. It uses the
+/// wire bounds because other members replay it.
+pub(super) fn public_checkpoint(workspace: &Workspace) -> Result<Vec<u8>, &'static str> {
+    encode_checkpoint(
+        &workspace.group,
+        workspace.provider.crypto(),
+        &workspace._signer,
+        Vec::new(),
+        CheckpointBound::Wire,
+    )
+}
+
 impl Workspace {
     /// This device's own accepted state as a checkpoint, for local verification.
     fn local_checkpoint(&self) -> Result<Vec<u8>, &'static str> {
@@ -239,7 +251,23 @@ pub struct AdmissionAuthorization {
 pub enum MembershipAuthorization {
     Admission(AdmissionAuthorization),
     AdmissionBatch(Vec<AdmissionAuthorization>),
+    /// Promote and invitation create / approve / decline. The committer must
+    /// be an administrator. Remove, Demote and DisableInvitation are rejected
+    /// here: they need a signed order (`Revocation`).
     Management(super::ManagementAction),
+    /// Remove, Leave, Demote, DisableInvitation (ADR A2 step 4). Any member
+    /// may commit a valid order.
+    Revocation(super::OrderStep),
+}
+
+impl MembershipAuthorization {
+    /// The member this step removes, if it removes one.
+    pub fn removed_member(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Revocation(step) if step.order.kind.removes() => Some(step.order.target),
+            _ => None,
+        }
+    }
 }
 
 /// Tracks a branch from a trusted checkpoint. This does not settle competing
@@ -266,8 +294,10 @@ struct AppendedHistory {
 /// The caller retains the checkpoint and accepted transitions for durable replay;
 /// verification does not persist them, establish membership, or resolve forks.
 pub struct MembershipVerifier {
-    provider: OpenMlsRustCrypto,
+    pub(super) provider: OpenMlsRustCrypto,
     pub(super) group: PublicGroup,
+    /// Nesting depth of anchor proofs this verifier replays (0 at top level).
+    pub(super) proof_depth: u8,
 }
 
 pub(super) fn authority(
@@ -428,7 +458,27 @@ impl MembershipVerifier {
         {
             return Err("administrator is not a member");
         }
-        Ok(Self { provider, group })
+        Ok(Self {
+            provider,
+            group,
+            proof_depth: 0,
+        })
+    }
+
+    /// Public state from an anchor proof's checkpoint. It is not trusted by
+    /// itself: `order::verify` trusts it only after the winning steps from it
+    /// reach the verifier's own state.
+    pub(super) fn from_proof_checkpoint(
+        workspace: [u8; 32],
+        bytes: &[u8],
+        depth: u8,
+    ) -> Result<Self, &'static str> {
+        let parts = checkpoint_parts(bytes, CheckpointBound::Wire)?;
+        let digest = Sha256::digest(parts.pin).into();
+        let mut verifier =
+            Self::from_checkpoint_within(workspace, digest, bytes, CheckpointBound::Wire)?;
+        verifier.proof_depth = depth;
+        Ok(verifier)
     }
 
     /// Validate one bounded commit against current authority and advance exactly
@@ -442,6 +492,13 @@ impl MembershipVerifier {
             MembershipAuthorization::Admission(auth) => self.apply_add(auth, commit),
             MembershipAuthorization::AdmissionBatch(auths) => self.apply_add_batch(auths, commit),
             MembershipAuthorization::Management(action) => self.apply_management(*action, commit),
+            MembershipAuthorization::Revocation(step) => {
+                let staged = self.revocation_commit(step, commit)?;
+                self.group
+                    .merge_commit(self.provider.storage(), staged)
+                    .map_err(|_| "public revocation merge failed")?;
+                Ok(())
+            }
         }
     }
 
@@ -455,6 +512,35 @@ impl MembershipVerifier {
             .merge_commit(self.provider.storage(), staged)
             .map_err(|_| "public management merge failed")?;
         Ok(())
+    }
+
+    /// Verify one revocation step against this parent state (ADR A2 step 4).
+    fn revocation_commit(
+        &self,
+        step: &super::OrderStep,
+        commit: &[u8],
+    ) -> Result<StagedCommit, &'static str> {
+        if commit.is_empty() || commit.len() > MAX_BYTES {
+            return Err("management commit exceeds bounds");
+        }
+        let message = MlsMessageIn::tls_deserialize_exact(commit)
+            .map_err(|_| "invalid management commit")?
+            .try_into_protocol_message()
+            .map_err(|_| "expected management commit")?;
+        let processed = self
+            .group
+            .process_message(self.provider.crypto(), message)
+            .map_err(|_| "invalid management signature or epoch")?;
+        if processed.aad() != super::order::commit_aad(&step.order) {
+            return Err("revocation commit does not carry its order");
+        }
+        let sender = processed.sender().clone();
+        let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
+            return Err("not a management commit");
+        };
+        super::order::verify(self, step)?;
+        super::management::verify_revocation(&self.group, &sender, &staged, &step.order)?;
+        Ok(*staged)
     }
 
     fn apply_add(
@@ -623,19 +709,14 @@ impl MembershipVerifier {
         self.group.group_context().epoch().as_u64()
     }
 
-    pub(super) fn verify_management(
-        &self,
-        action: super::ManagementAction,
-        commit: &[u8],
-    ) -> Result<(), &'static str> {
-        self.management_commit(action, commit).map(|_| ())
-    }
-
     fn management_commit(
         &self,
         action: super::ManagementAction,
         commit: &[u8],
     ) -> Result<StagedCommit, &'static str> {
+        if super::ForkClass::of_action(&action) < super::ForkClass::Management {
+            return Err("revocation requires a signed order");
+        }
         if commit.is_empty() || commit.len() > MAX_BYTES {
             return Err("management commit exceeds bounds");
         }
@@ -651,13 +732,7 @@ impl MembershipVerifier {
         let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
             return Err("not a management commit");
         };
-        super::management::verify(
-            self.provider.crypto(),
-            &self.group,
-            &sender,
-            &staged,
-            action,
-        )?;
+        super::management::verify(&self.group, &sender, &staged, action)?;
         Ok(*staged)
     }
 
@@ -815,6 +890,12 @@ impl JoinProof {
                 Ok(())
             }
             MembershipAuthorization::Management(action) => self.apply_management(*action, commit),
+            MembershipAuthorization::Revocation(_) => {
+                let appended = self.appended_history(authorization, commit)?;
+                self.verifier.apply_transition(authorization, commit)?;
+                self.adopt_history(appended);
+                Ok(())
+            }
         }
     }
 

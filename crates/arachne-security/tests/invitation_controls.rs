@@ -4,7 +4,7 @@ use arachne_security::{
 
 fn apply(owner: &Workspace, change: &PreparedManagement) -> Workspace {
     let PreparedManagementUpdate::Active(owner) = owner
-        .prepare_management_update(change.action, &change.commit)
+        .prepare_step_update(&change.authorization, &change.commit)
         .unwrap()
     else {
         panic!()

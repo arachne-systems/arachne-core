@@ -27,6 +27,10 @@ pub use branch::{
     BranchDecision, BranchState, MAX_BRANCH_RECORD, MAX_BRANCH_SNAPSHOT, MAX_ROLLBACK_BYTES,
     PreparedBranchSwitch, ROLLBACK_EPOCHS,
 };
+mod order;
+pub use order::{
+    AnchorProof, MAX_ANCHOR_PROOF, ORDER_WINDOW, OrderStep, RevocationKind, RevocationOrder,
+};
 mod step;
 pub use step::{FORMAT_NOT_SUPPORTED, decode_membership_step, encode_membership_step};
 mod removed;

@@ -176,7 +176,7 @@ mod tests {
         let (registration, invitation, checkpoint) =
             admin.prepare_invitation(0, false, false).unwrap();
         let super::super::PreparedManagementUpdate::Active(helper) = helper
-            .prepare_management_update(registration.action, &registration.commit)
+            .prepare_step_update(&registration.authorization, &registration.commit)
             .unwrap()
         else {
             panic!("registration removed the helper")

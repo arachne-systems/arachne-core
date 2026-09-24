@@ -510,7 +510,8 @@ impl Workspace {
                 MembershipAuthorization::AdmissionBatch(_) => {
                     Err("admission history requires membership support")
                 }
-                MembershipAuthorization::Management(_) => {
+                MembershipAuthorization::Management(_)
+                | MembershipAuthorization::Revocation(_) => {
                     Err("membership history requires management support")
                 }
             })
@@ -1062,12 +1063,9 @@ impl Workspace {
                 let mut proof = history.verifier(self.id)?;
                 for (auth, commit) in &history.steps {
                     if proof.epoch() == after {
-                        let terminal = match auth {
-                            MembershipAuthorization::Management(
-                                super::ManagementAction::Remove(id)
-                                | super::ManagementAction::Leave(id, _),
-                            ) => proof.member_for_endpoint(endpoint)? == Some(*id),
-                            _ => false,
+                        let terminal = match auth.removed_member() {
+                            Some(id) => proof.member_for_endpoint(endpoint)? == Some(id),
+                            None => false,
                         };
                         if terminal {
                             return Ok(Some((auth.clone(), commit.clone())));
@@ -1639,7 +1637,7 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
         .prepare_management(super::ManagementAction::Promote(member.id()))
         .unwrap();
     let super::PreparedManagementUpdate::Active(helper) = helper
-        .prepare_management_update(promotion.action, &promotion.commit)
+        .prepare_step_update(&promotion.authorization, &promotion.commit)
         .unwrap()
     else {
         panic!("promotion removed helper")
@@ -1822,7 +1820,7 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
         returning.prepare_invitation(0, false, false).unwrap();
     let returning = registration.workspace;
     let super::PreparedManagementUpdate::Active(helper) = helper
-        .prepare_management_update(registration.action, &registration.commit)
+        .prepare_step_update(&registration.authorization, &registration.commit)
         .unwrap()
     else {
         panic!("invitation registration removed helper")

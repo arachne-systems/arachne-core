@@ -1,8 +1,9 @@
 //! Invitation controls in the existing authority extension. A disabled grant
 //! cannot authorize a later Add on this branch. Wall-clock expiry is checked
 //! when handling a new request, independently of replaying accepted history.
-use super::{AUTHORITY, ManagementAction, PreparedManagement, Workspace, bootstrap};
+use super::{AUTHORITY, ManagementAction, Workspace, bootstrap};
 use openmls::prelude::*;
+#[cfg(test)]
 use openmls_traits::OpenMlsProvider;
 
 pub const INVITATION_DISABLED: &str =
@@ -201,7 +202,7 @@ pub(super) fn now() -> Result<u64, &'static str> {
         .map_err(|_| "device clock is invalid")
 }
 
-fn changed(
+pub(super) fn changed(
     extensions: &Extensions<GroupContext>,
     action: ManagementAction,
 ) -> Result<Extensions<GroupContext>, &'static str> {
@@ -357,52 +358,6 @@ impl Workspace {
     pub fn invitation_controls(&self) -> Result<Vec<InvitationControl>, &'static str> {
         decode(&policy_bytes(self.group.extensions())?)
     }
-}
-
-pub(super) fn prepare(
-    owner: &Workspace,
-    action: ManagementAction,
-) -> Result<PreparedManagement, &'static str> {
-    let extensions = changed(owner.group.extensions(), action)?;
-    let mut candidate = owner.provisional_copy()?;
-    let commit = candidate
-        .group
-        .commit_builder()
-        .propose_group_context_extensions(extensions)
-        .map_err(|_| "invitation control proposal failed")?
-        .load_psks(candidate.provider.storage())
-        .map_err(|_| "invitation control state failed")?
-        .build(
-            candidate.provider.rand(),
-            candidate.provider.crypto(),
-            &candidate._signer,
-            |_| true,
-        )
-        .map_err(|_| "invitation control preparation failed")?
-        .stage_commit(&candidate.provider)
-        .map_err(|_| "invitation control staging failed")?
-        .into_contents()
-        .0
-        .to_bytes()
-        .map_err(|_| "invitation control encoding failed")?;
-    let mut proof = super::MembershipVerifier::from_workspace(owner)?;
-    proof.apply_transition(&super::MembershipAuthorization::Management(action), &commit)?;
-    super::object::retain_receive_epoch(&candidate.provider, &candidate.group)?;
-    candidate
-        .group
-        .merge_pending_commit(&candidate.provider)
-        .map_err(|_| "invitation control merge failed")?;
-    candidate.join_history =
-        Some(owner.append_history(super::MembershipAuthorization::Management(action), &commit)?);
-    candidate.prune_invitation_checkpoints()?;
-    if !proof.matches_workspace(&candidate)? {
-        return Err("invitation control branch mismatch");
-    }
-    Ok(PreparedManagement {
-        workspace: candidate,
-        action,
-        commit,
-    })
 }
 
 pub(super) fn verify(

@@ -454,7 +454,7 @@ mod tests {
 
     fn accept_role(owner: &Workspace, change: &crate::PreparedManagement) -> Workspace {
         let PreparedManagementUpdate::Active(next) = owner
-            .prepare_management_update(change.action, &change.commit)
+            .prepare_step_update(&change.authorization, &change.commit)
             .unwrap()
         else {
             panic!("unexpected removal")
