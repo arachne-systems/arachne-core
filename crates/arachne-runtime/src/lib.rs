@@ -9,7 +9,7 @@ use std::{
 };
 
 use arachne_node::{
-    AdmissionReport, Node, Timeouts, Topic,
+    AdmissionReport, Node, Topic,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -33,10 +33,6 @@ use registry::{
     DEVICE_OVERLAY_PATHS, MAX_DEVICE_OVERLAY_PATHS, release_overlay_paths,
     reserve_overlay_paths, session, shutdown_session,
 };
-use ops::recovery::{
-    PendingCurrentView, PendingDirectRange, PendingRange, ReadyCurrentView, ReadyDirectRange,
-    ReadyRange,
-};
 use ops::admission::{
     ADMISSION_HISTORY_PAGE_REQUEST, admission_packet, admission_reply_page,
     parse_admission_history_page_packet, pinned_checkpoint,
@@ -44,8 +40,12 @@ use ops::admission::{
 #[cfg(test)]
 use ops::admission::retained_reply;
 use ops::join::{
-    INVITATION_CHECKPOINT_REQUEST, JoinLifecycle, PendingCheckpointExchange, PendingJoinExchange,
+    INVITATION_CHECKPOINT_REQUEST, JoinLifecycle,
     invitation_checkpoint_page, pending_metadata,
+};
+pub(crate) use session::{
+    MembershipState, PendingAdmissionApproval, PendingControl, QueuedAdmission, Session,
+    StagedWorkspace, TransportSummary, WorkspaceTransition,
 };
 use session::{
     carry_delivery, check_epoch_transition, commit_workspace, seal_state,
@@ -113,283 +113,6 @@ pub use json::{
 };
 
 
-enum WorkspaceTransition {
-    RoutedPublication(
-        arachne_routing::PublicationContext,
-        arachne_node::DeliveryClass,
-        Vec<u8>,
-        Vec<[u8; 32]>,
-        Vec<[u8; 32]>,
-    ),
-    Inbox,
-    InboxRejected,
-    InboxRecovery {
-        count: usize,
-    },
-    DirectMiss {
-        missing: u64,
-    },
-    CurrentView {
-        cut: u64,
-        pending: usize,
-        stale: usize,
-    },
-    Admission,
-    Management(arachne_security::ManagementAction, Vec<u8>),
-    WorkspaceName,
-    Invitation(
-        Box<arachne_security::Invitation>,
-        Vec<u8>,
-        arachne_security::ManagementAction,
-        Vec<u8>,
-    ),
-    Join,
-}
-
-struct StagedWorkspace {
-    publisher: Option<arachne_delivery::PublisherLog>,
-    inbox: Option<arachne_delivery::inbox::ObjectInbox>,
-    transition: WorkspaceTransition,
-    workspace: arachne_security::Workspace,
-    snapshot: Vec<u8>,
-}
-
-struct QueuedAdmission {
-    checkpoint: Option<Vec<u8>>,
-    display_name: Option<String>,
-    approval_automatic: Option<bool>,
-    validated: arachne_security::ValidatedAdmission,
-}
-
-struct PendingAdmissionApproval {
-    attempt: arachne_security::AdmissionAttempt,
-    queued: QueuedAdmission,
-    delivered: bool,
-    acknowledged: bool,
-}
-
-struct PendingControl<Q> {
-    query: Q,
-    peer: [u8; 32],
-    task: tokio::task::JoinHandle<Result<Vec<u8>, arachne_node::Error>>,
-}
-impl<Q> Drop for PendingControl<Q> {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-/// The transport services this endpoint was bound with, for `describe`.
-#[derive(Clone, Copy)]
-struct TransportSummary {
-    public_lookup: bool,
-    operator_relay: bool,
-    timeouts: Timeouts,
-}
-
-/// One endpoint session. Each subsystem owns its state in its own struct.
-struct Session {
-    // Transport and runtime.
-    node: Node,
-    receiver: arachne_node::MessageReceiver,
-    runtime: Runtime,
-    overlay_paths: usize,
-    // Committed workspace and durable state.
-    /// The committed workspace. Shared and never edited in place: a transition
-    /// works on a provisional copy, and `commit_workspace` replaces this.
-    workspace: Option<Arc<arachne_security::Workspace>>,
-    /// The same state, published for inquiries answered without the host.
-    committed: committed_view::Published,
-    activity: WorkspaceActivity,
-    storage_key: Option<arachne_security::StorageKey>,
-    records: Option<persistence::NativeStore>,
-    // Subsystems.
-    transition: TransitionState,
-    delivery: DeliveryState,
-    admission: AdmissionState,
-    join: JoinState,
-    membership: MembershipState,
-    recovery: RecoveryState,
-    nearby: NearbyState,
-    resources: resources::Jobs,
-    presence: presence::Presence,
-    interests: interest::Updates,
-    /// Set by an op that ended the session (a removal was adopted or
-    /// restored). `ops::run` then takes the session and shuts it down.
-    ending: bool,
-}
-
-/// The one staged transition and the one inbound exchange that waits for it.
-#[derive(Default)]
-struct TransitionState {
-    /// A staged workspace candidate that awaits durable adoption.
-    staged: Option<StagedWorkspace>,
-    /// A staged removal (this member left or was removed) and its token.
-    removal: Option<(arachne_security::RemovedMembership, Vec<u8>)>,
-    /// A received control request (admission, leave, offer) that waits for
-    /// the staged transition before it is answered.
-    inbound: Option<arachne_node::ControlRequest>,
-}
-
-/// Object delivery state of the committed workspace.
-#[derive(Default)]
-struct DeliveryState {
-    publisher: Option<arachne_delivery::PublisherLog>,
-    inbox: Option<arachne_delivery::inbox::ObjectInbox>,
-}
-
-/// Owner-side admission intake.
-struct AdmissionState {
-    queue: arachne_security::AdmissionQueue,
-    metadata: BTreeMap<[u8; 32], QueuedAdmission>,
-    waiters: admission_waiters::AdmissionWaiters<arachne_node::ControlRequest>,
-    pushes: Vec<PendingControl<[u8; 32]>>,
-    pending_approvals: BTreeMap<[u8; 32], PendingAdmissionApproval>,
-    staged_approval_id: Option<[u8; 32]>,
-    // The bounded set of queued membership transitions handed to the durable
-    // stage/adopt boundary; retained replies remain independently retryable.
-    in_flight: Vec<arachne_security::AdmissionAttempt>,
-    // Forced-progress trigger for batch staging: admission packets read since
-    // the last staging attempt. Duplicate retries can keep the inbox non-empty
-    // for ever; a count of reads ends that without waiting on a clock.
-    reads_since_stage: usize,
-}
-
-impl Default for AdmissionState {
-    fn default() -> Self {
-        Self {
-            queue: arachne_security::AdmissionQueue::new(),
-            metadata: BTreeMap::new(),
-            waiters: admission_waiters::AdmissionWaiters::new(MAX_ADMISSION_WAITERS),
-            pushes: Vec::new(),
-            pending_approvals: BTreeMap::new(),
-            staged_approval_id: None,
-            in_flight: Vec::new(),
-            reads_since_stage: 0,
-        }
-    }
-}
-
-/// Joiner-side state of one pending join.
-#[derive(Default)]
-struct JoinState {
-    pending: Option<arachne_security::PendingJoin>,
-    lifecycle: Option<JoinLifecycle>,
-    checkpoint_exchange: Option<PendingCheckpointExchange>,
-    exchange: Option<PendingJoinExchange>,
-    /// History this session already fetched for the pending join, beyond the
-    /// last rollover boundary the host still carries. Untrusted until
-    /// `StageJoin` replays it through the verifier from the pinned checkpoint.
-    history_prefix: Vec<Value>,
-}
-
-/// Membership reconciliation: queries, offers, gossip and profiles.
-struct MembershipState {
-    update: Option<PendingControl<membership::StateBasis>>,
-    offer: Option<PendingControl<u64>>,
-    offer_requires_adoption: bool,
-    /// Last failed membership query per peer, for the peer-choice cooldown.
-    peer_failures: BTreeMap<[u8; 32], std::time::Instant>,
-    /// The staged candidate came from a peer's step, not a local commit.
-    staged_step_received: bool,
-    /// Gossiped steps that skip ahead of this node's epoch, keyed by the
-    /// epoch they extend. Bounded; applied in order as earlier steps land.
-    steps_ahead: BTreeMap<u64, Vec<u8>>,
-    /// The newest epoch heard by gossip or presence, and members that have it.
-    /// A hint only: the steps are pulled and verified.
-    head: Option<(u64, Vec<[u8; 32]>)>,
-    /// One range pull toward `head`, keyed by the epoch it extends.
-    range_pull: Option<PendingControl<u64>>,
-    /// Membership gossip outcomes, for workspace_metrics.
-    gossip_counts: Arc<membership::GossipCounts>,
-    /// One page pull of a peer's retained names, and the peer sets already
-    /// walked to the end (peer -> its profile digest), bounded.
-    profile_pull: Option<PendingControl<membership::ProfilePull>>,
-    profiles_walked: BTreeMap<[u8; 32], [u8; 32]>,
-    /// Gossiped profiles of members not yet in this roster (bounded).
-    profiles_pending: VecDeque<Vec<u8>>,
-    /// Retained member profiles, shared with the inquiry responder.
-    profiles: membership::Profiles,
-    peer_profile_summaries: BTreeMap<[u8; 32], [u8; 32]>,
-}
-
-impl MembershipState {
-    fn new(profiles: membership::Profiles) -> Self {
-        Self {
-            update: None,
-            offer: None,
-            offer_requires_adoption: false,
-            peer_failures: BTreeMap::new(),
-            staged_step_received: false,
-            steps_ahead: BTreeMap::new(),
-            head: None,
-            range_pull: None,
-            gossip_counts: Arc::default(),
-            profile_pull: None,
-            profiles_walked: BTreeMap::new(),
-            profiles_pending: VecDeque::new(),
-            profiles,
-            peer_profile_summaries: BTreeMap::new(),
-        }
-    }
-}
-
-/// Recovery, direct recovery and current-view repair jobs.
-#[derive(Default)]
-struct RecoveryState {
-    cutoff: Option<PendingControl<arachne_delivery::wire::CutoffQuery>>,
-    current_view: Option<PendingCurrentView>,
-    ready_current_view: Option<ReadyCurrentView>,
-    range: Option<PendingRange>,
-    ready_range: Option<ReadyRange>,
-    direct_range: Option<PendingDirectRange>,
-    ready_direct_range: Option<ReadyDirectRange>,
-    direct_miss: Option<arachne_delivery::wire::DirectRangeQuery>,
-}
-
-/// Device-level nearby advertisement.
-#[derive(Default)]
-struct NearbyState {
-    workspaces: BTreeMap<[u8; 32], Vec<u8>>,
-    identity: Option<String>,
-}
-
-impl Session {
-    /// The one constructor: an empty session around a bound node.
-    fn new(
-        node: Node,
-        receiver: arachne_node::MessageReceiver,
-        runtime: Runtime,
-        committed: committed_view::Published,
-        storage_key: Option<arachne_security::StorageKey>,
-        presence: presence::Presence,
-    ) -> Self {
-        let profiles = committed.profiles();
-        Self {
-            node,
-            receiver,
-            runtime,
-            overlay_paths: 0,
-            workspace: None,
-            committed,
-            activity: WorkspaceActivity::default(),
-            storage_key,
-            records: None,
-            transition: TransitionState::default(),
-            delivery: DeliveryState::default(),
-            admission: AdmissionState::default(),
-            join: JoinState::default(),
-            membership: MembershipState::new(profiles),
-            recovery: RecoveryState::default(),
-            nearby: NearbyState::default(),
-            resources: resources::Jobs::default(),
-            presence,
-            interests: interest::Updates::default(),
-            ending: false,
-        }
-    }
-}
-
 const MAX_WORKSPACE_OVERLAY_PATHS: usize = 5;
 // JSON commit/authorization arrays must fit both the 32 KiB membership offer
 // request and the 128 KiB admission reply. The lower MLS seam supports 128;
@@ -397,7 +120,7 @@ const MAX_WORKSPACE_OVERLAY_PATHS: usize = 5;
 const MAX_RUNTIME_ADMISSION_BATCH: usize = 16;
 // Half of the 512 control-exchange reserve (arachne-node budget.rs). Presence,
 // profile and recovery exchanges always keep the other half.
-const MAX_ADMISSION_WAITERS: usize = 256;
+pub(crate) const MAX_ADMISSION_WAITERS: usize = 256;
 
 /// Stable host-facing vocabulary for the admission lifecycle.
 pub mod admission_state {
