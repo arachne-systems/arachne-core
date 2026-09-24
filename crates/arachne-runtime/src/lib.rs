@@ -1378,6 +1378,15 @@ fn check_recovery_policy(
     session
         .runtime
         .block_on(session.node.with_routing_policy(|policy| {
+            // This re-checks a result held locally before it is shown. The
+            // one-revision window is for peers' frames in flight; this device
+            // knows it installed a newer policy, so the caller asks again.
+            if policy
+                .installed_revision(owner.id())
+                .is_some_and(|installed| installed != revision)
+            {
+                return Err("recovery scope changed".to_owned());
+            }
             for topic in topics {
                 let publishers = policy
                     .publishers(owner.id(), revision, session.node.id(), topic)

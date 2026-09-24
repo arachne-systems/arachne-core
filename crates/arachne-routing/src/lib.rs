@@ -158,6 +158,12 @@ pub struct RoutingTable {
 }
 
 impl RoutingTable {
+    /// The revision this table last installed for `workspace`. Frames from
+    /// peers may still use the previous one; a local re-check must not.
+    pub fn installed_revision(&self, workspace: WorkspaceId) -> Option<u64> {
+        self.workspaces.get(&workspace).map(|state| state.revision)
+    }
+
     /// Authorized transport endpoints for an already verified policy revision.
     /// This is bootstrap input, never evidence that an endpoint is online.
     pub fn authorized_endpoints(
@@ -507,4 +513,20 @@ fn all_member_access_still_requires_bounded_explicit_interests() {
             .is_empty()
     );
     assert!(table.subscribe(workspace, 2, [2; 32], topic).is_err());
+}
+
+/// A caller re-checking a result it holds locally must compare against the
+/// revision it installed, not the one-behind window kept for peers' frames.
+#[test]
+fn installed_revision_is_the_current_one_not_the_window() {
+    let mut table = RoutingTable::default();
+    let workspace = [1; 32];
+    assert_eq!(table.installed_revision(workspace), None);
+    let policy = BTreeMap::from([([1; 32], Permissions::AllTopics)]);
+    table
+        .install_verified_policy(workspace, 18, policy.clone())
+        .unwrap();
+    table.install_verified_policy(workspace, 19, policy).unwrap();
+    assert!(table.authorizes_endpoint(workspace, 18, [1; 32]).is_ok());
+    assert_eq!(table.installed_revision(workspace), Some(19));
 }
