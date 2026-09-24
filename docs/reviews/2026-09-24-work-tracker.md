@@ -6,6 +6,7 @@ test is red → green and the crate tests pass.
 ## Fix-now bugs (core)
 
 - [ ] **B1** New workspaces default to legacy invitations (no expiry, revoke or use limit).
+  Decision: remove the legacy mode entirely. No legacy workspaces, no compatibility path.
 - [ ] **B2** A removed member can rejoin with the old approved request.
 - [ ] **B3** Receivers reject management commits above ~250 members (64 KiB inline bound).
 - [ ] **B4** Invitation controls fill at 221 rows and are never pruned.
@@ -19,6 +20,19 @@ test is red → green and the crate tests pass.
 
 - [ ] **B10** Go, Python and Swift hold the client lock in `wait_for_work`; `close()` deadlocks.
 - [ ] **B11** The SDK pins core 7123166, which is missing `fbc4e91` (wake host loop after delivery).
+
+## ATAK plugin → SDK readiness (from `arachne-sdk/docs/android-consumer-plan.md`)
+
+The plugin reaches Core through `fabric-android` today; the SDK has its own native entry point
+and a different Core pin. Core work that each plan step depends on:
+
+| Plan step | Core dependency |
+| --- | --- |
+| 1. One Core revision, one native library and session owner | B11 (pin); A4 (owned `Context`, no static registry, no per-cdylib runtimes) |
+| 2. Typed SDK methods for ATAK workflows | A1: add typed methods in core `Client` (management, invitations, workspace name, presence, nearby, seal/restore), not in Kotlin |
+| 3. Candidate safety through Rust and the C boundary | A5 (typed candidate handles that carry their kind, one persistence mode), B5 |
+| 4. Distinct ID types, error categories through the C ABI | A1: core must emit real error codes first; today `ErrorKind` is a substring guess |
+| 5. End-to-end flow through the AAR, then ATAK host | B9 (freshness anchor), A4 (suspend/resume, `wait_for_work(timeout)`) |
 
 ## Architecture work (needs design first)
 
