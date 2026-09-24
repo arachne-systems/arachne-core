@@ -807,13 +807,6 @@ impl JoinProof {
     pub fn epoch(&self) -> u64 {
         self.verifier.epoch()
     }
-    pub(super) fn verify_management(
-        &self,
-        action: super::ManagementAction,
-        commit: &[u8],
-    ) -> Result<(), &'static str> {
-        self.verifier.verify_management(action, commit)
-    }
     pub fn matches_workspace(&self, workspace: &Workspace) -> Result<bool, &'static str> {
         self.verifier.matches_workspace(workspace)
     }

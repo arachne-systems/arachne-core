@@ -1,6 +1,6 @@
 //! Exact administrator actions, verified against the receiver's accepted state.
 //! Verification alone does not adopt, persist, disseminate or finalize a change.
-use super::{AUTHORITY, JoinProof, Workspace, bootstrap, storage};
+use super::{AUTHORITY, Workspace, bootstrap, storage};
 use openmls::prelude::tls_codec::{Deserialize, Serialize};
 use openmls::prelude::*;
 use openmls_traits::{OpenMlsProvider, crypto::OpenMlsCrypto, signatures::Signer};
@@ -355,7 +355,8 @@ impl Workspace {
         action: ManagementAction,
         commit: &[u8],
     ) -> Result<(), &'static str> {
-        JoinProof::from_workspace(self)?.verify_management(action, commit)?;
+        // Own local state: the local bound, not the joiner's inline wire bound.
+        super::MembershipVerifier::from_workspace(self)?.verify_management(action, commit)?;
         // PublicGroup checks signatures/policy but cannot check membership tags.
         // Use a disposable private owner as well; never consume the live state.
         let provider = storage::copy_provider(&self.provider)?;
@@ -518,7 +519,7 @@ pub(super) fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PendingJoin, StorageKey};
+    use crate::{JoinProof, PendingJoin, StorageKey};
     use openmls::prelude::tls_codec::Deserialize;
     use openmls_traits::OpenMlsProvider;
 
