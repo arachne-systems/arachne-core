@@ -37,7 +37,7 @@ use std::{
 use tempfile::TempDir;
 use tokio::task::JoinSet;
 
-const HISTORY_PAGE_PACKET: &[u8] = b"DFJP\x01";
+const HISTORY_PAGE_PACKET: &[u8] = b"DFJP\x02";
 const MAX_ENDPOINTS: usize = 1_000;
 
 #[derive(Clone, Copy, Debug)]
@@ -580,23 +580,22 @@ fn array64(value: &Value) -> Result<[u8; 64], String> {
         .map_err(|_| "expected 64 bytes".to_string())
 }
 
-fn packet(request: &[u8], name: &str, checkpoint: &[u8]) -> Vec<u8> {
-    let mut packet = b"DFJA\x02".to_vec();
+/// `DFJA\x03`; the checkpoint is not sent (B3a).
+fn packet(request: &[u8], name: &str, _checkpoint: &[u8]) -> Vec<u8> {
+    let mut packet = b"DFJA\x03".to_vec();
     packet.extend((request.len() as u32).to_be_bytes());
     packet.extend((name.len() as u16).to_be_bytes());
     packet.extend(request);
     packet.extend(name.as_bytes());
-    packet.extend(checkpoint);
     packet
 }
 
-fn history_packet(request: &[u8], checkpoint: &[u8], offset: u32) -> Vec<u8> {
+/// `DFJP\x02`; the checkpoint is not sent (B3a).
+fn history_packet(request: &[u8], _checkpoint: &[u8], offset: u32) -> Vec<u8> {
     let mut packet = HISTORY_PAGE_PACKET.to_vec();
     packet.extend((request.len() as u32).to_be_bytes());
-    packet.extend((checkpoint.len() as u32).to_be_bytes());
     packet.extend(offset.to_be_bytes());
     packet.extend(request);
-    packet.extend(checkpoint);
     packet
 }
 

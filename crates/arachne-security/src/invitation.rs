@@ -106,12 +106,7 @@ fn commit_epoch(commit: &[u8]) -> Option<u64> {
 /// The epoch a checkpoint describes, without building the public group. Used
 /// only for checkpoints this owner issued and retained itself.
 fn checkpoint_epoch(checkpoint: &[u8]) -> Result<u64, &'static str> {
-    let message =
-        MlsMessageIn::tls_deserialize_exact(checkpoint).map_err(|_| "invalid checkpoint")?;
-    let MlsMessageBodyIn::GroupInfo(info) = message.extract() else {
-        return Err("expected GroupInfo");
-    };
-    Ok(info.epoch().as_u64())
+    Ok(bootstrap::checkpoint_info(checkpoint)?.epoch().as_u64())
 }
 
 fn binding_message(grant: &[u8]) -> Vec<u8> {
@@ -437,6 +432,27 @@ impl Workspace {
                 signature,
             )
             .map_err(|_| "invalid invitation checkpoint proof")?;
+        self.checkpoint_for_grant(grant, true)
+    }
+
+    /// The checkpoint an admission request's invitation pins, resolved from
+    /// this owner's own state. Requests carry only the pinned digest (inside
+    /// the grant), never the checkpoint, so they stay within the small control
+    /// request bound at any roster size. The request itself is authorized
+    /// separately by the membership-history calls.
+    pub fn admission_checkpoint(&self, request: &[u8]) -> Result<Vec<u8>, &'static str> {
+        if request.len() <= REQUEST_HEADER || request.len() > MAX_REQUEST || !request.starts_with(REQUEST) {
+            return Err("invalid admission request");
+        }
+        let grant = &request[5..5 + PUBLIC];
+        verify_grant(&self.provider, grant)?;
+        // Resolution only: every admission and history-page path verifies the
+        // checkpoint as an authorized ancestor itself, so replaying it here on
+        // each page would repeat that work.
+        self.checkpoint_for_grant(grant, false)
+    }
+
+    fn checkpoint_for_grant(&self, grant: &[u8], verify: bool) -> Result<Vec<u8>, &'static str> {
         if grant[5..37] != self.id() {
             return Err("invitation belongs to another workspace");
         }
@@ -444,10 +460,12 @@ impl Workspace {
         let checkpoint = match self
             .join_history
             .as_ref()
-            .filter(|history| <[u8; 32]>::from(Sha256::digest(&history.checkpoint)) == digest)
+            .filter(|history| bootstrap::checkpoint_digest(&history.checkpoint) == Ok(digest))
         {
             Some(history) => {
-                history.verify(self)?;
+                if verify {
+                    history.verify(self)?;
+                }
                 history.checkpoint.clone()
             }
             None => match self
@@ -456,9 +474,19 @@ impl Workspace {
                 .find(|saved| saved.grant.as_slice() == grant)
             {
                 Some(saved) => saved.checkpoint.clone(),
-                None => self.join_checkpoint()?,
+                // Only the checkpoint-fetch path may export a fresh one: the
+                // admission path resolves before the request is authorized, so
+                // it never pays to sign the full tree for a replayed grant.
+                None if verify => self.join_checkpoint()?,
+                None => return Err("invitation checkpoint unavailable"),
             },
         };
+        if !verify {
+            return match bootstrap::checkpoint_digest(&checkpoint) == Ok(digest) {
+                true => Ok(checkpoint),
+                false => Err("invitation checkpoint unavailable"),
+            };
+        }
         let proof = JoinProof::from_trusted_checkpoint(self.id(), digest, &checkpoint)?;
         if !proof.authorizes_issuer(&grant[69..101])? {
             return Err("invitation issuer is not a checkpoint administrator");
@@ -593,8 +621,8 @@ impl Workspace {
     ) -> Result<Option<u64>, &'static str> {
         let Some(saved) = self.invitation_checkpoints.iter().find(|saved| {
             saved.checkpoint == checkpoint
-                && <[u8; 32]>::from(Sha256::digest(&saved.checkpoint))
-                    == request.checkpoint_digest
+                && bootstrap::checkpoint_digest(&saved.checkpoint)
+                    == Ok(request.checkpoint_digest)
                 && saved.grant[69..101] == request.issuer
                 && saved.grant[101..133] == request.authorization.invitation_key
         }) else {
@@ -749,7 +777,7 @@ impl Workspace {
         let mut grant = [0; PUBLIC];
         grant[..5].copy_from_slice(TOKEN);
         grant[5..37].copy_from_slice(&self.id());
-        grant[37..69].copy_from_slice(&Sha256::digest(&checkpoint));
+        grant[37..69].copy_from_slice(&bootstrap::checkpoint_digest(&checkpoint)?);
         grant[69..101].copy_from_slice(self._signer.public());
         grant[101..133].copy_from_slice(&public);
         let signature = self
@@ -823,7 +851,7 @@ impl Workspace {
         };
         let mut prepared = self.prepare_management(action)?;
         let checkpoint = prepared.workspace.join_checkpoint()?;
-        invitation.grant[37..69].copy_from_slice(&Sha256::digest(&checkpoint));
+        invitation.grant[37..69].copy_from_slice(&bootstrap::checkpoint_digest(&checkpoint)?);
         let binding = binding_message(&invitation.grant);
         invitation.grant[197..261].copy_from_slice(
             &self

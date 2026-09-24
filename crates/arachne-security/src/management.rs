@@ -556,10 +556,9 @@ mod tests {
     fn incremental_verification_has_no_workspace_lifetime_counter() {
         let (mut admin, member) = pair();
         let checkpoint = admin.join_checkpoint().unwrap();
-        use sha2::{Digest, Sha256};
         let mut verifier = crate::MembershipVerifier::from_trusted_checkpoint(
             admin.id(),
-            Sha256::digest(&checkpoint).into(),
+            crate::checkpoint_digest(&checkpoint).unwrap(),
             &checkpoint,
         )
         .unwrap();

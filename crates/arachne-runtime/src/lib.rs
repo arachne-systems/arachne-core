@@ -1599,38 +1599,51 @@ fn retained_reply(
     )
 }
 
-// Versioned admission transport wrapper. Legacy local/raw requests remain
-// available; the plugin sends its pinned checkpoint for history preflight.
-type AdmissionPacket<'a> = (&'a [u8], Option<&'a [u8]>, Option<&'a str>);
+// Versioned admission transport wrapper. A raw local request carries no
+// history pin. `DFJA\x03` pins history: the checkpoint is never sent, since the
+// request's grant already names its digest and the responder resolves the
+// checkpoint from its own state (B3a). The bool says whether history is pinned.
+type AdmissionPacket<'a> = (&'a [u8], bool, Option<&'a str>);
 
-const ADMISSION_HISTORY_PAGE_REQUEST: &[u8; 5] = b"DFJP\x01";
+const ADMISSION_PACKET: &[u8; 5] = b"DFJA\x03";
+const ADMISSION_HISTORY_PAGE_REQUEST: &[u8; 5] = b"DFJP\x02";
+
+/// `DFJA\x03 | u32 request length | u16 name length | request | name`.
+fn admission_request_packet(request: &[u8], name: &[u8]) -> Result<Vec<u8>, String> {
+    let request_len = u32::try_from(request.len()).map_err(|_| "admission request too large")?;
+    let name_len = u16::try_from(name.len()).map_err(|_| "admission display name too large")?;
+    let mut packet = ADMISSION_PACKET.to_vec();
+    packet.extend(request_len.to_be_bytes());
+    packet.extend(name_len.to_be_bytes());
+    packet.extend(request);
+    packet.extend(name);
+    Ok(packet)
+}
+
+/// The checkpoint an admission request pins, from this responder's own state.
+fn pinned_checkpoint(
+    workspace: &arachne_security::Workspace,
+    request: &[u8],
+) -> Result<Vec<u8>, String> {
+    workspace.admission_checkpoint(request).map_err(str::to_owned)
+}
 
 fn admission_packet(bytes: &[u8]) -> Result<AdmissionPacket<'_>, String> {
     if !bytes.starts_with(b"DFJA") {
-        return Ok((bytes, None, None));
+        return Ok((bytes, false, None));
     }
-    if bytes.len() < 9 || (!bytes.starts_with(b"DFJA\x01") && !bytes.starts_with(b"DFJA\x02")) {
+    if bytes.len() < 11 || !bytes.starts_with(ADMISSION_PACKET) {
         return Err("invalid admission packet".into());
     }
     let length = u32::from_be_bytes(bytes[5..9].try_into().unwrap()) as usize;
-    let (header, name_length): (usize, usize) = if bytes.starts_with(b"DFJA\x02") {
-        if bytes.len() < 11 {
-            return Err("invalid admission packet bounds".into());
-        }
-        (
-            11,
-            u16::from_be_bytes(bytes[9..11].try_into().unwrap()) as usize,
-        )
-    } else {
-        (9, 0)
-    };
+    let (header, name_length) = (11usize, u16::from_be_bytes(bytes[9..11].try_into().unwrap()) as usize);
     let request_end = header
         .checked_add(length)
         .ok_or("invalid admission packet bounds")?;
     let name_end = request_end
         .checked_add(name_length)
         .ok_or("invalid admission packet bounds")?;
-    if length == 0 || name_end >= bytes.len() {
+    if length == 0 || name_end != bytes.len() {
         return Err("invalid admission packet bounds".into());
     }
     let name = if name_length == 0 {
@@ -1651,28 +1664,22 @@ fn admission_packet(bytes: &[u8]) -> Result<AdmissionPacket<'_>, String> {
         }
         Some(value)
     };
-    Ok((&bytes[header..request_end], Some(&bytes[name_end..]), name))
+    Ok((&bytes[header..request_end], true, name))
 }
 
-fn admission_parts(bytes: &[u8]) -> Result<(&[u8], Option<&[u8]>), String> {
-    let (request, checkpoint, _) = admission_packet(bytes)?;
-    Ok((request, checkpoint))
+fn admission_parts(bytes: &[u8]) -> Result<(&[u8], bool), String> {
+    let (request, pinned, _) = admission_packet(bytes)?;
+    Ok((request, pinned))
 }
 
-fn admission_history_page_packet(
-    request: &[u8],
-    checkpoint: &[u8],
-    offset: usize,
-) -> Result<Vec<u8>, String> {
+/// `DFJP\x02 | u32 request length | u32 offset | request`. No checkpoint.
+fn admission_history_page_packet(request: &[u8], offset: usize) -> Result<Vec<u8>, String> {
     let request_len = u32::try_from(request.len()).map_err(|_| "admission request too large")?;
-    let checkpoint_len = u32::try_from(checkpoint.len()).map_err(|_| "checkpoint too large")?;
     let offset = u32::try_from(offset).map_err(|_| "history offset too large")?;
     let mut packet = ADMISSION_HISTORY_PAGE_REQUEST.to_vec();
     packet.extend(request_len.to_be_bytes());
-    packet.extend(checkpoint_len.to_be_bytes());
     packet.extend(offset.to_be_bytes());
     packet.extend(request);
-    packet.extend(checkpoint);
     Ok(packet)
 }
 
@@ -1709,16 +1716,13 @@ async fn request_invitation_checkpoint(
     }
     let mut last_error = None;
     for peer in peers {
-        let mut packet = INVITATION_CHECKPOINT_REQUEST.to_vec();
-        packet.extend(
-            invitation
-                .checkpoint_request(requester, peer)
-                .map_err(str::to_owned)?,
-        );
-        let checkpoint = match client.clone().request_control(peer, &packet).await {
+        let proof = invitation
+            .checkpoint_request(requester, peer)
+            .map_err(str::to_owned)?;
+        let checkpoint = match fetch_invitation_checkpoint(&client, peer, &proof).await {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
-                last_error = Some(error.to_string());
+                last_error = Some(error);
                 continue;
             }
         };
@@ -1736,27 +1740,94 @@ async fn request_invitation_checkpoint(
     Err(last_error.unwrap_or_else(|| "no authorized workspace member is reachable".into()))
 }
 
+/// Pull one invitation checkpoint in pages. A checkpoint is up to
+/// `MAX_CHECKPOINT` (about 832 KiB), larger than one control reply. Pages are
+/// full except the last, so a peer cannot stretch the exchange: the page count
+/// is exactly `total.div_ceil(CHECKPOINT_PAGE_BYTES)`, at most 7.
+async fn fetch_invitation_checkpoint(
+    client: &ControlClient,
+    peer: [u8; 32],
+    proof: &[u8],
+) -> Result<Vec<u8>, String> {
+    let mut checkpoint = Vec::new();
+    let mut total = None;
+    loop {
+        let offset = u32::try_from(checkpoint.len()).map_err(|_| "checkpoint too large")?;
+        let mut packet = INVITATION_CHECKPOINT_REQUEST.to_vec();
+        packet.extend(offset.to_be_bytes());
+        packet.extend(proof);
+        let page = client
+            .clone()
+            .request_control(peer, &packet)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (page_total, page_offset, chunk) = parse_checkpoint_page(&page)?;
+        if page_offset != checkpoint.len() || total.is_some_and(|total| total != page_total) {
+            return Err("invitation checkpoint page mismatch".into());
+        }
+        total = Some(page_total);
+        checkpoint.extend(chunk);
+        if checkpoint.len() == page_total {
+            return Ok(checkpoint);
+        }
+    }
+}
+
+/// `DFCP\x01 | u32 total | u32 offset | chunk`; the chunk is exactly
+/// `min(CHECKPOINT_PAGE_BYTES, total - offset)` bytes.
+fn parse_checkpoint_page(page: &[u8]) -> Result<(usize, usize, &[u8]), String> {
+    if page.len() < 13 || !page.starts_with(INVITATION_CHECKPOINT_PAGE) {
+        return Err("invalid invitation checkpoint page".into());
+    }
+    let total = u32::from_be_bytes(page[5..9].try_into().unwrap()) as usize;
+    let offset = u32::from_be_bytes(page[9..13].try_into().unwrap()) as usize;
+    let chunk = &page[13..];
+    if total == 0
+        || total > arachne_security::MAX_CHECKPOINT
+        || offset >= total
+        || chunk.len() != CHECKPOINT_PAGE_BYTES.min(total - offset)
+    {
+        return Err("invalid invitation checkpoint page bounds".into());
+    }
+    Ok((total, offset, chunk))
+}
+
+/// Serve one page of the checkpoint an invitation holder may fetch.
+fn invitation_checkpoint_page(
+    workspace: &arachne_security::Workspace,
+    requester: [u8; 32],
+    responder: [u8; 32],
+    request: &[u8],
+) -> Result<Vec<u8>, String> {
+    let body = request
+        .strip_prefix(INVITATION_CHECKPOINT_REQUEST)
+        .filter(|body| body.len() > 4)
+        .ok_or("invalid invitation checkpoint request")?;
+    let offset = u32::from_be_bytes(body[..4].try_into().unwrap()) as usize;
+    let checkpoint = workspace
+        .checkpoint_for_invitation(requester, responder, &body[4..])
+        .map_err(str::to_owned)?;
+    if offset >= checkpoint.len() {
+        return Err("invitation checkpoint page offset is out of bounds".into());
+    }
+    let end = checkpoint.len().min(offset + CHECKPOINT_PAGE_BYTES);
+    let mut page = INVITATION_CHECKPOINT_PAGE.to_vec();
+    page.extend(u32::try_from(checkpoint.len()).map_err(|_| "checkpoint too large")?.to_be_bytes());
+    page.extend(u32::try_from(offset).map_err(|_| "checkpoint too large")?.to_be_bytes());
+    page.extend(&checkpoint[offset..end]);
+    Ok(page)
+}
+
 async fn request_join_exchange(
     client: ControlClient,
     peer: [u8; 32],
     request: Vec<u8>,
     name: Vec<u8>,
-    checkpoint: Vec<u8>,
 ) -> JoinAttemptOutcome {
-    let mut packet = b"DFJA\x02".to_vec();
-    let request_len = match u32::try_from(request.len()) {
-        Ok(length) => length,
-        Err(_) => return JoinAttemptOutcome::Failed("admission request too large".into()),
+    let packet = match admission_request_packet(&request, &name) {
+        Ok(packet) => packet,
+        Err(error) => return JoinAttemptOutcome::Failed(error),
     };
-    let name_len = match u16::try_from(name.len()) {
-        Ok(length) => length,
-        Err(_) => return JoinAttemptOutcome::Failed("admission display name too large".into()),
-    };
-    packet.extend(request_len.to_be_bytes());
-    packet.extend(name_len.to_be_bytes());
-    packet.extend(&request);
-    packet.extend(&name);
-    packet.extend(&checkpoint);
 
     let first = match client.clone().request_control(peer, &packet).await {
         Ok(reply) => reply,
@@ -1794,7 +1865,7 @@ async fn request_join_exchange(
                     "admission history page count exceeds bounds".into(),
                 );
             }
-            let page = match admission_history_page_packet(&request, &checkpoint, offset) {
+            let page = match admission_history_page_packet(&request, offset) {
                 Ok(packet) => packet,
                 Err(error) => return JoinAttemptOutcome::Failed(error),
             };
@@ -1877,68 +1948,44 @@ async fn request_join_exchange(
     }
 }
 
-fn parse_admission_history_page_packet(bytes: &[u8]) -> Result<(&[u8], &[u8], usize), String> {
-    if !bytes.starts_with(ADMISSION_HISTORY_PAGE_REQUEST) || bytes.len() < 17 {
+fn parse_admission_history_page_packet(bytes: &[u8]) -> Result<(&[u8], usize), String> {
+    if !bytes.starts_with(ADMISSION_HISTORY_PAGE_REQUEST) || bytes.len() < 13 {
         return Err("invalid admission history page request".into());
     }
     let request_len = u32::from_be_bytes(bytes[5..9].try_into().unwrap()) as usize;
-    let checkpoint_len = u32::from_be_bytes(bytes[9..13].try_into().unwrap()) as usize;
-    let offset = u32::from_be_bytes(bytes[13..17].try_into().unwrap()) as usize;
-    let request_end = 17usize
-        .checked_add(request_len)
-        .ok_or("invalid admission history page bounds")?;
-    let checkpoint_end = request_end
-        .checked_add(checkpoint_len)
-        .ok_or("invalid admission history page bounds")?;
-    if request_len == 0 || checkpoint_end != bytes.len() {
+    let offset = u32::from_be_bytes(bytes[9..13].try_into().unwrap()) as usize;
+    if request_len == 0 || 13usize.checked_add(request_len) != Some(bytes.len()) {
         return Err("invalid admission history page bounds".into());
     }
-    Ok((
-        &bytes[17..request_end],
-        &bytes[request_end..checkpoint_end],
-        offset,
-    ))
+    Ok((&bytes[13..], offset))
 }
 
-const INVITATION_CHECKPOINT_REQUEST: &[u8; 5] = b"DFIC\x01";
+/// `DFIC\x02 | u32 offset | checkpoint request proof`; answered by one
+/// `DFCP\x01` checkpoint page (B3a).
+const INVITATION_CHECKPOINT_REQUEST: &[u8; 5] = b"DFIC\x02";
+const INVITATION_CHECKPOINT_PAGE: &[u8; 5] = b"DFCP\x01";
+const CHECKPOINT_PAGE_BYTES: usize = arachne_node::MAX_CONTROL_REPLY - 13;
 
 fn invitation_checkpoint_reply(
     session: &Session,
     requester: [u8; 32],
     request: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let proof = request
-        .strip_prefix(INVITATION_CHECKPOINT_REQUEST)
-        .ok_or("invalid invitation checkpoint request")?;
     let workspace = session
         .workspace
         .as_ref()
         .ok_or("session has no workspace")?;
-    workspace
-        .checkpoint_for_invitation(requester, session.node.id(), proof)
-        .map_err(str::to_owned)
+    invitation_checkpoint_page(workspace, requester, session.node.id(), request)
 }
 
 #[test]
 fn admission_packet_rejects_invalid_version_and_lengths() {
-    let packet = [b"DFJA\x01".as_slice(), &1u32.to_be_bytes(), &[7, 8]].concat();
-    assert_eq!(
-        admission_parts(&packet).unwrap(),
-        (&[7][..], Some(&[8][..]))
-    );
-    let named = [
-        b"DFJA\x02".as_slice(),
-        &1u32.to_be_bytes(),
-        &4u16.to_be_bytes(),
-        &[7],
-        b"Alex",
-        &[8],
-    ]
-    .concat();
-    assert_eq!(
-        admission_packet(&named).unwrap(),
-        (&[7][..], Some(&[8][..]), Some("Alex"))
-    );
+    let packet = admission_request_packet(&[7], b"").unwrap();
+    assert_eq!(admission_parts(&packet).unwrap(), (&[7][..], true));
+    let named = admission_request_packet(&[7], b"Alex").unwrap();
+    assert_eq!(admission_packet(&named).unwrap(), (&[7][..], true, Some("Alex")));
+    // No checkpoint rides along; trailing bytes are rejected.
+    assert!(admission_packet(&[named.as_slice(), &[8]].concat()).is_err());
     for length in 4..packet.len() {
         assert!(admission_parts(&packet[..length]).is_err());
     }
@@ -1947,9 +1994,31 @@ fn admission_packet_rejects_invalid_version_and_lengths() {
         bad[5..9].copy_from_slice(&length.to_be_bytes());
         assert!(admission_parts(&bad).is_err());
     }
-    let mut bad = packet;
-    bad[4] = 2;
-    assert!(admission_parts(&bad).is_err());
+    // Earlier versions embedded the checkpoint; they are not decoded.
+    for version in [1, 2] {
+        let mut bad = packet.clone();
+        bad[4] = version;
+        assert!(admission_parts(&bad).is_err());
+    }
+    let page = admission_history_page_packet(&[7, 8], 3).unwrap();
+    assert_eq!(parse_admission_history_page_packet(&page).unwrap(), (&[7, 8][..], 3));
+    assert!(parse_admission_history_page_packet(&[page.as_slice(), &[9]].concat()).is_err());
+}
+
+#[test]
+fn checkpoint_pages_are_full_and_bounded() {
+    let page = |total: u32, offset: u32, chunk: usize| {
+        [INVITATION_CHECKPOINT_PAGE.as_slice(), &total.to_be_bytes(), &offset.to_be_bytes(), &vec![1; chunk]].concat()
+    };
+    let total = CHECKPOINT_PAGE_BYTES as u32 + 5;
+    assert!(parse_checkpoint_page(&page(total, 0, CHECKPOINT_PAGE_BYTES)).is_ok());
+    assert!(parse_checkpoint_page(&page(total, CHECKPOINT_PAGE_BYTES as u32, 5)).is_ok());
+    // A short page would let a peer stretch the exchange.
+    assert!(parse_checkpoint_page(&page(total, 0, 1)).is_err());
+    assert!(parse_checkpoint_page(&page(total, total, 0)).is_err());
+    let over = arachne_security::MAX_CHECKPOINT as u32 + 1;
+    assert!(parse_checkpoint_page(&page(over, 0, CHECKPOINT_PAGE_BYTES)).is_err());
+    assert!(CHECKPOINT_PAGE_BYTES + 13 <= arachne_node::MAX_CONTROL_REPLY);
 }
 
 fn admission_reply(
@@ -1977,8 +2046,9 @@ fn send_inbound_admission_reply(session: &mut Session) -> Result<Value, String> 
     {
         vec![1] // Acknowledge only after the staged transition or verified Welcome is durable.
     } else {
-        let (request, checkpoint) = admission_parts(incoming.payload())?;
-        admission_reply(workspace, incoming.peer(), request, checkpoint)?
+        let (request, pinned) = admission_parts(incoming.payload())?;
+        let checkpoint = pinned.then(|| pinned_checkpoint(workspace, request)).transpose()?;
+        admission_reply(workspace, incoming.peer(), request, checkpoint.as_deref())?
     };
     let queued = match incoming.respond(reply) {
         Ok(()) => true,
@@ -2219,10 +2289,13 @@ fn queue_admission(
     let packet = incoming.payload().to_vec();
     if packet.starts_with(ADMISSION_HISTORY_PAGE_REQUEST) {
         let response = match parse_admission_history_page_packet(&packet) {
-            Ok((request, checkpoint, offset)) => session.workspace.as_ref().map_or_else(
+            Ok((request, offset)) => session.workspace.as_ref().map_or_else(
                 || b"{\"state\":\"admission_unavailable\",\"reason\":\"unavailable\"}".to_vec(),
                 |workspace| {
-                    admission_reply_page(workspace, peer, request, Some(checkpoint), offset)
+                    pinned_checkpoint(workspace, request)
+                        .and_then(|checkpoint| {
+                            admission_reply_page(workspace, peer, request, Some(&checkpoint), offset)
+                        })
                         .unwrap_or_else(|_| {
                             b"{\"state\":\"admission_unavailable\",\"reason\":\"unavailable\"}"
                                 .to_vec()
@@ -2235,12 +2308,18 @@ fn queue_admission(
         return Ok(json!({"state":"admission_replied", "accepted":accepted,
             "history_page":true}));
     }
-    let (request, checkpoint, display_name) = match admission_packet(&packet) {
-        Ok((request, checkpoint, display_name)) => (
-            request.to_vec(),
-            checkpoint.map(ToOwned::to_owned),
-            display_name.map(str::to_owned),
-        ),
+    // A pinned request names its checkpoint by digest; resolve it from this
+    // owner's own state. An unresolvable pin is answered like a bad packet.
+    let parsed = admission_packet(&packet).and_then(|(request, pinned, display_name)| {
+        let checkpoint = match (pinned, session.workspace.as_ref()) {
+            (false, _) => None,
+            (true, Some(workspace)) => Some(pinned_checkpoint(workspace, request)?),
+            (true, None) => return Err("session has no workspace".to_string()),
+        };
+        Ok((request.to_vec(), checkpoint, display_name.map(str::to_owned)))
+    });
+    let (request, checkpoint, display_name) = match parsed {
+        Ok(parsed) => parsed,
         Err(_) => {
             let _ = incoming.respond(
                 serde_json::to_vec(
@@ -2604,6 +2683,18 @@ pub fn execute(handle: i64, bytes: &[u8]) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&execute_request(handle, request)?).map_err(|e| e.to_string())
 }
 
+/// Largest binary snapshot `execute_stored` accepts or returns: a sealed
+/// workspace bundle, or a sealed pending join, which carries its invitation
+/// checkpoint (up to `MAX_CHECKPOINT`, B3a) and so can be the larger one.
+pub const MAX_STORED_SNAPSHOT: usize =
+    if arachne_security::MAX_SEALED_BUNDLE > arachne_security::MAX_SEALED_PENDING_JOIN {
+        arachne_security::MAX_SEALED_BUNDLE
+    } else {
+        arachne_security::MAX_SEALED_PENDING_JOIN
+    };
+// A pending join, with its checkpoint, is saved as one host record.
+const _: () = assert!(arachne_security::MAX_SEALED_PENDING_JOIN <= arachne_store::MAX_RECORD_BYTES);
+
 // Binary snapshots never pass through the JSON request size bound. Metadata is
 // independently bounded and cannot supply a second, ambiguous snapshot value.
 /// Execute metadata with a binary snapshot; return metadata and snapshot separately.
@@ -2613,7 +2704,7 @@ pub fn execute_stored(
     metadata: &[u8],
     snapshot: &[u8],
 ) -> Result<[Vec<u8>; 2], String> {
-    if metadata.len() > MAX_REQUEST || snapshot.len() > arachne_security::MAX_SEALED_BUNDLE {
+    if metadata.len() > MAX_REQUEST || snapshot.len() > MAX_STORED_SNAPSHOT {
         return Err("stored request exceeds limit".into());
     }
     // Parse original bytes strictly before a generic map can hide duplicate fields.
@@ -2675,7 +2766,7 @@ pub fn execute_stored(
         .transpose()
         .map_err(|e| e.to_string())?
         .unwrap_or_default();
-    if snapshot.len() > arachne_security::MAX_SEALED_BUNDLE {
+    if snapshot.len() > MAX_STORED_SNAPSHOT {
         return Err("stored response exceeds limit; close and restore".into());
     }
     Ok([
@@ -3222,7 +3313,7 @@ fn execute_in_session(
             return Ok(joined);
         }
 
-        let (peer, request, name, checkpoint) = {
+        let (peer, request, name) = {
             let session = guard.as_mut().ok_or("node is closed")?;
             let lifecycle = session
                 .join_lifecycle
@@ -3247,10 +3338,6 @@ fn execute_in_session(
                 peer,
                 pending.admission_request().map_err(str::to_owned)?.to_vec(),
                 pending.member().display_name().as_bytes().to_vec(),
-                pending
-                    .admission_checkpoint()
-                    .map_err(str::to_owned)?
-                    .to_vec(),
             )
         };
         let wake = guard
@@ -3268,7 +3355,7 @@ fn execute_in_session(
             .ok_or("node is closed")?
             .runtime
             .spawn(async move {
-                let outcome = request_join_exchange(client, peer, request, name, checkpoint).await;
+                let outcome = request_join_exchange(client, peer, request, name).await;
                 wake.notify_one();
                 outcome
             });
@@ -4490,12 +4577,7 @@ fn execute_in_session(
             .ok_or("session has no pending join")?;
         let request = pending.admission_request().map_err(str::to_owned)?;
         let name = pending.member().display_name().as_bytes();
-        let mut packet = b"DFJA\x02".to_vec();
-        packet.extend((request.len() as u32).to_be_bytes());
-        packet.extend((name.len() as u16).to_be_bytes());
-        packet.extend(request);
-        packet.extend(name);
-        packet.extend(pending.admission_checkpoint().map_err(str::to_owned)?);
+        let packet = admission_request_packet(request, name)?;
         let outcome = session
             .runtime
             .block_on(session.node.request_control(peer, &packet));
@@ -4543,11 +4625,7 @@ fn execute_in_session(
                 if page_count > arachne_security::MAX_JOIN_HISTORY_STEPS {
                     return Err("admission history page count exceeds bounds".into());
                 }
-                let page = admission_history_page_packet(
-                    request,
-                    pending.admission_checkpoint().map_err(str::to_owned)?,
-                    offset,
-                )?;
+                let page = admission_history_page_packet(request, offset)?;
                 let page = session
                     .runtime
                     .block_on(session.node.request_control(peer, &page))
@@ -4982,7 +5060,9 @@ fn execute_in_session(
                 .workspace
                 .as_ref()
                 .ok_or("session has no workspace")?;
-            let (request, checkpoint) = admission_parts(incoming.payload())?;
+            let (request, pinned) = admission_parts(incoming.payload())?;
+            let checkpoint = pinned.then(|| pinned_checkpoint(workspace, request)).transpose()?;
+            let checkpoint = checkpoint.as_deref();
             if let Some(checkpoint) = checkpoint {
                 workspace
                     .membership_history(incoming.peer(), request, checkpoint)
@@ -5937,6 +6017,9 @@ fn execute_in_session(
 }
 
 #[cfg(test)]
+mod large_invitation_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -6785,7 +6868,7 @@ mod tests {
             execute_stored(
                 admin,
                 br#"{"op":"adopt_publication"}"#,
-                &vec![0; arachne_security::MAX_SEALED_BUNDLE + 1]
+                &vec![0; MAX_STORED_SNAPSHOT + 1]
             )
             .is_err()
         );

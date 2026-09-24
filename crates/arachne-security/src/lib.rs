@@ -54,15 +54,19 @@ pub use invitation::{
 };
 mod storage;
 pub use bootstrap::{
-    AdmissionAuthorization, HISTORY_CHUNK_STEPS, JoinProof, MAX_JOIN_HISTORY_BYTES,
-    MAX_JOIN_HISTORY_STEPS, MembershipAuthorization, MembershipVerifier,
+    AdmissionAuthorization, HISTORY_CHUNK_STEPS, JoinProof, MAX_CHECKPOINT, MAX_CHECKPOINT_PIN,
+    MAX_CHECKPOINT_TREE, MAX_JOIN_HISTORY_BYTES, MAX_JOIN_HISTORY_STEPS, MembershipAuthorization,
+    MembershipVerifier, checkpoint_digest,
 };
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::{OpenMlsProvider, random::OpenMlsRand};
 pub use pending::{MAX_WELCOME, PendingJoin};
-pub use storage::{MAX_SEALED_BUNDLE, MAX_SEALED_WORKSPACE, MAX_WORKSPACE_ATTACHMENT, StorageKey};
+pub use storage::{
+    MAX_SEALED_BUNDLE, MAX_SEALED_PENDING_JOIN, MAX_SEALED_WORKSPACE, MAX_WORKSPACE_ATTACHMENT,
+    StorageKey,
+};
 
 const SUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 const AUTHORITY: u16 = 0xff00; // Candidate encoding shared with admission experiment.

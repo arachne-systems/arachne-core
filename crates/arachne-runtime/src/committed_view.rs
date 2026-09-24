@@ -122,17 +122,16 @@ impl CommittedView {
     /// the authenticated transport identity, never a field of the payload.
     fn answer(&self, peer: [u8; 32], payload: &[u8]) -> Option<Vec<u8>> {
         if payload.starts_with(INVITATION_CHECKPOINT_REQUEST) {
-            let proof = &payload[INVITATION_CHECKPOINT_REQUEST.len()..];
             return Some(
-                self.workspace
-                    .checkpoint_for_invitation(peer, self.endpoint, proof)
+                invitation_checkpoint_page(&self.workspace, peer, self.endpoint, payload)
                     .unwrap_or_default(),
             );
         }
         if payload.starts_with(ADMISSION_HISTORY_PAGE_REQUEST) {
             let page = parse_admission_history_page_packet(payload).ok().and_then(
-                |(request, checkpoint, offset)| {
-                    admission_reply_page(&self.workspace, peer, request, Some(checkpoint), offset)
+                |(request, offset)| {
+                    let checkpoint = pinned_checkpoint(&self.workspace, request).ok()?;
+                    admission_reply_page(&self.workspace, peer, request, Some(&checkpoint), offset)
                         .ok()
                 },
             );
@@ -149,9 +148,14 @@ impl CommittedView {
         // A join request is an inquiry only when its result is already
         // retained. Otherwise it asks for a membership change: host queue.
         if payload.starts_with(b"DFJA") {
-            let (request, checkpoint, _) = admission_packet(payload).ok()?;
+            let (request, pinned, _) = admission_packet(payload).ok()?;
             self.workspace.retained_admission(peer, request).ok()??;
-            return admission_reply_page(&self.workspace, peer, request, checkpoint, 0).ok();
+            let checkpoint = match pinned {
+                true => Some(pinned_checkpoint(&self.workspace, request).ok()?),
+                false => None,
+            };
+            return admission_reply_page(&self.workspace, peer, request, checkpoint.as_deref(), 0)
+                .ok();
         }
         None
     }

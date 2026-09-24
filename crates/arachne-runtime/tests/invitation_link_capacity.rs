@@ -20,7 +20,7 @@ const PREFIX: &str = "arachne://join#";
 const INVITATION_SIZE: usize = 293;
 const COMPACT_SIZE: usize = 390;
 const BOOTSTRAP_PEERS: usize = 3;
-const CONTROL_PACKET: &[u8] = b"DFIC\x01";
+const CONTROL_PACKET: &[u8] = b"DFIC\x02";
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// What a capacity run actually measured. `AdmissionOnly` is the legacy
@@ -142,13 +142,14 @@ fn link(path: &str) -> Result<(Invitation, Vec<[u8; 32]>), String> {
     Ok((invitation, peers))
 }
 
-fn packet(request: &[u8], name: &str, checkpoint: &[u8]) -> Vec<u8> {
-    let mut packet = b"DFJA\x02".to_vec();
+/// `DFJA\x03`: the checkpoint is never sent; the responder resolves it from
+/// the digest the request's grant pins (B3a).
+fn packet(request: &[u8], name: &str, _checkpoint: &[u8]) -> Vec<u8> {
+    let mut packet = b"DFJA\x03".to_vec();
     packet.extend((request.len() as u32).to_be_bytes());
     packet.extend((name.len() as u16).to_be_bytes());
     packet.extend(request);
     packet.extend(name.as_bytes());
-    packet.extend(checkpoint);
     packet
 }
 
@@ -162,14 +163,36 @@ async fn fetch_checkpoint(
         let request = invitation
             .checkpoint_request(node.id(), *peer)
             .map_err(str::to_owned)?;
-        let mut payload = CONTROL_PACKET.to_vec();
-        payload.extend(request);
-        match node.request_control(*peer, &payload).await {
-            Ok(reply) => return Ok((reply, *peer)),
-            Err(error) => last = Some(error.to_string()),
+        match fetch_checkpoint_pages(node, *peer, &request).await {
+            Ok(checkpoint) => return Ok((checkpoint, *peer)),
+            Err(error) => last = Some(error),
         }
     }
     Err(last.unwrap_or_else(|| "no bootstrap peers".into()))
+}
+
+/// Mirrors the runtime's paged checkpoint fetch: `DFIC\x02 | u32 offset |
+/// proof`, answered by `DFCP\x01 | u32 total | u32 offset | chunk`.
+async fn fetch_checkpoint_pages(node: &Node, peer: [u8; 32], proof: &[u8]) -> Result<Vec<u8>, String> {
+    let mut checkpoint = Vec::new();
+    loop {
+        let mut payload = CONTROL_PACKET.to_vec();
+        payload.extend((checkpoint.len() as u32).to_be_bytes());
+        payload.extend(proof);
+        let page = node.request_control(peer, &payload).await.map_err(|error| error.to_string())?;
+        if page.len() <= 13 || !page.starts_with(b"DFCP\x01") {
+            return Err("invalid invitation checkpoint page".into());
+        }
+        let total = u32::from_be_bytes(page[5..9].try_into().unwrap()) as usize;
+        let offset = u32::from_be_bytes(page[9..13].try_into().unwrap()) as usize;
+        if offset != checkpoint.len() || total > arachne_security::MAX_CHECKPOINT {
+            return Err("invitation checkpoint page mismatch".into());
+        }
+        checkpoint.extend(&page[13..]);
+        if checkpoint.len() >= total {
+            return Ok(checkpoint);
+        }
+    }
 }
 
 fn rss_bytes() -> u64 {
@@ -215,19 +238,16 @@ fn build_authorization(value: &Value) -> Result<AdmissionAuthorization, String> 
     })
 }
 
-const ADMISSION_HISTORY_PAGE_REQUEST: &[u8; 5] = b"DFJP\x01";
+const ADMISSION_HISTORY_PAGE_REQUEST: &[u8; 5] = b"DFJP\x02";
 
-/// Mirrors `arachne_runtime::admission_history_page_packet` (lib.rs:1258),
-/// a stable, already-shipped wire request any authenticated peer may send:
-/// `"DFJP\x01" ++ request_len(u32 BE) ++ checkpoint_len(u32 BE) ++
-/// offset(u32 BE) ++ request ++ checkpoint`.
-fn history_page_packet(request: &[u8], checkpoint: &[u8], offset: u32) -> Vec<u8> {
+/// Mirrors `arachne_runtime::admission_history_page_packet`, a wire request
+/// any authenticated peer may send: `"DFJP\x02" ++ request_len(u32 BE) ++
+/// offset(u32 BE) ++ request`. No checkpoint (B3a).
+fn history_page_packet(request: &[u8], _checkpoint: &[u8], offset: u32) -> Vec<u8> {
     let mut packet = ADMISSION_HISTORY_PAGE_REQUEST.to_vec();
     packet.extend((request.len() as u32).to_be_bytes());
-    packet.extend((checkpoint.len() as u32).to_be_bytes());
     packet.extend(offset.to_be_bytes());
     packet.extend(request);
-    packet.extend(checkpoint);
     packet
 }
 
