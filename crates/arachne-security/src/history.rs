@@ -1,6 +1,5 @@
 //! Accepted control records, independent of the legacy inline transfer format.
 use super::{JoinProof, MembershipAuthorization, MembershipVerifier, Workspace, storage};
-use sha2::{Digest, Sha256};
 
 #[derive(Clone)]
 pub(super) struct MembershipHistory {
@@ -14,7 +13,7 @@ impl MembershipHistory {
         let mut rest = &bytes[37..];
         let length = storage::number(&mut rest)?;
         let checkpoint = storage::take(&mut rest, length)?.to_vec();
-        if Sha256::digest(&checkpoint).as_slice() != &bytes[5..37] {
+        if super::bootstrap::checkpoint_digest(&checkpoint)?.as_slice() != &bytes[5..37] {
             return Err("history checkpoint mismatch");
         }
         Ok(Self { checkpoint, steps })
@@ -27,7 +26,7 @@ impl MembershipHistory {
     pub fn verifier(&self, workspace: [u8; 32]) -> Result<MembershipVerifier, &'static str> {
         MembershipVerifier::from_local_checkpoint(
             workspace,
-            Sha256::digest(&self.checkpoint).into(),
+            super::bootstrap::checkpoint_digest(&self.checkpoint)?,
             &self.checkpoint,
         )
     }
@@ -48,7 +47,7 @@ impl MembershipHistory {
     pub fn inline(&self, workspace: [u8; 32]) -> Result<Vec<u8>, &'static str> {
         let mut proof = JoinProof::from_local_checkpoint(
             workspace,
-            Sha256::digest(&self.checkpoint).into(),
+            super::bootstrap::checkpoint_digest(&self.checkpoint)?,
             &self.checkpoint,
         )?;
         for (auth, commit) in &self.steps {

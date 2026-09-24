@@ -208,8 +208,8 @@ impl PendingJoin {
         let package = self.key_package()?;
         prefix.extend((package.len() as u32).to_be_bytes());
         prefix.extend(package);
-        let plain = storage::encode_provider(&self.provider, prefix)?;
-        key.protect(
+        let plain = storage::encode_pending_provider(&self.provider, prefix)?;
+        key.protect_pending(
             &self.provider,
             if self.request.is_some() {
                 MAGIC
@@ -232,7 +232,7 @@ impl PendingJoin {
         } else {
             MAGIC
         };
-        let plain = key.unprotect(magic, workspace, endpoint, sealed)?;
+        let plain = key.unprotect_pending(magic, workspace, endpoint, sealed)?;
         let mut bytes = plain.as_slice();
         let checkpoint_digest = storage::take(&mut bytes, 32)?.try_into().unwrap();
         let request = if magic == MAGIC {
@@ -246,7 +246,7 @@ impl PendingJoin {
         };
         let checkpoint = if magic == MAGIC {
             let length = storage::number(&mut bytes)?;
-            if length > MAX_WELCOME {
+            if length > super::MAX_CHECKPOINT {
                 return Err("saved checkpoint exceeds bounds");
             }
             Some(storage::take(&mut bytes, length)?.to_vec())
@@ -415,6 +415,22 @@ impl PendingJoin {
     }
 }
 
+/// The bound chain at its maximum: a pending join holding a checkpoint of
+/// exactly MAX_CHECKPOINT bytes must seal (provider encoding, protection) and
+/// fit MAX_SEALED_PENDING_JOIN, so the only thing restore can reject is the
+/// checkpoint's content, never its size.
+#[test]
+fn a_pending_join_seals_a_maximum_size_checkpoint() {
+    let mut pending = PendingJoin::new([7; 32], [8; 32], [9; 32], "Jordan").unwrap();
+    pending.request = Some(vec![1; super::invitation::MAX_REQUEST]);
+    pending.checkpoint = Some(vec![0; super::MAX_CHECKPOINT]);
+    let key = StorageKey::derive(&[10; 32]).unwrap();
+    let sealed = pending.seal(&key).unwrap();
+    assert!(sealed.len() <= super::MAX_SEALED_PENDING_JOIN);
+    let error = PendingJoin::restore(&key, [9; 32], [7; 32], &sealed).err().unwrap();
+    assert!(!matches!(error, "invalid protected snapshot" | "saved checkpoint exceeds bounds"), "{error}");
+}
+
 #[test]
 fn compact_pending_invitation_survives_restart_and_becomes_admission_ready() {
     let admin = Workspace::create([4; 32], "Coordinator").unwrap();
@@ -438,9 +454,8 @@ fn compact_pending_invitation_survives_restart_and_becomes_admission_ready() {
 #[test]
 fn pending_identity_recovers_and_rejected_welcome_does_not_consume_it() {
     use super::bootstrap::{grant, redemption};
-    use super::{AdmissionAuthorization, MAX_SEALED_WORKSPACE};
+    use super::{AdmissionAuthorization, MAX_SEALED_PENDING_JOIN};
     use openmls_traits::signatures::Signer;
-    use sha2::{Digest, Sha256};
     let invite = SignatureKeyPair::new(SUITE.signature_algorithm()).unwrap();
     let invitation_key = invite.public().try_into().unwrap();
     let mut admin = Workspace::create([1; 32], "Coordinator")
@@ -453,7 +468,7 @@ fn pending_identity_recovers_and_rejected_welcome_does_not_consume_it() {
         .unwrap()
         .workspace;
     let checkpoint = admin.join_checkpoint().unwrap();
-    let digest = Sha256::digest(&checkpoint).into();
+    let digest = crate::checkpoint_digest(&checkpoint).unwrap();
     let mut proof = JoinProof::from_trusted_checkpoint(admin.id(), digest, &checkpoint).unwrap();
     let pending = PendingJoin::new(admin.id(), digest, [2; 32], "Jordan Lee").unwrap();
     let member = pending.member().clone();
@@ -482,7 +497,7 @@ fn pending_identity_recovers_and_rejected_welcome_does_not_consume_it() {
             &key,
             [2; 32],
             admin.id(),
-            &vec![0; MAX_SEALED_WORKSPACE + 1]
+            &vec![0; MAX_SEALED_PENDING_JOIN + 1]
         )
         .is_err()
     );
@@ -544,7 +559,7 @@ fn pending_identity_recovers_and_rejected_welcome_does_not_consume_it() {
     let other_checkpoint = admin.join_checkpoint().unwrap();
     let other_proof = JoinProof::from_trusted_checkpoint(
         admin.id(),
-        Sha256::digest(&other_checkpoint).into(),
+        crate::checkpoint_digest(&other_checkpoint).unwrap(),
         &other_checkpoint,
     )
     .unwrap();
@@ -578,5 +593,5 @@ fn pending_identity_recovers_and_rejected_welcome_does_not_consume_it() {
     assert_eq!(message.into_bytes(), b"after joining and restart");
 }
 
-// ponytail: checkpoint is inline within the 128KiB pending snapshot cap; move it
-// to protected content storage when larger roster checkpoints must be supported.
+// The checkpoint is inline in the pending snapshot; MAX_SEALED_PENDING_JOIN adds
+// one MAX_CHECKPOINT to the ordinary protected-state bound for it.

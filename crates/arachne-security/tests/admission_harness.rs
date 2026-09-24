@@ -410,13 +410,10 @@ fn an_existing_member_accepts_management_past_three_hundred_members() {
     assert_eq!(restored.epoch(), prepared.workspace.epoch());
 }
 
-/// Known limit: a new invitation's checkpoint is signed GroupInfo with the
-/// ratchet tree and crosses the network, so it keeps the 64 KiB wire bound.
-/// Past ~250 members an administrator cannot issue a new invitation. An
-/// invitation issued earlier keeps working for any number of joiners. Needs a
-/// checkpoint that does not carry the whole tree (byte-bound finding F3).
+/// B3a: a new invitation's checkpoint once was signed GroupInfo with the
+/// ratchet tree inside one 64 KiB wire bound, so past ~241 members an
+/// administrator could not issue an invitation a joiner would accept.
 #[test]
-#[ignore = "known limit: invitation checkpoint exceeds 64 KiB past ~250 members (F3)"]
 fn an_administrator_invites_past_three_hundred_members() {
     let mut owner = Workspace::create([204; 32], "Large workspace owner").unwrap();
     let (registration, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
@@ -454,4 +451,132 @@ fn an_administrator_invites_past_three_hundred_members() {
     }
     let joined = late.prepare_workspace(&proof, &prepared.welcome).unwrap();
     assert_eq!(joined.member_count(), owner.member_count() + 1);
+}
+
+/// Grow an owner to at least `size` members from one early invitation.
+fn grow(seed: u8, size: usize, base: usize) -> Workspace {
+    let owner = Workspace::create([seed; 32], "Large workspace owner").unwrap();
+    let (registration, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+    let mut owner = registration.workspace;
+    let mut next = 0;
+    while owner.member_count() < size {
+        let range = next..(next + MAX_ADMISSION_BATCH);
+        let joins: Vec<_> = range.clone()
+            .map(|index| PendingJoin::from_invitation(&invitation, &checkpoint, endpoint(index + base), "Member").unwrap())
+            .collect();
+        let requests: Vec<_> = joins.iter().map(|join| join.admission_request().unwrap().to_vec()).collect();
+        let validated: Vec<_> = range.clone().zip(&requests).map(|(index, request)| {
+            match owner.assess_admission(endpoint(index + base), request).unwrap() {
+                AdmissionAssessment::Ready(validated) => validated,
+                _ => panic!("open invitation needs no approval"),
+            }
+        }).collect();
+        let entries: Vec<_> = range.clone().zip(requests.iter().zip(&validated))
+            .map(|(index, (request, validated))| (endpoint(index + base), request.as_slice(), validated)).collect();
+        owner = owner.prepare_validated_admission_batch(&entries).unwrap().workspace;
+        next = range.end;
+    }
+    owner
+}
+
+/// B3a end to end in the security crate: a registered invitation issued past
+/// 300 members is retained, survives an owner restore, resolves from the
+/// request alone after the owner moves on, and its joiner survives a pending
+/// restore and joins. Prints the measured checkpoint sizes.
+fn registered_invitation_admits_at(size: usize, seed: u8, base: usize) {
+    let owner = grow(seed, size, base);
+    let members = owner.member_count();
+    let (prepared, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+    let mut owner = prepared.workspace;
+    // The invitation pins the checkpoint's pin, and the pin alone.
+    assert_eq!(arachne_security::checkpoint_digest(&checkpoint).unwrap(), invitation.checkpoint_digest());
+    let pin = u32::from_be_bytes(checkpoint[5..9].try_into().unwrap()) as usize;
+    let tree = checkpoint.len() - 13 - pin;
+    println!(
+        "B3a checkpoint at {members} members: pin {pin} B, tree {tree} B ({} B/member), total {} B",
+        tree / members,
+        checkpoint.len()
+    );
+    assert!(pin <= arachne_security::MAX_CHECKPOINT_PIN && tree <= arachne_security::MAX_CHECKPOINT_TREE);
+
+    // The joiner's pending state, with the checkpoint, survives a restart.
+    let key = arachne_security::StorageKey::derive(&[seed; 32]).unwrap();
+    let late = PendingJoin::from_invitation(&invitation, &checkpoint, endpoint(base - 1), "Late member").unwrap();
+    let sealed = late.seal(&key).unwrap();
+    assert!(sealed.len() <= arachne_security::MAX_SEALED_PENDING_JOIN);
+    let late = PendingJoin::restore(&key, endpoint(base - 1), owner.id(), &sealed).unwrap();
+    assert_eq!(late.admission_checkpoint().unwrap(), checkpoint.as_slice());
+
+    // The owner moves on (one more member), then restores from its records:
+    // the request alone must still resolve the retained, pinned checkpoint.
+    let filler = grow_one(&mut owner, &invitation, &checkpoint, base - 2);
+    assert_eq!(owner.member_count(), filler);
+    assert_ne!(owner.join_checkpoint().unwrap(), checkpoint);
+    let records = owner.export_records().unwrap();
+    let owner = Workspace::restore_records(owner.endpoint(), owner.id(), &records).unwrap();
+    let request = late.admission_request().unwrap().to_vec();
+    assert_eq!(owner.admission_checkpoint(&request).unwrap(), checkpoint);
+
+    let AdmissionAssessment::Ready(validated) = owner.assess_admission(endpoint(base - 1), &request).unwrap() else {
+        panic!("open invitation needs no approval");
+    };
+    owner.check_membership_history(endpoint(base - 1), &request, &checkpoint).unwrap();
+    let prepared = owner.prepare_validated_admission_batch(&[(endpoint(base - 1), request.as_slice(), &validated)]).unwrap();
+    let mut proof = late.join_proof().unwrap();
+    for (authorization, commit) in prepared.workspace.membership_history(endpoint(base - 1), &request, &checkpoint).unwrap() {
+        proof.apply_transition(&authorization, &commit).unwrap();
+    }
+    let joined = late.prepare_workspace(&proof, &prepared.welcome).unwrap();
+    assert_eq!(joined.member_count(), owner.member_count() + 1);
+    assert_eq!(joined.epoch(), prepared.workspace.epoch());
+}
+
+/// Admit one member through `invitation`; returns the new member count.
+fn grow_one(owner: &mut Workspace, invitation: &arachne_security::Invitation, checkpoint: &[u8], index: usize) -> usize {
+    let join = PendingJoin::from_invitation(invitation, checkpoint, endpoint(index), "Filler").unwrap();
+    let request = join.admission_request().unwrap().to_vec();
+    let AdmissionAssessment::Ready(validated) = owner.assess_admission(endpoint(index), &request).unwrap() else {
+        panic!("open invitation needs no approval");
+    };
+    let prepared = owner.prepare_validated_admission_batch(&[(endpoint(index), request.as_slice(), &validated)]).unwrap();
+    *owner = prepared.workspace;
+    owner.member_count()
+}
+
+#[test]
+fn a_registered_invitation_admits_past_three_hundred_members() {
+    registered_invitation_admits_at(310, 207, 60_000);
+}
+
+/// Measures the 1,000-member target. The checkpoint side holds: the joiner
+/// accepts a 1,025-member checkpoint. Registering a new invitation needs a
+/// management commit, which has its own 64 KiB commit bound; this prints that
+/// commit's size per roster size so the separate limit is visible.
+#[test]
+#[ignore = "explicit 1,000-member invitation checkpoint measurement"]
+fn an_administrator_checkpoint_past_one_thousand_members() {
+    let mut size = 129;
+    while size <= 1_025 {
+        let owner = grow(208, size, 70_000);
+        let checkpoint = owner.join_checkpoint().unwrap();
+        let pin = u32::from_be_bytes(checkpoint[5..9].try_into().unwrap()) as usize;
+        arachne_security::JoinProof::from_trusted_checkpoint(
+            owner.id(),
+            arachne_security::checkpoint_digest(&checkpoint).unwrap(),
+            &checkpoint,
+        )
+        .unwrap();
+        let registration = owner.prepare_invitation(0, false, false);
+        println!(
+            "B3a {} members: checkpoint pin {pin} B, tree {} B, total {} B; registration commit {}",
+            owner.member_count(),
+            checkpoint.len() - 13 - pin,
+            checkpoint.len(),
+            match &registration {
+                Ok((prepared, ..)) => format!("{} B", prepared.commit.len()),
+                Err(error) => format!("failed: {error}"),
+            }
+        );
+        size += 128;
+    }
 }

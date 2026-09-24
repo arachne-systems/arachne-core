@@ -19,6 +19,9 @@ const HEADER: usize = 5 + 32 + 12;
 pub(super) const MAX_PLAIN: usize = 128 * 1024;
 const MAX_RECORDS: usize = 256;
 pub const MAX_SEALED_WORKSPACE: usize = HEADER + MAX_PLAIN + 16;
+const MAX_PENDING_PLAIN: usize = MAX_PLAIN + super::MAX_CHECKPOINT;
+/// Bound for one sealed pending join, which holds its invitation checkpoint.
+pub const MAX_SEALED_PENDING_JOIN: usize = HEADER + MAX_PENDING_PLAIN + 16;
 const BUNDLE: &[u8; 5] = b"DFWB\x01";
 pub const MAX_WORKSPACE_ATTACHMENT: usize = 528 * 1024;
 pub const MAX_SEALED_BUNDLE: usize =
@@ -67,7 +70,24 @@ pub(super) fn read_profile(bytes: &mut &[u8]) -> Result<MemberProfile, &'static 
 }
 pub(super) fn encode_provider(
     provider: &OpenMlsRustCrypto,
+    prefix: Zeroizing<Vec<u8>>,
+) -> Result<Zeroizing<Vec<u8>>, &'static str> {
+    encode_provider_within(provider, prefix, MAX_PLAIN)
+}
+
+/// A pending join's prefix holds its invitation checkpoint (B3a), so it is
+/// encoded within `MAX_PENDING_PLAIN` rather than the workspace bound.
+pub(super) fn encode_pending_provider(
+    provider: &OpenMlsRustCrypto,
+    prefix: Zeroizing<Vec<u8>>,
+) -> Result<Zeroizing<Vec<u8>>, &'static str> {
+    encode_provider_within(provider, prefix, MAX_PENDING_PLAIN)
+}
+
+fn encode_provider_within(
+    provider: &OpenMlsRustCrypto,
     mut prefix: Zeroizing<Vec<u8>>,
+    limit: usize,
 ) -> Result<Zeroizing<Vec<u8>>, &'static str> {
     let state = provider
         .storage()
@@ -86,7 +106,7 @@ pub(super) fn encode_provider(
                 .checked_add(v.len())
         })
         .ok_or("protected state exceeds bounds")?;
-    if size > MAX_PLAIN {
+    if size > limit {
         return Err("protected state exceeds bounds");
     }
     let additional = size - prefix.len();
@@ -193,6 +213,30 @@ impl StorageKey {
             .map_err(|_| "snapshot protection failed")?;
         result.extend(encrypted);
         Ok(result)
+    }
+    /// A pending join carries one invitation checkpoint beside ordinary
+    /// protected state, so its bound adds exactly one checkpoint wire bound.
+    pub(super) fn protect_pending(
+        &self,
+        provider: &OpenMlsRustCrypto,
+        magic: &[u8; 5],
+        id: [u8; 32],
+        endpoint: [u8; 32],
+        plain: &[u8],
+    ) -> Result<Vec<u8>, &'static str> {
+        if plain.len() > MAX_PENDING_PLAIN {
+            return Err("protected state exceeds bounds");
+        }
+        self.protect_record(provider, magic, id, endpoint, plain)
+    }
+    pub(super) fn unprotect_pending(
+        &self,
+        magic: &[u8; 5],
+        id: [u8; 32],
+        endpoint: [u8; 32],
+        sealed: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, &'static str> {
+        self.unprotect_record(magic, id, endpoint, sealed, MAX_SEALED_PENDING_JOIN)
     }
     pub(super) fn unprotect(
         &self,
@@ -447,7 +491,7 @@ impl Workspace {
                     .try_into()
                     .unwrap();
                 let length = number(&mut bytes)?;
-                if length == 0 || length > 64 * 1024 {
+                if length == 0 || length > super::MAX_CHECKPOINT {
                     return Err("invalid retained invitation checkpoint");
                 }
                 invitation_checkpoints.push(super::invitation::RetainedInvitationCheckpoint {

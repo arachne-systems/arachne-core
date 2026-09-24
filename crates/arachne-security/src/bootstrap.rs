@@ -35,6 +35,128 @@ pub const MAX_JOIN_HISTORY_STEPS: usize = HISTORY_CHUNK_STEPS * MAX_HISTORY_CHUN
 /// able to grow a pending join's memory one page at a time.
 pub const MAX_JOIN_HISTORY_BYTES: usize = MAX_HISTORY_BYTES;
 
+/// Invitation checkpoint codec: `DFCK\x01`, u32 pin length, pin, u32 tree
+/// length, tree. The pin is signed MLS GroupInfo without the ratchet tree; an
+/// invitation pins SHA-256 of the pin only. The tree is the TLS-encoded ratchet
+/// tree at the pin's epoch. It is bound by the pin's signed tree hash, which
+/// `PublicGroup::from_external` checks, so a substituted tree fails.
+const CHECKPOINT_MAGIC: &[u8; 5] = b"DFCK\x01";
+/// Wire bound for a checkpoint pin: GroupContext, extensions and signature.
+pub const MAX_CHECKPOINT_PIN: usize = 64 * 1024;
+/// Wire bound for a checkpoint tree. About 270 bytes per member (measured at
+/// 385 and 1,025 members), so this admits about 2,900 members; see the B3a
+/// harness tests. It is sized so a sealed pending join, which holds one
+/// checkpoint, still fits one 1 MiB host record.
+pub const MAX_CHECKPOINT_TREE: usize = 768 * 1024;
+/// Wire bound for a whole encoded checkpoint. Issuer and joiner apply the same
+/// parts bounds, so an issuer never produces a checkpoint a joiner rejects.
+pub const MAX_CHECKPOINT: usize = 13 + MAX_CHECKPOINT_PIN + MAX_CHECKPOINT_TREE;
+
+/// Where checkpoint bytes came from: a peer (wire bounds), or this device's own
+/// accepted state (local-state bound only).
+#[derive(Clone, Copy)]
+pub(super) enum CheckpointBound {
+    Wire,
+    Local,
+}
+
+pub(super) struct CheckpointParts<'a> {
+    pub pin: &'a [u8],
+    pub tree: &'a [u8],
+}
+
+pub(super) fn checkpoint_parts(
+    bytes: &[u8],
+    bound: CheckpointBound,
+) -> Result<CheckpointParts<'_>, &'static str> {
+    use super::storage::{number, take};
+    let limit = match bound {
+        CheckpointBound::Wire => MAX_CHECKPOINT,
+        CheckpointBound::Local => MAX_LOCAL_STATE_BYTES,
+    };
+    if bytes.len() > limit {
+        return Err("checkpoint exceeds bounds");
+    }
+    let mut rest = bytes
+        .strip_prefix(CHECKPOINT_MAGIC)
+        .ok_or("invalid checkpoint")?;
+    let length = number(&mut rest)?;
+    if length == 0 || (matches!(bound, CheckpointBound::Wire) && length > MAX_CHECKPOINT_PIN) {
+        return Err("checkpoint exceeds bounds");
+    }
+    let pin = take(&mut rest, length)?;
+    let length = number(&mut rest)?;
+    if length == 0 || (matches!(bound, CheckpointBound::Wire) && length > MAX_CHECKPOINT_TREE) {
+        return Err("checkpoint exceeds bounds");
+    }
+    let tree = take(&mut rest, length)?;
+    if !rest.is_empty() {
+        return Err("invalid checkpoint");
+    }
+    Ok(CheckpointParts { pin, tree })
+}
+
+/// The digest an invitation pins for these checkpoint bytes: SHA-256 of the
+/// pin. Structure only; this does not verify the checkpoint.
+pub fn checkpoint_digest(bytes: &[u8]) -> Result<[u8; 32], &'static str> {
+    Ok(Sha256::digest(checkpoint_parts(bytes, CheckpointBound::Local)?.pin).into())
+}
+
+/// The signed GroupInfo a checkpoint pins. Structure only.
+pub(super) fn checkpoint_info(bytes: &[u8]) -> Result<openmls::messages::group_info::VerifiableGroupInfo, &'static str> {
+    let parts = checkpoint_parts(bytes, CheckpointBound::Local)?;
+    let message =
+        MlsMessageIn::tls_deserialize_exact(parts.pin).map_err(|_| "invalid checkpoint")?;
+    let MlsMessageBodyIn::GroupInfo(info) = message.extract() else {
+        return Err("expected GroupInfo");
+    };
+    Ok(info)
+}
+
+fn encode_checkpoint(
+    group: &MlsGroup,
+    crypto: &impl OpenMlsCrypto,
+    signer: &impl openmls_traits::signatures::Signer,
+    extensions: Vec<Extension>,
+    bound: CheckpointBound,
+) -> Result<Vec<u8>, &'static str> {
+    let pin = group
+        .export_group_info_with_additional_extensions(crypto, signer, false, extensions)
+        .map_err(|_| "checkpoint creation failed")?
+        .to_bytes()
+        .map_err(|_| "checkpoint encoding failed")?;
+    let tree = group
+        .export_ratchet_tree()
+        .tls_serialize_detached()
+        .map_err(|_| "checkpoint encoding failed")?;
+    let mut bytes = CHECKPOINT_MAGIC.to_vec();
+    for part in [&pin, &tree] {
+        bytes.extend(
+            u32::try_from(part.len())
+                .map_err(|_| "checkpoint exceeds bounds")?
+                .to_be_bytes(),
+        );
+        bytes.extend(part);
+    }
+    // The same check every receiver applies.
+    checkpoint_parts(&bytes, bound)?;
+    Ok(bytes)
+}
+
+impl Workspace {
+    /// This device's own accepted state as a checkpoint, for local verification.
+    fn local_checkpoint(&self) -> Result<Vec<u8>, &'static str> {
+        encode_checkpoint(
+            &self.group,
+            self.provider.crypto(),
+            &self._signer,
+            Vec::new(),
+            CheckpointBound::Local,
+        )
+        .map_err(|_| "group comparison export failed")
+    }
+}
+
 /// Public proof of an ordinary-member invitation and its exact redemption.
 /// No bearer private key is carried here. Fields are untrusted until verified.
 #[derive(Clone)]
@@ -159,21 +281,13 @@ impl Workspace {
         {
             return Err("only an administrator may issue a checkpoint");
         }
-        let bytes = self
-            .group
-            .export_group_info_with_additional_extensions(
-                self.provider.crypto(),
-                &self._signer,
-                true,
-                self.name_checkpoint_extension()?,
-            )
-            .map_err(|_| "checkpoint creation failed")?
-            .to_bytes()
-            .map_err(|_| "checkpoint encoding failed")?;
-        if bytes.len() > MAX_BYTES {
-            return Err("checkpoint exceeds bounds");
-        }
-        Ok(bytes)
+        encode_checkpoint(
+            &self.group,
+            self.provider.crypto(),
+            &self._signer,
+            self.name_checkpoint_extension()?,
+            CheckpointBound::Wire,
+        )
     }
 }
 
@@ -185,7 +299,7 @@ impl MembershipVerifier {
         digest: [u8; 32],
         bytes: &[u8],
     ) -> Result<Self, &'static str> {
-        Self::from_checkpoint_within(workspace, digest, bytes, MAX_BYTES)
+        Self::from_checkpoint_within(workspace, digest, bytes, CheckpointBound::Wire)
     }
 
     /// See [`JoinProof::from_local_checkpoint`]: own accepted state only.
@@ -194,35 +308,34 @@ impl MembershipVerifier {
         digest: [u8; 32],
         bytes: &[u8],
     ) -> Result<Self, &'static str> {
-        Self::from_checkpoint_within(workspace, digest, bytes, MAX_LOCAL_STATE_BYTES)
+        Self::from_checkpoint_within(workspace, digest, bytes, CheckpointBound::Local)
     }
 
     fn from_checkpoint_within(
         workspace: [u8; 32],
         digest: [u8; 32],
         bytes: &[u8],
-        limit: usize,
+        bound: CheckpointBound,
     ) -> Result<Self, &'static str> {
-        if bytes.len() > limit {
-            return Err("checkpoint exceeds bounds");
-        }
-        if <[u8; 32]>::from(Sha256::digest(bytes)) != digest {
+        let parts = checkpoint_parts(bytes, bound)?;
+        if <[u8; 32]>::from(Sha256::digest(parts.pin)) != digest {
             return Err("checkpoint does not match invitation");
         }
         let message =
-            MlsMessageIn::tls_deserialize_exact(bytes).map_err(|_| "invalid checkpoint")?;
+            MlsMessageIn::tls_deserialize_exact(parts.pin).map_err(|_| "invalid checkpoint")?;
         let MlsMessageBodyIn::GroupInfo(info) = message.extract() else {
             return Err("expected GroupInfo");
         };
         if info.group_id().as_slice() != workspace || info.ciphersuite() != SUITE {
             return Err("wrong checkpoint workspace");
         }
-        let tree = info
-            .extensions()
-            .ratchet_tree()
-            .ok_or("missing checkpoint tree")?
-            .ratchet_tree()
-            .clone();
+        // One canonical form: the tree travels beside the pin, never inside it.
+        if info.extensions().ratchet_tree().is_some() {
+            return Err("invalid checkpoint");
+        }
+        // Bound by the pinned GroupInfo's tree hash in `from_external` below.
+        let tree = RatchetTreeIn::tls_deserialize_exact(parts.tree)
+            .map_err(|_| "invalid checkpoint tree")?;
         let provider = OpenMlsRustCrypto::default();
         let (group, _) = PublicGroup::from_external(
             provider.crypto(),
@@ -415,13 +528,8 @@ impl MembershipVerifier {
     }
 
     pub(super) fn from_workspace(workspace: &Workspace) -> Result<Self, &'static str> {
-        let bytes = workspace
-            .group
-            .export_group_info(workspace.provider.crypto(), &workspace._signer, true)
-            .map_err(|_| "group comparison export failed")?
-            .to_bytes()
-            .map_err(|_| "group comparison encoding failed")?;
-        Self::from_checkpoint_within(workspace.id(), Sha256::digest(&bytes).into(), &bytes, MAX_LOCAL_STATE_BYTES)
+        let bytes = workspace.local_checkpoint()?;
+        Self::from_local_checkpoint(workspace.id(), checkpoint_digest(&bytes)?, &bytes)
     }
 
     pub(super) fn member_for_endpoint(
@@ -500,10 +608,7 @@ impl JoinProof {
         digest: [u8; 32],
         bytes: &[u8],
     ) -> Result<Self, &'static str> {
-        if bytes.len() > MAX_BYTES - 41 {
-            return Err("checkpoint exceeds inline history bounds");
-        }
-        Self::from_checkpoint_within(workspace, digest, bytes, MAX_BYTES)
+        Self::from_checkpoint_within(workspace, digest, bytes, CheckpointBound::Wire)
     }
 
     /// A checkpoint this device holds as its own accepted state (a saved join
@@ -514,21 +619,17 @@ impl JoinProof {
         digest: [u8; 32],
         bytes: &[u8],
     ) -> Result<Self, &'static str> {
-        Self::from_checkpoint_within(workspace, digest, bytes, MAX_LOCAL_STATE_BYTES)
+        Self::from_checkpoint_within(workspace, digest, bytes, CheckpointBound::Local)
     }
 
     fn from_checkpoint_within(
         workspace: [u8; 32],
         digest: [u8; 32],
         bytes: &[u8],
-        limit: usize,
+        bound: CheckpointBound,
     ) -> Result<Self, &'static str> {
-        let verifier = MembershipVerifier::from_checkpoint_within(workspace, digest, bytes, limit)?;
-        let message =
-            MlsMessageIn::tls_deserialize_exact(bytes).map_err(|_| "invalid checkpoint")?;
-        let MlsMessageBodyIn::GroupInfo(info) = message.extract() else {
-            return Err("expected GroupInfo");
-        };
+        let verifier = MembershipVerifier::from_checkpoint_within(workspace, digest, bytes, bound)?;
+        let info = checkpoint_info(bytes)?;
         let name_checkpoint = info
             .extensions()
             .unknown(super::name::EXTENSION)
@@ -676,9 +777,8 @@ impl JoinProof {
         encoded: &[u8],
     ) -> Result<Self, &'static str> {
         use super::storage::{number, take};
-        if encoded.len() > MAX_BYTES {
-            return Err("invalid join history");
-        }
+        // Bounded by `history_steps` (MAX_HISTORY_BYTES); the checkpoint
+        // inside keeps its wire bound in `from_trusted_checkpoint`.
         let steps = Self::history_steps(encoded)?;
         let mut bytes = &encoded[5..];
         if take(&mut bytes, 32)? != digest {
@@ -815,13 +915,8 @@ impl JoinProof {
     }
 
     pub(super) fn from_workspace(workspace: &Workspace) -> Result<Self, &'static str> {
-        let bytes = workspace
-            .group
-            .export_group_info(workspace.provider.crypto(), &workspace._signer, true)
-            .map_err(|_| "group comparison export failed")?
-            .to_bytes()
-            .map_err(|_| "group comparison encoding failed")?;
-        Self::from_local_checkpoint(workspace.id(), Sha256::digest(&bytes).into(), &bytes)
+        let bytes = workspace.local_checkpoint()?;
+        Self::from_local_checkpoint(workspace.id(), checkpoint_digest(&bytes)?, &bytes)
     }
 
     pub fn apply_management(
@@ -955,7 +1050,7 @@ mod tests {
             .unwrap()
             .workspace;
         let checkpoint = admin.join_checkpoint().unwrap();
-        let digest: [u8; 32] = Sha256::digest(&checkpoint).into();
+        let digest: [u8; 32] = checkpoint_digest(&checkpoint).unwrap();
         let mut proof =
             JoinProof::from_trusted_checkpoint(admin.id(), digest, &checkpoint).unwrap();
         assert!(proof.matches_workspace(&admin).unwrap());
@@ -965,21 +1060,36 @@ mod tests {
             .unwrap();
         assert!(JoinProof::from_trusted_checkpoint(admin.id(), digest, &other).is_err());
         assert!(JoinProof::from_trusted_checkpoint([99; 32], digest, &checkpoint).is_err());
+        // The last byte is in the tree, outside the pinned digest: the pin's
+        // signed tree hash must still reject the substituted tree.
         let mut damaged = checkpoint.clone();
         let end = damaged.len() - 1;
         damaged[end] ^= 1;
+        assert_eq!(checkpoint_digest(&damaged).unwrap(), digest);
         assert!(JoinProof::from_trusted_checkpoint(admin.id(), digest, &damaged).is_err());
-        // Even a caller supplying the damaged hash cannot bypass MLS signature validation.
+        // A tree from another group with the same pin also fails.
+        let parts = checkpoint_parts(&checkpoint, CheckpointBound::Wire).unwrap();
+        let other_parts = checkpoint_parts(&other, CheckpointBound::Wire).unwrap();
+        let mut swapped = CHECKPOINT_MAGIC.to_vec();
+        for part in [parts.pin, other_parts.tree] {
+            swapped.extend((part.len() as u32).to_be_bytes());
+            swapped.extend(part);
+        }
+        assert!(JoinProof::from_trusted_checkpoint(admin.id(), digest, &swapped).is_err());
+        // A damaged pin: even a caller supplying the damaged hash cannot bypass
+        // MLS signature validation.
+        let mut damaged = checkpoint.clone();
+        damaged[9 + parts.pin.len() - 1] ^= 1;
         assert!(
             JoinProof::from_trusted_checkpoint(
                 admin.id(),
-                Sha256::digest(&damaged).into(),
+                checkpoint_digest(&damaged).unwrap(),
                 &damaged
             )
             .is_err()
         );
         assert!(
-            JoinProof::from_trusted_checkpoint(admin.id(), [0; 32], &vec![0; MAX_BYTES + 1])
+            JoinProof::from_trusted_checkpoint(admin.id(), [0; 32], &vec![0; MAX_CHECKPOINT + 1])
                 .is_err()
         );
 
@@ -1094,7 +1204,7 @@ mod tests {
         let before_fork = admin.join_checkpoint().unwrap();
         let mut fork_proof = JoinProof::from_trusted_checkpoint(
             admin.id(),
-            Sha256::digest(&before_fork).into(),
+            checkpoint_digest(&before_fork).unwrap(),
             &before_fork,
         )
         .unwrap();
