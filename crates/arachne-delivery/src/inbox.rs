@@ -15,6 +15,8 @@ const MAX_REPLAY_WINDOWS: usize = 4096;
 /// given up as lost.
 pub const REPLAY_ENTRIES: usize = 1024;
 const MAX_PENDING_OBJECTS: usize = 512;
+/// Pending objects one author may hold in this inbox.
+pub const MAX_PENDING_OBJECTS_PER_AUTHOR: usize = 128;
 /// Pending payload bytes one author may hold in this inbox.
 pub const MAX_PENDING_BYTES_PER_AUTHOR: usize = 32 * 1024;
 /// Pending payload bytes of all authors together.
@@ -119,6 +121,25 @@ struct Pending {
     recipients: Vec<[u8; 32]>,
     current: Option<CurrentReceipt>,
     payload: Vec<u8>,
+}
+
+impl Pending {
+    /// Encoded size in the inbox snapshot (see `Snapshot::encode`).
+    fn weight(topic: usize, recipients: usize, current: bool, payload: usize) -> usize {
+        32 + 32 + 8 * 3 + 1 + topic + 16 + 8 + 1 + 32 * recipients + 1
+            + if current { 72 } else { 0 }
+            + 4
+            + payload
+    }
+
+    fn encoded_len(&self) -> usize {
+        Self::weight(
+            self.topic.len(),
+            self.recipients.len(),
+            self.current.is_some(),
+            self.payload.len(),
+        )
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1087,17 +1108,26 @@ impl ObjectInbox {
         // Never discard an undelivered object to make room. The object is not
         // recorded, so it can come again (live or by recovery) after the
         // application drains work. One author cannot use up everyone's space.
-        let size = authenticated.message.payload.len();
-        let author_bytes: usize = self
+        // The author is charged the encoded size, metadata included.
+        let size = Pending::weight(
+            context.topic.as_str().len(),
+            recipients.len(),
+            current.is_some(),
+            authenticated.message.payload.len(),
+        );
+        let (author_objects, author_bytes) = self
             .pending
             .iter()
             .filter(|pending| pending.author == author)
-            .map(|pending| pending.payload.len())
-            .sum();
-        if author_bytes + size > MAX_PENDING_BYTES_PER_AUTHOR {
+            .fold((0, 0), |(count, bytes), pending| {
+                (count + 1, bytes + pending.encoded_len())
+            });
+        if author_objects == MAX_PENDING_OBJECTS_PER_AUTHOR
+            || author_bytes + size > MAX_PENDING_BYTES_PER_AUTHOR
+        {
             return Err("author pending quota exhausted");
         }
-        let total: usize = self.pending.iter().map(|pending| pending.payload.len()).sum();
+        let total: usize = self.pending.iter().map(Pending::encoded_len).sum();
         if self.pending.len() == MAX_PENDING_OBJECTS || total + size > MAX_PENDING_BYTES {
             return Err("pending inbox full");
         }

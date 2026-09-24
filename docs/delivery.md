@@ -79,11 +79,15 @@ An incoming object is accepted when all of these are true:
 
 ### Pending bounds
 
+Bytes are encoded bytes: payload plus metadata (topic, recipients, current
+value data). An author is charged for its own metadata too.
+
 | Bound | Value |
 | --- | --- |
-| Pending payload bytes per author | 32 KiB (`MAX_PENDING_BYTES_PER_AUTHOR`) |
-| Pending payload bytes, all authors | 96 KiB (`MAX_PENDING_BYTES`) |
-| Pending objects | 512 |
+| Pending bytes per author | 32 KiB (`MAX_PENDING_BYTES_PER_AUTHOR`) |
+| Pending objects per author | 128 (`MAX_PENDING_OBJECTS_PER_AUTHOR`) |
+| Pending bytes, all authors | 96 KiB (`MAX_PENDING_BYTES`) |
+| Pending objects, all authors | 512 |
 
 An object over a bound is refused (`author pending quota exhausted` or
 `pending inbox full`) and is **not recorded**. It can come again, live or by

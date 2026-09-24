@@ -250,6 +250,29 @@ fn per_author_quota_and_binary_pending_storage() {
     // some work, the same object is accepted.
     let (drained, _) = acknowledge(&inbox, &c);
     inbox = stage(&drained, &c, &refused.1, &refused.2);
+    // Many tiny objects cannot fill the inbox either: metadata counts.
+    let mut tiny = ObjectInbox::new(c.id(), c.epoch());
+    let mut sent = 0usize;
+    let error = loop {
+        let mut context = crate::context(a.id(), a_log.head() + 1, 0);
+        context.id = (1_000_000 + sent as u128).to_be_bytes();
+        let object = a
+            .protect_object(b"chat", &context.authenticated_bytes(), &[1])
+            .unwrap();
+        a_log.append(context.clone(), object.clone()).unwrap();
+        match tiny.stage(&c, &context, &object) {
+            Ok(InboxStage::Prepared(next)) => {
+                tiny = *next;
+                sent += 1;
+            }
+            Ok(_) => panic!("fresh object was not new"),
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(error, "author pending quota exhausted");
+    assert!(sent <= arachne_delivery::inbox::MAX_PENDING_OBJECTS_PER_AUTHOR);
+    let (context, object) = publish(&mut b, &mut b_log, 91);
+    stage(&tiny, &c, &context, &object);
     // The binary codec round-trips and rejects truncation and trailing bytes.
     let bytes = inbox.snapshot_with_publisher(&c, &c_log).unwrap();
     let (_, restored) = ObjectInbox::restore_snapshot(&c, &bytes).unwrap();
