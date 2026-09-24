@@ -1174,7 +1174,6 @@ enum Request {
         authenticated_endpoint: [u8; 32],
         request: Vec<u8>,
     },
-    IssueInvitation {},
     BeginJoin {
         invitation: Vec<u8>,
         #[serde(default)]
@@ -5252,8 +5251,8 @@ fn execute_in_session(
             .workspace
             .as_ref()
             .ok_or("session has no workspace")?;
-        let (legacy, controls) = owner.invitation_controls().map_err(str::to_owned)?;
-        json!({"legacy_enabled":legacy,"invitations":controls.iter().filter(|c| !c.is_request_decision(&controls)).enumerate().map(|(i,c)| json!({"number":i+1,"key":c.key,"expires_at":c.expires_at,"enabled":c.enabled,"personal":c.personal,"automatic":c.automatic(),"request_access":c.request_access(),"approved":c.approved()})).collect::<Vec<_>>()})
+        let controls = owner.invitation_controls().map_err(str::to_owned)?;
+        json!({"invitations":controls.iter().filter(|c| !c.is_request_decision(&controls)).enumerate().map(|(i,c)| json!({"number":i+1,"key":c.key,"expires_at":c.expires_at,"enabled":c.enabled,"personal":c.personal,"automatic":c.automatic(),"request_access":c.request_access(),"approved":c.approved()})).collect::<Vec<_>>()})
     } else if let Request::StageManagement { action } = request {
         membership::stage_management(session, action.action()?)?
     } else if let Request::LeaveViaPeer { peer } = request {
@@ -5549,13 +5548,6 @@ fn execute_in_session(
             .as_ref()
             .ok_or("session has no workspace")?;
         retained_reply(workspace, authenticated_endpoint, &request)?
-    } else if matches!(request, Request::IssueInvitation {}) {
-        let workspace = session
-            .workspace
-            .as_ref()
-            .ok_or("session has no workspace")?;
-        let (invitation, checkpoint) = workspace.issue_invitation().map_err(str::to_owned)?;
-        invitation_envelope(session, &invitation, checkpoint)?
     } else if let Request::InspectInvitation {
         invitation,
         checkpoint,
@@ -6026,7 +6018,6 @@ fn execute_in_session(
                     | Request::AdoptAdmission { .. }
                     | Request::RetainedAdmission { .. }
                     | Request::Poll {}
-                    | Request::IssueInvitation {}
                     | Request::BeginJoin { .. }
                     | Request::SealPendingJoin {}
                     | Request::RestorePendingJoin { .. }
@@ -6149,7 +6140,8 @@ mod tests {
                 value
             };
             let mut owner = Workspace::create(endpoint(10_000), "Wire-size owner").unwrap();
-            let (invitation, checkpoint) = owner.issue_invitation().unwrap();
+            let (registered, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+            owner = registered.workspace;
             let mut joins = Vec::with_capacity(count);
             let mut requests = Vec::with_capacity(count);
             let mut validated = Vec::with_capacity(count);
@@ -6230,7 +6222,8 @@ mod tests {
             value
         };
         let mut owner = Workspace::create(endpoint(10_000), "500-member owner").unwrap();
-        let (invitation, checkpoint) = owner.issue_invitation().unwrap();
+        let (registered, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+        owner = registered.workspace;
         let mut joins = Vec::with_capacity(500);
         let mut requests = Vec::with_capacity(500);
         let mut validated = Vec::with_capacity(500);
@@ -6334,8 +6327,9 @@ mod tests {
         };
         let description: Value = serde_json::from_str(&describe(handle).unwrap()).unwrap();
         let endpoint = serde_json::from_value(description["endpoint_key"].clone()).unwrap();
-        let admin = Workspace::create([104; 32], "Publisher").unwrap();
-        let (invitation, checkpoint) = admin.issue_invitation().unwrap();
+        let mut admin = Workspace::create([104; 32], "Publisher").unwrap();
+        let (registered, invitation, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+        admin = registered.workspace;
         let join =
             PendingJoin::from_invitation(&invitation, &checkpoint, endpoint, "Reader").unwrap();
         let prepared = admin
@@ -6499,6 +6493,19 @@ mod tests {
             serde_json::from_slice(&execute(handle, &serde_json::to_vec(&value).unwrap())?)
                 .map_err(|e| e.to_string())
         };
+        let issue_invitation = |handle: i64| -> Value {
+            let staged = call(
+                handle,
+                json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+            )
+            .unwrap();
+            call(
+                handle,
+                json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+            )
+            .unwrap()["issued_invitation"]
+                .clone()
+        };
         assert_eq!(
             call(a, json!({"op":"network_change"})).unwrap(),
             json!({"notified":true})
@@ -6573,8 +6580,11 @@ mod tests {
             json!({"op":"create_workspace","display_name":"Coordinator"}),
         )
         .unwrap();
+        // The invitation must be registered before it is sealed as the
+        // rollback target below, otherwise restoring to `old` would make the
+        // admission look up a key that was never committed to policy.
+        let invite = issue_invitation(admin);
         let old = call(admin, json!({"op":"seal_workspace"})).unwrap();
-        let invite = call(admin, json!({"op":"issue_invitation"})).unwrap();
         let pending = call(
             joiner,
             json!({"op":"begin_join","invitation":invite["invitation"],
@@ -6604,7 +6614,9 @@ mod tests {
         admin = create(Some(&[41; 32])).unwrap();
         let restored = call(admin, json!({"op":"restore_workspace","workspace":created["workspace"],"snapshot":saved["snapshot"]})).unwrap();
         assert_eq!(restored["members"], 2);
-        assert_eq!(restored["epoch"], 1);
+        // +1: registering the invitation now costs an epoch before the
+        // admission commit that seated the second member.
+        assert_eq!(restored["epoch"], 2);
         let reply = call(admin, retry.clone()).unwrap();
         assert_eq!(reply["welcome"], call(admin, retry).unwrap()["welcome"]);
         call(
@@ -7907,7 +7919,19 @@ mod tests {
         );
         execute_stored(restored, br#"{"op":"adopt_recovery"}"#, &snapshot).unwrap();
         let service = create(Some(&[43; 32])).unwrap();
-        let invite = call(admin, json!({"op":"issue_invitation"})).unwrap();
+        // Registering the link is itself a membership step the restored
+        // member must accept before the service's Add.
+        let staged_link = call(
+            admin,
+            json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+        )
+        .unwrap();
+        let registration = call(
+            admin,
+            json!({"op":"adopt_admission","snapshot":staged_link["snapshot"]}),
+        )
+        .unwrap();
+        let invite = registration["issued_invitation"].clone();
         let pending_service = call(
             service,
             json!({"op":"begin_join", "invitation":invite["invitation"],
@@ -7926,30 +7950,33 @@ mod tests {
         )
         .unwrap();
         let step = json!({"commit":response["commit"], "authorization":response["authorization"]});
-        call(
-            restored,
-            json!({"op":"fetch_membership_update", "peer":peer}),
-        )
-        .unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let fetched = loop {
-            call(admin, json!({"op":"poll_admission"})).unwrap();
-            let result = call(restored, json!({"op":"poll_membership_update"})).unwrap();
-            if result != Value::Null {
-                break result;
+        let fetch = || {
+            call(
+                restored,
+                json!({"op":"fetch_membership_update", "peer":peer}),
+            )
+            .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                call(admin, json!({"op":"poll_admission"})).unwrap();
+                let result = call(restored, json!({"op":"poll_membership_update"})).unwrap();
+                if result != Value::Null {
+                    break result;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "membership query deadline"
+                );
+                std::thread::sleep(Duration::from_millis(10));
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "membership query deadline"
-            );
-            std::thread::sleep(Duration::from_millis(10));
         };
+        let fetched = fetch();
         assert_eq!(fetched["state"], "membership_update_available");
-        assert_eq!(fetched["step"], step);
+        assert_eq!(fetched["step"]["commit"], registration["step"]["commit"]);
         assert!(fetched.get("welcome").is_none());
-        let update = json!({"op":"stage_admission_update", "step":fetched["step"]});
+        let registered = json!({"op":"stage_admission_update", "step":fetched["step"]});
         assert_eq!(
-            call(restored, update.clone()).unwrap_err(),
+            call(restored, registered.clone()).unwrap_err(),
             "pending application delivery must be acknowledged before membership update"
         );
         assert_eq!(
@@ -7961,6 +7988,14 @@ mod tests {
             assert_eq!(pending["payload"], json!([number]));
             ack(restored, &pending);
         }
+        let [_, saved] =
+            execute_stored(restored, &serde_json::to_vec(&registered).unwrap(), &[]).unwrap();
+        execute_stored(restored, br#"{"op":"adopt_admission"}"#, &saved).unwrap();
+        let fetched = fetch();
+        assert_eq!(fetched["state"], "membership_update_available");
+        assert_eq!(fetched["step"], step);
+        assert!(fetched.get("welcome").is_none());
+        let update = json!({"op":"stage_admission_update", "step":fetched["step"]});
         println!(
             "NATIVE_OBJECT_INBOX legacy_preserved=true live_pending_restart=true acknowledgement_restart=true missed_recovery=true adapter_callback=not_exercised"
         );

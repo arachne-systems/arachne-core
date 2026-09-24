@@ -112,7 +112,8 @@ fn typed_clients_recover_an_opaque_publication() {
     let workspace = owner
         .create_workspace("Owner", Some("Recovery proof"))
         .unwrap();
-    let invitation = owner.issue_invitation().unwrap();
+    let candidate = owner.stage_invitation(0).unwrap();
+    let invitation = owner.adopt_invitation(&candidate.snapshot).unwrap();
     let owner_address = invitation.address.replace("0.0.0.0:", "127.0.0.1:");
     reader
         .add_address_hint(invitation.peer, &owner_address)
@@ -318,7 +319,8 @@ fn typed_client_issues_an_invitation_with_bounded_route_hints() {
         .create_workspace("Owner", Some("Field Team"))
         .unwrap();
 
-    let invitation = client.issue_invitation().unwrap();
+    let candidate = client.stage_invitation(0).unwrap();
+    let invitation = client.adopt_invitation(&candidate.snapshot).unwrap();
     assert_eq!(invitation.workspace, workspace.workspace);
     assert_eq!(invitation.workspace_name.as_deref(), Some("Field Team"));
     assert!(!invitation.invitation.is_empty());
@@ -330,7 +332,8 @@ fn typed_client_issues_an_invitation_with_bounded_route_hints() {
         .unwrap();
     assert_eq!(inspected.workspace, workspace.workspace);
     assert_eq!(inspected.workspace_name.as_deref(), Some("Field Team"));
-    assert_eq!(inspected.epoch, 0);
+    // +1: registering the invitation now costs an epoch.
+    assert_eq!(inspected.epoch, 1);
     client.close().unwrap();
 }
 

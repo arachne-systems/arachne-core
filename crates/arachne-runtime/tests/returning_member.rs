@@ -18,6 +18,17 @@ fn poll(h: i64, op: &str) -> Value {
 fn step(reply: &Value) -> Value {
     json!({"commit":reply["commit"],"authorization":reply["authorization"]})
 }
+fn issue(admin: i64) -> Value {
+    let staged = call(
+        admin,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    );
+    call(
+        admin,
+        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+    )["issued_invitation"]
+        .clone()
+}
 fn add(owner: i64, joiner: i64, invite: &Value, prior: Vec<Value>, name: &str) -> Value {
     let begin = call(
         joiner,
@@ -56,7 +67,7 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
         admin,
         json!({"op":"create_workspace","display_name":"Admin"}),
     );
-    let invite = call(admin, json!({"op":"issue_invitation"}));
+    let invite = issue(admin);
     let first = add(admin, helper, &invite, vec![], "Helper");
     let saved = call(admin, json!({"op":"seal_workspace"}));
     close(admin).unwrap();
@@ -103,7 +114,8 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
             .iter()
             .map(|v| v.as_u64().unwrap() as u8),
     );
-    packet.extend(1u64.to_be_bytes());
+    // Epoch 2: the link registration and the helper's admission come first.
+    packet.extend(2u64.to_be_bytes());
     packet.extend(serde_json::to_vec(&altered).unwrap());
     let peer: [u8; 32] = info["endpoint_key"]
         .as_array()
@@ -133,7 +145,7 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
         execute(
             newer,
             &serde_json::to_vec(
-                &json!({"op":"offer_membership_update","peer":([99;32]),"after":1})
+                &json!({"op":"offer_membership_update","peer":([99;32]),"after":2})
             )
             .unwrap()
         )
@@ -160,7 +172,7 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
     outsider.join().unwrap();
     call(
         newer,
-        json!({"op":"offer_membership_update","peer":info["endpoint_key"],"after":1}),
+        json!({"op":"offer_membership_update","peer":info["endpoint_key"],"after":2}),
     );
     let candidate = poll(admin, "poll_admission");
     assert_eq!(candidate["state"], "awaiting_save");
@@ -170,7 +182,7 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
         json!({"op":"adopt_admission","snapshot":candidate["snapshot"]}),
     );
     assert_eq!(saved["members"], 3);
-    assert_eq!(saved["epoch"], 2);
+    assert_eq!(saved["epoch"], 3);
     assert_eq!(
         call(admin, json!({"op":"send_admission_reply"}))["queued"],
         true
@@ -182,7 +194,7 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
     // Replayed transition receives only a generic rejection, never duplicate membership.
     call(
         newer,
-        json!({"op":"offer_membership_update","peer":info["endpoint_key"],"after":1}),
+        json!({"op":"offer_membership_update","peer":info["endpoint_key"],"after":2}),
     );
     assert_eq!(poll(admin, "poll_admission")["state"], "membership_replied");
     poll(newer, "poll_membership_offer");
@@ -203,7 +215,7 @@ fn group_presence_announces_new_members_and_returning_peers_without_application_
     let b = create(Some(&[102; 32])).unwrap();
     let c = create(Some(&[103; 32])).unwrap();
     call(a, json!({"op":"create_workspace","display_name":"Admin"}));
-    let invite = call(a, json!({"op":"issue_invitation"}));
+    let invite = issue(a);
     let first = add(a, b, &invite, vec![], "Existing member");
     add(a, c, &invite, vec![step(&first)], "New member");
     let info = |h| serde_json::from_str::<Value>(&describe(h).unwrap()).unwrap();

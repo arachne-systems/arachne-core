@@ -121,7 +121,15 @@ fn ramp(seed: u8) -> Ramp {
     )
     .unwrap();
     enable_record_storage(admin, &dirs[0].path().join("admin.db"), &[seed; 32]).unwrap();
-    let invite = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let staged = call(
+        admin,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    )
+    .unwrap();
+    save_candidate(admin, &bytes(&staged["snapshot"])).unwrap();
+    let invite = call(admin, json!({"op":"adopt_admission","snapshot":staged["snapshot"]}))
+        .unwrap()["issued_invitation"]
+        .clone();
 
     // The helper joins at the very beginning, so its own retained history is
     // anchored at the same epoch-0 checkpoint the late joiner pins.
@@ -180,7 +188,10 @@ fn ramp(seed: u8) -> Ramp {
     }
     assert_eq!(
         current["epoch"],
-        json!(steps),
+        // +1: registering the invitation now costs an epoch, and that epoch
+        // lands before the pinned checkpoint, so it is not one of `steps`
+        // but still counts toward the helper's absolute epoch.
+        json!(steps + 1),
         "the ordinary member must be current before it serves an old invitation"
     );
 
@@ -316,7 +327,10 @@ fn epoch_zero_invitation_redeems_through_the_issuer_after_a_hundred_epochs() {
     )
     .expect("a joiner must be able to verify more than 64 steps of history");
     let joined = adopt(ramp.late, "adopt_join", &staged);
-    assert_eq!(joined["epoch"], json!(ramp.steps + 1));
+    // +1 on top of the usual +1: the registration epoch that pinned this
+    // invitation's checkpoint also lands before it, and late's own join adds
+    // one more on top of the full ramp.
+    assert_eq!(joined["epoch"], json!(ramp.steps + 2));
 
     close(ramp.late).unwrap();
     close(ramp.helper).unwrap();
@@ -364,7 +378,10 @@ fn epoch_zero_invitation_redeems_through_an_ordinary_member_with_the_issuer_offl
     )
     .expect("an ordinary member must serve the full authorized history");
     let joined = adopt(ramp.late, "adopt_join", &staged);
-    assert_eq!(joined["epoch"], json!(ramp.steps + 1));
+    // +1 on top of the usual +1: the registration epoch that pinned this
+    // invitation's checkpoint also lands before it, and late's own join adds
+    // one more on top of the full ramp.
+    assert_eq!(joined["epoch"], json!(ramp.steps + 2));
 
     close(ramp.late).unwrap();
     close(ramp.helper).unwrap();

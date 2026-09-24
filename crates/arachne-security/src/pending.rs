@@ -440,7 +440,17 @@ fn pending_identity_recovers_and_rejected_welcome_does_not_consume_it() {
     use super::{AdmissionAuthorization, MAX_SEALED_WORKSPACE};
     use openmls_traits::signatures::Signer;
     use sha2::{Digest, Sha256};
-    let mut admin = Workspace::create([1; 32], "Coordinator").unwrap();
+    let invite = SignatureKeyPair::new(SUITE.signature_algorithm()).unwrap();
+    let invitation_key = invite.public().try_into().unwrap();
+    let mut admin = Workspace::create([1; 32], "Coordinator")
+        .unwrap()
+        .prepare_management(super::ManagementAction::CreateInvitation(
+            invitation_key,
+            0,
+            false,
+        ))
+        .unwrap()
+        .workspace;
     let checkpoint = admin.join_checkpoint().unwrap();
     let digest = Sha256::digest(&checkpoint).into();
     let mut proof = JoinProof::from_trusted_checkpoint(admin.id(), digest, &checkpoint).unwrap();
@@ -486,8 +496,6 @@ fn pending_identity_recovers_and_rejected_welcome_does_not_consume_it() {
         .unwrap()
         .validate(admin.provider.crypto(), ProtocolVersion::Mls10)
         .unwrap();
-    let invite = SignatureKeyPair::new(SUITE.signature_algorithm()).unwrap();
-    let invitation_key = invite.public().try_into().unwrap();
     let auth = AdmissionAuthorization {
         invitation_key,
         grant_signature: admin

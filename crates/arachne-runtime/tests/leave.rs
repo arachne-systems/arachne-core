@@ -134,6 +134,20 @@ fn offer_and_drive(owner: i64, peer: i64, after: u64) {
     assert_eq!(wait_for_offer(owner)["state"], "membership_offer_finished");
 }
 
+fn issue_invitation(handle: i64) -> Value {
+    let staged = call(
+        handle,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    )
+    .unwrap();
+    call(
+        handle,
+        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+    )
+    .unwrap()["issued_invitation"]
+        .clone()
+}
+
 fn adopt_candidate(handle: i64, staged: &Value) -> Value {
     let snapshot = serde_json::from_value::<Vec<u8>>(staged["snapshot"].clone()).unwrap();
     save_candidate(handle, &snapshot).unwrap();
@@ -149,7 +163,7 @@ fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave()
         json!({"op":"create_workspace","display_name":"Original admin"}),
     )
     .unwrap();
-    let invite = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let invite = issue_invitation(admin);
     join(admin, successor, &invite, "Successor");
     let dir = common::directory();
     enable_record_storage(
@@ -272,9 +286,32 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
         json!({"op":"create_workspace","display_name":"Alpha"}),
     )
     .unwrap();
-    let invite = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let invite = issue_invitation(admin);
     join(admin, successor, &invite, "Bravo");
-    let invite = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    // Registering the second invitation costs admin an epoch that successor
+    // (already a member) does not automatically have. Apply that management
+    // step to successor directly so it doesn't fork before the third join.
+    let staged = call(
+        admin,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    )
+    .unwrap();
+    let adopted = call(
+        admin,
+        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+    )
+    .unwrap();
+    let invite = adopted["issued_invitation"].clone();
+    let synced = call(
+        successor,
+        json!({"op":"stage_admission_update","step":adopted["step"]}),
+    )
+    .unwrap();
+    call(
+        successor,
+        json!({"op":"adopt_admission","snapshot":synced["snapshot"]}),
+    )
+    .unwrap();
     join(admin, third, &invite, "Charlie");
 
     let dir = common::directory();
@@ -313,9 +350,14 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
 
     // The second join advances the creator while the first member still has
     // the previous accepted view. Reconcile that view before any management.
-    offer_and_drive(admin, successor, 1);
+    // +2 on both numbers below: registering each invitation now costs an
+    // epoch. Successor's own join lands at epoch 2 (not 1), and it is synced
+    // to epoch 3 directly above for the second invitation's registration, so
+    // only the third member's join (epoch 3 -> 4) remains to reconcile here.
+    // Admin's epoch after the second invite+join is 4 (not 2).
+    offer_and_drive(admin, successor, 3);
     let before_promotion = call(admin, json!({"op":"member_roster"})).unwrap();
-    assert_eq!(before_promotion["epoch"], 2);
+    assert_eq!(before_promotion["epoch"], 4);
     let before_promotion_epoch = before_promotion["epoch"].as_u64().unwrap();
 
     let promotion = call(
@@ -399,7 +441,7 @@ fn leave_over_iroh_retries_saved_outcome_then_restores_only_terminal_state() {
         json!({"op":"create_workspace","display_name":"Admin"}),
     )
     .unwrap();
-    let invite = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let invite = issue_invitation(admin);
     let join = call(
         member,
         json!({"op":"begin_join","display_name":"Departing member",

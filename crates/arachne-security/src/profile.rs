@@ -118,7 +118,8 @@ fn profiles_bind_names_to_current_workspace_members() {
         bad[i] ^= 1;
         assert!(admin.verify_member_profile(&bad).is_err());
     }
-    let (invitation, checkpoint) = admin.issue_invitation().unwrap();
+    let (registration, invitation, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    admin = registration.workspace;
     let pending =
         super::PendingJoin::from_invitation(&invitation, &checkpoint, [93; 32], "Alex Morgan")
             .unwrap();

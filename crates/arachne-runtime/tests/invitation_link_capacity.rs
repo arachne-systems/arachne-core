@@ -906,7 +906,18 @@ fn local_full_onboarding_state_machine_rejects_a_corrupted_joiner() {
     let dir = tempfile::tempdir().unwrap();
     arachne_runtime::enable_record_storage(owner, &dir.path().join("owner.db"), &[211; 32])
         .unwrap();
-    let invite = call(owner, json!({"op":"issue_invitation"})).unwrap();
+    let staged = call(
+        owner,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    )
+    .unwrap();
+    arachne_runtime::save_candidate(owner, &bytes(&staged["snapshot"])).unwrap();
+    let invite = call(
+        owner,
+        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+    )
+    .unwrap()["issued_invitation"]
+        .clone();
     let invitation_bytes = bytes(&invite["invitation"]);
     let checkpoint = bytes(&invite["checkpoint"]);
     let owner_peer = endpoint(&invite["peer"]);

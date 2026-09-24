@@ -463,7 +463,8 @@ mod tests {
     }
     fn pair() -> (Workspace, Workspace) {
         let admin = Workspace::create_named([1; 32], "Alex", Some("Storm Assessment")).unwrap();
-        let (invite, checkpoint) = admin.issue_invitation().unwrap();
+        let (registration, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+        let admin = registration.workspace;
         let pending =
             PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Jordan").unwrap();
         let add = admin
@@ -687,7 +688,9 @@ mod tests {
     #[test]
     fn admission_helper_cannot_replace_invitation_name_and_bad_saved_metadata_fails_restore() {
         let (admin, helper) = pair();
-        let (invite, checkpoint) = admin.issue_invitation().unwrap();
+        let (registration, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+        let helper = accept_role(&helper, &registration);
+        let admin = registration.workspace;
         let pending = PendingJoin::from_invitation(&invite, &checkpoint, [3; 32], "Sam").unwrap();
         helper
             .initialize_name_checkpoint(&NameState {

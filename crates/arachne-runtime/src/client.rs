@@ -749,9 +749,36 @@ impl Client {
         Ok(())
     }
 
-    pub fn issue_invitation(&self) -> Result<InvitationInfo> {
-        let response = self.request(json!({"op": "issue_invitation"}))?;
-        let raw: RawInvitationInfo = serde_json::from_value(response).map_err(|parse_error| {
+    /// Register a reusable invitation link in shared policy. The link is
+    /// released only by `adopt_invitation`, after the candidate is saved.
+    pub fn stage_invitation(&self, expires_at: u64) -> Result<WorkspaceCandidate> {
+        let metadata = serde_json::to_vec(&json!({
+            "op": "stage_invitation",
+            "personal": false,
+            "expires_at": expires_at,
+        }))
+        .map_err(|parse_error| error(ErrorKind::Internal, parse_error.to_string()))?;
+        let [metadata, snapshot] = execute_stored(self.handle()?, &metadata, &[])
+            .map_err(|message| map_error(&message))?;
+        parse_workspace_candidate(&metadata, snapshot, "invitation")
+    }
+
+    /// Adopt a staged invitation registration and return its bearer link.
+    pub fn adopt_invitation(&self, snapshot: &[u8]) -> Result<InvitationInfo> {
+        let [metadata, _] = execute_stored(
+            self.handle()?,
+            br#"{"op":"adopt_admission"}"#,
+            snapshot,
+        )
+        .map_err(|message| map_error(&message))?;
+        let response: Value = serde_json::from_slice(&metadata).map_err(|parse_error| {
+            error(
+                ErrorKind::Internal,
+                format!("invalid invitation adoption result: {parse_error}"),
+            )
+        })?;
+        let raw: RawInvitationInfo = serde_json::from_value(response["issued_invitation"].clone())
+            .map_err(|parse_error| {
             error(
                 ErrorKind::Internal,
                 format!("invalid invitation: {parse_error}"),

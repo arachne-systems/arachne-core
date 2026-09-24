@@ -1,21 +1,32 @@
 use arachne_security::{
-    ManagementAction, PendingJoin, PreparedManagementUpdate, StorageKey, Workspace,
+    Invitation, ManagementAction, PendingJoin, PreparedManagementUpdate, StorageKey, Workspace,
 };
+
+/// A registered reusable link and the owner that holds its registration.
+fn register(owner: &Workspace) -> (Workspace, Invitation, Vec<u8>) {
+    let (registration, invite, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+    (registration.workspace, invite, checkpoint)
+}
 
 fn add(
     owner: &Workspace,
+    (invite, checkpoint): (&Invitation, &[u8]),
     endpoint: u8,
 ) -> (Workspace, Workspace, arachne_security::PreparedAdmission) {
-    let (invite, checkpoint) = owner.issue_invitation().unwrap();
     let join =
-        PendingJoin::from_invitation(&invite, &checkpoint, [endpoint; 32], "Member").unwrap();
+        PendingJoin::from_invitation(invite, checkpoint, [endpoint; 32], "Member").unwrap();
     let admitted = owner
         .prepare_admission([endpoint; 32], join.admission_request().unwrap())
         .unwrap();
     let mut proof = join.join_proof().unwrap();
-    proof
-        .apply_add(&admitted.authorization, &admitted.commit)
-        .unwrap();
+    // A reused link replays every step since its checkpoint, ending with this Add.
+    for (authorization, commit) in admitted
+        .workspace
+        .membership_history([endpoint; 32], join.admission_request().unwrap(), checkpoint)
+        .unwrap()
+    {
+        proof.apply_transition(&authorization, &commit).unwrap();
+    }
     let member = join.prepare_workspace(&proof, &admitted.welcome).unwrap();
     (
         admitted.workspace.provisional_copy().unwrap(),
@@ -26,8 +37,9 @@ fn add(
 
 #[test]
 fn member_departure_requires_own_signature_rotates_keys_and_survives_restore() {
-    let (admin, member, _) = add(&Workspace::create([1; 32], "Admin").unwrap(), 2);
-    let (admin, helper, joined) = add(&admin, 3);
+    let (admin, invite, checkpoint) = register(&Workspace::create([1; 32], "Admin").unwrap());
+    let (admin, member, _) = add(&admin, (&invite, &checkpoint), 2);
+    let (admin, helper, joined) = add(&admin, (&invite, &checkpoint), 3);
     let member = member
         .prepare_admission_update(&joined.authorization, &joined.commit)
         .unwrap();
@@ -105,7 +117,8 @@ fn last_member_can_end_locally_but_admin_must_handover_a_team() {
         .unwrap(),
         ended
     );
-    let (admin, member, _) = add(&solo, 2);
+    let (solo, invite, checkpoint) = register(&solo);
+    let (admin, member, _) = add(&solo, (&invite, &checkpoint), 2);
     assert!(admin.prepare_solo_leave().is_err());
     assert!(member.prepare_solo_leave().is_err());
     let promotion = admin

@@ -20,7 +20,8 @@ fn run(member_count: usize) {
     assert!(member_count >= 32);
     let started = Instant::now();
     let mut owner = Workspace::create([200; 32], "Admission harness owner").unwrap();
-    let (invitation, checkpoint) = owner.issue_invitation().unwrap();
+    let (registration, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+    owner = registration.workspace;
     let mut queue = AdmissionQueue::new();
 
     let mut request_build_time = std::time::Duration::ZERO;
@@ -128,7 +129,8 @@ fn run_batched(member_count: usize) {
     assert!(member_count >= 2);
     let started = Instant::now();
     let mut owner = Workspace::create([201; 32], "Batch harness owner").unwrap();
-    let (invitation, checkpoint) = owner.issue_invitation().unwrap();
+    let (registration, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+    owner = registration.workspace;
     let mut pending = Vec::with_capacity(member_count);
     let mut requests = Vec::with_capacity(member_count);
     let mut validated = Vec::with_capacity(member_count);
@@ -299,7 +301,8 @@ fn admission_batch_harness_covers_shared_welcome_and_restart() {
 #[test]
 fn an_existing_member_follows_batch_adds_past_three_hundred_members() {
     let mut owner = Workspace::create([203; 32], "Large workspace owner").unwrap();
-    let (invitation, checkpoint) = owner.issue_invitation().unwrap();
+    let (registration, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+    owner = registration.workspace;
     let joiner = |index: usize| {
         PendingJoin::from_invitation(&invitation, &checkpoint, endpoint(index + 30_000), "Member").unwrap()
     };
@@ -415,7 +418,8 @@ fn an_existing_member_accepts_management_past_three_hundred_members() {
 #[ignore = "known limit: invitation checkpoint exceeds 64 KiB past ~250 members (F3)"]
 fn an_administrator_invites_past_three_hundred_members() {
     let mut owner = Workspace::create([204; 32], "Large workspace owner").unwrap();
-    let (invitation, checkpoint) = owner.issue_invitation().unwrap();
+    let (registration, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+    owner = registration.workspace;
     let mut next = 0;
     while owner.member_count() < 310 {
         let range = next..(next + MAX_ADMISSION_BATCH);
@@ -434,7 +438,9 @@ fn an_administrator_invites_past_three_hundred_members() {
         owner = owner.prepare_validated_admission_batch(&entries).unwrap().workspace;
         next = range.end;
     }
-    let (late_invitation, late_checkpoint) = owner.issue_invitation().unwrap();
+    let (registration, late_invitation, late_checkpoint) =
+        owner.prepare_invitation(0, false, false).unwrap();
+    owner = registration.workspace;
     let late = PendingJoin::from_invitation(&late_invitation, &late_checkpoint, endpoint(39_999), "Late member").unwrap();
     let request = late.admission_request().unwrap().to_vec();
     let AdmissionAssessment::Ready(validated) = owner.assess_admission(endpoint(39_999), &request).unwrap() else {

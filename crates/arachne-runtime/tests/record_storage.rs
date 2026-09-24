@@ -62,16 +62,29 @@ fn hundred_members_save_as_records_and_follower_crosses_old_history_ceiling() {
     let old_key = StorageKey::derive(&[201; 32]).unwrap();
     let old_file = admin.seal(&old_key).unwrap();
     admin = Workspace::restore(&old_key, [200; 32], id, &old_file).unwrap();
-    let (old_invitation, old_checkpoint) = admin.issue_invitation().unwrap();
+    let (registered, old_invitation, old_checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    admin = registered.workspace;
     let admin_path = directory.path().join("admin.db");
     let follower_path = directory.path().join("follower.db");
     let mut admin_store = Store::open(&admin_path, &[202; 32], id).unwrap();
     let mut follower_store = Store::open(&follower_path, &[203; 32], id).unwrap();
     save(&mut admin_store, &admin);
-    let mut follower = None;
+    let mut follower: Option<Workspace> = None;
     let mut latest = None;
     for member in 1u8..100 {
-        let (invite, checkpoint) = admin.issue_invitation().unwrap();
+        let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+        admin = registered.workspace;
+        if let Some(owner) = &follower {
+            // The follower is already a member once one exists, so it must
+            // apply the registration commit too or it forks from admin.
+            let updated = owner
+                .prepare_management_update(registered.action, &registered.commit)
+                .unwrap();
+            let arachne_security::PreparedManagementUpdate::Active(boxed) = updated else {
+                panic!("expected active update")
+            };
+            follower = Some(*boxed);
+        }
         let pending =
             PendingJoin::from_invitation(&invite, &checkpoint, [member; 32], "Workspace member")
                 .unwrap();
@@ -135,7 +148,10 @@ fn hundred_members_save_as_records_and_follower_crosses_old_history_ceiling() {
             &old_checkpoint,
         )
         .unwrap();
-    assert_eq!(steps.len(), 99);
+    // 99 -> 198: each of the 99 loop iterations now also registers its
+    // invitation via prepare_invitation before admitting, costing one extra
+    // epoch per member on top of the admission commit itself.
+    assert_eq!(steps.len(), 198);
     let mut verifier = MembershipVerifier::from_trusted_checkpoint(
         id,
         old_invitation.checkpoint_digest(),

@@ -395,7 +395,8 @@ fn current_view_statement(context: &[u8], body: &[u8]) -> Vec<u8> {
 fn recovery_offer_authenticates_request_and_exact_packet_set() {
     use crate::{PendingJoin, StorageKey};
     let admin = Workspace::create([1; 32], "Publisher").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let (registration, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let admin = registration.workspace;
     let pending = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
     let prepared = admin
         .prepare_admission([2; 32], pending.admission_request().unwrap())

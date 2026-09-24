@@ -43,8 +43,8 @@ pub use recovery::{
 mod invitation;
 mod invitation_controls;
 pub use invitation_controls::{
-    INVITATION_APPROVAL_REQUIRED, INVITATION_AUTOMATIC_APPROVAL_REQUIRED, INVITATION_DISABLED,
-    INVITATION_EXPIRED, InvitationControl,
+    INVITATION_APPROVAL_REQUIRED, INVITATION_AUTOMATIC_APPROVAL_REQUIRED, INVITATION_CONTROLS_FULL,
+    INVITATION_DISABLED, INVITATION_EXPIRED, InvitationControl,
 };
 mod pending;
 pub use invitation::{
@@ -204,8 +204,10 @@ impl Workspace {
             credential: BasicCredential::new(identity).into(),
             signature_key: signer.to_public_vec().into(),
         };
-        let mut authority = vec![1, 1];
+        // Every invitation must be registered; a new workspace has none.
+        let mut authority = vec![2, 1];
         authority.extend(signer.public());
+        authority.extend(0u16.to_be_bytes());
         let extensions = Extensions::from_vec(vec![
             Extension::Unknown(AUTHORITY, UnknownExtension(authority)),
             Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
@@ -360,6 +362,7 @@ fn creation_owns_distinct_groups_and_initial_authority() {
     assert_eq!(a.epoch(), 0);
     assert_eq!(a.member_count(), 1);
     let admins = &a.group.extensions().unknown(AUTHORITY).unwrap().0;
-    assert_eq!(&admins[..2], &[1, 1]);
-    assert_eq!(&admins[2..], a._signer.public());
+    assert_eq!(&admins[..2], &[2, 1]);
+    assert_eq!(&admins[2..34], a._signer.public());
+    assert_eq!(&admins[34..], &[0, 0]);
 }
