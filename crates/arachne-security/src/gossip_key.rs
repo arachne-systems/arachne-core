@@ -70,6 +70,9 @@ pub(super) fn add_members(
     if packages.is_empty() {
         return Err("admission preparation failed");
     }
+    group.set_aad(super::bootstrap::asserted_time_aad(
+        super::invitation_controls::now()?,
+    ));
     let bundle = group
         .commit_builder()
         .propose_adds(packages)
@@ -168,7 +171,8 @@ mod tests {
             "a commit changed the key"
         );
 
-        // A third member admitted by the second, not the issuer, gets it too.
+        // A third member, admitted after more commits, gets it too. Only
+        // administrators admit (ADR A2 step 2).
         let (registration, invitation, checkpoint) =
             admin.prepare_invitation(0, false, false).unwrap();
         let super::super::PreparedManagementUpdate::Active(helper) = helper
@@ -177,7 +181,7 @@ mod tests {
         else {
             panic!("registration removed the helper")
         };
-        let (helper, third) = admit(&helper, &invitation, &checkpoint, [3; 32]);
+        let (_, third) = admit(&registration.workspace, &invitation, &checkpoint, [3; 32]);
         assert_eq!(third.gossip_tag_key().unwrap(), key);
         assert_eq!(helper.gossip_tag_key().unwrap(), key);
 

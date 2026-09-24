@@ -1187,6 +1187,7 @@ impl Workspace {
         &self,
         remote_endpoint: [u8; 32],
         request: &ValidatedAdmission,
+        now: u64,
     ) -> Result<(), &'static str> {
         if request.workspace != self.id() {
             return Err("admission belongs to another workspace");
@@ -1194,7 +1195,7 @@ impl Workspace {
         super::invitation_controls::check(
             self.group.extensions(),
             request.authorization.invitation_key,
-            Some(super::invitation_controls::now()?),
+            Some(now),
             &request.package,
         )?;
         if !bootstrap::authority(self.group.extensions())?.contains(&request.issuer.to_vec()) {
@@ -1232,7 +1233,11 @@ impl Workspace {
         if request.workspace != self.id() {
             return Err("admission belongs to another workspace");
         }
-        if let Err(error) = self.check_validated_admission(remote_endpoint, &request) {
+        if let Err(error) = self.check_validated_admission(
+            remote_endpoint,
+            &request,
+            super::invitation_controls::now()?,
+        ) {
             return match error {
                 super::INVITATION_APPROVAL_REQUIRED => Ok(AdmissionAssessment::ApprovalRequired(request)),
                 super::INVITATION_AUTOMATIC_APPROVAL_REQUIRED => {
@@ -1290,8 +1295,18 @@ impl Workspace {
         if admissions.is_empty() || admissions.len() > super::MAX_ADMISSION_BATCH {
             return Err("invalid admission batch size");
         }
+        // ADR A2 step 2: every verifier rejects an Add from a non-administrator.
+        if !bootstrap::authority(self.group.extensions())?
+            .iter()
+            .any(|key| key == self._signer.public())
+        {
+            return Err("only an administrator may admit members");
+        }
         let profile = std::env::var_os("ARACHNE_PROFILE_ADMISSION").is_some();
         let profile_started = std::time::Instant::now();
+        // Read the clock once: the commit asserts the same time the policy
+        // check used, so the committer never asserts a time it did not check.
+        let now = super::invitation_controls::now()?;
         let mut bindings = BTreeSet::new();
         let mut packages = Vec::with_capacity(admissions.len());
         for (remote_endpoint, bytes, request) in admissions {
@@ -1299,7 +1314,7 @@ impl Workspace {
             if request.endpoint != *remote_endpoint || request.digest != digest {
                 return Err("validated admission does not match request");
             }
-            self.check_validated_admission(*remote_endpoint, request)?;
+            self.check_validated_admission(*remote_endpoint, request, now)?;
             if !bindings.insert(bootstrap::binding(request.package.leaf_node().credential())?) {
                 return Err("duplicate member binding");
             }
@@ -1329,6 +1344,7 @@ impl Workspace {
             .map(|(_, _, request)| (request.authorization.invitation_key, &request.package))
             .collect();
         let policy = super::invitation_controls::consumed(self.group.extensions(), &admitted)?;
+        group.set_aad(bootstrap::asserted_time_aad(now));
         let mut builder = group
             .commit_builder()
             .propose_adds(packages)
@@ -1610,6 +1626,28 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
     let checkpoint_length = u32::from_be_bytes(altered[37..41].try_into().unwrap()) as usize;
     altered[41 + checkpoint_length + 32] ^= 1; // Administrator grant signature, not the secret-only membership MAC.
     assert!(JoinProof::from_history(admin.id(), invitation.checkpoint_digest(), &altered).is_err());
+    // ADR A2 step 2: an ordinary member cannot admit. Promote the helper so
+    // the link still works while the issuer is offline.
+    let early = PendingJoin::from_invitation(&invitation, &checkpoint, [3; 32], "Early").unwrap();
+    assert_eq!(
+        helper
+            .prepare_admission([3; 32], early.admission_request().unwrap())
+            .err(),
+        Some("only an administrator may admit members")
+    );
+    let promotion = recovered
+        .prepare_management(super::ManagementAction::Promote(member.id()))
+        .unwrap();
+    let super::PreparedManagementUpdate::Active(helper) = helper
+        .prepare_management_update(promotion.action, &promotion.commit)
+        .unwrap()
+    else {
+        panic!("promotion removed helper")
+    };
+    proof
+        .apply_management(promotion.action, &promotion.commit)
+        .unwrap();
+    let recovered = promotion.workspace;
     let helper_snapshot = helper.seal(&key).unwrap();
     assert!(helper_snapshot.starts_with(b"DFWS\x04"));
     drop(helper);
@@ -1618,50 +1656,50 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
     let workspace_id = admin.id();
     drop(recovered);
     drop(admin);
-    // The issuer is gone. The same preissued token works through an ordinary member.
+    // The issuer is gone. The same preissued token works through another administrator.
     let newcomer =
         PendingJoin::from_invitation(&invitation, &checkpoint, [3; 32], "Jordan Lee").unwrap();
     let request = newcomer.admission_request().unwrap();
     assert_eq!(
         helper
-            .admission_history([3; 32], request, &checkpoint)
+            .membership_history([3; 32], request, &checkpoint)
             .unwrap()
             .len(),
-        1
+        2
     );
     assert!(
         helper
-            .admission_history([9; 32], request, &checkpoint)
+            .membership_history([9; 32], request, &checkpoint)
             .is_err()
     );
     let mut bad_checkpoint = checkpoint.clone();
     *bad_checkpoint.last_mut().unwrap() ^= 1;
     assert!(
         helper
-            .admission_history([3; 32], request, &bad_checkpoint)
+            .membership_history([3; 32], request, &bad_checkpoint)
             .is_err()
     );
     let mut bad_request = request.to_vec();
     bad_request[5 + 133] ^= 1;
     assert!(
         helper
-            .admission_history([3; 32], &bad_request, &checkpoint)
+            .membership_history([3; 32], &bad_request, &checkpoint)
             .is_err()
     );
     let mut missing = Workspace::restore(&key, [2; 32], workspace_id, &helper_snapshot).unwrap();
     missing.join_history = None;
     assert_eq!(
         missing
-            .admission_history([3; 32], request, &checkpoint)
+            .membership_history([3; 32], request, &checkpoint)
             .err(),
         Some("invitation history unavailable")
     );
-    assert_eq!(missing.epoch(), 2);
+    assert_eq!(missing.epoch(), 3);
     assert_eq!(missing.member_count(), 2);
     let second = helper
         .prepare_admission([3; 32], newcomer.admission_request().unwrap())
         .unwrap();
-    assert_eq!(helper.epoch(), 2);
+    assert_eq!(helper.epoch(), 3);
     assert_eq!(helper.member_count(), 2);
     proof
         .apply_add(&second.authorization, &second.commit)
@@ -1708,7 +1746,7 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
     };
     assert_eq!(message.into_bytes(), b"generic fabric payload");
     let returning = Workspace::restore(&key, [1; 32], workspace_id, &admin_state).unwrap();
-    assert_eq!(returning.epoch(), 2);
+    assert_eq!(returning.epoch(), 3);
     let mut bad = second.authorization.clone();
     bad.grant_signature[0] ^= 1;
     assert!(
@@ -1723,7 +1761,7 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
             .prepare_admission_update(&second.authorization, &bad_commit)
             .is_err()
     );
-    assert_eq!(returning.epoch(), 2); // Rejection and preparation never mutate the accepted owner.
+    assert_eq!(returning.epoch(), 3); // Rejection and preparation never mutate the accepted owner.
     assert!(
         updated_admin
             .prepare_admission_update(&second.authorization, &second.commit)
@@ -1731,18 +1769,18 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
     );
     let stored_update = updated_admin.seal(&key).unwrap();
     let mut returning = Workspace::restore(&key, [1; 32], workspace_id, &stored_update).unwrap();
-    assert_eq!(returning.epoch(), 3);
+    assert_eq!(returning.epoch(), 4);
     assert_eq!(returning.member_count(), 3);
     // A restored creator must relay the helper's accepted Add, not only Adds
     // it originated. This history must not depend on retaining a Welcome reply.
     let (_, relayed) = returning
-        .membership_update_for([2; 32], 2)
+        .membership_update_for([2; 32], 3)
         .unwrap()
         .expect("restored creator retains the helper admission");
     assert_eq!(relayed, second.commit);
     assert!(
         returning
-            .membership_update_for([9; 32], 2)
+            .membership_update_for([9; 32], 3)
             .unwrap()
             .is_none()
     );
@@ -1753,7 +1791,7 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
             .membership_history([8; 32], later.admission_request().unwrap(), &checkpoint,)
             .unwrap()
             .len(),
-        2
+        3
     );
     let sample = joined
         .protect_object(b"app", b"feed/opaque", b"third member sample")
@@ -2042,4 +2080,43 @@ fn batch_replies_share_one_commit_and_welcome_across_copies_and_restores() {
     };
     assert_eq!(resealed[..5], sealed[..5]);
     assert_eq!(plain(&resealed), plain(&sealed));
+}
+
+/// ADR A2 step 2: only administrators commit Adds, and the Add carries the
+/// same time the committer checked the invitation against.
+#[test]
+fn only_administrators_admit_and_the_add_carries_the_checked_time() {
+    use super::PendingJoin;
+    let owner = Workspace::create([1; 32], "Organizer").unwrap();
+    let (registration, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+    let owner = registration.workspace;
+    let first = PendingJoin::from_invitation(&invitation, &checkpoint, [2; 32], "Member").unwrap();
+    let before = super::invitation_controls::now().unwrap();
+    let admitted = owner
+        .prepare_admission([2; 32], first.admission_request().unwrap())
+        .unwrap();
+    let after = super::invitation_controls::now().unwrap();
+    let asserted = super::admission_asserted_time(&admitted.commit).unwrap();
+    assert!((before..=after).contains(&asserted), "{before} <= {asserted} <= {after}");
+    let mut proof = first.join_proof().unwrap();
+    proof
+        .apply_add(&admitted.authorization, &admitted.commit)
+        .unwrap();
+    let member = first.prepare_workspace(&proof, &admitted.welcome).unwrap();
+    let second = PendingJoin::from_invitation(&invitation, &checkpoint, [3; 32], "Member").unwrap();
+    let request = second.admission_request().unwrap();
+    assert_eq!(
+        member.prepare_admission([3; 32], request).err(),
+        Some("only an administrator may admit members")
+    );
+    let AdmissionAssessment::Ready(validated) = member.assess_admission([3; 32], request).unwrap()
+    else {
+        panic!("open invitation needs no approval");
+    };
+    assert_eq!(
+        member
+            .prepare_validated_admission_batch(&[([3; 32], request, &validated)])
+            .err(),
+        Some("only an administrator may admit members")
+    );
 }

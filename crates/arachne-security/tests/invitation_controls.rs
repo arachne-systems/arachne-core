@@ -42,7 +42,7 @@ fn joined(
 }
 
 #[test]
-fn open_event_link_is_reusable_without_admin_and_disable_survives_history() {
+fn open_event_link_is_reusable_and_disable_survives_history() {
     let admin = Workspace::create([1; 32], "Organizer").unwrap();
     let (created, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     assert!(
@@ -93,22 +93,30 @@ fn open_event_link_is_reusable_without_admin_and_disable_survives_history() {
             .retained_invitation_checkpoint(&created.action)
             .is_some()
     );
-    let (helper, _) = joined(&helper, &invite, &checkpoint, 3); // Organizer need not handle this join.
+    // Only administrators admit (ADR A2 step 2), even through a reusable link.
+    let third = PendingJoin::from_invitation(&invite, &checkpoint, [3; 32], "Attendee").unwrap();
+    assert_eq!(
+        helper
+            .prepare_admission([3; 32], third.admission_request().unwrap())
+            .err(),
+        Some("only an administrator may admit members")
+    );
+    let (admin, _) = joined(&admin, &invite, &checkpoint, 3);
     let id = helper.invitation_controls().unwrap()[0].key;
     assert!(
         helper
             .prepare_management(ManagementAction::DisableInvitation(id))
             .is_err()
     );
-    // Synchronize the organizer before disabling the event link.
-    let (auth, commit) = helper
-        .membership_update_for(admin.endpoint(), admin.epoch())
+    // Synchronize the helper before disabling the event link.
+    let (auth, commit) = admin
+        .membership_update_for(helper.endpoint(), helper.epoch())
         .unwrap()
         .unwrap();
     let arachne_security::MembershipAuthorization::Admission(auth) = auth else {
         panic!()
     };
-    let admin = admin.prepare_admission_update(&auth, &commit).unwrap();
+    let helper = helper.prepare_admission_update(&auth, &commit).unwrap();
     let disable = admin
         .prepare_management(ManagementAction::DisableInvitation(id))
         .unwrap();
@@ -141,10 +149,16 @@ fn open_event_link_is_reusable_without_admin_and_disable_survives_history() {
 }
 
 #[test]
-fn personal_invitation_admits_only_the_approved_request_through_an_ordinary_member() {
+fn personal_invitation_admits_only_the_approved_request_through_another_administrator() {
     let admin = Workspace::create([1; 32], "Admin").unwrap();
     let (open, token, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let (admin, helper) = joined(&open.workspace, &token, &checkpoint, 2);
+    // Only administrators admit (ADR A2 step 2): the helper is a second admin.
+    let promotion = admin
+        .prepare_management(ManagementAction::Promote(helper.member().unwrap().id()))
+        .unwrap();
+    let helper = apply(&helper, &promotion);
+    let admin = promotion.workspace;
     let (personal, token, checkpoint) = admin.prepare_invitation(0, true, false).unwrap();
     let helper = apply(&helper, &personal);
     let intended =
@@ -153,11 +167,6 @@ fn personal_invitation_admits_only_the_approved_request_through_an_ordinary_memb
     assert!(
         helper
             .prepare_admission([3; 32], intended.admission_request().unwrap())
-            .is_err()
-    );
-    assert!(
-        helper
-            .prepare_invitation_approval(intended.admission_request().unwrap())
             .is_err()
     );
     let approval = personal

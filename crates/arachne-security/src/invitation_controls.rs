@@ -507,6 +507,9 @@ fn admission_cannot_carry_a_policy_change_it_does_not_consume() {
         ManagementAction::DisableInvitation(invitation.key()),
     )
     .unwrap();
+    admin
+        .group
+        .set_aad(bootstrap::asserted_time_aad(now().unwrap()));
     let forged = admin
         .group
         .commit_builder()

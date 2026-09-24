@@ -157,6 +157,69 @@ impl Workspace {
     }
 }
 
+/// Domain tag of an Add's authenticated data (ADR A2 step 2). The rest is the
+/// committer's asserted Unix time in seconds, as a big-endian u64.
+const ASSERTED_TIME: &[u8] = b"arachne/asserted-time/v1";
+
+pub(super) fn asserted_time_aad(time: u64) -> Vec<u8> {
+    let mut aad = ASSERTED_TIME.to_vec();
+    aad.extend(time.to_be_bytes());
+    aad
+}
+
+/// The committer's asserted time in an admission commit. Parsing only: it
+/// does not verify the commit. A host can compare it with its own clock and
+/// warn on a large difference; verifiers never reject for that.
+pub fn admission_asserted_time(commit: &[u8]) -> Option<u64> {
+    asserted_time(public_message_aad(commit)?).ok()
+}
+
+fn asserted_time(aad: &[u8]) -> Result<u64, &'static str> {
+    aad.strip_prefix(ASSERTED_TIME)
+        .and_then(|time| <[u8; 8]>::try_from(time).ok())
+        .map(u64::from_be_bytes)
+        .ok_or("admission requires the committer's asserted time")
+}
+
+/// Authenticated data of a public MLS message, read from its TLS encoding:
+/// version, wire format, then `FramedContent` up to `authenticated_data`.
+/// Parsing only; OpenMLS exposes the AAD only after verification.
+pub(super) fn public_message_aad(message: &[u8]) -> Option<&[u8]> {
+    fn take<'a>(bytes: &mut &'a [u8], count: usize) -> Option<&'a [u8]> {
+        let (head, rest) = bytes.split_at_checked(count)?;
+        *bytes = rest;
+        Some(head)
+    }
+    // RFC 9000 variable-length integer, as RFC 9420 uses for vector lengths.
+    fn vector<'a>(bytes: &mut &'a [u8]) -> Option<&'a [u8]> {
+        let first = *bytes.first()?;
+        let size = 1usize << (first >> 6);
+        if size == 8 {
+            return None;
+        }
+        let mut length = u64::from(first & 0x3f);
+        for byte in &take(bytes, size)?[1..] {
+            length = (length << 8) | u64::from(*byte);
+        }
+        take(bytes, usize::try_from(length).ok()?)
+    }
+    let mut bytes = message;
+    // mls10, public_message
+    if take(&mut bytes, 4)? != [0, 1, 0, 1] {
+        return None;
+    }
+    vector(&mut bytes)?; // group_id
+    take(&mut bytes, 8)?; // epoch
+    match take(&mut bytes, 1)?[0] {
+        1 | 2 => {
+            take(&mut bytes, 4)?; // member leaf index or external sender index
+        }
+        3 | 4 => {}
+        _ => return None,
+    }
+    vector(&mut bytes)
+}
+
 /// Public proof of an ordinary-member invitation and its exact redemption.
 /// No bearer private key is carried here. Fields are untrusted until verified.
 #[derive(Clone)]
@@ -425,6 +488,14 @@ impl MembershipVerifier {
             .members()
             .find(|member| member.index == *index)
             .ok_or("unknown committer")?;
+        let admins = authority(self.group.group_context().extensions())?;
+        // ADR A2 step 2: only administrators commit Adds.
+        if !admins.contains(&actor.signature_key) {
+            return Err("only an administrator may commit an Add");
+        }
+        // Every verifier checks expiry against the committer's signed time,
+        // never its own clock, so all verifiers reach the same answer.
+        let asserted = asserted_time(processed.aad())?;
         let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
             return Err("not a commit");
         };
@@ -468,7 +539,6 @@ impl MembershipVerifier {
             return Err("admission cannot replace committer identity");
         }
         let mut bindings = std::collections::BTreeSet::new();
-        let admins = authority(self.group.group_context().extensions())?;
         let crypto = self.provider.crypto();
         for (authorization, add) in authorizations.iter().zip(adds) {
             let package = add.add_proposal().key_package();
@@ -487,7 +557,7 @@ impl MembershipVerifier {
             super::invitation_controls::check(
                 self.group.group_context().extensions(),
                 authorization.invitation_key,
-                None,
+                Some(asserted),
                 package,
             )?;
             if !admins.iter().any(|admin| {
@@ -1030,6 +1100,84 @@ mod tests {
         }
     }
 
+    fn now_for_test() -> u64 {
+        crate::invitation_controls::now().unwrap()
+    }
+
+    /// A raw administrator Add that carries `time` as its asserted time.
+    fn add_raw(owner: &mut Workspace, package: &KeyPackage, time: u64) -> (Vec<u8>, MlsMessageOut) {
+        owner.group.set_aad(asserted_time_aad(time));
+        let (commit, welcome, _) = owner
+            .group
+            .add_members(&owner.provider, &owner._signer, std::slice::from_ref(package))
+            .unwrap();
+        (commit.to_bytes().unwrap(), welcome)
+    }
+
+    /// ADR A2 T12: the committer's asserted time, not the verifier's clock,
+    /// decides expiry. Every verifier reaches the same answer.
+    #[test]
+    fn asserted_time_decides_invitation_expiry_for_every_verifier() {
+        let invite = SignatureKeyPair::new(SUITE.signature_algorithm()).unwrap();
+        let invitation_key: [u8; 32] = invite.public().try_into().unwrap();
+        // Expiry far in the past of every verifier's clock.
+        let expires_at = 1_000;
+        let mut admin = Workspace::create([1; 32], "Coordinator")
+            .unwrap()
+            .prepare_management(crate::ManagementAction::CreateInvitation(
+                invitation_key,
+                expires_at,
+                false,
+            ))
+            .unwrap()
+            .workspace;
+        let checkpoint = admin.join_checkpoint().unwrap();
+        let digest = checkpoint_digest(&checkpoint).unwrap();
+        let candidate = Candidate::new(3);
+        let authorization = AdmissionAuthorization {
+            invitation_key,
+            grant_signature: admin
+                ._signer
+                .sign(&grant(admin.group.group_id(), &invitation_key))
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            redemption_signature: invite
+                .sign(&redemption(admin.group.group_id(), &invitation_key, &candidate.package).unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        };
+        let (late, _) = add_raw(&mut admin, &candidate.package, expires_at);
+        assert_eq!(admission_asserted_time(&late), Some(expires_at));
+        admin
+            .group
+            .clear_pending_commit(admin.provider.storage())
+            .unwrap();
+        let (in_time, _) = add_raw(&mut admin, &candidate.package, expires_at - 1);
+        for _ in 0..2 {
+            let mut joiner = JoinProof::from_trusted_checkpoint(admin.id(), digest, &checkpoint).unwrap();
+            let mut member =
+                MembershipVerifier::from_trusted_checkpoint(admin.id(), digest, &checkpoint).unwrap();
+            assert_eq!(
+                joiner.apply_add(&authorization, &late),
+                Err(crate::INVITATION_EXPIRED)
+            );
+            assert_eq!(
+                member.apply_transition(&MembershipAuthorization::Admission(authorization.clone()), &late),
+                Err(crate::INVITATION_EXPIRED)
+            );
+            // Before expiry by the committer's time: accepted, although every
+            // local clock is long past the expiry.
+            joiner.apply_add(&authorization, &in_time).unwrap();
+            member
+                .apply_transition(&MembershipAuthorization::Admission(authorization.clone()), &in_time)
+                .unwrap();
+            assert_eq!(joiner.epoch(), 2);
+            assert_eq!(member.epoch(), 2);
+        }
+    }
+
     #[test]
     fn trusted_checkpoint_rejects_substitution_and_unauthorized_branch() {
         let invalid = BasicCredential::new(credential_identity(
@@ -1110,7 +1258,8 @@ mod tests {
                 .unwrap(),
         };
         let helper_auth = authorize(admin.group.group_id(), &helper.package);
-        let (commit, welcome, _) = admin
+        // An Add without the committer's asserted time is rejected.
+        let (untimed, _, _) = admin
             .group
             .add_members(
                 &admin.provider,
@@ -1118,7 +1267,15 @@ mod tests {
                 std::slice::from_ref(&helper.package),
             )
             .unwrap();
-        let commit = commit.to_bytes().unwrap();
+        assert_eq!(
+            proof.apply_add(&helper_auth, &untimed.to_bytes().unwrap()),
+            Err("admission requires the committer's asserted time")
+        );
+        admin
+            .group
+            .clear_pending_commit(admin.provider.storage())
+            .unwrap();
+        let (commit, welcome) = add_raw(&mut admin, &helper.package, now_for_test());
         let mut invalid_auth = authorize(admin.group.group_id(), &helper.package);
         invalid_auth.grant_signature[0] ^= 1;
         // Epochs start at 1: the invitation registration is epoch 1.
@@ -1136,30 +1293,32 @@ mod tests {
         assert!(proof.matches_workspace(&helper).unwrap());
         assert!(helper.join_checkpoint().is_err()); // ordinary member cannot issue a new trust root
 
-        // Admin is no longer involved. An ordinary helper fulfills the existing grant.
-        let fork_key = crate::StorageKey::derive(&[42; 32]).unwrap();
-        let fork_snapshot = helper.seal(&fork_key).unwrap();
-        let mut fork =
-            Workspace::restore(&fork_key, helper.endpoint, helper.id(), &fork_snapshot).unwrap();
+        // ADR A2 step 2 (T10): an ordinary member cannot commit an Add, even
+        // for a valid grant and redemption. Only administrators admit.
         let joined = Candidate::new(4);
         let joined_auth = authorize(helper.group.group_id(), &joined.package);
-        let (commit, welcome, _) = helper
+        let (member_commit, _) = add_raw(&mut helper, &joined.package, now_for_test());
+        assert_eq!(
+            proof.apply_add(&joined_auth, &member_commit),
+            Err("only an administrator may commit an Add")
+        );
+        assert_eq!(proof.epoch(), 2);
+        helper
             .group
-            .add_members(
-                &helper.provider,
-                &helper._signer,
-                std::slice::from_ref(&joined.package),
-            )
+            .clear_pending_commit(helper.provider.storage())
             .unwrap();
-        let commit = commit.to_bytes().unwrap();
-        let mismatched = authorize(helper.group.group_id(), &Candidate::new(5).package);
+
+        // An independent copy of the administrator at the same epoch.
+        let mut fork = admin.provisional_copy().unwrap();
+        let (commit, welcome) = add_raw(&mut admin, &joined.package, now_for_test());
+        let mismatched = authorize(admin.group.group_id(), &Candidate::new(5).package);
         assert!(proof.apply_add(&mismatched, &commit).is_err());
         assert_eq!(proof.epoch(), 2);
         proof.apply_add(&joined_auth, &commit).unwrap();
-        helper.group.merge_pending_commit(&helper.provider).unwrap();
-        let mut joined = joined.join(helper.id(), welcome);
+        admin.group.merge_pending_commit(&admin.provider).unwrap();
+        let mut joined = joined.join(admin.id(), welcome);
         assert!(proof.matches_workspace(&joined).unwrap());
-        assert!(!proof.matches_workspace(&admin).unwrap()); // same ID and admin, older branch
+        assert!(!proof.matches_workspace(&fork).unwrap()); // same ID and admin, older branch
         let encrypted = joined
             .group
             .create_message(
@@ -1176,22 +1335,17 @@ mod tests {
 
         // A fully MLS-valid unauthorized Welcome at the SAME epoch/ID/admin
         // roster is not the authorized branch. This catches more than staleness.
+        // The grant is signed by an ordinary member, not an administrator.
+        let before_fork = fork.join_checkpoint().unwrap();
         let uninvited = Candidate::new(6);
         let mut forged = authorize(fork.group.group_id(), &uninvited.package);
-        forged.grant_signature = fork
+        forged.grant_signature = helper
             ._signer
             .sign(&grant(fork.group.group_id(), &invitation_key))
             .unwrap()
             .try_into()
             .unwrap();
-        let (bad_commit, bad_welcome, _) = fork
-            .group
-            .add_members(
-                &fork.provider,
-                &fork._signer,
-                std::slice::from_ref(&uninvited.package),
-            )
-            .unwrap();
+        let (bad_commit, bad_welcome) = add_raw(&mut fork, &uninvited.package, now_for_test());
         fork.group.merge_pending_commit(&fork.provider).unwrap();
         let uninvited = uninvited.join(fork.id(), bad_welcome);
         assert_eq!(uninvited.epoch(), proof.epoch());
@@ -1201,7 +1355,6 @@ mod tests {
         // Verify authorization rejection from the correct previous epoch too.
         // A separate verifier starts at the pre-fork checkpoint, so this
         // negative assertion tests grant authority rather than epoch mismatch.
-        let before_fork = admin.join_checkpoint().unwrap();
         let mut fork_proof = JoinProof::from_trusted_checkpoint(
             admin.id(),
             checkpoint_digest(&before_fork).unwrap(),
@@ -1209,7 +1362,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            fork_proof.apply_add(&forged, &bad_commit.to_bytes().unwrap()),
+            fork_proof.apply_add(&forged, &bad_commit),
             Err("unapproved invitation")
         );
         assert_eq!(fork_proof.epoch(), 2);

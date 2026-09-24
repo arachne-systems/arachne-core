@@ -688,6 +688,12 @@ mod tests {
     #[test]
     fn admission_helper_cannot_replace_invitation_name_and_bad_saved_metadata_fails_restore() {
         let (admin, helper) = pair();
+        // Only administrators admit (ADR A2 step 2): the helper is a second admin.
+        let promotion = admin
+            .prepare_management(ManagementAction::Promote(helper.member().unwrap().id()))
+            .unwrap();
+        let helper = accept_role(&helper, &promotion);
+        let admin = promotion.workspace;
         let (registration, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
         let helper = accept_role(&helper, &registration);
         let admin = registration.workspace;
