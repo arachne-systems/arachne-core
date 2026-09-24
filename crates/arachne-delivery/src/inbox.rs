@@ -236,6 +236,22 @@ struct DirectStream {
 }
 
 impl DirectStream {
+    /// Evict the oldest recovery copy and move the floor to it. Sequences
+    /// between the old floor and that copy were never received: they are
+    /// given up as missed (B7e). Returns how many.
+    fn evict_first(&mut self) -> u64 {
+        let expected = self.floor.max(self.recovery_floor).saturating_add(1);
+        let sequence = self.records.remove(0).sequence;
+        self.floor = self.floor.max(sequence);
+        sequence.saturating_sub(expected)
+    }
+
+    /// True when `sequence` is at or below the floor: accepted, evicted, or
+    /// given up as missed. A late copy of such a sequence is dropped.
+    fn closed(&self, sequence: u64) -> bool {
+        sequence <= self.floor.max(self.recovery_floor)
+    }
+
     fn effective_head(&self) -> u64 {
         self.known_head.max(
             self.records
@@ -271,6 +287,10 @@ pub struct ObjectInbox {
     progress: Vec<SelectionProgress>,
     current_progress: Vec<CurrentProgress>,
     direct: Vec<DirectStream>,
+    /// Direct sequences given up as missed since this inbox was created or
+    /// restored (B7e). Not persisted: a staging step reports the difference
+    /// between its candidate and the adopted state.
+    missed: u64,
 }
 
 /// Decoded state part of an inbox snapshot. Binary, canonical, bounded:
@@ -713,6 +733,7 @@ impl ObjectInbox {
             progress: Vec::new(),
             current_progress: Vec::new(),
             direct: Vec::new(),
+            missed: 0,
         }
     }
 
@@ -776,6 +797,14 @@ impl ObjectInbox {
         });
         advanced.snapshot()?;
         Ok(advanced)
+    }
+
+    /// Direct sequences given up as missed since this inbox was created or
+    /// restored: a record window overflow moved a scope floor past a gap
+    /// (B7e). The difference between a staged candidate and the current state
+    /// is the misses of that step.
+    pub fn missed_direct(&self) -> u64 {
+        self.missed
     }
 
     pub fn recovery_progress(&self, author: [u8; 32], epoch: u64, topics: &BTreeSet<Topic>) -> u64 {
@@ -1134,6 +1163,21 @@ impl ObjectInbox {
         if self.recent.contains(&identity) {
             return Ok(InboxStage::Duplicate);
         }
+        // B7e: a direct sequence at or below its scope floor was accepted or
+        // given up as missed. A late copy is dropped, never delivered after
+        // newer objects of the scope.
+        if !recipients.is_empty()
+            && sequence != 0
+            && self.direct.iter().any(|stream| {
+                stream.author == author
+                    && stream.revision == context.revision
+                    && stream.topic == context.topic.as_str()
+                    && stream.recipients == recipients
+                    && stream.closed(sequence)
+            })
+        {
+            return Ok(InboxStage::Duplicate);
+        }
         // Never discard an undelivered object to make room. The object is not
         // recorded, so it can come again (live or by recovery) after the
         // application drains work. One author cannot use up everyone's space.
@@ -1451,7 +1495,7 @@ impl ObjectInbox {
         stream.records.sort_by_key(|record| record.sequence);
         stream.known_head = stream.known_head.max(sequence);
         if stream.records.len() > DIRECT_WINDOW {
-            stream.floor = stream.records.remove(0).sequence;
+            self.missed += stream.evict_first();
         }
         // The encoded size is the persisted byte budget.
         while self.direct.iter().map(DirectStream::encoded_len).sum::<usize>()
@@ -1469,7 +1513,7 @@ impl ObjectInbox {
                         .sum::<usize>()
                 })
                 .ok_or("direct recovery metadata capacity exhausted")?;
-            stream.floor = stream.floor.max(stream.records.remove(0).sequence);
+            self.missed += stream.evict_first();
         }
         Ok(())
     }
@@ -2310,6 +2354,7 @@ impl ObjectInbox {
             progress: parsed.progress,
             current_progress: parsed.current_progress,
             direct: parsed.direct,
+            missed: 0,
         };
         inbox.validate_owner(owner)?;
         for range in &inbox.retained_ranges {
