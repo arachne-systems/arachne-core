@@ -88,12 +88,46 @@ impl MembershipInbox {
 struct Envelope {
     workspace: WorkspaceId,
     revision: u64,
+    /// The author. Bound by the author's signature (`seal`/`open`), never by
+    /// the gossip link, which may be a relaying member.
     sender: PeerId,
     #[serde(deserialize_with = "wire::topic")]
     topic: String,
     delivery: DeliveryClass,
     #[serde(with = "wire::envelope_payload")]
     payload: Vec<u8>,
+}
+
+/// Gossip relays an envelope through other members, so the link peer is not
+/// its author. The author signs the encoded envelope with its endpoint key;
+/// the signature follows the envelope bytes on the wire.
+const SIGNATURE: usize = 64;
+const SIGNATURE_DOMAIN: &[u8] = b"arachne/gossip-envelope/1\0";
+
+fn seal(envelope: &Envelope, secret: &iroh::SecretKey) -> Result<Vec<u8>> {
+    let mut bytes = wire::encode(envelope)?;
+    let signature = secret.sign(&[SIGNATURE_DOMAIN, &bytes].concat());
+    bytes.extend_from_slice(&signature.to_bytes());
+    if bytes.len() > super::MAX_FRAME {
+        return Err(Error::TooLarge);
+    }
+    Ok(bytes)
+}
+
+/// Decode an envelope whose author signature verifies against its sender.
+fn open(bytes: &[u8]) -> Result<Envelope> {
+    let split = bytes
+        .len()
+        .checked_sub(SIGNATURE)
+        .ok_or(Error::InvalidFrame)?;
+    let (body, signature) = bytes.split_at(split);
+    let envelope: Envelope = wire::decode(body)?;
+    let signature = iroh::Signature::from_bytes(signature.try_into().map_err(|_| Error::InvalidFrame)?);
+    iroh::PublicKey::from_bytes(&envelope.sender)
+        .map_err(|_| Error::InvalidFrame)?
+        .verify(&[SIGNATURE_DOMAIN, body].concat(), &signature)
+        .map_err(|_| Error::InvalidFrame)?;
+    Ok(envelope)
 }
 
 pub(super) struct Overlay {
@@ -107,6 +141,8 @@ pub(super) struct Overlay {
     pub(super) tag: [u8; TAG],
     pub(super) gossip: Gossip,
     sender: GossipSender,
+    /// This endpoint's key: every envelope it authors is signed with it.
+    secret: iroh::SecretKey,
     neighbors: Arc<StdMutex<BTreeSet<PeerId>>>,
     changed: Arc<Notify>,
     receiver: JoinHandle<()>,
@@ -166,6 +202,7 @@ impl Overlay {
         membership: MembershipInbox,
     ) -> Result<Self> {
         let endpoint = connections.endpoint();
+        let secret = endpoint.secret_key().clone();
         let local = *endpoint.id().as_bytes();
         let local_index = peers.binary_search(&local).map_err(|_| Error::Rejected)?;
         let peers_set: BTreeSet<PeerId> = peers.iter().copied().collect();
@@ -235,7 +272,7 @@ impl Overlay {
                         notify.notify_waiters();
                     }
                     Ok(Event::Received(message)) => {
-                        let envelope = match wire::decode::<Envelope>(&message.content) {
+                        let envelope = match open(&message.content) {
                             Ok(value) if value.workspace == workspace => value,
                             _ => {
                                 tracing::warn!(target: "data_fabric_gossip", "GOSSIP_ENVELOPE_REJECTED");
@@ -330,6 +367,7 @@ impl Overlay {
             tag,
             gossip,
             sender,
+            secret,
             neighbors,
             changed,
             receiver,
@@ -337,9 +375,9 @@ impl Overlay {
         })
     }
 
+    /// Broadcast an envelope authored and signed by this endpoint.
     pub(super) async fn broadcast(
         &self,
-        sender: PeerId,
         topic: &Topic,
         delivery: DeliveryClass,
         payload: Vec<u8>,
@@ -359,14 +397,17 @@ impl Overlay {
                 return Err(Error::MissingPeer);
             }
         }
-        let bytes = wire::encode(&Envelope {
-            workspace: self.workspace,
-            revision: self.revision(),
-            sender,
-            topic: topic.as_str().into(),
-            delivery,
-            payload,
-        })?;
+        let bytes = seal(
+            &Envelope {
+                workspace: self.workspace,
+                revision: self.revision(),
+                sender: *self.secret.public().as_bytes(),
+                topic: topic.as_str().into(),
+                delivery,
+                payload,
+            },
+            &self.secret,
+        )?;
         self.sender
             .broadcast(bytes.into())
             .await
@@ -376,7 +417,6 @@ impl Overlay {
 
     pub(super) async fn broadcast_membership(
         &self,
-        sender: PeerId,
         payload: Vec<u8>,
     ) -> Result<bool> {
         if payload.len() > wire::envelope_payload::MAX {
@@ -384,7 +424,7 @@ impl Overlay {
         }
         let topic = Topic::new(MEMBERSHIP_TOPIC).map_err(|_| Error::Rejected)?;
         tracing::info!(target: "data_fabric_transport", bytes = payload.len(), neighbors = self.neighbor_count(), "GOSSIP_MEMBERSHIP_SENT");
-        self.broadcast(sender, &topic, DeliveryClass::Critical, payload)
+        self.broadcast(&topic, DeliveryClass::Critical, payload)
             .await
     }
 
@@ -579,6 +619,67 @@ mod tests {
         .unwrap();
     }
 
+    /// Gossip relays, so the author is not the link peer. A member could
+    /// claim another member as sender; the envelope must prove its author.
+    #[tokio::test]
+    async fn a_member_cannot_publish_as_another_member_over_gossip() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let bind = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+            let (a, _) = Node::bind_with_identity(bind(), &[93; 32]).await.unwrap();
+            let (b, _) = Node::bind_with_identity(bind(), &[94; 32]).await.unwrap();
+            let (c, mut received) = Node::bind_with_identity(bind(), &[95; 32]).await.unwrap();
+            let workspace = [96; 32];
+            let topic = Topic::new("streams/opaque").unwrap();
+            let policy = BTreeMap::from([
+                (a.id(), Permissions::AllTopics),
+                (b.id(), Permissions::AllTopics),
+                (c.id(), Permissions::AllTopics),
+            ]);
+            for node in [&a, &b, &c] {
+                node.install_verified_policy(workspace, 1, policy.clone())
+                    .await
+                    .unwrap();
+            }
+            c.subscribe(workspace, 1, topic.clone()).await.unwrap();
+            a.add_address_hint(c.id(), c.address()).await.unwrap();
+            c.add_address_hint(a.id(), a.address()).await.unwrap();
+            for node in [&a, &c] {
+                node.enable_gossip(workspace, 1, &workspace).await.unwrap();
+            }
+            while !a.live_neighbors(workspace).await.contains(&c.id()) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let overlay = a.overlays.lock().await.get(&workspace).cloned().unwrap();
+            let forged = wire::encode(&Envelope {
+                workspace,
+                revision: 1,
+                sender: b.id(),
+                topic: topic.as_str().into(),
+                delivery: DeliveryClass::Critical,
+                payload: b"forged".to_vec(),
+            })
+            .unwrap();
+            overlay.sender.broadcast(forged.into()).await.unwrap();
+            a.publish(workspace, 1, topic.clone(), b"genuine".to_vec())
+                .await
+                .unwrap();
+            let first = tokio::time::timeout(Duration::from_secs(5), received.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (first.sender, first.payload.as_slice()),
+                (a.id(), &b"genuine"[..]),
+                "a forged sender was accepted"
+            );
+            for node in [a, b, c] {
+                node.close().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn discovery_and_protocol_names_say_arachne() {
         assert_eq!(crate::ALPN, b"arachne/data/1");
@@ -677,6 +778,26 @@ fn compact_gossip_preserves_author_and_payload_and_rejects_bad_frames() {
             assert!(wire::decode::<Envelope>(&wire::encode(&envelope).unwrap()).is_err());
         }
     }
+    // Only the sender's own key opens an envelope; any changed byte fails.
+    let author = iroh::SecretKey::from_bytes(&[5; 32]);
+    let other = iroh::SecretKey::from_bytes(&[6; 32]);
+    let envelope = |sender: &iroh::SecretKey| Envelope {
+        workspace: [171; 32],
+        revision: 1,
+        sender: *sender.public().as_bytes(),
+        topic: "streams/opaque".into(),
+        delivery: DeliveryClass::Critical,
+        payload: vec![1, 2, 3],
+    };
+    let sealed = seal(&envelope(&author), &author).unwrap();
+    assert_eq!(open(&sealed).unwrap().payload, vec![1, 2, 3]);
+    for index in [0, 40, sealed.len() - 1] {
+        let mut changed = sealed.clone();
+        changed[index] ^= 1;
+        assert!(open(&changed).is_err());
+    }
+    assert!(open(&seal(&envelope(&other), &author).unwrap()).is_err());
+    assert!(open(&wire::encode(&envelope(&author)).unwrap()).is_err());
     assert_ne!(tag(&[0; 32], [1; 32]), tag(&[0; 32], [2; 32]));
     assert_ne!(tag(&[0; 32], [1; 32]), tag(&[1; 32], [1; 32]));
 }

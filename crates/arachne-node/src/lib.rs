@@ -762,12 +762,11 @@ impl Node {
         payload: Vec<u8>,
     ) -> impl std::future::Future<Output = Result<bool>> + Send + 'static {
         let overlays = self.overlays.clone();
-        let sender = self.id();
         async move {
             let Some(overlay) = overlays.lock().await.get(&workspace).cloned() else {
                 return Ok(false);
             };
-            overlay.broadcast_membership(sender, payload).await
+            overlay.broadcast_membership(payload).await
         }
     }
     pub fn address(&self) -> SocketAddr {
@@ -1133,7 +1132,7 @@ impl Node {
                 report.admitted.push(self.id());
             }
             report.queued = overlay
-                .broadcast(self.id(), &topic, delivery, payload)
+                .broadcast(&topic, delivery, payload)
                 .await?;
             return Ok(report);
         }
