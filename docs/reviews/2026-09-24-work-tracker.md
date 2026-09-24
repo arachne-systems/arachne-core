@@ -12,11 +12,11 @@ test is red → green and the crate tests pass.
 - [ ] **B3a** Joiners cannot receive an invitation above 241 members (64 KiB wire checkpoint carries the full ratchet tree). Needs a smaller joiner checkpoint (wire change).
 - [ ] **B3b** A member restored with `join_history == None` still uses the inline bound and can reject a valid management commit above ~250 members.
 - [ ] **B4** Invitation controls fill at 221 rows and are never pruned.
-- [ ] **B5** `stage_protected_publication` does not send `workspace`; a mismatch leaves the session stuck.
-- [ ] **B6** `create_endpoint` holds the global `REGISTRY` lock during bind (up to 10 s).
-- [ ] **B7** Automatic recovery never shrinks the range; large payloads can never catch up.
-- [ ] **B8** The latest-value index never prunes and fills for good.
-- [ ] **B9** The freshness anchor is not wired into restore (rollback → state replay, SFrame counter reuse).
+- [x] **B5** (`7dc9201`, workspace tests 387 pass / 0 fail) `stage_protected_publication` does not send `workspace`; a mismatch leaves the session stuck.
+- [x] **B6** (`3236e4f`, workspace tests 387 pass / 0 fail) `create_endpoint` holds the global `REGISTRY` lock during bind (up to 10 s).
+- [x] **B7** (`7984237`, workspace tests 387 pass / 0 fail) Automatic recovery never shrinks the range; large payloads can never catch up.
+- [x] **B8** (`c142361`, workspace tests 387 pass / 0 fail) The latest-value index never prunes and fills for good.
+- [x] **B9** (`71f8cfa`, workspace tests 387 pass / 0 fail) The freshness anchor is not wired into restore (rollback → state replay, SFrame counter reuse).
 
 ## SDK bugs (arachne-sdk repo — owned by the SDK agent, not this branch)
 
