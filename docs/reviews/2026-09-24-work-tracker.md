@@ -44,13 +44,15 @@ and a different Core pin. Core work that each plan step depends on:
 - [ ] **A4** Owned `Context`, event stream, `wait_for_work(timeout)`, `close(&self)`, suspend/resume.
 - [ ] **A5** One persistence mode behind a `Storage` trait; schema versions and migrations.
 - [ ] **A6** Delivery spec; per-author quotas; bitmap dedup; remove the legacy receive stack.
-- [ ] **A7** Gate the data plane at handshake; fix metadata leaks; relay config; `Link` trait.
+- [x] **A7** (`fix/a7-network`, merged)
+  - [ ] A7r: runtime wiring — members-only gossip tag key, revision window in runtime checks and `real_node_lifecycle` test, one-behind `Message.revision`, `NodeOptions` into `create_endpoint`, stranger error kind Gate the data plane at handshake; fix metadata leaks; relay config; `Link` trait.
 - [ ] **A8** Per-app or per-topic isolation.
 - [x] **A9** Version ranges; renamed forks with own versions; SPDX license field. (`fix/a9-supply-chain`, merged into `integrate/wave1`)
   - [ ] A9a: ~40 `.rs` comments cite ADR 0008/0009/0010 that live only in `arachne-development`. Replace with inline rationale.
-  - [ ] A9b: `tor` feature pulls `torut` → `ed25519-dalek 1.0.1` / `curve25519-dalek 3.2.0` (RUSTSEC-2022-0093, RUSTSEC-2024-0344).
+  - [x] A9b (`fix/a9b-tor`; torut replaced, deny clean): `tor` feature pulls `torut` → `ed25519-dalek 1.0.1` / `curve25519-dalek 3.2.0` (RUSTSEC-2022-0093, RUSTSEC-2024-0344).
   - [ ] A9c: behind latest: sha2 0.11, aes-gcm 0.11, hkdf 0.13, sframe 2.0, rusqlite 0.40; getrandom 0.2 vs 0.4 split.
-  - [ ] A9d: in-file change notices in fork sources; stale `release = false` in `release-plz.toml`.
+  - [x] A9d (`334ab7f`): in-file change notices in fork sources; stale `release = false` in `release-plz.toml`.
+  - [ ] A9f: Tor control client uses plain COOKIE auth; add SAFECOOKIE. Full `tor_transport` node test not run (no Tor network reach here).
   - [ ] A9e (owner approval): publish `arachne-bao-tree`, then blobs, gossip, node, runtime; decide on yanking old fork versions.
 - [ ] **A10** Split `arachne-runtime/src/lib.rs` by subsystem; test through the typed Client.
 - [ ] Fix stale docs (`docs/integration.md` gaps list, missing ADR 0008/0009).
