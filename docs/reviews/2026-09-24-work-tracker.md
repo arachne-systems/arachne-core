@@ -46,6 +46,11 @@ and a different Core pin. Core work that each plan step depends on:
 - [ ] **A6** Delivery spec; per-author quotas; bitmap dedup; remove the legacy receive stack.
 - [ ] **A7** Gate the data plane at handshake; fix metadata leaks; relay config; `Link` trait.
 - [ ] **A8** Per-app or per-topic isolation.
-- [ ] **A9** Version ranges; renamed forks with own versions; SPDX license field.
+- [x] **A9** Version ranges; renamed forks with own versions; SPDX license field. (`fix/a9-supply-chain`, merged into `integrate/wave1`)
+  - [ ] A9a: ~40 `.rs` comments cite ADR 0008/0009/0010 that live only in `arachne-development`. Replace with inline rationale.
+  - [ ] A9b: `tor` feature pulls `torut` → `ed25519-dalek 1.0.1` / `curve25519-dalek 3.2.0` (RUSTSEC-2022-0093, RUSTSEC-2024-0344).
+  - [ ] A9c: behind latest: sha2 0.11, aes-gcm 0.11, hkdf 0.13, sframe 2.0, rusqlite 0.40; getrandom 0.2 vs 0.4 split.
+  - [ ] A9d: in-file change notices in fork sources; stale `release = false` in `release-plz.toml`.
+  - [ ] A9e (owner approval): publish `arachne-bao-tree`, then blobs, gossip, node, runtime; decide on yanking old fork versions.
 - [ ] **A10** Split `arachne-runtime/src/lib.rs` by subsystem; test through the typed Client.
 - [ ] Fix stale docs (`docs/integration.md` gaps list, missing ADR 0008/0009).
