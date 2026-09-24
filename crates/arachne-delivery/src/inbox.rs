@@ -236,6 +236,22 @@ struct DirectStream {
 }
 
 impl DirectStream {
+    /// Evict the oldest recovery copy and move the floor to it. Sequences
+    /// between the old floor and that copy were never received: they are
+    /// given up as missed (B7e). Returns how many.
+    fn evict_first(&mut self) -> u64 {
+        let expected = self.floor.max(self.recovery_floor).saturating_add(1);
+        let sequence = self.records.remove(0).sequence;
+        self.floor = self.floor.max(sequence);
+        sequence.saturating_sub(expected)
+    }
+
+    /// True when `sequence` is at or below the floor: accepted, evicted, or
+    /// given up as missed. A late copy of such a sequence is dropped.
+    fn closed(&self, sequence: u64) -> bool {
+        sequence <= self.floor.max(self.recovery_floor)
+    }
+
     fn effective_head(&self) -> u64 {
         self.known_head.max(
             self.records
@@ -271,6 +287,10 @@ pub struct ObjectInbox {
     progress: Vec<SelectionProgress>,
     current_progress: Vec<CurrentProgress>,
     direct: Vec<DirectStream>,
+    /// Direct sequences given up as missed since this inbox was created or
+    /// restored (B7e). Not persisted: a staging step reports the difference
+    /// between its candidate and the adopted state.
+    missed: u64,
 }
 
 /// Decoded state part of an inbox snapshot. Binary, canonical, bounded:
@@ -713,6 +733,7 @@ impl ObjectInbox {
             progress: Vec::new(),
             current_progress: Vec::new(),
             direct: Vec::new(),
+            missed: 0,
         }
     }
 
@@ -776,6 +797,14 @@ impl ObjectInbox {
         });
         advanced.snapshot()?;
         Ok(advanced)
+    }
+
+    /// Direct sequences given up as missed since this inbox was created or
+    /// restored: a record window overflow moved a scope floor past a gap
+    /// (B7e). The difference between a staged candidate and the current state
+    /// is the misses of that step.
+    pub fn missed_direct(&self) -> u64 {
+        self.missed
     }
 
     pub fn recovery_progress(&self, author: [u8; 32], epoch: u64, topics: &BTreeSet<Topic>) -> u64 {
@@ -1134,6 +1163,21 @@ impl ObjectInbox {
         if self.recent.contains(&identity) {
             return Ok(InboxStage::Duplicate);
         }
+        // B7e: a direct sequence at or below its scope floor was accepted or
+        // given up as missed. A late copy is dropped, never delivered after
+        // newer objects of the scope.
+        if !recipients.is_empty()
+            && sequence != 0
+            && self.direct.iter().any(|stream| {
+                stream.author == author
+                    && stream.revision == context.revision
+                    && stream.topic == context.topic.as_str()
+                    && stream.recipients == recipients
+                    && stream.closed(sequence)
+            })
+        {
+            return Ok(InboxStage::Duplicate);
+        }
         // Never discard an undelivered object to make room. The object is not
         // recorded, so it can come again (live or by recovery) after the
         // application drains work. One author cannot use up everyone's space.
@@ -1151,8 +1195,9 @@ impl ObjectInbox {
             .fold((0, 0), |(count, bytes), pending| {
                 (count + 1, bytes + pending.encoded_len())
             });
-        if author_objects == MAX_PENDING_OBJECTS_PER_AUTHOR
-            || author_bytes + size > MAX_PENDING_BYTES_PER_AUTHOR
+        if (author_objects >= MAX_PENDING_OBJECTS_PER_AUTHOR
+            || author_bytes + size > MAX_PENDING_BYTES_PER_AUTHOR)
+            && !self.fills_blocking_gap(author, context, recipients)
         {
             return Err(AUTHOR_QUOTA_EXHAUSTED);
         }
@@ -1450,7 +1495,7 @@ impl ObjectInbox {
         stream.records.sort_by_key(|record| record.sequence);
         stream.known_head = stream.known_head.max(sequence);
         if stream.records.len() > DIRECT_WINDOW {
-            stream.floor = stream.records.remove(0).sequence;
+            self.missed += stream.evict_first();
         }
         // The encoded size is the persisted byte budget.
         while self.direct.iter().map(DirectStream::encoded_len).sum::<usize>()
@@ -1468,7 +1513,7 @@ impl ObjectInbox {
                         .sum::<usize>()
                 })
                 .ok_or("direct recovery metadata capacity exhausted")?;
-            stream.floor = stream.floor.max(stream.records.remove(0).sequence);
+            self.missed += stream.evict_first();
         }
         Ok(())
     }
@@ -1541,13 +1586,27 @@ impl ObjectInbox {
         };
         let mut next = self.clone();
         let mut count = 0;
+        // B7c: the reply is verified whole and holds every sequence in
+        // (after, through] in order. Admit the in-order prefix that fits the
+        // pending bounds. The first refused record and all after it are not
+        // recorded, so the stream keeps its gap from there and
+        // `next_direct_gap` asks for the rest after the application drains.
         for packet in packets {
-            match next.stage_with_recipients(
+            let staged = next.stage_with_recipients(
                 owner,
                 &packet.context,
                 &query.recipients,
                 &packet.ciphertext,
-            )? {
+            );
+            let staged = match staged {
+                // Nothing fits yet: report the refusal, claim nothing.
+                Err(error) if drains_with_application(error) && count == 0 => {
+                    return Err(error);
+                }
+                Err(error) if drains_with_application(error) => break,
+                staged => staged?,
+            };
+            match staged {
                 InboxStage::Prepared(candidate) => {
                     next = *candidate;
                     count += 1;
@@ -1638,6 +1697,58 @@ impl ObjectInbox {
             }
             false
         })
+    }
+
+    /// B7c: true when a direct object is the next missing sequence of its
+    /// scope and every pending object of its author waits behind a direct gap.
+    /// The application can then acknowledge nothing of this author, so the
+    /// quota alone would block the gap for good. Such an object may go over the
+    /// author quota. Once admitted it is deliverable, so the author has
+    /// deliverable work again and the next object meets the quota: the author
+    /// is over its quota by one object at most.
+    fn fills_blocking_gap(
+        &self,
+        author: [u8; 32],
+        context: &PublicationContext,
+        recipients: &[[u8; 32]],
+    ) -> bool {
+        let Some(sequence) = context.sequence.map(|sequence| sequence.get()) else {
+            return false;
+        };
+        if recipients.is_empty() {
+            return false;
+        }
+        let mut author_pending = self
+            .pending
+            .iter()
+            .filter(|pending| pending.author == author)
+            .peekable();
+        if author_pending.peek().is_none()
+            || !author_pending.all(|pending| self.behind_direct_gap(pending))
+        {
+            return false;
+        }
+        let expected = self
+            .direct
+            .iter()
+            .find(|stream| {
+                stream.author == author
+                    && stream.revision == context.revision
+                    && stream.topic == context.topic.as_str()
+                    && stream.recipients == recipients
+            })
+            .map_or(1, |stream| {
+                let mut expected = stream.floor.max(stream.recovery_floor).saturating_add(1);
+                for record in &stream.records {
+                    if record.sequence == expected {
+                        expected = expected.saturating_add(1);
+                    } else if record.sequence > expected {
+                        break;
+                    }
+                }
+                expected
+            });
+        sequence == expected
     }
 
     fn same_scope(a: &Pending, b: &Pending) -> bool {
@@ -2243,6 +2354,7 @@ impl ObjectInbox {
             progress: parsed.progress,
             current_progress: parsed.current_progress,
             direct: parsed.direct,
+            missed: 0,
         };
         inbox.validate_owner(owner)?;
         for range in &inbox.retained_ranges {

@@ -300,8 +300,9 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
         publisher.as_ref(),
         inbox.as_ref(),
     ).map_err(crate::errors::text)?;
-    let value =
+    let mut value =
         json!({"workspace":candidate.id(), "snapshot":snapshot, "state":state, "durable":false});
+    report_missed(session, inbox.as_ref(), &mut value);
     session.transition.staged = Some(StagedWorkspace {
         publisher,
         inbox,
@@ -310,6 +311,25 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
         snapshot,
     });
     Ok(value)
+}
+
+/// B7e: when staging moved a direct scope floor past a gap, report the
+/// sequences given up as `missing_count`, as an explicit miss does.
+fn report_missed(
+    session: &Session,
+    candidate: Option<&arachne_delivery::inbox::ObjectInbox>,
+    value: &mut Value,
+) {
+    let before = session
+        .delivery.inbox
+        .as_ref()
+        .map_or(0, arachne_delivery::inbox::ObjectInbox::missed_direct);
+    let missed = candidate
+        .map_or(0, arachne_delivery::inbox::ObjectInbox::missed_direct)
+        .saturating_sub(before);
+    if missed > 0 {
+        value["missing_count"] = json!(missed);
+    }
 }
 
 /// Stage only a locally requested, verified range; no caller-supplied reply bytes.
@@ -480,6 +500,7 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
         if ready.automatic {
             value["accepted_through"] = json!(covered);
         }
+        report_missed(session, Some(&next), &mut value);
         session.transition.staged = Some(StagedWorkspace {
             workspace: candidate,
             publisher: Some(publisher),
@@ -514,12 +535,21 @@ pub(super) fn stage_direct_recovery(session: &mut Session) -> Result<Value, Stri
         .storage_key
         .as_ref()
         .ok_or("session has no protected root key")?;
-    let (next, count) = session
+    // B7c: a partial range is admitted as its in-order prefix; the stream
+    // keeps its gap for the rest. When nothing fits, nothing is staged.
+    let (next, count) = match session
         .delivery.inbox
         .as_ref()
         .ok_or("no object delivery state")?
         .stage_direct_range(owner, &ready.query, &ready.reply)
-        .map_err(str::to_owned)?;
+    {
+        Err(error) if arachne_delivery::inbox::drains_with_application(error) => {
+            session.recovery.ready_direct_range = None;
+            return Ok(json!({"state":"direct_recovery_awaiting_application",
+                "accepted_progress":false}));
+        }
+        staged => staged.map_err(str::to_owned)?,
+    };
     if count == 0 {
         session.recovery.ready_direct_range = None;
         return Ok(json!({"state":"direct_recovery_already_covered"}));
@@ -533,9 +563,10 @@ pub(super) fn stage_direct_recovery(session: &mut Session) -> Result<Value, Stri
         Some(&next),
     ).map_err(crate::errors::text)?;
     let candidate = owner.provisional_copy().map_err(str::to_owned)?;
-    let value = json!({"workspace":owner.id(), "snapshot":snapshot,
+    let mut value = json!({"workspace":owner.id(), "snapshot":snapshot,
         "state":"awaiting_recovery_save", "publication_count":count,
         "durable":false, "accepted_progress":false});
+    report_missed(session, Some(&next), &mut value);
     session.transition.staged = Some(StagedWorkspace {
         workspace: candidate,
         publisher: Some(publisher),
