@@ -1151,8 +1151,9 @@ impl ObjectInbox {
             .fold((0, 0), |(count, bytes), pending| {
                 (count + 1, bytes + pending.encoded_len())
             });
-        if author_objects == MAX_PENDING_OBJECTS_PER_AUTHOR
-            || author_bytes + size > MAX_PENDING_BYTES_PER_AUTHOR
+        if (author_objects >= MAX_PENDING_OBJECTS_PER_AUTHOR
+            || author_bytes + size > MAX_PENDING_BYTES_PER_AUTHOR)
+            && !self.fills_blocking_gap(author, context, recipients)
         {
             return Err(AUTHOR_QUOTA_EXHAUSTED);
         }
@@ -1541,13 +1542,27 @@ impl ObjectInbox {
         };
         let mut next = self.clone();
         let mut count = 0;
+        // B7c: the reply is verified whole and holds every sequence in
+        // (after, through] in order. Admit the in-order prefix that fits the
+        // pending bounds. The first refused record and all after it are not
+        // recorded, so the stream keeps its gap from there and
+        // `next_direct_gap` asks for the rest after the application drains.
         for packet in packets {
-            match next.stage_with_recipients(
+            let staged = next.stage_with_recipients(
                 owner,
                 &packet.context,
                 &query.recipients,
                 &packet.ciphertext,
-            )? {
+            );
+            let staged = match staged {
+                // Nothing fits yet: report the refusal, claim nothing.
+                Err(error) if drains_with_application(error) && count == 0 => {
+                    return Err(error);
+                }
+                Err(error) if drains_with_application(error) => break,
+                staged => staged?,
+            };
+            match staged {
                 InboxStage::Prepared(candidate) => {
                     next = *candidate;
                     count += 1;
@@ -1638,6 +1653,58 @@ impl ObjectInbox {
             }
             false
         })
+    }
+
+    /// B7c: true when a direct object is the next missing sequence of its
+    /// scope and every pending object of its author waits behind a direct gap.
+    /// The application can then acknowledge nothing of this author, so the
+    /// quota alone would block the gap for good. Such an object may go over the
+    /// author quota. Once admitted it is deliverable, so the author has
+    /// deliverable work again and the next object meets the quota: the author
+    /// is over its quota by one object at most.
+    fn fills_blocking_gap(
+        &self,
+        author: [u8; 32],
+        context: &PublicationContext,
+        recipients: &[[u8; 32]],
+    ) -> bool {
+        let Some(sequence) = context.sequence.map(|sequence| sequence.get()) else {
+            return false;
+        };
+        if recipients.is_empty() {
+            return false;
+        }
+        let mut author_pending = self
+            .pending
+            .iter()
+            .filter(|pending| pending.author == author)
+            .peekable();
+        if author_pending.peek().is_none()
+            || !author_pending.all(|pending| self.behind_direct_gap(pending))
+        {
+            return false;
+        }
+        let expected = self
+            .direct
+            .iter()
+            .find(|stream| {
+                stream.author == author
+                    && stream.revision == context.revision
+                    && stream.topic == context.topic.as_str()
+                    && stream.recipients == recipients
+            })
+            .map_or(1, |stream| {
+                let mut expected = stream.floor.max(stream.recovery_floor).saturating_add(1);
+                for record in &stream.records {
+                    if record.sequence == expected {
+                        expected = expected.saturating_add(1);
+                    } else if record.sequence > expected {
+                        break;
+                    }
+                }
+                expected
+            });
+        sequence == expected
     }
 
     fn same_scope(a: &Pending, b: &Pending) -> bool {
