@@ -1265,7 +1265,7 @@ pub(crate) mod tests {
                 metrics.clone(),
                 None,
                 address_lookup,
-                None,
+                DialOptions::default(),
             );
             let max_message_size = actor.state.max_message_size();
 
