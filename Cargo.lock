@@ -319,6 +319,7 @@ version = "0.1.0"
 name = "arachne-runtime"
 version = "0.1.0"
 dependencies = [
+ "arachne-api",
  "arachne-delivery",
  "arachne-node",
  "arachne-routing",

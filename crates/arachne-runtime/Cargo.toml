@@ -17,6 +17,7 @@ publish = ["crates-io"]
 tor = ["arachne-node/tor"]
 
 [dependencies]
+arachne-api = { path = "../arachne-api", version = "0.1.0" }
 arachne-delivery = { path = "../arachne-delivery", version = "0.1.0" }
 arachne-routing = { path = "../arachne-routing", version = "0.1.0" }
 arachne-security = { path = "../arachne-security", version = "0.1.0" }

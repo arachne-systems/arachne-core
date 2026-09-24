@@ -4,8 +4,10 @@
 //! [`ApiError`] with stable [`ErrorCode`]s, [`Event`], [`Network`],
 //! [`Capabilities`] and [`API_VERSION`]. It has no I/O and no async runtime.
 //!
-//! Step 1 of the ADR migration adds this crate only. No other crate uses it
-//! yet. Typed request and result structs arrive with the op extraction (step 2).
+//! `arachne-runtime` returns [`ApiError`] from its typed operations (ADR
+//! step 2). The per-op request and result structs stay in the runtime until
+//! the JSON dispatcher is removed (step 9): the JSON wire carries IDs as byte
+//! arrays, while the ID newtypes here serialize as hex.
 //!
 //! Compatibility: every public enum is `#[non_exhaustive]`. A new variant,
 //! code or public field increments [`API_VERSION`]. Foreign bindings must keep
@@ -31,4 +33,7 @@ pub use network::Network;
 /// The version of the public contract. It increments for every change to a
 /// public type, variant, error code or op. Before 1.0 there is no
 /// compatibility promise; the SDK checks this value at load.
-pub const API_VERSION: u32 = 1;
+///
+/// History: 1 = first contract (ADR step 1). 2 = `ApiError::LimitReached`
+/// and a `detail` field on `ApiError::CapacityExceeded` (ADR step 2).
+pub const API_VERSION: u32 = 2;

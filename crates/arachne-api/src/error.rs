@@ -39,10 +39,16 @@ pub enum ErrorCode {
     InvalidId = 101,
     WrongState = 102,
     Unsupported = 103,
+    /// A resource is full for now (a queue, a worker pool); retry later.
     CapacityExceeded = 200,
+    /// A fixed limit is reached (sessions, advertisements, overlay paths).
     LimitReached = 201,
     StorageFailed = 300,
     StorageCorrupt = 301,
+    /// A staged candidate no longer matches the state it was staged from
+    /// (ADR decision 5). It stays in the storage range on purpose: a
+    /// candidate is a staged storage record, and "stale" means its stored
+    /// basis moved. Numbers never move, so this is also the stable place.
     CandidateStale = 302,
     PeerUnreachable = 400,
     Timeout = 401,
@@ -169,12 +175,38 @@ impl<'de> Deserialize<'de> for ErrorCode {
 /// The error of every public operation.
 ///
 /// Make it where the failure happens. Do not guess it from message text.
-/// Variants that carry a `code` take a code from their range: `Storage` takes
-/// 3xx, `Transport` 4xx, `Authorization` 5xx, and `State` takes 102, 103 or 6xx.
+///
+/// # Pairing rule
+///
+/// Variants that carry a `code` accept only codes from their own group:
+///
+/// | Variant         | Codes                                              |
+/// | --------------- | -------------------------------------------------- |
+/// | `Storage`       | 300-399 (`StorageFailed`, `StorageCorrupt`, `CandidateStale`) |
+/// | `Transport`     | 400-499                                            |
+/// | `Authorization` | 500-599                                            |
+/// | `State`         | `WrongState`, `Unsupported`, 600-699               |
+///
+/// The fields of an enum variant are public in Rust, so the compiler cannot
+/// stop a wrong pair. Make errors with the checked constructors
+/// ([`ApiError::new`] and the named ones such as [`ApiError::timeout`]); they
+/// always pick the right variant. [`ApiError::is_well_formed`] checks a value,
+/// and deserialization rejects a wrong pair.
+///
+/// # No secrets
+///
+/// `detail`, `reason`, `resource` and `kind` are for people. They must never
+/// hold key material, invitation tokens, snapshots, plaintext payloads or
+/// other secret bytes. Put only fixed text, lengths, counts and public IDs in
+/// them.
 // TODO(ADR A1/A4 step 7): `cfg_attr(feature = "uniffi", derive(uniffi::Error))`.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
-#[serde(tag = "error", rename_all = "snake_case")]
+#[serde(
+    tag = "error",
+    rename_all = "snake_case",
+    try_from = "UncheckedApiError"
+)]
 pub enum ApiError {
     #[error("closed")]
     Closed,
@@ -187,8 +219,25 @@ pub enum ApiError {
     /// Not in the ADR sketch; added so `ErrorCode::InvalidId` has a variant.
     #[error("invalid {kind} id: {reason}")]
     InvalidId { kind: String, reason: String },
-    #[error("capacity exceeded for {resource} (limit {limit})")]
-    CapacityExceeded { resource: String, limit: u64 },
+    /// A resource is full for now (a queue, a worker pool). A later retry can
+    /// succeed. `limit` is 0 when the bound is not one fixed number.
+    #[error("capacity exceeded for {resource} (limit {limit}): {detail}")]
+    CapacityExceeded {
+        resource: String,
+        limit: u64,
+        #[serde(default)]
+        detail: String,
+    },
+    /// A fixed limit is reached (sessions, advertisements, overlay paths).
+    /// It stays reached until something is released. `limit` is 0 when the
+    /// bound is not one fixed number. Added in API version 2.
+    #[error("limit reached for {resource} (limit {limit}): {detail}")]
+    LimitReached {
+        resource: String,
+        limit: u64,
+        #[serde(default)]
+        detail: String,
+    },
     #[error("storage error ({code}): {detail}")]
     Storage { code: ErrorCode, detail: String },
     #[error("transport error ({code}): {detail}")]
@@ -205,6 +254,101 @@ pub enum ApiError {
     Internal { detail: String },
 }
 
+/// The serde twin of [`ApiError`] without the pairing check.
+#[derive(Deserialize)]
+#[serde(tag = "error", rename_all = "snake_case")]
+enum UncheckedApiError {
+    Closed,
+    Cancelled,
+    DeadlineExceeded,
+    InvalidInput {
+        field: String,
+        reason: String,
+    },
+    InvalidId {
+        kind: String,
+        reason: String,
+    },
+    CapacityExceeded {
+        resource: String,
+        limit: u64,
+        #[serde(default)]
+        detail: String,
+    },
+    LimitReached {
+        resource: String,
+        limit: u64,
+        #[serde(default)]
+        detail: String,
+    },
+    Storage {
+        code: ErrorCode,
+        detail: String,
+    },
+    Transport {
+        code: ErrorCode,
+        peer: Option<EndpointId>,
+        detail: String,
+    },
+    Authorization {
+        code: ErrorCode,
+        detail: String,
+    },
+    State {
+        code: ErrorCode,
+        detail: String,
+    },
+    Internal {
+        detail: String,
+    },
+}
+
+impl TryFrom<UncheckedApiError> for ApiError {
+    type Error = String;
+
+    fn try_from(value: UncheckedApiError) -> Result<Self, String> {
+        use UncheckedApiError as U;
+        let error = match value {
+            U::Closed => Self::Closed,
+            U::Cancelled => Self::Cancelled,
+            U::DeadlineExceeded => Self::DeadlineExceeded,
+            U::InvalidInput { field, reason } => Self::InvalidInput { field, reason },
+            U::InvalidId { kind, reason } => Self::InvalidId { kind, reason },
+            U::CapacityExceeded {
+                resource,
+                limit,
+                detail,
+            } => Self::CapacityExceeded {
+                resource,
+                limit,
+                detail,
+            },
+            U::LimitReached {
+                resource,
+                limit,
+                detail,
+            } => Self::LimitReached {
+                resource,
+                limit,
+                detail,
+            },
+            U::Storage { code, detail } => Self::Storage { code, detail },
+            U::Transport { code, peer, detail } => Self::Transport { code, peer, detail },
+            U::Authorization { code, detail } => Self::Authorization { code, detail },
+            U::State { code, detail } => Self::State { code, detail },
+            U::Internal { detail } => Self::Internal { detail },
+        };
+        if error.is_well_formed() {
+            Ok(error)
+        } else {
+            Err(format!(
+                "error code {} does not belong to this variant",
+                error.code().as_u32()
+            ))
+        }
+    }
+}
+
 impl ApiError {
     /// The stable code. Programs branch on this, never on the text.
     pub fn code(&self) -> ErrorCode {
@@ -215,11 +359,207 @@ impl ApiError {
             Self::InvalidInput { .. } => ErrorCode::InvalidInput,
             Self::InvalidId { .. } => ErrorCode::InvalidId,
             Self::CapacityExceeded { .. } => ErrorCode::CapacityExceeded,
+            Self::LimitReached { .. } => ErrorCode::LimitReached,
             Self::Storage { code, .. }
             | Self::Transport { code, .. }
             | Self::Authorization { code, .. }
             | Self::State { code, .. } => *code,
             Self::Internal { .. } => ErrorCode::Internal,
+        }
+    }
+
+    /// Whether a `code` field belongs to its variant (see the pairing rule).
+    /// Values made by the constructors are always well formed.
+    pub fn is_well_formed(&self) -> bool {
+        use ErrorCode as C;
+        match self {
+            Self::Storage { code, .. } => {
+                matches!(code, C::StorageFailed | C::StorageCorrupt | C::CandidateStale)
+            }
+            Self::Transport { code, .. } => {
+                matches!(code, C::PeerUnreachable | C::Timeout | C::TransportFailed)
+            }
+            Self::Authorization { code, .. } => matches!(
+                code,
+                C::NotAuthorized | C::InvitationInvalid | C::InvitationExpired | C::NotMember
+            ),
+            Self::State { code, .. } => matches!(
+                code,
+                C::WrongState | C::Unsupported | C::EpochMismatch | C::PolicyMismatch
+            ),
+            _ => true,
+        }
+    }
+
+    /// The human text without the code prefix: the `detail` or `reason`, or
+    /// a fixed word for the variants without text.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Closed => "closed",
+            Self::Cancelled => "cancelled",
+            Self::DeadlineExceeded => "deadline exceeded",
+            Self::InvalidInput { reason, .. } | Self::InvalidId { reason, .. } => reason,
+            Self::CapacityExceeded { detail, .. }
+            | Self::LimitReached { detail, .. }
+            | Self::Storage { detail, .. }
+            | Self::Transport { detail, .. }
+            | Self::Authorization { detail, .. }
+            | Self::State { detail, .. }
+            | Self::Internal { detail } => detail,
+        }
+    }
+
+    /// The error for any code, with its right variant. Fields that the code
+    /// does not name get neutral values (empty `field`/`kind`/`resource`,
+    /// `limit` 0, no peer). Prefer a named constructor when one fits.
+    pub fn new(code: ErrorCode, detail: impl Into<String>) -> Self {
+        use ErrorCode as C;
+        let detail = detail.into();
+        match code {
+            C::Closed => Self::Closed,
+            C::Cancelled => Self::Cancelled,
+            C::DeadlineExceeded => Self::DeadlineExceeded,
+            C::InvalidInput => Self::InvalidInput {
+                field: String::new(),
+                reason: detail,
+            },
+            C::InvalidId => Self::InvalidId {
+                kind: String::new(),
+                reason: detail,
+            },
+            C::CapacityExceeded => Self::CapacityExceeded {
+                resource: String::new(),
+                limit: 0,
+                detail,
+            },
+            C::LimitReached => Self::LimitReached {
+                resource: String::new(),
+                limit: 0,
+                detail,
+            },
+            C::StorageFailed | C::StorageCorrupt | C::CandidateStale => {
+                Self::Storage { code, detail }
+            }
+            C::PeerUnreachable | C::Timeout | C::TransportFailed => Self::Transport {
+                code,
+                peer: None,
+                detail,
+            },
+            C::NotAuthorized | C::InvitationInvalid | C::InvitationExpired | C::NotMember => {
+                Self::Authorization { code, detail }
+            }
+            C::WrongState | C::Unsupported | C::EpochMismatch | C::PolicyMismatch => {
+                Self::State { code, detail }
+            }
+            C::Internal => Self::Internal { detail },
+        }
+    }
+
+    pub fn invalid_input(field: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::InvalidInput {
+            field: field.into(),
+            reason: reason.into(),
+        }
+    }
+
+    pub fn invalid_id(kind: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::InvalidId {
+            kind: kind.into(),
+            reason: reason.into(),
+        }
+    }
+
+    pub fn wrong_state(detail: impl Into<String>) -> Self {
+        Self::new(ErrorCode::WrongState, detail)
+    }
+
+    pub fn unsupported(detail: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Unsupported, detail)
+    }
+
+    pub fn capacity_exceeded(
+        resource: impl Into<String>,
+        limit: u64,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self::CapacityExceeded {
+            resource: resource.into(),
+            limit,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn limit_reached(
+        resource: impl Into<String>,
+        limit: u64,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self::LimitReached {
+            resource: resource.into(),
+            limit,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn storage_failed(detail: impl Into<String>) -> Self {
+        Self::new(ErrorCode::StorageFailed, detail)
+    }
+
+    pub fn storage_corrupt(detail: impl Into<String>) -> Self {
+        Self::new(ErrorCode::StorageCorrupt, detail)
+    }
+
+    pub fn candidate_stale(detail: impl Into<String>) -> Self {
+        Self::new(ErrorCode::CandidateStale, detail)
+    }
+
+    pub fn peer_unreachable(peer: Option<EndpointId>, detail: impl Into<String>) -> Self {
+        Self::transport(ErrorCode::PeerUnreachable, peer, detail)
+    }
+
+    pub fn timeout(peer: Option<EndpointId>, detail: impl Into<String>) -> Self {
+        Self::transport(ErrorCode::Timeout, peer, detail)
+    }
+
+    pub fn transport_failed(peer: Option<EndpointId>, detail: impl Into<String>) -> Self {
+        Self::transport(ErrorCode::TransportFailed, peer, detail)
+    }
+
+    fn transport(code: ErrorCode, peer: Option<EndpointId>, detail: impl Into<String>) -> Self {
+        Self::Transport {
+            code,
+            peer,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn not_authorized(detail: impl Into<String>) -> Self {
+        Self::new(ErrorCode::NotAuthorized, detail)
+    }
+
+    pub fn invitation_invalid(detail: impl Into<String>) -> Self {
+        Self::new(ErrorCode::InvitationInvalid, detail)
+    }
+
+    pub fn invitation_expired(detail: impl Into<String>) -> Self {
+        Self::new(ErrorCode::InvitationExpired, detail)
+    }
+
+    pub fn not_member(detail: impl Into<String>) -> Self {
+        Self::new(ErrorCode::NotMember, detail)
+    }
+
+    pub fn epoch_mismatch(detail: impl Into<String>) -> Self {
+        Self::new(ErrorCode::EpochMismatch, detail)
+    }
+
+    pub fn policy_mismatch(detail: impl Into<String>) -> Self {
+        Self::new(ErrorCode::PolicyMismatch, detail)
+    }
+
+    pub fn internal(detail: impl Into<String>) -> Self {
+        Self::Internal {
+            detail: detail.into(),
         }
     }
 }
