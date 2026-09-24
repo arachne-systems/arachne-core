@@ -374,6 +374,8 @@ struct Session {
 
 struct Registry {
     next: i64,
+    // Slots held by startups binding outside the lock; they count toward the cap.
+    reserved: usize,
     sessions: BTreeMap<i64, SharedSession>,
     // Kept outside the session mutex: a parked host never blocks `execute`.
     signals: BTreeMap<i64, Arc<work_signal::WorkSignal>>,
@@ -383,18 +385,53 @@ struct Registry {
 
 type SharedSession = Arc<Mutex<Option<Session>>>;
 
-// ponytail: Startup is serialized and capped at eight sessions; replace the registry
+// ponytail: Startup reserves a slot under the registry lock and binds outside it; sessions
+// are capped at eight; replace the registry
 // with owned sessions when the secured capacity harness requires more. Data operations take only
 // their session lock; a slow peer cannot hold the global registry during fanout.
 static REGISTRY: std::sync::LazyLock<Mutex<Registry>> = std::sync::LazyLock::new(|| {
     Mutex::new(Registry {
         next: 1,
+        reserved: 0,
         sessions: BTreeMap::new(),
         signals: BTreeMap::new(),
         cancellations: BTreeMap::new(),
         connection_budget: ConnectionBudget::default(),
     })
 });
+const MAX_SESSIONS: usize = 8;
+
+impl Registry {
+    /// Claim a handle and a session slot for a startup that binds outside the lock.
+    fn reserve(&mut self) -> Result<i64, String> {
+        if self.sessions.len() + self.reserved >= MAX_SESSIONS || self.next == i64::MAX {
+            return Err("node limit reached".into());
+        }
+        let handle = self.next;
+        self.next += 1;
+        self.reserved += 1;
+        Ok(handle)
+    }
+
+    fn release(&mut self) {
+        self.reserved -= 1;
+    }
+}
+
+/// Returns an unused startup slot to the registry if startup fails.
+struct Reservation {
+    armed: bool,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Ok(mut registry) = REGISTRY.lock() {
+                registry.release();
+            }
+        }
+    }
+}
 const MAX_DEVICE_OVERLAY_PATHS: usize = 24;
 const MAX_WORKSPACE_OVERLAY_PATHS: usize = 5;
 const NEARBY_INVITATION: &[u8; 5] = b"DFNI\x01";
@@ -551,16 +588,20 @@ fn create_endpoint(
     profile: NetworkProfile,
     relay: Option<RelayOptions>,
 ) -> Result<i64, String> {
-    let mut registry = REGISTRY.lock().map_err(|_| "node registry unavailable")?;
-    if registry.sessions.len() >= 8 || registry.next == i64::MAX {
-        return Err("node limit reached".into());
-    }
-    let connection_budget = registry.connection_budget.clone();
+    // Hold the registry only to reserve; a bind can take seconds and every
+    // other session's lookup needs this lock.
+    let (handle, connection_budget) = {
+        let mut registry = REGISTRY.lock().map_err(|_| "node registry unavailable")?;
+        (registry.reserve()?, registry.connection_budget.clone())
+    };
+    let mut reservation = Reservation { armed: true };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
+    #[cfg(test)]
+    tests::pause_bind(secret);
     let (node, receiver) = runtime
         .block_on(async {
             tokio::time::timeout(Duration::from_secs(10), async {
@@ -589,8 +630,6 @@ fn create_endpoint(
         })
         .map_err(|_| "node startup timed out")?
         .map_err(|e| e.to_string())?;
-    let handle = registry.next;
-    registry.next += 1;
     let signal = Arc::new(work_signal::WorkSignal::default());
     let committed = committed_view::Published::new(Some(Arc::clone(&signal)));
     node.set_inquiry_responder(committed.responder());
@@ -603,14 +642,9 @@ fn create_endpoint(
             forward.raise();
         }
     });
-    registry.signals.insert(handle, signal);
-    registry
-        .cancellations
-        .insert(handle, node.control_cancellation());
+    let cancellation = node.control_cancellation();
     let presence = presence::Presence::new()?;
-    registry.sessions.insert(
-        handle,
-        Arc::new(Mutex::new(Some(Session {
+    let shared = Arc::new(Mutex::new(Some(Session {
             resources: resources::Jobs::default(),
             presence,
             interests: interest::Updates::default(),
@@ -670,8 +704,13 @@ fn create_endpoint(
             node,
             receiver,
             runtime,
-        }))),
-    );
+        })));
+    let mut registry = REGISTRY.lock().map_err(|_| "node registry unavailable")?;
+    registry.signals.insert(handle, signal);
+    registry.cancellations.insert(handle, cancellation);
+    registry.sessions.insert(handle, shared);
+    registry.release();
+    reservation.armed = false;
     Ok(handle)
 }
 
@@ -6007,6 +6046,75 @@ fn execute_in_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type BindPause = (
+        [u8; 32],
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    );
+    static BIND_PAUSE: Mutex<Option<BindPause>> = Mutex::new(None);
+
+    /// Hold one endpoint bind (matched by secret) until the test releases it.
+    pub(super) fn pause_bind(secret: Option<&[u8; 32]>) {
+        let pause = {
+            let mut slot = BIND_PAUSE.lock().unwrap();
+            match (&*slot, secret) {
+                (Some((expected, _, _)), Some(secret)) if expected == secret => slot.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, entered, release)) = pause {
+            let _ = entered.send(());
+            // Returns when the test sends or drops its release handle.
+            let _ = release.recv();
+        }
+    }
+
+    #[test]
+    fn startup_reservations_count_toward_the_session_cap() {
+        let mut registry = Registry {
+            next: 1,
+            reserved: 0,
+            sessions: BTreeMap::new(),
+            signals: BTreeMap::new(),
+            cancellations: BTreeMap::new(),
+            connection_budget: ConnectionBudget::default(),
+        };
+        let handles: Vec<_> = (0..MAX_SESSIONS)
+            .map(|_| registry.reserve().unwrap())
+            .collect();
+        assert_eq!(handles, (1..=MAX_SESSIONS as i64).collect::<Vec<_>>());
+        assert_eq!(registry.reserve().unwrap_err(), "node limit reached");
+        // A failed startup returns its slot; handles are never reused.
+        registry.release();
+        assert_eq!(registry.reserve().unwrap(), MAX_SESSIONS as i64 + 1);
+    }
+
+    #[test]
+    fn slow_endpoint_bind_does_not_block_other_sessions() {
+        let other = create(Some(&[91; 32])).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        *BIND_PAUSE.lock().unwrap() = Some(([92; 32], entered_tx, release_rx));
+        let creator = std::thread::spawn(|| create(Some(&[92; 32])));
+        let entered = entered_rx.recv_timeout(Duration::from_secs(30));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let probe = std::thread::spawn(move || {
+            let _ = done_tx.send(describe(other).and_then(|_| cancel(other)));
+        });
+        // The timeout bounds only the failing case; an unblocked probe returns at once.
+        let probed = done_rx.recv_timeout(Duration::from_secs(5));
+        // Release the paused bind before any assertion so a failure cannot
+        // leave the registry locked for later tests.
+        drop(release_tx);
+        let created = creator.join().unwrap();
+        probe.join().unwrap();
+        entered.expect("paused bind did not start");
+        let probed = probed.expect("another session waited on a slow endpoint bind");
+        probed.unwrap();
+        close(created.unwrap()).unwrap();
+        close(other).unwrap();
+    }
 
     #[test]
     fn join_lifecycle_retries_after_the_last_peer() {
