@@ -204,7 +204,9 @@ fn recent_epochs_stay_readable_for_receive_only_then_expire() {
         PreparedManagementUpdate::Removed(_) => panic!("unexpected removal"),
     };
     let admin = Workspace::create([1; 32], "Publisher").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    // Registering the link is one membership commit (B1).
+    let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let admin = registered.workspace;
     let pending = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
     let prepared = admin
         .prepare_admission([2; 32], pending.admission_request().unwrap())
@@ -232,8 +234,17 @@ fn recent_epochs_stay_readable_for_receive_only_then_expire() {
         );
     };
 
-    // 1. Local admission (committer) and received admission update.
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    // 1. Local registration and admission (committer) and the received
+    // updates. Registering the link is its own epoch (B1).
+    let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    reader = active(
+        reader
+            .prepare_management_update(registered.action, &registered.commit)
+            .unwrap(),
+    );
+    admin = registered.workspace;
+    assert_eq!(admin.epoch(), start + 1);
+    both_read(&admin, &reader);
     let third = PendingJoin::from_invitation(&invite, &checkpoint, [3; 32], "Third").unwrap();
     let added = admin
         .prepare_admission([3; 32], third.admission_request().unwrap())
@@ -257,7 +268,7 @@ fn recent_epochs_stay_readable_for_receive_only_then_expire() {
     let fresh = admin.protect_object(b"app", b"ctx", b"newer").unwrap();
     assert_eq!(
         admin.unprotect_object(b"app", b"ctx", &fresh).unwrap().epoch,
-        start + 1
+        start + 2
     );
     assert_eq!(
         lagging.unprotect_object(b"app", b"ctx", &fresh).unwrap_err(),
@@ -278,7 +289,8 @@ fn recent_epochs_stay_readable_for_receive_only_then_expire() {
 
     // 3. Local invitation control and received update; the window survives
     // seal and restore.
-    for _ in 0..2 {
+    // Registration took one of the window's epochs in step 1.
+    for _ in 0..RECEIVE_EPOCHS - 3 {
         let (control, _, _) = admin.prepare_invitation(u64::MAX, false, false).unwrap();
         reader = active(
             reader
@@ -304,7 +316,7 @@ fn recent_epochs_stay_readable_for_receive_only_then_expire() {
     );
     assert_eq!(
         admin.unprotect_object(b"app", b"ctx", &fresh).unwrap().epoch,
-        start + 1
+        start + 2
     );
     let storage = admin.provider.storage().values.read().unwrap();
     let window = storage.get(RECEIVE_WINDOW).unwrap();
@@ -328,7 +340,8 @@ fn recent_epochs_stay_readable_for_receive_only_then_expire() {
 fn objects_are_bound_to_their_application_namespace() {
     use super::PendingJoin;
     let admin = Workspace::create([1; 32], "Publisher").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let admin = registered.workspace;
     let pending = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
     let prepared = admin
         .prepare_admission([2; 32], pending.admission_request().unwrap())
