@@ -705,6 +705,7 @@ pub fn describe(handle: i64) -> Result<String, String> {
                 "operation": transport.timeouts.operation,
                 "dial": transport.timeouts.dial,
                 "gossip_join": transport.timeouts.gossip_join,
+                "close_drain": transport.timeouts.close_drain,
             },
         },
     })
@@ -770,6 +771,9 @@ pub fn wait_for_work(handle: i64) -> Result<bool, String> {
     Ok(signal.wait())
 }
 
+/// Time `shutdown_session` allows for local teardown after the peer drain.
+const LOCAL_TEARDOWN: Duration = Duration::from_secs(2);
+
 fn shutdown_session(mut session: Session) -> Result<(), String> {
     release_overlay_paths(&DEVICE_OVERLAY_PATHS, session.overlay_paths);
     session.overlay_paths = 0;
@@ -782,9 +786,13 @@ fn shutdown_session(mut session: Session) -> Result<(), String> {
     session.recovery.ready_current_view = None;
     drop(session.recovery.range.take());
     session.resources = resources::Jobs::default();
-    let result = session.runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(5), session.node.close()).await
-    });
+    // `Node::close` bounds its peer drain by the close drain deadline (5 s by
+    // default, host-overridable). This guard only catches a stuck local
+    // teardown, so it allows the drain plus a small margin for the local work.
+    let deadline = session.node.timeouts().close_drain + LOCAL_TEARDOWN;
+    let result = session
+        .runtime
+        .block_on(async { tokio::time::timeout(deadline, session.node.close()).await });
     session.runtime.shutdown_timeout(Duration::from_secs(2));
     result.map_err(|_| "node shutdown timed out".into())
 }

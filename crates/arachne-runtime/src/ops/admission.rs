@@ -712,15 +712,8 @@ pub(crate) fn admission_reply_page(
     checkpoint: Option<&[u8]>,
     offset: usize,
 ) -> Result<Vec<u8>, ApiError> {
-    let mut reply =
+    let reply =
         serde_json::to_value(retained_reply(workspace, peer, request)?).map_err(errors::encode)?;
-    let too_large = |detail: &str| {
-        ApiError::limit_reached(
-            "control reply",
-            arachne_node::MAX_CONTROL_REPLY as u64,
-            detail,
-        )
-    };
     if let Some(checkpoint) = checkpoint {
         let mut steps = workspace
             .membership_history(peer, request, checkpoint)
@@ -731,50 +724,73 @@ pub(crate) fn admission_reply_page(
             .ok_or_else(|| ApiError::internal("retained admission missing from verified history"))?;
         steps.truncate(last + 1); // Retry may follow later Adds; Welcome pins this exact step.
         if offset >= steps.len() {
-            return Err(ApiError::invalid_input(
-                "offset",
-                "admission history page offset is out of bounds",
-            ));
+            return Err(page_offset_out_of_bounds());
         }
-        let mut page = Vec::new();
-        let mut next = offset;
-        for (authorization, commit) in steps.iter().skip(offset) {
-            let step = membership::step_json(authorization, commit);
-            let mut candidate = page.clone();
-            candidate.push(step);
-            reply["commits"] = json!(candidate);
-            reply["history_offset"] = json!(offset);
-            reply["history_next"] = json!(next + 1);
-            reply["history_complete"] = json!(next + 1 == steps.len());
-            if serde_json::to_vec(&reply).map_err(errors::encode)?.len()
-                > arachne_node::MAX_CONTROL_REPLY
-            {
-                if page.is_empty() {
-                    return Err(too_large("admission history step exceeds transport bound"));
+        let steps: Vec<Value> = steps
+            .iter()
+            .map(|(authorization, commit)| membership::step_json(authorization, commit))
+            .collect();
+        return admission_history_page(reply, &steps, offset, arachne_node::MAX_CONTROL_REPLY);
+    }
+    let encoded = serde_json::to_vec(&reply).map_err(errors::encode)?;
+    if encoded.len() > arachne_node::MAX_CONTROL_REPLY {
+        return Err(reply_too_large("admission reply exceeds transport bound"));
+    }
+    Ok(encoded)
+}
+
+fn page_offset_out_of_bounds() -> ApiError {
+    ApiError::invalid_input("offset", "admission history page offset is out of bounds")
+}
+
+fn reply_too_large(detail: &str) -> ApiError {
+    ApiError::limit_reached(
+        "control reply",
+        arachne_node::MAX_CONTROL_REPLY as u64,
+        detail,
+    )
+}
+
+/// Fill one admission reply with as many history steps from `offset` as fit
+/// in `limit` encoded bytes.
+///
+/// Each candidate is encoded in its exact final form (every paging field it
+/// will carry) and the bytes returned are the bytes measured, so the reply is
+/// bounded by construction. B3d: the size used to be checked before
+/// `history_page` was added, so a page filled to within 20 bytes of the bound
+/// overshot it; random commit bytes (1-3 JSON digits each) moved the fill
+/// point, so it failed only sometimes.
+fn admission_history_page(
+    mut reply: Value,
+    steps: &[Value],
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<u8>, ApiError> {
+    if offset >= steps.len() {
+        return Err(page_offset_out_of_bounds());
+    }
+    let mut fitted = None;
+    for next in offset + 1..=steps.len() {
+        reply["commits"] = json!(steps[offset..next]);
+        if offset == 0 && next == steps.len() {
+            if let Some(object) = reply.as_object_mut() {
+                for key in ["history_offset", "history_next", "history_complete", "history_page"] {
+                    object.remove(key);
                 }
-                break;
             }
-            page = candidate;
-            next += 1;
-        }
-        reply["commits"] = json!(page);
-        if next < steps.len() || offset > 0 {
+        } else {
             reply["history_offset"] = json!(offset);
             reply["history_next"] = json!(next);
             reply["history_complete"] = json!(next == steps.len());
             reply["history_page"] = json!(true);
-        } else if let Some(object) = reply.as_object_mut() {
-            object.remove("history_offset");
-            object.remove("history_next");
-            object.remove("history_complete");
-            object.remove("history_page");
         }
+        let encoded = serde_json::to_vec(&reply).map_err(errors::encode)?;
+        if encoded.len() > limit {
+            break;
+        }
+        fitted = Some(encoded);
     }
-    let encoded = serde_json::to_vec(&reply).map_err(errors::encode)?;
-    if encoded.len() > arachne_node::MAX_CONTROL_REPLY {
-        return Err(too_large("admission reply exceeds transport bound"));
-    }
-    Ok(encoded)
+    fitted.ok_or_else(|| reply_too_large("admission history step exceeds transport bound"))
 }
 
 pub(crate) fn send_inbound_admission_reply(session: &mut Session) -> Result<ReplySent, ApiError> {
@@ -1529,6 +1545,71 @@ mod tests {
             (&[7, 8][..], 3)
         );
         assert!(parse_admission_history_page_packet(&[page.as_slice(), &[9]].concat()).is_err());
+    }
+
+    /// B3d: every admission history page must fit the byte limit it was
+    /// filled against, whatever fill point the (random) commit bytes land on.
+    /// Sweeping the limit byte by byte forces every fill point, including one
+    /// that leaves less room than the fields added after the size check.
+    #[test]
+    fn every_admission_history_page_fits_its_limit_at_every_fill_point() {
+        let reply = json!({"workspace":(vec![7_u8; 32]), "epoch":42_u64, "commit":(vec![200_u8; 40]),
+            "welcome":(vec![9_u8; 64]), "authorization":{"invitation_key":(vec![1_u8; 32]),
+            "grant_signature":(vec![2_u8; 64]), "redemption_signature":(vec![3_u8; 64])}});
+        let steps: Vec<Value> = (0..12_usize)
+            .map(|index| {
+                let commit: Vec<u8> = (0..40 + index * 23)
+                    .map(|byte| ((byte * 37 + index * 11) % 256) as u8)
+                    .collect();
+                json!({"commit":commit, "authorization":{"invitation_key":(vec![index as u8; 32])}})
+            })
+            .collect();
+        let whole = serde_json::to_vec(&{
+            let mut whole = reply.clone();
+            whole["commits"] = json!(steps);
+            whole
+        })
+        .unwrap()
+        .len();
+        for offset in [0, 3] {
+            for limit in 200..whole + 64 {
+                let encoded = match admission_history_page(reply.clone(), &steps, offset, limit) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        assert_eq!(
+                            error.message(),
+                            "admission history step exceeds transport bound",
+                            "offset={offset} limit={limit}"
+                        );
+                        assert_eq!(error.code(), ErrorCode::LimitReached);
+                        continue;
+                    }
+                };
+                assert!(
+                    encoded.len() <= limit,
+                    "offset={offset} limit={limit}: page of {} bytes overshoots by {}",
+                    encoded.len(),
+                    encoded.len() - limit
+                );
+                let page: Value = serde_json::from_slice(&encoded).unwrap();
+                let carried = page["commits"].as_array().unwrap();
+                assert_eq!(carried[..], steps[offset..offset + carried.len()]);
+                if page.get("history_page").is_some() {
+                    assert_eq!(page["history_page"], json!(true));
+                    assert_eq!(page["history_offset"], json!(offset));
+                    let next = page["history_next"].as_u64().unwrap() as usize;
+                    assert!(next > offset, "offset={offset} limit={limit}: no progress");
+                    assert_eq!(next, offset + carried.len());
+                    assert_eq!(page["history_complete"], json!(next == steps.len()));
+                } else {
+                    assert_eq!(offset, 0);
+                    assert_eq!(carried.len(), steps.len());
+                    for key in ["history_offset", "history_next", "history_complete"] {
+                        assert!(page.get(key).is_none(), "unpaged reply carries {key}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
