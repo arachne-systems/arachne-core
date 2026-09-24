@@ -704,12 +704,24 @@ impl ObjectInbox {
             return Err("inbox cannot advance to this owner");
         }
         let oldest = next.oldest_receive_epoch();
+        let member = |id: &[u8; 32]| next.endpoints_for_members(&[*id]).is_ok();
+        let before: BTreeSet<_> = previous.member_endpoints()?.into_iter().collect();
+        let admits = next
+            .member_endpoints()?
+            .iter()
+            .any(|endpoint| !before.contains(endpoint));
         let mut advanced = self.clone();
         advanced.epoch = next.epoch();
         advanced.replay.retain(|replay| replay.epoch >= oldest);
         advanced.progress.retain(|progress| progress.epoch >= oldest);
+        // Retained third-party ranges: only from current members, and none
+        // from before a join (a holder never serves pre-join history).
         advanced.retained_ranges.retain(|range| {
-            RangeQuery::from_wire(&range.query).is_ok_and(|query| query.epoch >= oldest)
+            RangeQuery::from_wire(&range.query).is_ok_and(|query| {
+                query.epoch >= oldest
+                    && member(&query.author)
+                    && (!admits || query.epoch >= next.epoch())
+            })
         });
         advanced.current = None;
         advanced.retained_current_views.clear();
@@ -723,9 +735,13 @@ impl ObjectInbox {
                 stream.floor = stream.floor.max(stream.records.remove(0).sequence);
             }
         }
-        advanced
-            .direct
-            .retain(|stream| !stream.records.is_empty() || stream.known_head != 0);
+        // A direct scope that names a removed member ends: its copies can no
+        // longer be authenticated or served to that audience.
+        advanced.direct.retain(|stream| {
+            (!stream.records.is_empty() || stream.known_head != 0)
+                && member(&stream.author)
+                && stream.recipients.iter().all(member)
+        });
         advanced.snapshot()?;
         Ok(advanced)
     }

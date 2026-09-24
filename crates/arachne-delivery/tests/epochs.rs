@@ -310,6 +310,82 @@ fn publisher_history_never_shrinks_to_make_room_for_inbox_state() {
     let _ = &mut b;
 }
 
+fn direct(
+    author: &mut Workspace,
+    inbox: &ObjectInbox,
+    recipient: [u8; 32],
+    id: u8,
+) -> (PublicationContext, Vec<u8>) {
+    let topic = Topic::new("chat/direct").unwrap();
+    let context = PublicationContext {
+        workspace: author.id(),
+        revision: REVISION,
+        topic: topic.clone(),
+        id: [id; 16],
+        sequence: Some(
+            inbox
+                .next_direct_sequence(author, REVISION, &topic, &[recipient])
+                .unwrap(),
+        ),
+    };
+    let object = author
+        .protect_object(
+            b"chat",
+            &context.direct_authenticated_bytes(&[recipient]).unwrap(),
+            &[id],
+        )
+        .unwrap();
+    (context, object)
+}
+
+#[test]
+fn state_that_names_a_removed_member_does_not_block_restore() {
+    let (mut a, mut b, _, _) = admit(Workspace::create([1; 32], "A").unwrap(), [2; 32], "B");
+    let a_member = a.member().unwrap().id();
+    let b_member = b.member().unwrap().id();
+    let mut a_log = PublisherLog::new(&a).unwrap();
+    let mut b_log = PublisherLog::new(&b).unwrap();
+    let mut a_inbox = ObjectInbox::new(a.id(), a.epoch());
+    let b_inbox = ObjectInbox::new(b.id(), b.epoch());
+    // A sends B a direct object (A keeps a sender copy) and B sends A one.
+    let (context, object) = direct(&mut a, &a_inbox, b_member, 1);
+    a_inbox = a_inbox
+        .stage_sent_direct(&a, &context, &[b_member], &object)
+        .unwrap();
+    let (context, object) = direct(&mut b, &b_inbox, a_member, 2);
+    let InboxStage::Prepared(next) = a_inbox
+        .stage_with_recipients(&a, &context, &[a_member], &object)
+        .unwrap()
+    else {
+        panic!("direct object was not new")
+    };
+    (a_inbox, _) = acknowledge(&next, &a);
+    // A holds a retained range authored by B.
+    publish(&mut b, &mut b_log, 3);
+    let query = range(&b, b.epoch(), 1);
+    let reply = wire::serve_range(&b_log, &b, &policy(b.id()), a.endpoint(), &query).unwrap();
+    a_inbox = a_inbox
+        .retain_range(
+            &a,
+            &query,
+            &reply,
+            u64::MAX,
+            arachne_delivery::UnixSeconds(0),
+        )
+        .unwrap();
+    publish(&mut a, &mut a_log, 4);
+
+    // A removes B. The carried state still saves and restores.
+    let removed = a
+        .prepare_management(ManagementAction::Remove(b_member))
+        .unwrap()
+        .workspace;
+    let a_inbox = a_inbox.advance(&a, &removed).unwrap();
+    let a_log = a_log.advance(&a, &removed).unwrap();
+    let bytes = a_inbox.snapshot_with_publisher(&removed, &a_log).unwrap();
+    ObjectInbox::restore_snapshot(&removed, &bytes).unwrap();
+}
+
 #[test]
 fn members_at_different_epochs_exchange_data_after_a_partition_heals() {
     // A and B share an epoch.
@@ -326,6 +402,18 @@ fn members_at_different_epochs_exchange_data_after_a_partition_heals() {
     b_inbox = stage(&b_inbox, &b, &a0_context, &a0);
     // B sends one object that A misses.
     let (b1_context, b1) = publish(&mut b, &mut b_log, 21);
+    // A holds a copy of B's range for third-party recovery.
+    let held = range(&b, start, 1);
+    let held_reply = wire::serve_range(&b_log, &b, &policy(b.id()), a.endpoint(), &held).unwrap();
+    a_inbox = a_inbox
+        .retain_range(
+            &a,
+            &held,
+            &held_reply,
+            u64::MAX,
+            arachne_delivery::UnixSeconds(0),
+        )
+        .unwrap();
 
     // Partition. A admits C: two epochs. B does not see the commits.
     let previous_a = a.provisional_copy().unwrap();
@@ -341,6 +429,20 @@ fn members_at_different_epochs_exchange_data_after_a_partition_heals() {
         .advance(&middle, &a)
         .unwrap();
     assert_eq!(a_log.epochs(), vec![start, start + 1, start + 2]);
+    // A holder never serves pre-join history: the held copy of the old
+    // epoch is dropped when a member joins.
+    assert_eq!(
+        a_inbox
+            .serve_range(
+                &a,
+                &policy(a.id()),
+                c.endpoint(),
+                &held,
+                arachne_delivery::UnixSeconds(1)
+            )
+            .unwrap(),
+        wire::unavailable_reply()
+    );
     // Both sides keep sending in their own epoch.
     let (a1_context, a1) = publish(&mut a, &mut a_log, 11);
     let (b2_context, b2) = publish(&mut b, &mut b_log, 22);
