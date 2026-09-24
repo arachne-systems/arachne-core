@@ -1942,7 +1942,10 @@ impl Client {
     pub fn adopt_recovery(&self, snapshot: &[u8]) -> Result<RecoveryAdoption> {
         let adopted = self.adopt(Op::AdoptRecovery, candidate::adopt_recovery, snapshot)?;
         let (recovered_publications, missing_publications) = match adopted.state {
-            Some("recovery_adopted") => (adopted.publication_count.unwrap_or(0), 0),
+            Some("recovery_adopted") => (
+                adopted.publication_count.unwrap_or(0),
+                adopted.missing_count.unwrap_or(0) as usize,
+            ),
             Some("direct_miss_adopted") => (0, adopted.missing_count.unwrap_or(0) as usize),
             other => {
                 return Err(error(

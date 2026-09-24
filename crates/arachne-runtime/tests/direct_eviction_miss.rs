@@ -99,6 +99,7 @@ fn evicting_past_a_direct_gap_reports_the_miss_and_keeps_order() {
             "revision":3,"topic":TOPIC}),
     );
     let mut missing = 0;
+    let mut adopted_missing = 0;
     for sequence in 2..=LIVE_THROUGH {
         let sent = publish(sender, &recipients, sequence);
         assert_eq!(sent["sequence"], sequence);
@@ -111,11 +112,16 @@ fn evicting_past_a_direct_gap_reports_the_miss_and_keeps_order() {
             assert!(Instant::now() < deadline, "sequence {sequence} not received");
             std::thread::sleep(Duration::from_millis(5));
         };
-        missing += staged["missing_count"].as_u64().unwrap_or(0);
-        call(
+        let staged_missing = staged["missing_count"].as_u64().unwrap_or(0);
+        missing += staged_missing;
+        let adopted = call(
             receiver,
             json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
         );
+        // B7f-1: the adoption reports the same miss as the staging reply.
+        let adopted_here = adopted["missing_count"].as_u64().unwrap_or(0);
+        assert_eq!(adopted_here, staged_missing, "sequence {sequence}");
+        adopted_missing += adopted_here;
         if sequence < LIVE_THROUGH {
             assert!(
                 call(receiver, json!({"op":"poll_pending_object"})).is_null(),
@@ -124,6 +130,7 @@ fn evicting_past_a_direct_gap_reports_the_miss_and_keeps_order() {
         }
     }
     assert_eq!(missing, 1, "the skipped sequence was not reported as missed");
+    assert_eq!(adopted_missing, 1, "the adoption did not report the miss");
     assert!(call(receiver, json!({"op":"next_direct_gap"})).is_null());
     let mut delivered = Vec::new();
     loop {

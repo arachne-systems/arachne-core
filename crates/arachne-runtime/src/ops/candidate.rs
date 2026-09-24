@@ -271,6 +271,9 @@ pub(crate) fn adopt(
         reply_queued: None,
         activity: activity_view(session),
     };
+    // B7f-1: direct sequences this step gave up (B7e), reported on the
+    // adoption as on the staging reply.
+    let missed = crate::ops::publication::missed_since_commit(session, staged.inbox.as_ref());
     session.delivery.publisher = staged.publisher;
     session.delivery.inbox = staged.inbox;
     if matches!(&staged.transition, WorkspaceTransition::Join) {
@@ -440,6 +443,9 @@ pub(crate) fn adopt(
         });
     if committed_here || reached_head {
         membership::announce_head(session);
+    }
+    if value.missing_count.is_none() {
+        value.missing_count = missed;
     }
     value.activity = activity_view(session);
     Ok(AdoptReply::Adopted(Box::new(value)))
