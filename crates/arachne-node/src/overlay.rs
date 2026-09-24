@@ -40,46 +40,99 @@ const BOOTSTRAP_RETRY_DELAYS: [Duration; 3] = [
 /// The one overlay topic delivered across policy revisions (ADR 0008). Only
 /// self-authenticating membership steps may use it.
 pub(super) const MEMBERSHIP_TOPIC: &str = "arachne/membership/1";
-const MAX_MEMBERSHIP_QUEUE: usize = 64;
+/// Membership steps queued per (workspace, author). A flooding member fills
+/// only its own queue; steps are taken round-robin across authors.
+const MAX_MEMBERSHIP_PER_SENDER: usize = 8;
+/// Authors with queued steps. Only verified overlay members can author one.
+const MAX_MEMBERSHIP_SENDERS: usize = 64;
 
-/// One membership message received by gossip: its workspace and opaque bytes.
-type MembershipMessage = (WorkspaceId, Vec<u8>);
+/// Queued membership steps of one workspace author: (revision, bytes).
+type SenderQueue = std::collections::VecDeque<(u64, Vec<u8>)>;
 
-/// Membership steps received by gossip, waiting for the host. Bounded; an
-/// arrival wakes the host through the control signal.
+#[derive(Default)]
+struct MembershipQueues {
+    by_sender: std::collections::BTreeMap<(WorkspaceId, PeerId), SenderQueue>,
+    /// Authors with queued steps, in the order they are served.
+    turn: std::collections::VecDeque<(WorkspaceId, PeerId)>,
+}
+
+impl MembershipQueues {
+    /// Take the next step of the first author in turn that matches.
+    fn take(&mut self, matches: impl Fn(&WorkspaceId) -> bool) -> Option<(WorkspaceId, Vec<u8>)> {
+        let index = self.turn.iter().position(|(workspace, _)| matches(workspace))?;
+        let key = self.turn.remove(index)?;
+        let queue = self.by_sender.get_mut(&key)?;
+        let (_, payload) = queue.pop_front()?;
+        if queue.is_empty() {
+            self.by_sender.remove(&key);
+        } else {
+            self.turn.push_back(key);
+        }
+        Some((key.0, payload))
+    }
+}
+
+/// Membership steps received by gossip, waiting for the host. Bounded per
+/// author and in authors; an arrival wakes the host through the control signal.
 #[derive(Clone)]
 pub(super) struct MembershipInbox {
-    queue: Arc<StdMutex<std::collections::VecDeque<MembershipMessage>>>,
+    queues: Arc<StdMutex<MembershipQueues>>,
     signal: Arc<Notify>,
 }
 
 impl MembershipInbox {
     pub(super) fn new(signal: Arc<Notify>) -> Self {
         Self {
-            queue: Arc::default(),
+            queues: Arc::default(),
             signal,
         }
     }
 
-    fn offer(&self, workspace: WorkspaceId, payload: Vec<u8>) {
-        let mut queue = self.queue.lock().unwrap();
-        if queue.len() >= MAX_MEMBERSHIP_QUEUE {
-            tracing::warn!(target: "data_fabric_transport", "GOSSIP_MEMBERSHIP_QUEUE_FULL");
-            return;
+    /// Queue a step from a verified author. When the author's queue is full,
+    /// a step of a newer policy revision replaces its oldest-revision step;
+    /// otherwise the new step is dropped.
+    fn offer(&self, workspace: WorkspaceId, sender: PeerId, revision: u64, payload: Vec<u8>) {
+        let mut queues = self.queues.lock().unwrap();
+        let key = (workspace, sender);
+        if !queues.by_sender.contains_key(&key) {
+            if queues.by_sender.len() >= MAX_MEMBERSHIP_SENDERS {
+                tracing::warn!(target: "data_fabric_transport", "GOSSIP_MEMBERSHIP_QUEUE_FULL");
+                return;
+            }
+            queues.turn.push_back(key);
         }
-        queue.push_back((workspace, payload));
-        drop(queue);
+        let queue = queues.by_sender.entry(key).or_default();
+        if queue.len() >= MAX_MEMBERSHIP_PER_SENDER {
+            let oldest = queue
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (revision, _))| *revision)
+                .map(|(index, (revision, _))| (index, *revision));
+            match oldest {
+                Some((index, oldest)) if oldest < revision => {
+                    queue.remove(index);
+                }
+                _ => {
+                    tracing::warn!(target: "data_fabric_transport", "GOSSIP_MEMBERSHIP_SENDER_QUEUE_FULL");
+                    return;
+                }
+            }
+        }
+        queue.push_back((revision, payload));
+        drop(queues);
         self.signal.notify_one();
     }
 
     pub(super) fn pop(&self) -> Option<(WorkspaceId, Vec<u8>)> {
-        self.queue.lock().unwrap().pop_front()
+        self.queues.lock().unwrap().take(|_| true)
     }
 
     pub(super) fn pop_for(&self, workspace: WorkspaceId) -> Option<Vec<u8>> {
-        let mut queue = self.queue.lock().unwrap();
-        let index = queue.iter().position(|(scope, _)| *scope == workspace)?;
-        queue.remove(index).map(|(_, payload)| payload)
+        self.queues
+            .lock()
+            .unwrap()
+            .take(|scope| *scope == workspace)
+            .map(|(_, payload)| payload)
     }
 }
 
@@ -283,7 +336,7 @@ impl Overlay {
                         // epoch must still hear the step that moves it on.
                         if envelope.topic == MEMBERSHIP_TOPIC {
                             tracing::info!(target: "data_fabric_transport", bytes = envelope.payload.len(), from = %message.delivered_from.fmt_short(), "GOSSIP_MEMBERSHIP_RECEIVED");
-                            membership.offer(envelope.workspace, envelope.payload);
+                            membership.offer(envelope.workspace, envelope.sender, envelope.revision, envelope.payload);
                             continue;
                         }
                         // Only membership messages may use the frame-sized bound.
@@ -725,11 +778,34 @@ async fn membership_inbox_wakes_and_scopes_queued_payloads() {
     let signal = Arc::new(Notify::new());
     let inbox = MembershipInbox::new(signal.clone());
     let notified = signal.notified();
-    inbox.offer([1; 32], vec![1]);
+    inbox.offer([1; 32], [7; 32], 1, vec![1]);
     notified.await;
-    inbox.offer([2; 32], vec![2]);
+    inbox.offer([2; 32], [7; 32], 1, vec![2]);
     assert_eq!(inbox.pop_for([2; 32]), Some(vec![2]));
     assert_eq!(inbox.pop_for([1; 32]), Some(vec![1]));
+}
+
+/// One member flooding membership gossip must not crowd another member's
+/// step out of the inbox: the next step may be the one that removes it.
+#[test]
+fn a_flooding_member_cannot_crowd_out_another_members_step() {
+    let inbox = MembershipInbox::new(Arc::new(Notify::new()));
+    for step in 0..128_u64 {
+        inbox.offer([1; 32], [2; 32], 1, step.to_be_bytes().to_vec());
+    }
+    inbox.offer([1; 32], [3; 32], 1, b"from-b".to_vec());
+    // A full author queue takes a newer revision's step over its oldest.
+    inbox.offer([1; 32], [2; 32], 2, b"next-revision".to_vec());
+    let drained: Vec<_> = std::iter::from_fn(|| inbox.pop()).collect();
+    assert!(
+        drained.iter().any(|(_, payload)| payload == b"from-b"),
+        "the other member's step was dropped after {} queued",
+        drained.len()
+    );
+    // Authors are served in turn, and one author holds a bounded share.
+    assert_eq!(drained[1].1, b"from-b");
+    assert_eq!(drained.len(), MAX_MEMBERSHIP_PER_SENDER + 1);
+    assert!(drained.iter().any(|(_, payload)| payload == b"next-revision"));
 }
 
 #[test]
