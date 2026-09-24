@@ -550,6 +550,7 @@ impl Node {
             // peers cannot occupy the slots needed to reach the control budget.
             let handshake_capacity = budget.handshakes;
             let [data_capacity, control_capacity] = budget.exchanges;
+            let stranger_capacity = budget.stranger_exchanges;
             let mut workers = tokio::task::JoinSet::new();
             while let Some(incoming) = accepted_connections.accept().await {
                 while workers.try_join_next().is_some() {}
@@ -560,6 +561,7 @@ impl Node {
                 let control_inbox = control_inbox.clone();
                 let control_capacity = control_capacity.clone();
                 let data_capacity = data_capacity.clone();
+                let stranger_capacity = stranger_capacity.clone();
                 let routing = shared.clone();
                 let overlays = accepted_overlays.clone();
                 let connections = accepted_connections.clone();
@@ -640,7 +642,11 @@ impl Node {
                             tokio::select! {
                                 streams = connection.accept_bi() => {
                                     let Ok((mut send, mut recv)) = streams else { return Ok(()); };
-                                    let Ok(permit) = capacity.clone().try_acquire_owned() else {
+                                    // Strangers (no installed policy names them) share
+                                    // their own part of the control exchanges.
+                                    let stranger = is_control && !connections.is_member(&sender);
+                                    let stranger_permit = stranger.then(|| stranger_capacity.clone().try_acquire_owned());
+                                    let (Ok(permit), None | Some(Ok(_))) = (capacity.clone().try_acquire_owned(), &stranger_permit) else {
                                         let _ = send.reset(1u8.into());
                                         let _ = recv.stop(1u8.into());
                                         continue;
@@ -648,7 +654,7 @@ impl Node {
                                     idle.as_mut().reset(tokio::time::Instant::now() + CONNECTION_IDLE);
                                     let guard = connections.exchange(connection_key);
                                     exchanges.push(async move {
-                                        let _permit = permit;
+                                        let _permits = (permit, stranger_permit);
                                         let _guard = guard;
                                         let result = async {
                                             if !is_control {
@@ -663,7 +669,7 @@ impl Node {
                                             }
                                             tokio::time::timeout(budget, async {
                                               if is_control {
-                                                control::receive(connection, control_inbox, address, (&mut send, &mut recv)).await
+                                                control::receive(connection, control_inbox, address, stranger, (&mut send, &mut recv)).await
                                               } else {
                                                 receive_frame(connection, connections, routing, output, address, (&mut send, &mut recv)).await
                                               }
@@ -874,11 +880,11 @@ impl Node {
     ) -> Result<()> {
         let existing = self.overlays.lock().await.get(&workspace).cloned();
         let peers = endpoint_permissions.keys().copied().collect::<Vec<_>>();
-        self.routing.lock().await.install_verified_policy(
-            workspace,
-            revision,
-            endpoint_permissions,
-        )?;
+        {
+            let mut routing = self.routing.lock().await;
+            routing.install_verified_policy(workspace, revision, endpoint_permissions)?;
+            self.connections.set_members(routing.endpoints());
+        }
         self.resources.policy_changed();
         if let Some(existing) = existing {
             let tag = existing.tag;

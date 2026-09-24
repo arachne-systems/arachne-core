@@ -149,6 +149,7 @@ fn unreachable_backoff(failures: u32) -> std::time::Duration {
 pub(super) struct Connections {
     endpoint: Endpoint,
     budget: ConnectionBudget,
+    members: super::budget::Members,
     bound_address: SocketAddr,
     addresses: Arc<Mutex<BTreeMap<PeerId, SocketAddr>>>,
     memory: MemoryLookup,
@@ -198,6 +199,7 @@ impl Connections {
         };
         let gossip_authorization = GossipAuthorization::default();
         let observer = ConnectionObserver::default();
+        let members = super::budget::Members::default();
         #[cfg(feature = "tor")]
         let builder = if let Some(tor_transport) = tor_transport.as_ref() {
             Endpoint::builder(tor_transport.preset())
@@ -224,7 +226,10 @@ impl Connections {
         }
         .alpns(alpns)
         .hooks(gossip_authorization.clone())
-        .hooks(budget.clone())
+        .hooks(super::budget::Admission {
+            budget: budget.clone(),
+            members: members.clone(),
+        })
         .hooks(observer.clone());
         if !profile.uses_tor() {
             builder = builder.address_lookup(memory.clone());
@@ -291,6 +296,7 @@ impl Connections {
         Ok(Self {
             endpoint,
             budget,
+            members,
             bound_address,
             addresses: Arc::new(Mutex::new(BTreeMap::new())),
             memory,
@@ -353,6 +359,15 @@ impl Connections {
 
     pub(super) fn capacity_counts(&self) -> super::budget::CapacityCounts {
         self.budget.capacity_counts()
+    }
+
+    /// Replace the endpoints the installed policies name.
+    pub(super) fn set_members(&self, members: BTreeSet<PeerId>) {
+        self.members.replace(members);
+    }
+
+    pub(super) fn is_member(&self, peer: &PeerId) -> bool {
+        self.members.contains(peer)
     }
 
     pub(super) fn mark_evictable(&self, id: usize) {

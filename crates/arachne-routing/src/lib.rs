@@ -176,6 +176,15 @@ impl RoutingTable {
             .collect())
     }
 
+    /// Every endpoint the current policy of any workspace names. A connection
+    /// from any other endpoint carries no workspace authority at all.
+    pub fn endpoints(&self) -> BTreeSet<PeerId> {
+        self.workspaces
+            .values()
+            .flat_map(|state| state.endpoint_permissions.keys().copied())
+            .collect()
+    }
+
     /// Check an authenticated transport endpoint against the current policy.
     pub fn authorizes_endpoint(
         &self,

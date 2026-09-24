@@ -21,6 +21,17 @@ async fn stalled_frame_times_out_without_closing_other_exchanges() {
             .bind()
             .await
             .unwrap();
+        // Only a policy member reaches the data plane.
+        node.install_verified_policy(
+            [46; 32],
+            1,
+            std::collections::BTreeMap::from([
+                (node.id(), arachne_node::Permissions::AllTopics),
+                (*peer.id().as_bytes(), arachne_node::Permissions::AllTopics),
+            ]),
+        )
+        .await
+        .unwrap();
         let connection = peer
             .connect(
                 iroh::EndpointAddr::new(iroh::PublicKey::from_bytes(&node.id()).unwrap())

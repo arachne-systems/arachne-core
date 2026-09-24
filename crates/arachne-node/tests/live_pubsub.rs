@@ -560,20 +560,6 @@ async fn wire_sender_cannot_claim_the_receivers_identity() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let (node, mut messages) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let topic = Topic::new("data").unwrap();
-        node.install_verified_policy(
-            [1; 32],
-            1,
-            BTreeMap::from([(
-                node.id(),
-                Permissions::Selected {
-                    publish: BTreeSet::from([topic.clone()]),
-                    subscribe: BTreeSet::from([topic.clone()]),
-                },
-            )]),
-        )
-        .await
-        .unwrap();
-        node.subscribe([1; 32], 1, topic).await.unwrap();
         let stranger = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
             .clear_ip_transports()
             .bind_addr("127.0.0.1:0")
@@ -581,6 +567,25 @@ async fn wire_sender_cannot_claim_the_receivers_identity() {
             .bind()
             .await
             .unwrap();
+        // A member without topic rights: a key no policy names never gets
+        // past the data handshake at all.
+        node.install_verified_policy(
+            [1; 32],
+            1,
+            BTreeMap::from([
+                (
+                    node.id(),
+                    Permissions::Selected {
+                        publish: BTreeSet::from([topic.clone()]),
+                        subscribe: BTreeSet::from([topic.clone()]),
+                    },
+                ),
+                (*stranger.id().as_bytes(), Permissions::default()),
+            ]),
+        )
+        .await
+        .unwrap();
+        node.subscribe([1; 32], 1, topic).await.unwrap();
         let mut frame = postcard::to_allocvec(&(1_u8, [1_u8;32], 1_u64, "data", DeliveryClass::Critical, 2_u8, &[99_u8][..])).unwrap();
         for spoof_sender in [false, true] {
             if spoof_sender {
@@ -720,13 +725,11 @@ async fn authorized_subscription_learns_return_path_but_rejection_does_not() {
         .add_address_hint(publisher.id(), publisher.address())
         .await
         .unwrap();
+    // The publisher's policy does not name the outsider: refused at the
+    // data handshake.
     let rejected = outsider.subscribe([1; 32], 1, topic.clone()).await.unwrap();
-    assert!(
-        rejected
-            .failed
-            .iter()
-            .any(|(id, error)| *id == publisher.id() && matches!(error, Error::Rejected))
-    );
+    assert!(rejected.failed.iter().any(|(id, _)| *id == publisher.id()));
+    assert!(!rejected.admitted.contains(&publisher.id()));
     // Only the subscriber knows an initial address. The publisher learns its
     // authenticated source path when admitting the subscription.
     subscriber
@@ -784,6 +787,18 @@ async fn stalled_data_connections_do_not_consume_control_capacity() {
         .bind_addr("127.0.0.1:0")
         .unwrap()
         .bind()
+        .await
+        .unwrap();
+    // A member: a key no policy names is refused at the data handshake.
+    server
+        .install_verified_policy(
+            [1; 32],
+            1,
+            BTreeMap::from([
+                (server.id(), Permissions::AllTopics),
+                (*attacker.id().as_bytes(), Permissions::AllTopics),
+            ]),
+        )
         .await
         .unwrap();
     let destination = iroh::EndpointAddr::new(iroh::PublicKey::from_bytes(&server.id()).unwrap())
