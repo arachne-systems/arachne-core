@@ -149,15 +149,18 @@ semantics around the core's reports and recovery results.
 Before presenting this as a supported application SDK, close or explicitly
 accept these gaps:
 
-- The typed facade does not yet expose the complete native record-storage
-  enable/restore/save lifecycle.
-- The typed facade does not yet expose the protected inbound receive and
-  durable adoption path that the lower-level runtime API uses.
 - `ClientConfig` does not expose custom relay settings available in lower-level
   transport construction.
 - Synchronous methods need a documented host threading and cancellation model
   for each target runtime, especially Android.
-- The public API has not been declared stable and the crates are not published.
+- The public API has not been declared stable. The crates have an initial
+  crates.io release, but APIs, wire formats and saved data can still change.
+
+The typed `Client` now covers the record-storage lifecycle
+(`enable_record_storage`, `restore_record_storage`,
+`restore_record_storage_with_freshness`, `record_freshness`, `save_candidate`)
+and protected receive with durable adoption (`poll_protected`,
+`adopt_protected_reception`).
 
 These are concrete implementation boundaries, not guarantees about the timing
 of future releases. Check the current API and tests before integrating.
