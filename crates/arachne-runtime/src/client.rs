@@ -321,6 +321,8 @@ pub struct PublicationCandidate {
 pub struct PublicationCurrent {
     pub selector: [u8; 32],
     pub replacement_key: [u8; 32],
+    /// Unix seconds (UTC), by the author's clock. Receivers and holders allow
+    /// `arachne_delivery::EXPIRY_SKEW_SECONDS` of clock difference.
     pub expires_at: u64,
     pub tombstone: bool,
 }
@@ -1254,6 +1256,8 @@ impl Client {
         }
     }
 
+    /// `retain_until` is Unix seconds (UTC) by this node's clock; 0 keeps no
+    /// copy for third-party recovery.
     pub fn stage_recovery_range(&self, retain_until: u64) -> Result<RecoveryStage> {
         let metadata = serde_json::to_vec(&json!({
             "op": "stage_recovery_range",

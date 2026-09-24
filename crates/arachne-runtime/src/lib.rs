@@ -4240,10 +4240,7 @@ fn execute_in_session(
             .storage_key
             .as_ref()
             .ok_or("session has no protected root key")?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| "system clock is before Unix epoch")?
-            .as_secs();
+        let now = arachne_delivery::UnixSeconds::now()?;
         let (mut inbox, pending, stale) = session
             .inbox
             .as_ref()
@@ -4252,7 +4249,11 @@ fn execute_in_session(
             .map_err(str::to_owned)?;
         if arachne_delivery::current::verify_wire_reply(owner, &query, &reply)
             .map_err(str::to_owned)?
-            .is_some_and(|view| view.values.iter().any(|value| value.expires_at > now))
+            .is_some_and(|view| {
+                view.values
+                    .iter()
+                    .any(|value| now.before_remote_expiry(value.expires_at))
+            })
         {
             inbox = inbox
                 .retain_current_view(owner, &query, &reply, now)
@@ -4766,10 +4767,7 @@ fn execute_in_session(
         {
             let reply = match session.workspace.as_ref() {
                 Some(owner) => {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_err(|_| "system clock is before Unix epoch")?
-                        .as_secs();
+                    let now = arachne_delivery::UnixSeconds::now()?;
                     session
                         .runtime
                         .block_on(session.node.with_routing_policy(|policy| {

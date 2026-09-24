@@ -163,10 +163,7 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
             }
             let packet = context.packet(&ciphertext).map_err(str::to_owned)?;
             if let Some(current) = current {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|_| "system clock is before Unix epoch")?
-                    .as_secs();
+                let now = arachne_delivery::UnixSeconds::now()?;
                 inbox = Some(
                     inbox
                         .as_ref()
@@ -370,10 +367,7 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
         };
         let mut next = inbox.clone();
         if retain_until != 0 {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|_| "system clock is before Unix epoch")?
-                .as_secs();
+            let now = arachne_delivery::UnixSeconds::now()?;
             next = next
                 .retain_range(owner, &ready.query, &ready.reply, retain_until, now)
                 .map_err(str::to_owned)?;

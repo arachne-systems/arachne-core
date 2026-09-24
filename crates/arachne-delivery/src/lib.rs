@@ -18,6 +18,35 @@ pub const MAX_PACKETS_PER_TOPIC: usize = 32;
 pub const MAX_RETAINED_BYTES: usize = 512 * 1024;
 pub const MAX_SNAPSHOT_BYTES: usize = MAX_RETAINED_BYTES + 16 * 1024;
 
+/// Time as whole seconds since the Unix epoch (UTC). Every delivery expiry
+/// (`expires_at`, `retain_until`) is in this unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UnixSeconds(pub u64);
+
+/// Clock difference tolerated between members. A receiver or holder judges an
+/// expiry that another member's clock set as passed only this long after it.
+pub const EXPIRY_SKEW_SECONDS: u64 = 120;
+
+impl UnixSeconds {
+    pub fn now() -> Result<Self, &'static str> {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| Self(elapsed.as_secs()))
+            .map_err(|_| "system clock is before Unix epoch")
+    }
+
+    /// An expiry set by another member (author, authority) has not passed,
+    /// allowing `EXPIRY_SKEW_SECONDS` for clock difference.
+    pub fn before_remote_expiry(self, expires_at: u64) -> bool {
+        expires_at.saturating_add(EXPIRY_SKEW_SECONDS) > self.0
+    }
+
+    /// An expiry set by this node's own clock has not passed. No skew.
+    pub fn before_local_expiry(self, expires_at: u64) -> bool {
+        expires_at > self.0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetainedPublication {
     pub sequence: u64,

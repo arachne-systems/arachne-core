@@ -744,7 +744,7 @@ impl ObjectInbox {
 
     /// Add or replace one publisher-owned latest value. The returned inbox must
     /// be saved atomically with the already protected publication and owner.
-    /// `now` is the host's current time, in the same units as `expires_at`.
+    /// `expires_at` is in `UnixSeconds`.
     #[allow(clippy::too_many_arguments)]
     pub fn stage_current(
         &self,
@@ -755,7 +755,7 @@ impl ObjectInbox {
         expires_at: u64,
         tombstone: bool,
         packet: Vec<u8>,
-        now: u64,
+        now: UnixSeconds,
     ) -> Result<Self, &'static str> {
         self.validate_owner(owner)?;
         let authority = owner.member().ok_or("member required")?.id();
@@ -787,7 +787,7 @@ impl ObjectInbox {
         policy: &arachne_routing::RoutingTable,
         requester: [u8; 32],
         query: &current::CurrentViewQuery,
-        now: u64,
+        now: UnixSeconds,
     ) -> Result<Vec<u8>, &'static str> {
         self.validate_owner(owner)?;
         if let Some(index) = &self.current {
@@ -815,7 +815,7 @@ impl ObjectInbox {
         let Some(view) = self
             .retained_current_views
             .iter()
-            .find(|view| view.query == encoded && view.expires_at > now)
+            .find(|view| view.query == encoded && now.before_remote_expiry(view.expires_at))
         else {
             return Ok(current::CurrentView::denied_wire());
         };
@@ -831,7 +831,7 @@ impl ObjectInbox {
         owner: &arachne_security::Workspace,
         query: &current::CurrentViewQuery,
         reply: &[u8],
-        now: u64,
+        now: UnixSeconds,
     ) -> Result<(Self, usize, usize), &'static str> {
         self.validate_owner(owner)?;
         let view =
@@ -870,7 +870,8 @@ impl ObjectInbox {
         let mut pending = 0;
         let mut stale = 0;
         for value in &view.values {
-            if value.expires_at <= now {
+            // The authority's clock set the expiry: allow clock skew.
+            if !now.before_remote_expiry(value.expires_at) {
                 stale += 1;
                 continue;
             }
@@ -1728,10 +1729,11 @@ impl ObjectInbox {
         query: &RangeQuery,
         reply: &[u8],
         expires_at: u64,
-        now: u64,
+        now: UnixSeconds,
     ) -> Result<Self, &'static str> {
         self.validate_owner(owner)?;
-        if expires_at <= now {
+        // `expires_at` is this holder's own retention limit: no skew.
+        if !now.before_local_expiry(expires_at) {
             return Err("retained range expiry must be in the future");
         }
         if !matches!(
@@ -1742,7 +1744,8 @@ impl ObjectInbox {
         }
         let encoded = query.to_wire()?;
         let mut next = self.clone();
-        next.retained_ranges.retain(|range| range.expires_at > now);
+        next.retained_ranges
+            .retain(|range| now.before_local_expiry(range.expires_at));
         if let Some(range) = next
             .retained_ranges
             .iter_mut()
@@ -1781,21 +1784,22 @@ impl ObjectInbox {
         owner: &arachne_security::Workspace,
         query: &current::CurrentViewQuery,
         reply: &[u8],
-        now: u64,
+        now: UnixSeconds,
     ) -> Result<Self, &'static str> {
         self.validate_owner(owner)?;
+        // The authority's clock set these expiries: allow clock skew.
         let expires_at = current::verify_wire_reply(owner, query, reply)?
             .ok_or("only an authenticated current view can be retained")?
             .values
             .iter()
             .map(|value| value.expires_at)
             .max()
-            .filter(|expires_at| *expires_at > now)
+            .filter(|expires_at| now.before_remote_expiry(*expires_at))
             .ok_or("current view has no fresh value")?;
         let encoded = query.to_wire()?;
         let mut next = self.clone();
         next.retained_current_views
-            .retain(|view| view.expires_at > now);
+            .retain(|view| now.before_remote_expiry(view.expires_at));
         if let Some(view) = next
             .retained_current_views
             .iter_mut()
@@ -1881,7 +1885,7 @@ impl ObjectInbox {
         policy: &arachne_routing::RoutingTable,
         requester: [u8; 32],
         query: &RangeQuery,
-        now: u64,
+        now: UnixSeconds,
     ) -> Result<Vec<u8>, &'static str> {
         self.validate_owner(owner)?;
         if query.workspace != self.workspace || !owner.in_receive_window(query.epoch) {
@@ -1903,7 +1907,7 @@ impl ObjectInbox {
         let Some(range) = self
             .retained_ranges
             .iter()
-            .find(|range| range.query == encoded && range.expires_at > now)
+            .find(|range| range.query == encoded && now.before_local_expiry(range.expires_at))
         else {
             return Ok(wire::unavailable_reply());
         };
@@ -1924,7 +1928,7 @@ impl ObjectInbox {
         policy: &arachne_routing::RoutingTable,
         requester: [u8; 32],
         request: &wire::AvailableRangeQuery,
-        now: u64,
+        now: UnixSeconds,
     ) -> Result<Vec<u8>, &'static str> {
         self.validate_owner(owner)?;
         if request.workspace != self.workspace || !owner.in_receive_window(request.epoch) {
@@ -1945,7 +1949,7 @@ impl ObjectInbox {
         let candidate = self
             .retained_ranges
             .iter()
-            .filter(|range| range.expires_at > now)
+            .filter(|range| now.before_local_expiry(range.expires_at))
             .filter_map(|range| {
                 RangeQuery::from_wire(&range.query)
                     .ok()
@@ -2381,7 +2385,7 @@ fn current_value_survives_authenticated_delivery_bundle() {
             metadata.expires_at,
             metadata.tombstone,
             packet,
-            0,
+            UnixSeconds(0),
         )
         .unwrap();
     let key = StorageKey::derive(&[3; 32]).unwrap();
@@ -2408,7 +2412,7 @@ fn current_value_survives_authenticated_delivery_bundle() {
         )
         .unwrap();
     let reply = restored
-        .serve_current(&restored_owner, &policy, [2; 32], &query, 50)
+        .serve_current(&restored_owner, &policy, [2; 32], &query, UnixSeconds(50))
         .unwrap();
     let verified = current::verify_wire_reply(&reader, &query, &reply)
         .unwrap()
@@ -2416,7 +2420,7 @@ fn current_value_survives_authenticated_delivery_bundle() {
     assert_eq!(verified.cut, 1);
     assert_eq!(verified.values[0].replacement_key, [8; 32]);
     let (accepted, pending_count, stale_count) = ObjectInbox::new(reader.id(), reader.epoch())
-        .accept_current_view(&reader, &query, &reply, 50)
+        .accept_current_view(&reader, &query, &reply, UnixSeconds(50))
         .unwrap();
     assert_eq!((pending_count, stale_count), (1, 0));
     assert_eq!(
@@ -2425,7 +2429,7 @@ fn current_value_survives_authenticated_delivery_bundle() {
     );
     assert_eq!(
         accepted
-            .accept_current_view(&reader, &query, &reply, 50)
+            .accept_current_view(&reader, &query, &reply, UnixSeconds(50))
             .unwrap()
             .1,
         0
@@ -2437,13 +2441,24 @@ fn current_value_survives_authenticated_delivery_bundle() {
         ObjectInbox::restore(&key, [2; 32], reader.id(), &accepted_sealed).unwrap();
     assert_eq!(
         restored_accepted
-            .accept_current_view(&restored_reader, &query, &reply, 50)
+            .accept_current_view(&restored_reader, &query, &reply, UnixSeconds(50))
             .unwrap()
             .1,
         0
     );
+    // Expiry 100 was set by the authority's clock. A reader whose clock is
+    // ahead by less than the skew allowance still accepts the value.
     let (_, pending_count, stale_count) = ObjectInbox::new(reader.id(), reader.epoch())
-        .accept_current_view(&reader, &query, &reply, 100)
+        .accept_current_view(
+            &reader,
+            &query,
+            &reply,
+            UnixSeconds(100 + EXPIRY_SKEW_SECONDS - 1),
+        )
+        .unwrap();
+    assert_eq!((pending_count, stale_count), (1, 0));
+    let (_, pending_count, stale_count) = ObjectInbox::new(reader.id(), reader.epoch())
+        .accept_current_view(&reader, &query, &reply, UnixSeconds(100 + EXPIRY_SKEW_SECONDS))
         .unwrap();
     assert_eq!((pending_count, stale_count), (0, 1));
     let (received_context, ciphertext) = PublicationContext::unpack(
@@ -3182,7 +3197,7 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
     };
     let reply = wire::serve_range(&author_log, &author, &policy, [2; 32], &query).unwrap();
     let inbox = ObjectInbox::new(holder.id(), holder.epoch())
-        .retain_range(&holder, &query, &reply, 200, 100)
+        .retain_range(&holder, &query, &reply, 200, UnixSeconds(100))
         .unwrap();
     let key = StorageKey::derive(&[9; 32]).unwrap();
     let holder_log = PublisherLog::new(&holder).unwrap();
@@ -3191,7 +3206,7 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         ObjectInbox::restore(&key, holder.endpoint(), holder.id(), &saved).unwrap();
 
     let relayed = inbox
-        .serve_range(&holder, &policy, [3; 32], &query, 150)
+        .serve_range(&holder, &policy, [3; 32], &query, UnixSeconds(150))
         .unwrap();
     assert_eq!(relayed, reply);
     assert!(matches!(
@@ -3247,7 +3262,7 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
             metadata.expires_at,
             metadata.tombstone,
             packet,
-            0,
+            UnixSeconds(0),
         )
         .unwrap();
     let current_query = current::CurrentViewQuery {
@@ -3259,31 +3274,39 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         selector: metadata.selector,
     };
     let current_reply = author_inbox
-        .serve_current(&author, &policy, [2; 32], &current_query, 100)
+        .serve_current(&author, &policy, [2; 32], &current_query, UnixSeconds(100))
         .unwrap();
     let inbox = inbox
-        .retain_current_view(&holder, &current_query, &current_reply, 100)
+        .retain_current_view(&holder, &current_query, &current_reply, UnixSeconds(100))
         .unwrap();
     let saved = inbox.seal(&holder, &key, &holder_log).unwrap();
     let (holder, _, inbox) =
         ObjectInbox::restore(&key, holder.endpoint(), holder.id(), &saved).unwrap();
     let relayed = inbox
-        .serve_current(&holder, &policy, [3; 32], &current_query, 150)
+        .serve_current(&holder, &policy, [3; 32], &current_query, UnixSeconds(150))
         .unwrap();
     assert_eq!(relayed, current_reply);
     let (_, pending, stale) = ObjectInbox::new(reader.id(), reader.epoch())
-        .accept_current_view(&reader, &current_query, &relayed, 150)
+        .accept_current_view(&reader, &current_query, &relayed, UnixSeconds(150))
         .unwrap();
     assert_eq!((pending, stale), (1, 0));
     assert_eq!(
         inbox
-            .serve_current(&holder, &policy, [3; 32], &current_query, 200)
+            // The authority's expiry (200) plus the skew allowance has passed.
+            .serve_current(
+                &holder,
+                &policy,
+                [3; 32],
+                &current_query,
+                UnixSeconds(200 + EXPIRY_SKEW_SECONDS),
+            )
             .unwrap(),
         current::CurrentView::denied_wire()
     );
     assert_eq!(
         inbox
-            .serve_range(&holder, &policy, [3; 32], &query, 200)
+            // The holder's own retention limit (200): no skew.
+            .serve_range(&holder, &policy, [3; 32], &query, UnixSeconds(200))
             .unwrap(),
         wire::unavailable_reply()
     );
@@ -3297,7 +3320,7 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         .unwrap();
     assert_eq!(
         inbox
-            .serve_range(&holder, &removed_reader_policy, [3; 32], &query, 150)
+            .serve_range(&holder, &removed_reader_policy, [3; 32], &query, UnixSeconds(150))
             .unwrap(),
         wire::denied_reply()
     );
@@ -3308,7 +3331,7 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
                 &removed_reader_policy,
                 [3; 32],
                 &current_query,
-                150
+                UnixSeconds(150)
             )
             .unwrap(),
         current::CurrentView::denied_wire()

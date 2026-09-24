@@ -1,5 +1,6 @@
 //! Authenticated, bounded current views for opaque latest-value publications.
 
+use crate::UnixSeconds;
 use arachne_routing::{PublicationContext, Topic};
 use arachne_security::{MAX_APPLICATION_CIPHERTEXT, Workspace};
 use sha2::{Digest, Sha256};
@@ -249,10 +250,11 @@ pub struct VerifiedCurrentView {
 }
 
 impl VerifiedCurrentView {
-    pub fn current_values(&self, now: u64) -> impl Iterator<Item = &CurrentValue> {
+    /// Values another member's clock has not expired, with clock skew.
+    pub fn current_values(&self, now: UnixSeconds) -> impl Iterator<Item = &CurrentValue> {
         self.values
             .iter()
-            .filter(move |value| value.expires_at > now)
+            .filter(move |value| now.before_remote_expiry(value.expires_at))
     }
 }
 
@@ -438,13 +440,14 @@ impl CurrentViewIndex {
     /// authorizes only the current one) and values or tombstones expired at the
     /// injected `now`. A current selection that loses a value advances its cut,
     /// so readers see a newer view, never a conflicting one at the same cut.
-    fn prune(&mut self, revision: u64, now: u64) -> Result<(), &'static str> {
+    fn prune(&mut self, revision: u64, now: UnixSeconds) -> Result<(), &'static str> {
         self.values.retain(|key, _| key.0 >= revision);
         self.cuts.retain(|scope, _| scope.0 >= revision);
+        // The authority's own values, judged by its own clock.
         let expired: Vec<_> = self
             .values
             .iter()
-            .filter(|(_, entry)| entry.value.expires_at <= now)
+            .filter(|(_, entry)| !now.before_local_expiry(entry.value.expires_at))
             .map(|(key, _)| key.clone())
             .collect();
         let mut scopes = BTreeSet::new();
@@ -463,7 +466,7 @@ impl CurrentViewIndex {
     }
 
     /// Add or replace one latest value. Expired and superseded-revision entries
-    /// are pruned first; `now` is in the same units as `expires_at`.
+    /// are pruned first.
     #[allow(clippy::too_many_arguments)]
     pub fn insert(
         &mut self,
@@ -473,7 +476,7 @@ impl CurrentViewIndex {
         expires_at: u64,
         tombstone: bool,
         packet: Vec<u8>,
-        now: u64,
+        now: UnixSeconds,
     ) -> Result<(), &'static str> {
         let sequence = context
             .sequence
@@ -1049,11 +1052,11 @@ mod tests {
         let mut index = CurrentViewIndex::new(publisher.id(), authority, publisher.epoch());
         let (first, first_packet) = packet(&mut publisher, 1, 1, b"old");
         index
-            .insert(first, [8; 32], [1; 32], 20, false, first_packet, 0)
+            .insert(first, [8; 32], [1; 32], 20, false, first_packet, UnixSeconds(0))
             .unwrap();
         let (other, other_packet) = packet(&mut publisher, 2, 2, b"other selector");
         index
-            .insert(other, [9; 32], [2; 32], 30, false, other_packet, 0)
+            .insert(other, [9; 32], [2; 32], 30, false, other_packet, UnixSeconds(0))
             .unwrap();
         let (newer, newer_packet) = packet(&mut publisher, 3, 3, b"new");
         index
@@ -1064,11 +1067,11 @@ mod tests {
                 30,
                 false,
                 newer_packet.clone(),
-                0,
+                UnixSeconds(0),
             )
             .unwrap();
         index
-            .insert(newer, [8; 32], [1; 32], 30, false, newer_packet, 0)
+            .insert(newer, [8; 32], [1; 32], 30, false, newer_packet, UnixSeconds(0))
             .unwrap();
         let revision_eight = PublicationContext {
             workspace: publisher.id(),
@@ -1094,7 +1097,7 @@ mod tests {
                 40,
                 false,
                 revision_eight.packet(&revision_eight_object).unwrap(),
-                0,
+                UnixSeconds(0),
             )
             .unwrap();
         assert_eq!(index.len(), 2);
@@ -1105,7 +1108,14 @@ mod tests {
         assert_eq!(current.cut, 2);
         assert_eq!(current.values.len(), 1);
         assert_eq!(current.values[0].replacement_key, [1; 32]);
-        assert_eq!(current.current_values(30).count(), 0);
+        // A remote expiry is judged with clock skew.
+        assert_eq!(current.current_values(UnixSeconds(30)).count(), 1);
+        assert_eq!(
+            current
+                .current_values(UnixSeconds(30 + crate::EXPIRY_SKEW_SECONDS))
+                .count(),
+            0
+        );
 
         let mut revision_eight_query = query.clone();
         revision_eight_query.policy_revision = 8;
@@ -1211,7 +1221,13 @@ mod tests {
                 .unwrap();
             let packet = context.packet(&ciphertext).unwrap();
             index.insert(
-                context, selector, [key; 32], expires_at, tombstone, packet, now,
+                context,
+                selector,
+                [key; 32],
+                expires_at,
+                tombstone,
+                packet,
+                UnixSeconds(now),
             )
         };
 
