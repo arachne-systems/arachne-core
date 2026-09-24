@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use arachne_api::{ApiError, ErrorCode};
 
-use crate::ops::{self, Op, admission, candidate, join};
+use crate::ops::{self, Op, admission, candidate, join, publication, receive};
 use crate::{
     Session, WorkspacePhase, cancel, close, create_with_options, describe,
     enable_record_storage as enable_runtime_record_storage, execute_stored_with_code,
@@ -1272,45 +1272,35 @@ impl Client {
         payload: Vec<u8>,
         current: Option<PublicationCurrent>,
     ) -> Result<PublicationCandidate> {
-        let request = serde_json::to_vec(&json!({
-            "op": "stage_network_publication",
-            "workspace": workspace,
-            "revision": revision,
-            "topic": topic,
-            "id": id,
-            "payload": payload,
-            "current": current,
-        }))
-        .map_err(|parse_error| error(ErrorKind::Internal, parse_error.to_string()))?;
-        let [metadata, snapshot] =
-            execute_stored_with_code(self.handle()?, &request, &[])
-            .map_err(Error::from)?;
-        let value: Value = serde_json::from_slice(&metadata).map_err(|parse_error| {
-            error(
-                ErrorKind::Internal,
-                format!("invalid publication candidate: {parse_error}"),
+        let staged = self.call(Op::StageNetworkPublication, |session| {
+            publication::stage(
+                session,
+                publication::StagePublicationArgs {
+                    workspace: Some(workspace),
+                    revision,
+                    topic: topic.to_owned(),
+                    id,
+                    payload,
+                    recipients: Vec::new(),
+                    current: current.map(|current| publication::CurrentPublication {
+                        selector: current.selector,
+                        replacement_key: current.replacement_key,
+                        expires_at: current.expires_at,
+                        tombstone: current.tombstone,
+                    }),
+                    bulk: false,
+                },
             )
         })?;
-        let candidate_workspace = value
-            .get("workspace")
-            .ok_or_else(|| error(ErrorKind::Internal, "publication candidate has no workspace"))
-            .and_then(|value| {
-                serde_json::from_value(value.clone()).map_err(|parse_error| {
-                    error(
-                        ErrorKind::Internal,
-                        format!("invalid publication candidate workspace: {parse_error}"),
-                    )
-                })
-            })?;
-        if candidate_workspace != workspace {
+        if staged.workspace != workspace {
             return Err(error(
                 ErrorKind::Internal,
                 "publication candidate workspace mismatch",
             ));
         }
         Ok(PublicationCandidate {
-            workspace: candidate_workspace,
-            snapshot,
+            workspace: staged.workspace,
+            snapshot: stored_output(staged.snapshot)?,
         })
     }
 
@@ -1330,41 +1320,15 @@ impl Client {
     /// Stage one protected incoming publication without exposing its plaintext.
     /// Save the exact snapshot before adoption whenever record storage is enabled.
     pub fn poll_protected(&self) -> Result<Option<ProtectedReceptionCandidate>> {
-        let [metadata, snapshot] =
-            execute_stored_with_code(self.handle()?, br#"{"op":"poll_protected"}"#, &[])
-            .map_err(Error::from)?;
-        let value: Value = serde_json::from_slice(&metadata).map_err(|parse_error| {
-            error(
-                ErrorKind::Internal,
-                format!("invalid protected reception candidate: {parse_error}"),
-            )
-        })?;
-        if value.is_null() {
-            if snapshot.is_empty() {
-                return Ok(None);
-            }
-            return Err(error(
-                ErrorKind::Internal,
-                "empty protected reception returned a snapshot",
-            ));
-        }
-        let raw: RawProtectedReceptionCandidate =
-            serde_json::from_value(value).map_err(|parse_error| {
-                error(
-                    ErrorKind::Internal,
-                    format!("invalid protected reception candidate: {parse_error}"),
-                )
-            })?;
-        if raw.state != "awaiting_reception_save" || snapshot.is_empty() {
-            return Err(error(
-                ErrorKind::Internal,
-                "protected reception has no adoptable snapshot",
-            ));
-        }
-        Ok(Some(ProtectedReceptionCandidate {
-            workspace: raw.workspace,
-            snapshot,
-        }))
+        let staged = self.call(Op::PollProtected, receive::poll_protected)?;
+        staged
+            .map(|staged| {
+                Ok(ProtectedReceptionCandidate {
+                    workspace: staged.workspace,
+                    snapshot: stored_output(staged.snapshot)?,
+                })
+            })
+            .transpose()
     }
 
     /// Adopt a staged inbox candidate: a reception from `poll_protected`, or an
@@ -1379,28 +1343,21 @@ impl Client {
     /// acknowledged or rejected. It stays pending (also after a restart) until
     /// an acknowledgement or rejection is adopted: delivery is at least once.
     pub fn poll_pending_object(&self) -> Result<Option<ReceivedProtectedPublication>> {
-        let response = self.request(json!({"op": "poll_pending_object"}))?;
-        if response.is_null() {
-            return Ok(None);
-        }
-        let raw: RawProtectedPublication = serde_json::from_value(response).map_err(|parse_error| {
-            error(
-                ErrorKind::Internal,
-                format!("invalid pending object: {parse_error}"),
-            )
+        let pending = self.call(Op::PollPendingObject, |session| {
+            receive::poll_pending(session, receive::PollPendingArgs::default())
         })?;
-        Ok(Some(ReceivedProtectedPublication {
-            workspace: raw.workspace,
-            revision: raw.revision,
-            member: raw.member,
-            endpoint: raw.endpoint,
-            topic: raw.topic,
-            id: raw.id,
-            sequence: raw.sequence,
-            payload: raw.payload,
-            recipients: raw.recipients,
-            counter: raw.counter,
-            current: raw.current,
+        Ok(pending.map(|pending| ReceivedProtectedPublication {
+            workspace: pending.workspace,
+            revision: pending.revision,
+            member: pending.member,
+            endpoint: pending.endpoint,
+            topic: pending.topic,
+            id: pending.id,
+            sequence: pending.sequence,
+            payload: pending.payload,
+            recipients: pending.recipients,
+            counter: pending.counter,
+            current: pending.current,
         }))
     }
 
@@ -1410,7 +1367,7 @@ impl Client {
         &self,
         object: &ReceivedProtectedPublication,
     ) -> Result<ProtectedReceptionCandidate> {
-        self.stage_inbox_resolution("stage_object_acknowledgement", object)
+        self.stage_inbox_resolution(Op::StageObjectAcknowledgement, receive::acknowledge, object)
     }
 
     /// Stage a permanent application rejection of a pending object. Its
@@ -1419,41 +1376,29 @@ impl Client {
         &self,
         object: &ReceivedProtectedPublication,
     ) -> Result<ProtectedReceptionCandidate> {
-        self.stage_inbox_resolution("stage_object_rejection", object)
+        self.stage_inbox_resolution(Op::StageObjectRejection, receive::reject, object)
     }
 
     fn stage_inbox_resolution(
         &self,
-        op: &str,
+        op: Op,
+        stage: fn(&mut Session, receive::ResolveArgs) -> std::result::Result<publication::StagedObject, ApiError>,
         object: &ReceivedProtectedPublication,
     ) -> Result<ProtectedReceptionCandidate> {
-        let request = serde_json::to_vec(&json!({
-            "op": op,
-            "member": object.member,
-            "topic": object.topic,
-            "counter": object.counter,
-            "id": object.id,
-        }))
-        .map_err(|parse_error| error(ErrorKind::Internal, parse_error.to_string()))?;
-        let [metadata, snapshot] =
-            execute_stored_with_code(self.handle()?, &request, &[])
-            .map_err(Error::from)?;
-        let raw: RawProtectedReceptionCandidate =
-            serde_json::from_slice(&metadata).map_err(|parse_error| {
-                error(
-                    ErrorKind::Internal,
-                    format!("invalid inbox candidate: {parse_error}"),
-                )
-            })?;
-        if raw.state != "awaiting_reception_save" || snapshot.is_empty() {
-            return Err(error(
-                ErrorKind::Internal,
-                "inbox resolution has no adoptable snapshot",
-            ));
-        }
+        let staged = self.call(op, |session| {
+            stage(
+                session,
+                receive::ResolveArgs {
+                    member: object.member,
+                    topic: object.topic.clone(),
+                    counter: object.counter,
+                    id: object.id,
+                },
+            )
+        })?;
         Ok(ProtectedReceptionCandidate {
-            workspace: raw.workspace,
-            snapshot,
+            workspace: staged.workspace,
+            snapshot: stored_output(staged.snapshot)?,
         })
     }
 
@@ -1952,29 +1897,6 @@ struct RawPublication {
     sender: [u8; 32],
     topic: String,
     payload: Vec<u8>,
-}
-
-#[derive(Deserialize)]
-struct RawProtectedReceptionCandidate {
-    workspace: [u8; 32],
-    state: String,
-}
-
-#[derive(Deserialize)]
-struct RawProtectedPublication {
-    workspace: [u8; 32],
-    revision: u64,
-    member: [u8; 32],
-    endpoint: [u8; 32],
-    topic: String,
-    id: [u8; 16],
-    sequence: Option<u64>,
-    payload: Vec<u8>,
-    #[serde(default)]
-    recipients: Vec<[u8; 32]>,
-    counter: u64,
-    #[serde(default)]
-    current: Option<PublicationCurrent>,
 }
 
 #[derive(Deserialize)]

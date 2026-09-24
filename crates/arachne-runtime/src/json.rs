@@ -13,21 +13,12 @@ use serde_json::Value;
 
 use crate::errors;
 use crate::ops::candidate::{self, AdoptArgs};
-use crate::ops::{self, Op, admission, join};
+use crate::ops::{self, Op, admission, join, publication, receive};
 use crate::{JoinStep, WireManagement, legacy_dispatch, resources};
 
 /// Maximum JSON request or metadata size in bytes.
 pub const MAX_REQUEST: usize = 128 * 1024;
 
-#[derive(Clone, Copy, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CurrentPublication {
-    pub(crate) selector: [u8; 32],
-    pub(crate) replacement_key: [u8; 32],
-    pub(crate) expires_at: u64,
-    #[serde(default)]
-    pub(crate) tombstone: bool,
-}
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -132,39 +123,10 @@ pub(crate) enum Request {
     FetchInvitationCheckpoint(join::FetchCheckpointArgs),
     #[serde(rename = "request_admission")]
     JoinViaPeer(join::RequestAdmissionArgs),
-    StageNetworkPublication {
-        /// When present, must name the session workspace; checked before staging.
-        #[serde(default)]
-        workspace: Option<[u8; 32]>,
-        revision: u64,
-        topic: String,
-        id: [u8; 16],
-        payload: Vec<u8>,
-        /// Empty is a normal topic publication. A nonempty scope contains
-        /// canonical workspace member identities for a direct publication.
-        #[serde(default)]
-        recipients: Vec<[u8; 32]>,
-        #[serde(default)]
-        current: Option<CurrentPublication>,
-        #[serde(default)]
-        bulk: bool,
-    },
-    PollPendingObject {
-        #[serde(default)]
-        deferred: Vec<arachne_delivery::inbox::DeferredDeliveryStream>,
-    },
-    StageObjectAcknowledgement {
-        member: [u8; 32],
-        topic: String,
-        counter: u64,
-        id: [u8; 16],
-    },
-    StageObjectRejection {
-        member: [u8; 32],
-        topic: String,
-        counter: u64,
-        id: [u8; 16],
-    },
+    StageNetworkPublication(publication::StagePublicationArgs),
+    PollPendingObject(receive::PollPendingArgs),
+    StageObjectAcknowledgement(receive::ResolveArgs),
+    StageObjectRejection(receive::ResolveArgs),
     PollProtected {},
     EndpointInfo {},
     /// One control request to a peer by endpoint key, with an optional
@@ -433,12 +395,12 @@ pub(crate) fn dispatch(session: &mut crate::Session, request: Request) -> Result
         Request::AdoptReception(args) => reply(candidate::adopt_reception(session, args)?),
         Request::AdoptRecovery(args) => reply(candidate::adopt_recovery(session, args)?),
         Request::AdoptCurrentView(args) => reply(candidate::adopt_current_view(session, args)?),
-        request => {
-            if let Request::StageNetworkPublication { workspace, .. } = &request {
-                ops::publication::check_workspace(session, *workspace)?;
-            }
-            legacy_dispatch(session, request).map_err(errors::legacy)
-        }
+        Request::StageNetworkPublication(args) => reply(publication::stage(session, args)?),
+        Request::PollProtected {} => reply(receive::poll_protected(session)?),
+        Request::PollPendingObject(args) => reply(receive::poll_pending(session, args)?),
+        Request::StageObjectAcknowledgement(args) => reply(receive::acknowledge(session, args)?),
+        Request::StageObjectRejection(args) => reply(receive::reject(session, args)?),
+        request => legacy_dispatch(session, request).map_err(errors::legacy),
     }
 }
 

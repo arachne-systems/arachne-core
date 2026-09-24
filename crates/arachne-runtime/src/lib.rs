@@ -1386,18 +1386,6 @@ pub(crate) fn legacy_dispatch(session: &mut Session, request: Request) -> Result
             | Request::PollMembershipOffer {}
     ) {
         membership::poll(session, request)?
-    } else if matches!(
-        request,
-        Request::PollPendingObject { .. }
-            | Request::StageObjectAcknowledgement { .. }
-            | Request::StageObjectRejection { .. }
-    ) {
-        protected::inbox_operation(session, request)?
-    } else if matches!(
-        request,
-        Request::StageNetworkPublication { .. } | Request::PollProtected {}
-    ) {
-        protected::stage(session, request)?
     } else if let Request::StageRecoveryRange { retain_until } = request {
         protected::stage_recovery(session, retain_until)?
     } else if let Request::FetchRecoveryRange {

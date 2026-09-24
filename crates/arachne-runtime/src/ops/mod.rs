@@ -22,7 +22,7 @@ pub(crate) mod join;
 // pub(crate) mod nearby;
 // pub(crate) mod policy;
 pub(crate) mod publication;
-// pub(crate) mod receive;
+pub(crate) mod receive;
 pub(crate) mod recovery;
 // pub(crate) mod workspace;
 
