@@ -36,8 +36,8 @@ not fork (`iroh` -> `netwatch`/`portmapper` -> `netdev`, `netlink-packet-route`
 
 The patch is not needed for correctness. `paste` is a compile-time proc macro,
 and its advisory (RUSTSEC-2024-0436) is "unmaintained", not a vulnerability.
-Without the patch, `cargo deny check advisories` reports only that
-informational advisory. The graph also contains `netlink-packet-core` 0.9.0
+That informational advisory is the only one this patch removes from
+`cargo deny check advisories`. The graph also contains `netlink-packet-core` 0.9.0
 (via `netdev` 0.46); that version does not use `paste`. Thus with the patch,
 `paste` is not in the graph.
 

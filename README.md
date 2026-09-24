@@ -47,7 +47,8 @@ silently persist application state on the host’s behalf.
 ## Status
 
 Pre-release software under active development. APIs and persisted formats may
-change. All eight crates have an initial release on crates.io.
+change. The six Arachne crates and the two Iroh forks have an initial release on
+crates.io; the `arachne-bao-tree` fork is not yet published.
 Direct, local, and selected relay paths have Rust test coverage, but that is not
 a guarantee of reachability or capacity on every network or deployment.
 

@@ -18,9 +18,10 @@ packages fetched by Cargo. Registry dependencies retain their own terms and are
 version-pinned in [`Cargo.lock`](Cargo.lock). Generate notices for the exact
 platform and feature set before distributing a binary.
 
-Modified files in Apache-2.0 components carry an in-file notice of
-modification (Apache-2.0 section 4(b)), for example
-`vendor/hax-lib-macros/src/implementation.rs`.
+The Apache-2.0-only component (`hax-lib-macros`) carries an in-file notice of
+modification (Apache-2.0 section 4(b)) in
+`vendor/hax-lib-macros/src/implementation.rs`. The dual-licensed
+(`MIT OR Apache-2.0`) forks record every change in their `ARACHNE-PATCH.md`.
 
 Binary distributions (the SDK `cdylib`, an Android AAR, or an application)
 must carry the MPL-2.0 source pointer and the third-party notices. See

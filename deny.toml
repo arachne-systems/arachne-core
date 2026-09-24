@@ -20,9 +20,9 @@ ignore = [
     { id = "RUSTSEC-2024-0344", reason = "tor feature only (torut -> curve25519-dalek 3.2.0); no upstream fix in iroh-tor-transport 0.1" },
     # Unmaintained, not a vulnerability. Only through the vendored
     # arachne-iroh-blobs default `tickets` feature (iroh-tickets -> postcard
-    # default -> heapless 0.7) and dev-dependencies. arachne-node disables
-    # that feature, so the published arachne-runtime graph does not contain it.
-    { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill only via fork default `tickets` feature / dev-deps; not in the arachne-runtime graph" },
+    # default -> heapless 0.7). arachne-node disables that feature, so the
+    # published arachne-runtime graph does not contain it.
+    { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill only via fork default `tickets` feature; not in the arachne-runtime graph" },
 ]
 
 [licenses]
@@ -83,10 +83,10 @@ deny = [
 # so a new third copy still fails.
 skip = [
     { crate = "sha2@0.9.9", reason = "tor feature only: torut -> ed25519-dalek 1.0.1" },
-    { crate = "sha2@0.11.0", reason = "RustCrypto 0.11 generation used by iroh/openmls-era deps; Arachne stays on 0.10 until an intentional bump" },
-    { crate = "hkdf@0.13.0", reason = "RustCrypto 0.13 generation from third-party deps; Arachne uses 0.12" },
-    { crate = "hmac@0.11.0", reason = "tor feature only: torut" },
-    { crate = "hmac@0.13.0", reason = "RustCrypto 0.13 generation from third-party deps" },
+    { crate = "sha2@0.11.0", reason = "iroh 1.2 (ed25519-dalek 3) and openmls_rust_crypto -> hpke-rs-rust-crypto; Arachne stays on 0.10 until an intentional bump" },
+    { crate = "hkdf@0.13.0", reason = "openmls_rust_crypto -> hpke-rs-rust-crypto; Arachne uses 0.12" },
+    { crate = "hmac@0.11.0", reason = "tor feature only: iroh-tor-transport -> torut" },
+    { crate = "hmac@0.13.0", reason = "openmls_rust_crypto -> hpke-rs-rust-crypto (via hkdf 0.13)" },
 ]
 
 [sources]

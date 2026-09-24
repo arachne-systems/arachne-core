@@ -43,8 +43,8 @@ chain is third-party (`openmls_rust_crypto` -> `hpke-rs` -> `libcrux-*` ->
 The patch is not needed for correctness. Upstream declares `proc-macro-error2`
 only under `[target."cfg(hax)".dependencies]`. Normal builds do not set
 `cfg(hax)`, so that crate is never compiled; it only appears in `Cargo.lock`.
-Without the patch, `cargo deny check advisories` reports only its
-"unmaintained" advisory (RUSTSEC-2026-0173), not a vulnerability.
+The only advisory this patch removes from `cargo deny check advisories` is
+the "unmaintained" advisory RUSTSEC-2026-0173, not a vulnerability.
 
 Build the macro with its existing nightly requirement and `RUSTFLAGS='--cfg hax'`,
 then run `python3 tests/check-diagnostics.py PATH_TO_LIBHAX_LIB_MACROS.so RUSTC`.

@@ -42,6 +42,9 @@ jobs:
         with:
           command: check
           arguments: --all-features
+          # Resolve metadata with the same toolchain as the other jobs, not
+          # the action image's default (1.85).
+          rust-version: "1.98.0"
 
   minimal-versions:
     name: Direct minimal versions
