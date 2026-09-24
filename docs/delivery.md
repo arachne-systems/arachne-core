@@ -192,8 +192,18 @@ Direct objects go to an explicit, sorted list of recipient members.
 - **Sequence.** Each recipient scope has its own sequence. It continues across
   epochs. The recipients are in the AAD.
 - **Ordering.** Inside a scope, an object waits while an earlier sequence is
-  missing. It is released when recovery fills the gap or when every source has
-  failed and the gap is recorded as missed (`stage_direct_miss`).
+  missing. It is released when recovery fills the gap or when the gap is
+  recorded as missed. A gap is recorded as missed in two ways, and both
+  report `missing_count`:
+  - every source has failed (`stage_direct_miss`);
+  - the receiver's recovery copies overflow (32 records per scope or 32 KiB)
+    and eviction moves the scope floor past the gap (B7e). The staging step
+    that evicts (`poll_protected`, `stage_recovery_range`,
+    `stage_direct_recovery`) reports the given-up sequences as
+    `missing_count` on its candidate.
+- **Late objects.** A direct sequence at or below its scope floor was either
+  accepted or recorded as missed. A late copy of it is dropped as a
+  duplicate. It is never delivered after newer objects of the scope.
 - **Retention.** Senders and recipients keep recovery copies: at most 32
   records per scope and 32 KiB in total; the largest scope gives way first.
   Only members of the audience can ask for them.
@@ -214,7 +224,8 @@ Direct objects go to an explicit, sorted list of recipient members.
   cannot hold back a gap filler for good (B7d): an object waits behind a gap
   only while the receiver keeps the records above that gap, at most 32 KiB
   and 32 records per scope. When a record is evicted, the scope floor moves
-  past the gap and the objects above it become deliverable. So gap-blocked
+  past the gap, the gap is recorded as missed, and the objects above it become
+  deliverable. So gap-blocked
   objects stay far below 96 KiB and 512 objects, and the application can
   always drain work.
 
@@ -256,6 +267,7 @@ topic, selector, replacement key).
 | Byte-bounded served range (B7) | `recovery_bound.rs` `automatic_recovery_serves_byte_bounded_prefix_and_continues` |
 | Prefix progress stays inside the signed range | `recovery_bound.rs` `recovery_prefix_progress_is_bounded_by_the_signed_range` |
 | Direct recovery prefix, gap that blocks all pending objects, direct flood | `direct_quota.rs` `direct_recovery_admits_the_prefix_that_fits_the_author_quota`, `a_gap_that_holds_back_all_pending_objects_can_always_be_filled`, `deliverable_direct_flood_still_hits_the_author_quota` |
+| Eviction past a gap records a miss; late direct objects are dropped | `direct_eviction.rs` `eviction_past_a_gap_drops_the_late_object`, `a_late_object_below_an_explicit_miss_is_dropped`; `arachne-runtime/tests/direct_eviction_miss.rs` `evicting_past_a_direct_gap_reports_the_miss_and_keeps_order` |
 | All-authors bound never stalls gap-blocked direct objects (3 authors) | `direct_global_bound.rs` `gap_blocked_objects_of_three_authors_never_stall_the_global_bound` |
 | Automatic recovery progresses under the author quota (runtime) | `arachne-runtime/tests/recovery_quota.rs` `automatic_recovery_of_large_objects_progresses_under_author_quota`, `automatic_recovery_waits_for_the_application_when_the_quota_is_full` |
 | Save never shrinks publisher history | `epochs.rs` `publisher_history_never_shrinks_to_make_room_for_inbox_state` |
