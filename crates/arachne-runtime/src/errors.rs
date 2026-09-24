@@ -280,4 +280,39 @@ mod tests {
             "operation cancelled because the local session closed"
         );
     }
+
+    /// Ratchet on `Internal`: every site that gives `ErrorCode::Internal`
+    /// (a named `internal` error or an `Internal` fallback for lower-crate
+    /// text). The count may only go down. When you remove one, lower
+    /// `CEILING` to the new count. Do not raise it: pick the right code at
+    /// the source instead.
+    #[test]
+    fn internal_fallbacks_only_go_down() {
+        const CEILING: usize = 89;
+        fn count(dir: &std::path::Path) -> usize {
+            let mut total = 0;
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    total += count(&path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    // Split so this test does not count itself.
+                    total += text.matches(concat!("ApiError::", "internal(")).count()
+                        + text.matches(concat!("(ErrorCode::", "Internal)")).count();
+                }
+            }
+            total
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let sites = count(&src);
+        assert!(
+            sites <= CEILING,
+            "{sites} Internal sites, ceiling {CEILING}: give the new error its real code"
+        );
+        assert!(
+            sites == CEILING,
+            "{sites} Internal sites: lower CEILING from {CEILING} to {sites}"
+        );
+    }
 }

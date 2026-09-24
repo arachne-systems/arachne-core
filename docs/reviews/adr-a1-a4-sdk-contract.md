@@ -396,6 +396,39 @@ longest. Do the ATAK groups first, so the Kotlin typed methods can ship before t
 - Define `Limits` (step 3), the full `Feature` list, and the `Event` payloads (step 4).
 - Error `detail` and `reason` strings must never hold secrets or plaintext. Add a rule and a test.
 
+### Step 2 (done: branch `feat/a1-typed-ops`)
+
+- The runtime `lib.rs` is now the crate root only (8,034 lines before). The ops live in
+  `ops/*`, one typed handler per op. `Session` and its per-subsystem state are in `session.rs`.
+  The registry and the session lifecycle are in `registry.rs`.
+- Every op error is an `ApiError`, made at the source with a named constructor. The
+  `&'static str` text of `arachne-security` and `arachne-delivery` maps in one place,
+  `errors.rs`, through exact-text tables. Text that is not in a table gets the code that the call
+  site gives. There is no substring match. `client.rs` `map_error` is deleted.
+- The typed `Client` calls the typed handlers. It sends no JSON. `execute` stays as a thin
+  decode, typed call, encode shim, and its docs mark it as deprecated. `execute_with_code` and
+  `execute_stored_with_code` also give the error code. The error text is the same as before.
+- A unit test (`errors::tests::internal_fallbacks_only_go_down`) counts the `Internal` sites. The
+  count can only go down.
+
+Resolution of the step 2 open points:
+
+- Checked constructors: done. `LimitReached` has a variant. Each code has a named constructor or
+  `ApiError::new(code, detail)`, which always picks the right variant. Deserialize rejects a
+  variant with a wrong code.
+- `CandidateStale` (302) stays in the storage range. A candidate is a staged storage record, and
+  "stale" means that its stored basis moved. Numbers never move, so 302 is also the stable place.
+  The reason is in the `ErrorCode` docs.
+- Topic rules: `tests/topic_rules.rs` checks that `arachne_routing::Topic` and
+  `arachne_api::TopicName` accept and reject the same inputs.
+- No secrets in error text: the rule is in the `errors.rs` and `ApiError` docs.
+  `tests/error_text.rs` feeds secret inputs (a sealed snapshot, an invitation, a candidate) into
+  failing ops and checks that no part of a secret is in the error. Scope: secrets that the
+  runtime holds. A JSON decode error of the deprecated dispatcher can show the caller's own
+  request text to that caller.
+- Still open (not step 2): `RecordId` uniqueness, `Limits` (step 3), the `Feature` list and the
+  `Event` payloads (step 4).
+
 ### UniFFI spike (done: `spike/a1-uniffi`, see `spike-a1-uniffi.md`)
 
 - uniffi `=0.31.2` and uniffi-bindgen-go `v0.7.1+v0.31.0`. Kotlin, Swift, Python and Go all pass:
