@@ -2401,11 +2401,11 @@ fn current_value_survives_authenticated_delivery_bundle() {
     use arachne_routing::{Permissions, RoutingTable};
     use arachne_security::{PendingJoin, StorageKey, Workspace};
 
-    let admin = Workspace::create([1; 32], "Publisher").unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     let (admin, invite, checkpoint) = issue_registered_invitation(admin);
-    let join = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let join = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], join.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(2), join.admission_request().unwrap())
         .unwrap();
     let mut proof = join.join_proof().unwrap();
     proof
@@ -2452,7 +2452,7 @@ fn current_value_survives_authenticated_delivery_bundle() {
     let key = StorageKey::derive(&[3; 32]).unwrap();
     let sealed = inbox.seal(&owner, &key, &publisher).unwrap();
     let (restored_owner, _, restored) =
-        ObjectInbox::restore(&key, [1; 32], owner.id(), &sealed).unwrap();
+        ObjectInbox::restore(&key, crate::test_endpoint(1), owner.id(), &sealed).unwrap();
     let query = current::CurrentViewQuery {
         workspace: owner.id(),
         authority: owner.member().unwrap().id(),
@@ -2467,13 +2467,13 @@ fn current_value_survives_authenticated_delivery_bundle() {
             owner.id(),
             7,
             BTreeMap::from([
-                ([1; 32], Permissions::AllTopics),
-                ([2; 32], Permissions::AllTopics),
+                (crate::test_endpoint(1), Permissions::AllTopics),
+                (crate::test_endpoint(2), Permissions::AllTopics),
             ]),
         )
         .unwrap();
     let reply = restored
-        .serve_current(&restored_owner, &policy, [2; 32], &query, UnixSeconds(50))
+        .serve_current(&restored_owner, &policy, crate::test_endpoint(2), &query, UnixSeconds(50))
         .unwrap();
     let verified = current::verify_wire_reply(&reader, &query, &reply)
         .unwrap()
@@ -2499,7 +2499,7 @@ fn current_value_survives_authenticated_delivery_bundle() {
         PublisherLog::new(&reader).unwrap();
     let accepted_sealed = accepted.seal(&reader, &key, &reader_publisher).unwrap();
     let (restored_reader, _, restored_accepted) =
-        ObjectInbox::restore(&key, [2; 32], reader.id(), &accepted_sealed).unwrap();
+        ObjectInbox::restore(&key, crate::test_endpoint(2), reader.id(), &accepted_sealed).unwrap();
     assert_eq!(
         restored_accepted
             .accept_current_view(&restored_reader, &query, &reply, UnixSeconds(50))
@@ -2551,11 +2551,11 @@ fn current_value_survives_authenticated_delivery_bundle() {
 fn repeated_direct_transfers_fit_storage_without_losing_pending_or_sequence() {
     use arachne_security::{PendingJoin, StorageKey, Workspace};
 
-    let admin = Workspace::create([1; 32], "Publisher").unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     let (admin, invite, checkpoint) = issue_registered_invitation(admin);
-    let join = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let join = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], join.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(2), join.admission_request().unwrap())
         .unwrap();
     let mut proof = join.join_proof().unwrap();
     proof
@@ -2631,7 +2631,7 @@ fn repeated_direct_transfers_fit_storage_without_losing_pending_or_sequence() {
             .stage_sent_direct(&sender, &ctx, &recipients, &object)
             .unwrap();
         let saved = inbox.seal(&sender, &key, &log).unwrap();
-        (sender, log, inbox) = ObjectInbox::restore(&key, [1; 32], sender.id(), &saved).unwrap();
+        (sender, log, inbox) = ObjectInbox::restore(&key, crate::test_endpoint(1), sender.id(), &saved).unwrap();
         assert_eq!(log.head(), 64);
         assert_eq!(
             inbox.pending(&sender).unwrap().unwrap().message.payload,
@@ -2672,11 +2672,11 @@ fn repeated_direct_transfers_fit_storage_without_losing_pending_or_sequence() {
 fn deferred_streams_preserve_order_identity_and_restart() {
     use arachne_security::{PendingJoin, StorageKey, Workspace};
 
-    let admin = Workspace::create([1; 32], "Publisher").unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     let (admin, invite, checkpoint) = issue_registered_invitation(admin);
-    let join = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let join = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], join.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(2), join.admission_request().unwrap())
         .unwrap();
     let mut proof = join.join_proof().unwrap();
     proof
@@ -2755,7 +2755,7 @@ fn deferred_streams_preserve_order_identity_and_restart() {
     let publisher = PublisherLog::new(&reader).unwrap();
     let sealed = inbox.seal(&reader, &key, &publisher).unwrap();
     let (restored_reader, _, restored) =
-        ObjectInbox::restore(&key, [2; 32], reader.id(), &sealed).unwrap();
+        ObjectInbox::restore(&key, crate::test_endpoint(2), reader.id(), &sealed).unwrap();
     assert_eq!(restored.pending_count(), 5);
     let restored_first = restored.pending(&restored_reader).unwrap().unwrap();
     assert_eq!(restored_first.context, first.context);
@@ -2796,11 +2796,11 @@ fn deferred_streams_preserve_order_identity_and_restart() {
 fn permanent_rejection_is_durable_and_unblocks_the_next_object() {
     use arachne_security::{PendingJoin, StorageKey, Workspace};
 
-    let admin = Workspace::create([1; 32], "Publisher").unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     let (admin, invite, checkpoint) = issue_registered_invitation(admin);
-    let join = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let join = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], join.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(2), join.admission_request().unwrap())
         .unwrap();
     let mut proof = join.join_proof().unwrap();
     proof
@@ -2864,7 +2864,7 @@ fn permanent_rejection_is_durable_and_unblocks_the_next_object() {
     let publisher = PublisherLog::new(&reader).unwrap();
     let sealed = rejected.seal(&reader, &key, &publisher).unwrap();
     let (restored_reader, _, restored) =
-        ObjectInbox::restore(&key, [2; 32], reader.id(), &sealed).unwrap();
+        ObjectInbox::restore(&key, crate::test_endpoint(2), reader.id(), &sealed).unwrap();
     assert_eq!(restored.pending_count(), 1);
     assert_eq!(
         restored
@@ -2884,11 +2884,11 @@ fn durable_pending_objects_and_bounded_topic_replay() {
         fs::{self, File, OpenOptions},
         io::Write,
     };
-    let admin = Workspace::create([1; 32], "Publisher").unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     let (admin, invite, checkpoint) = issue_registered_invitation(admin);
-    let join = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let join = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], join.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(2), join.admission_request().unwrap())
         .unwrap();
     let mut proof = join.join_proof().unwrap();
     proof
@@ -2976,7 +2976,7 @@ fn durable_pending_objects_and_bounded_topic_replay() {
     );
     let snapshot = scoped.seal(&reader, &key, &publisher).unwrap();
     let (restored_reader, _, restored) =
-        ObjectInbox::restore(&key, [2; 32], reader.id(), &snapshot).unwrap();
+        ObjectInbox::restore(&key, crate::test_endpoint(2), reader.id(), &snapshot).unwrap();
     let pending = restored.pending(&restored_reader).unwrap().unwrap();
     assert_eq!(pending.recipients, recipients);
     assert_eq!(pending.message.payload, b"recipient only");
@@ -3171,12 +3171,12 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
     use arachne_routing::{Permissions, RoutingTable};
     use arachne_security::{PendingJoin, StorageKey, Workspace};
 
-    let admin = Workspace::create([1; 32], "Publisher").unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     let (admin, invite, checkpoint) = issue_registered_invitation(admin);
     let holder_join =
-        PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Holder").unwrap();
+        PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Holder").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], holder_join.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(2), holder_join.admission_request().unwrap())
         .unwrap();
     let mut holder_proof = holder_join.join_proof().unwrap();
     holder_proof
@@ -3199,9 +3199,9 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         _ => panic!("member stays active"),
     };
     let reader_join =
-        PendingJoin::from_invitation(&invite, &checkpoint, [3; 32], "Reader").unwrap();
+        PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(3), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission([3; 32], reader_join.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(3), reader_join.admission_request().unwrap())
         .unwrap();
     let mut reader_proof = reader_join.join_proof().unwrap();
     reader_proof
@@ -3234,9 +3234,9 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
             author.id(),
             1,
             BTreeMap::from([
-                ([1; 32], permissions(false)),
-                ([2; 32], permissions(true)),
-                ([3; 32], permissions(true)),
+                (crate::test_endpoint(1), permissions(false)),
+                (crate::test_endpoint(2), permissions(true)),
+                (crate::test_endpoint(3), permissions(true)),
             ]),
         )
         .unwrap();
@@ -3266,7 +3266,7 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         through: 1,
         topics: BTreeSet::from([topic.clone()]),
     };
-    let reply = wire::serve_range(&author_log, &author, &policy, [2; 32], &query).unwrap();
+    let reply = wire::serve_range(&author_log, &author, &policy, crate::test_endpoint(2), &query).unwrap();
     let inbox = ObjectInbox::new(holder.id(), holder.epoch())
         .retain_range(&holder, &query, &reply, 200, UnixSeconds(100))
         .unwrap();
@@ -3277,7 +3277,7 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         ObjectInbox::restore(&key, holder.endpoint(), holder.id(), &saved).unwrap();
 
     let relayed = inbox
-        .serve_range(&holder, &policy, [3; 32], &query, UnixSeconds(150))
+        .serve_range(&holder, &policy, crate::test_endpoint(3), &query, UnixSeconds(150))
         .unwrap();
     assert_eq!(relayed, reply);
     assert!(matches!(
@@ -3345,7 +3345,7 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         selector: metadata.selector,
     };
     let current_reply = author_inbox
-        .serve_current(&author, &policy, [2; 32], &current_query, UnixSeconds(100))
+        .serve_current(&author, &policy, crate::test_endpoint(2), &current_query, UnixSeconds(100))
         .unwrap();
     let inbox = inbox
         .retain_current_view(&holder, &current_query, &current_reply, UnixSeconds(100))
@@ -3354,7 +3354,7 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
     let (holder, _, inbox) =
         ObjectInbox::restore(&key, holder.endpoint(), holder.id(), &saved).unwrap();
     let relayed = inbox
-        .serve_current(&holder, &policy, [3; 32], &current_query, UnixSeconds(150))
+        .serve_current(&holder, &policy, crate::test_endpoint(3), &current_query, UnixSeconds(150))
         .unwrap();
     assert_eq!(relayed, current_reply);
     let (_, pending, stale) = ObjectInbox::new(reader.id(), reader.epoch())
@@ -3367,7 +3367,7 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
             .serve_current(
                 &holder,
                 &policy,
-                [3; 32],
+                crate::test_endpoint(3),
                 &current_query,
                 UnixSeconds(200 + EXPIRY_SKEW_SECONDS),
             )
@@ -3377,7 +3377,7 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
     assert_eq!(
         inbox
             // The holder's own retention limit (200): no skew.
-            .serve_range(&holder, &policy, [3; 32], &query, UnixSeconds(200))
+            .serve_range(&holder, &policy, crate::test_endpoint(3), &query, UnixSeconds(200))
             .unwrap(),
         wire::unavailable_reply()
     );
@@ -3386,12 +3386,12 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         .install_verified_policy(
             holder.id(),
             1,
-            BTreeMap::from([([1; 32], permissions(false)), ([2; 32], permissions(true))]),
+            BTreeMap::from([(crate::test_endpoint(1), permissions(false)), (crate::test_endpoint(2), permissions(true))]),
         )
         .unwrap();
     assert_eq!(
         inbox
-            .serve_range(&holder, &removed_reader_policy, [3; 32], &query, UnixSeconds(150))
+            .serve_range(&holder, &removed_reader_policy, crate::test_endpoint(3), &query, UnixSeconds(150))
             .unwrap(),
         wire::denied_reply()
     );
@@ -3400,7 +3400,7 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
             .serve_current(
                 &holder,
                 &removed_reader_policy,
-                [3; 32],
+                crate::test_endpoint(3),
                 &current_query,
                 UnixSeconds(150)
             )
