@@ -348,8 +348,9 @@ fn an_existing_member_follows_batch_adds_past_three_hundred_members() {
 /// commit. The administrator advanced and the members did not: a fork (B3).
 #[test]
 fn an_existing_member_accepts_management_past_three_hundred_members() {
-    let mut owner = Workspace::create([205; 32], "Large workspace owner").unwrap();
-    let (invitation, checkpoint) = owner.issue_invitation().unwrap();
+    let owner = Workspace::create([205; 32], "Large workspace owner").unwrap();
+    let (registered, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+    let mut owner = registered.workspace;
     let joiner = |index: usize| {
         PendingJoin::from_invitation(&invitation, &checkpoint, endpoint(index + 50_000), "Member").unwrap()
     };
