@@ -7,7 +7,7 @@ fn publisher_or_new(
     session: &Session,
     owner: &arachne_security::Workspace,
 ) -> Result<arachne_delivery::PublisherLog, String> {
-    match &session.publisher {
+    match &session.delivery.publisher {
         Some(publisher) => Ok(publisher.clone()),
         None => arachne_delivery::PublisherLog::new(owner).map_err(str::to_owned),
     }
@@ -57,11 +57,11 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
         None
     };
     let mut candidate = owner.provisional_copy().map_err(str::to_owned)?;
-    let mut publisher = session.publisher.clone();
+    let mut publisher = session.delivery.publisher.clone();
     // Object delivery is the only receive path.
     let mut inbox = Some(
         session
-            .inbox
+            .delivery.inbox
             .clone()
             .unwrap_or_else(|| arachne_delivery::inbox::ObjectInbox::new(owner.id(), owner.epoch())),
     );
@@ -302,7 +302,7 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
     )?;
     let value =
         json!({"workspace":candidate.id(), "snapshot":snapshot, "state":state, "durable":false});
-    session.staged_workspace = Some(StagedWorkspace {
+    session.transition.staged = Some(StagedWorkspace {
         publisher,
         inbox,
         transition,
@@ -315,7 +315,7 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
 /// Stage only a locally requested, verified range; no caller-supplied reply bytes.
 pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result<Value, String> {
     let ready = session
-        .ready_range
+        .recovery.ready_range
         .as_ref()
         .ok_or("no recovery range ready")?;
     check_recovery_policy(
@@ -337,7 +337,7 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
         .ok_or("session has no protected root key")?;
     let publisher = publisher_or_new(session, owner)?;
     let fresh;
-    let inbox = match session.inbox.as_ref() {
+    let inbox = match session.delivery.inbox.as_ref() {
         Some(inbox) => inbox,
         None => {
             fresh = arachne_delivery::inbox::ObjectInbox::new(owner.id(), owner.epoch());
@@ -352,7 +352,7 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
                 &ready.query.topics,
             );
             if ready.query.through <= progress {
-                session.ready_range = None;
+                session.recovery.ready_range = None;
                 return Ok(json!({"state":"recovery_already_covered"}));
             }
             if ready.query.after != progress {
@@ -433,7 +433,7 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
                 .map_err(str::to_owned)?;
         }
         if count == 0 && retain_until == 0 && !ready.automatic {
-            session.ready_range = None;
+            session.recovery.ready_range = None;
             return Ok(json!({"state":"recovery_no_new_objects"}));
         }
         let snapshot = seal_state(
@@ -446,21 +446,21 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
         let candidate = owner.provisional_copy().map_err(str::to_owned)?;
         let value = json!({"workspace":owner.id(), "snapshot":snapshot, "state":"awaiting_recovery_save",
             "publication_count":count, "durable":false, "accepted_progress":false});
-        session.staged_workspace = Some(StagedWorkspace {
+        session.transition.staged = Some(StagedWorkspace {
             workspace: candidate,
             publisher: Some(publisher),
                 inbox: Some(next),
             snapshot,
             transition: WorkspaceTransition::InboxRecovery { count },
         });
-        session.ready_range = None;
+        session.recovery.ready_range = None;
         Ok(value)
     }
 }
 
 pub(super) fn stage_direct_recovery(session: &mut Session) -> Result<Value, String> {
     let ready = session
-        .ready_direct_range
+        .recovery.ready_direct_range
         .as_ref()
         .ok_or("no direct recovery range ready")?;
     check_recovery_policy(
@@ -481,13 +481,13 @@ pub(super) fn stage_direct_recovery(session: &mut Session) -> Result<Value, Stri
         .as_ref()
         .ok_or("session has no protected root key")?;
     let (next, count) = session
-        .inbox
+        .delivery.inbox
         .as_ref()
         .ok_or("no object delivery state")?
         .stage_direct_range(owner, &ready.query, &ready.reply)
         .map_err(str::to_owned)?;
     if count == 0 {
-        session.ready_direct_range = None;
+        session.recovery.ready_direct_range = None;
         return Ok(json!({"state":"direct_recovery_already_covered"}));
     }
     let publisher = publisher_or_new(session, owner)?;
@@ -502,20 +502,20 @@ pub(super) fn stage_direct_recovery(session: &mut Session) -> Result<Value, Stri
     let value = json!({"workspace":owner.id(), "snapshot":snapshot,
         "state":"awaiting_recovery_save", "publication_count":count,
         "durable":false, "accepted_progress":false});
-    session.staged_workspace = Some(StagedWorkspace {
+    session.transition.staged = Some(StagedWorkspace {
         workspace: candidate,
         publisher: Some(publisher),
         inbox: Some(next),
         snapshot,
         transition: WorkspaceTransition::InboxRecovery { count },
     });
-    session.ready_direct_range = None;
+    session.recovery.ready_direct_range = None;
     Ok(value)
 }
 
 pub(super) fn stage_direct_miss(session: &mut Session) -> Result<Value, String> {
     let query = session
-        .direct_miss
+        .recovery.direct_miss
         .as_ref()
         .ok_or("no exhausted direct recovery ready")?;
     let owner = session
@@ -527,7 +527,7 @@ pub(super) fn stage_direct_miss(session: &mut Session) -> Result<Value, String> 
         .as_ref()
         .ok_or("session has no protected root key")?;
     let (next, missing) = session
-        .inbox
+        .delivery.inbox
         .as_ref()
         .ok_or("no object delivery state")?
         .skip_direct_gap(owner, query)
@@ -544,14 +544,14 @@ pub(super) fn stage_direct_miss(session: &mut Session) -> Result<Value, String> 
     let value = json!({"workspace":owner.id(), "snapshot":snapshot,
         "state":"awaiting_recovery_save", "missing_count":missing,
         "durable":false, "accepted_progress":false});
-    session.staged_workspace = Some(StagedWorkspace {
+    session.transition.staged = Some(StagedWorkspace {
         workspace: candidate,
         publisher: Some(publisher),
         inbox: Some(next),
         snapshot,
         transition: WorkspaceTransition::DirectMiss { missing },
     });
-    session.direct_miss = None;
+    session.recovery.direct_miss = None;
     Ok(value)
 }
 
@@ -566,7 +566,7 @@ pub(super) fn inbox_operation(session: &mut Session, request: Request) -> Result
         .as_ref()
         .ok_or("session has no protected root key")?;
     if let Request::PollPendingObject { deferred } = request {
-        let Some(inbox) = session.inbox.as_ref() else {
+        let Some(inbox) = session.delivery.inbox.as_ref() else {
             return Ok(Value::Null);
         };
         return match inbox
@@ -597,7 +597,7 @@ pub(super) fn inbox_operation(session: &mut Session, request: Request) -> Result
             counter,
             id,
         } => session
-            .inbox
+            .delivery.inbox
             .as_ref()
             .ok_or("no object delivery state")?
             .acknowledge(
@@ -613,7 +613,7 @@ pub(super) fn inbox_operation(session: &mut Session, request: Request) -> Result
             counter,
             id,
         } => session
-            .inbox
+            .delivery.inbox
             .as_ref()
             .ok_or("no object delivery state")?
             .reject(
@@ -635,7 +635,7 @@ pub(super) fn inbox_operation(session: &mut Session, request: Request) -> Result
     )?;
     let candidate = owner.provisional_copy().map_err(str::to_owned)?;
     let value = json!({"workspace":owner.id(), "snapshot":snapshot, "state":"awaiting_reception_save", "durable":false});
-    session.staged_workspace = Some(StagedWorkspace {
+    session.transition.staged = Some(StagedWorkspace {
         workspace: candidate,
         publisher: Some(publisher),
         inbox: Some(inbox),

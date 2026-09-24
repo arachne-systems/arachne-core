@@ -87,7 +87,7 @@ fn pending_records(session: &Session, pending: &arachne_security::PendingJoin) -
         .seal(session.storage_key.as_ref().ok_or("protected root required")?)
         .map_err(str::to_owned)?;
     let mut records = BTreeMap::from([(PENDING.to_vec(), Zeroizing::new(bytes))]);
-    if let Some(lifecycle) = &session.join_lifecycle {
+    if let Some(lifecycle) = &session.join.lifecycle {
         records.insert(
             JOIN_LIFECYCLE.to_vec(),
             Zeroizing::new(serde_json::to_vec(lifecycle).map_err(|error| error.to_string())?),
@@ -102,15 +102,15 @@ fn pending_records(session: &Session, pending: &arachne_security::PendingJoin) -
 
 fn idle(session: &Session) -> Result<(), String> {
     if session.records.is_some()
-        || session.staged_workspace.is_some()
-        || session.staged_removal.is_some()
-        || session.inbound_admission.is_some()
-        || session.membership_update.is_some()
-        || session.cutoff.is_some()
-        || session.current_view.is_some()
-        || session.ready_current_view.is_some()
-        || session.range.is_some()
-        || session.ready_range.is_some()
+        || session.transition.staged.is_some()
+        || session.transition.removal.is_some()
+        || session.transition.inbound.is_some()
+        || session.membership.update.is_some()
+        || session.recovery.cutoff.is_some()
+        || session.recovery.current_view.is_some()
+        || session.recovery.ready_current_view.is_some()
+        || session.recovery.range.is_some()
+        || session.recovery.ready_range.is_some()
     {
         return Err("record storage requires an idle session".into());
     }
@@ -136,12 +136,12 @@ pub fn enable_record_storage(handle: i64, path: &Path, root: &[u8; 32]) -> Resul
             owner.id(),
             active_records(
                 owner,
-                session.publisher.as_ref(),
-                session.inbox.as_ref(),
+                session.delivery.publisher.as_ref(),
+                session.delivery.inbox.as_ref(),
                 &session.activity,
             )?,
         )
-    } else if let Some(pending) = &session.pending_join {
+    } else if let Some(pending) = &session.join.pending {
         (pending.workspace_id(), pending_records(session, pending)?)
     } else {
         return Err("session has no workspace or pending join".into());
@@ -173,7 +173,7 @@ pub fn save_candidate(handle: i64, token: &[u8]) -> Result<(), String> {
 /// this session. The lifecycle driver calls this before adoption, so Android
 /// never becomes the authority for the save/adopt ordering.
 pub(super) fn commit_candidate(session: &mut Session, token: &[u8]) -> Result<(), String> {
-    let records = if let Some(staged) = &session.staged_workspace {
+    let records = if let Some(staged) = &session.transition.staged {
         if token != staged.snapshot {
             return Err("token does not match candidate".into());
         }
@@ -191,7 +191,7 @@ pub(super) fn commit_candidate(session: &mut Session, token: &[u8]) -> Result<()
             staged.inbox.as_ref(),
             &activity,
         )?
-    } else if let Some((removed, expected)) = &session.staged_removal {
+    } else if let Some((removed, expected)) = &session.transition.removal {
         if token != expected {
             return Err("token does not match removal".into());
         }
@@ -220,7 +220,7 @@ pub(super) fn commit_candidate(session: &mut Session, token: &[u8]) -> Result<()
 /// Persist pending join routing before an Iroh admission exchange can leave the
 /// endpoint. This makes an interrupted send retry the same attempt/peer.
 pub(super) fn commit_pending_join(session: &mut Session) -> Result<(), String> {
-    let pending = session.pending_join.as_ref().ok_or("session has no pending join")?;
+    let pending = session.join.pending.as_ref().ok_or("session has no pending join")?;
     let records = pending_records(session, pending)?;
     let token = candidate_token()?;
     session
@@ -298,7 +298,7 @@ pub fn restore_record_storage_with_freshness(
     let mut guard = shared.lock().map_err(|_| "node session unavailable")?;
     let session = guard.as_mut().ok_or("node is closed")?;
     idle(session)?;
-    if session.workspace.is_some() || session.pending_join.is_some() {
+    if session.workspace.is_some() || session.join.pending.is_some() {
         return Err("session already owns a workspace".into());
     }
     // An absent authoritative store must never become a new empty database.
@@ -347,7 +347,7 @@ pub fn restore_record_storage_with_freshness(
         }
         value["activity"] = activity.projection();
         session.activity = activity;
-        session.join_lifecycle = get(JOIN_LIFECYCLE)?
+        session.join.lifecycle = get(JOIN_LIFECYCLE)?
             .map(|bytes| {
                 let lifecycle: JoinLifecycle =
                     serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
@@ -355,7 +355,7 @@ pub fn restore_record_storage_with_freshness(
                 Ok::<JoinLifecycle, String>(lifecycle)
             })
             .transpose()?;
-        session.pending_join = Some(pending);
+        session.join.pending = Some(pending);
         session.records = Some(NativeStore { store, committed });
         return Ok(value);
     }
@@ -418,8 +418,8 @@ pub fn restore_record_storage_with_freshness(
     let mut value = value;
     value["activity"] = activity.projection();
     session.activity = activity;
-    session.publisher = publisher;
-    session.inbox = inbox;
+    session.delivery.publisher = publisher;
+    session.delivery.inbox = inbox;
     commit_workspace(session, owner);
     session.records = Some(NativeStore { store, committed });
     Ok(value)

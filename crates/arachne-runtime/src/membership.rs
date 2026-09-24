@@ -328,7 +328,7 @@ fn merge_profiles_with_budget(
         .ok_or("session has no workspace")?;
     merge_into(
         owner,
-        &mut lock_profiles(&session.profiles),
+        &mut lock_profiles(&session.membership.profiles),
         profiles,
         budget,
     )
@@ -456,7 +456,7 @@ fn roster_with_budget(
         .as_ref()
         .ok_or("session has no workspace")?;
     let own_id = owner.member().ok_or("member profile required")?.id();
-    let set = lock_profiles(&session.profiles);
+    let set = lock_profiles(&session.membership.profiles);
     let members = owner
         .member_roster()
         .map_err(str::to_owned)?
@@ -541,7 +541,7 @@ fn profile_page(
 pub(super) fn reply_with_profiles(session: &mut Session, peer: [u8; 32], bytes: &[u8]) -> Value {
     let result = answer_query(
         session.workspace.as_deref(),
-        &mut lock_profiles(&session.profiles),
+        &mut lock_profiles(&session.membership.profiles),
         peer,
         bytes,
         MAX_PROFILE_SET_BYTES,
@@ -552,7 +552,7 @@ pub(super) fn reply_with_profiles(session: &mut Session, peer: [u8; 32], bytes: 
 
 /// Gossip the profiles that membership queries retained first.
 pub(super) fn send_queued_profiles(session: &Session) {
-    let queued = std::mem::take(&mut lock_profiles(&session.profiles).to_gossip);
+    let queued = std::mem::take(&mut lock_profiles(&session.membership.profiles).to_gossip);
     for bytes in queued {
         broadcast_profile(session, &bytes);
     }
@@ -561,7 +561,7 @@ pub(super) fn send_queued_profiles(session: &Session) {
 /// The host-facing notice for queries the inquiry responder answered since
 /// the host last heard: the same event the host path returns for a query.
 pub(super) fn take_answered(session: &Session) -> Option<Value> {
-    let peer = lock_profiles(&session.profiles).answered.take()?;
+    let peer = lock_profiles(&session.membership.profiles).answered.take()?;
     let mut event = json!({"state":"membership_replied", "remote_receipt":false});
     if let Some(peer) = peer {
         event["peer"] = json!(peer);
@@ -726,11 +726,11 @@ pub(super) fn start_query_if_needed(
     session: &mut Session,
     peer: [u8; 32],
 ) -> Result<bool, String> {
-    if session.membership_update.is_some() {
+    if session.membership.update.is_some() {
         return Ok(false);
     }
     if session
-        .membership_peer_failures
+        .membership.peer_failures
         .get(&peer)
         .is_some_and(|failed| failed.elapsed() < MEMBERSHIP_PEER_COOLDOWN)
     {
@@ -750,13 +750,13 @@ fn start_query(
         .workspace
         .as_ref()
         .ok_or("session has no workspace")?;
-    if session.membership_update.is_some() && !replace_pending {
+    if session.membership.update.is_some() && !replace_pending {
         return Err("membership query already pending".into());
     }
     if peer == session.node.id() || owner.member_id_for_endpoint(peer).is_err() {
         return Err("membership query requires another admitted peer".into());
     }
-    drop(session.membership_update.take());
+    drop(session.membership.update.take());
     let basis = StateBasis {
         epoch: owner.epoch(),
         fingerprint: owner.epoch_fingerprint(),
@@ -768,9 +768,9 @@ fn start_query(
         .workspace
         .as_deref()
         .ok_or("session has no workspace")?;
-    let mut set = lock_profiles(&session.profiles);
+    let mut set = lock_profiles(&session.membership.profiles);
     let digest = profiles_digest(owner, &set);
-    let profiles = if session.peer_profile_summaries.get(&peer) == Some(&digest) {
+    let profiles = if session.membership.peer_profile_summaries.get(&peer) == Some(&digest) {
         Vec::new()
     } else {
         profile_page(owner, &mut set, peer)
@@ -794,7 +794,7 @@ fn start_query(
         wake.notify_one();
         reply
     });
-    session.membership_update = Some(PendingControl {
+    session.membership.update = Some(PendingControl {
         query: basis,
         peer,
         task,
@@ -810,7 +810,7 @@ fn queue_membership_offer(
     commit: Vec<u8>,
     requires_adoption: bool,
 ) -> Result<Value, String> {
-    if session.membership_offer.is_some() {
+    if session.membership.offer.is_some() {
         return Err("membership offer already pending".into());
     }
     let packet = {
@@ -837,12 +837,12 @@ fn queue_membership_offer(
     let task = session
         .runtime
         .spawn(session.node.request_control(peer, &packet));
-    session.membership_offer = Some(PendingControl {
+    session.membership.offer = Some(PendingControl {
         query: after,
         peer,
         task,
     });
-    session.membership_offer_requires_adoption = requires_adoption;
+    session.membership.offer_requires_adoption = requires_adoption;
     Ok(json!({"state":"membership_offer_pending"}))
 }
 
@@ -861,7 +861,7 @@ fn poll_with_budget(
     match request {
         Request::NextMembershipPeer { after } => {
             let now = std::time::Instant::now();
-            session.membership_peer_failures.retain(|_, failed| {
+            session.membership.peer_failures.retain(|_, failed| {
                 now.saturating_duration_since(*failed) < MEMBERSHIP_PEER_COOLDOWN
             });
             let mut peers = owner
@@ -875,7 +875,7 @@ fn poll_with_budget(
                         || presence::contact_age(&session.presence, member.endpoint, now)
                             .is_some_and(|age| age < MEMBERSHIP_PEER_RECENT),
                     cooling: session
-                        .membership_peer_failures
+                        .membership.peer_failures
                         .contains_key(&member.endpoint),
                 })
                 .collect::<Vec<_>>();
@@ -889,7 +889,7 @@ fn poll_with_budget(
             Ok(json!({"peer":peer,"member":member,"epoch":owner.epoch()}))
         }
         Request::OfferMembershipUpdate { peer, after } => {
-            if session.membership_offer.is_some() {
+            if session.membership.offer.is_some() {
                 return Err("membership offer already pending".into());
             }
             if peer == session.node.id() || owner.member_id_for_endpoint(peer).is_err() {
@@ -913,7 +913,7 @@ fn poll_with_budget(
                     return Err("membership offer requires another admitted peer".into());
                 }
                 let staged = session
-                    .staged_workspace
+                    .transition.staged
                     .as_ref()
                     .ok_or("workspace candidate is not staged")?;
                 let WorkspaceTransition::Management(action, commit) = &staged.transition else {
@@ -935,15 +935,15 @@ fn poll_with_budget(
         }
         Request::PollMembershipOffer {} => {
             if !session
-                .membership_offer
+                .membership.offer
                 .as_ref()
                 .is_some_and(|pending| pending.task.is_finished())
             {
                 return Ok(Value::Null);
             }
-            let requires_adoption = session.membership_offer_requires_adoption;
-            session.membership_offer_requires_adoption = false;
-            let mut pending = session.membership_offer.take().unwrap();
+            let requires_adoption = session.membership.offer_requires_adoption;
+            session.membership.offer_requires_adoption = false;
+            let mut pending = session.membership.offer.take().unwrap();
             let bytes = session
                 .runtime
                 .block_on(&mut pending.task)
@@ -972,13 +972,13 @@ fn poll_with_budget(
         }
         Request::PollMembershipUpdate {} => {
             if !session
-                .membership_update
+                .membership.update
                 .as_ref()
                 .is_some_and(|pending| pending.task.is_finished())
             {
                 return Ok(Value::Null);
             }
-            let mut pending = session.membership_update.take().unwrap();
+            let mut pending = session.membership.update.take().unwrap();
             let bytes = match session
                 .runtime
                 .block_on(&mut pending.task)
@@ -988,7 +988,7 @@ fn poll_with_budget(
                 Ok(bytes) => bytes,
                 Err(_error) => {
                     session
-                        .membership_peer_failures
+                        .membership.peer_failures
                         .insert(pending.peer, std::time::Instant::now());
                     // Reconciliation is advisory. A peer that is offline or
                     // saturated must not turn the workspace driver into a
@@ -1001,7 +1001,7 @@ fn poll_with_budget(
                     }));
                 }
             };
-            session.membership_peer_failures.remove(&pending.peer);
+            session.membership.peer_failures.remove(&pending.peer);
             if owner.epoch() != pending.query.epoch
                 || owner.epoch_fingerprint() != pending.query.fingerprint
                 || owner.workspace_name_head().map_err(str::to_owned)? != pending.query.name_head
@@ -1052,20 +1052,20 @@ fn poll_with_budget(
                 let digest = serde_json::from_value(digest.clone())
                     .map_err(|_| "invalid profiles summary")?;
                 // Only a peer's comparison hint, never authority for a profile.
-                if !session.peer_profile_summaries.contains_key(&pending.peer)
-                    && session.peer_profile_summaries.len() >= MAX_PEER_PROFILE_SUMMARIES
+                if !session.membership.peer_profile_summaries.contains_key(&pending.peer)
+                    && session.membership.peer_profile_summaries.len() >= MAX_PEER_PROFILE_SUMMARIES
                 {
-                    session.peer_profile_summaries.pop_first();
+                    session.membership.peer_profile_summaries.pop_first();
                 }
-                session.peer_profile_summaries.insert(pending.peer, digest);
+                session.membership.peer_profile_summaries.insert(pending.peer, digest);
                 // The peer holds names we do not: walk its set once, in
                 // pages, unless we already walked this exact set.
                 let owner = session
                     .workspace
                     .as_deref()
                     .ok_or("session has no workspace")?;
-                let ours = profiles_digest(owner, &lock_profiles(&session.profiles));
-                if ours != digest && session.profiles_walked.get(&pending.peer) != Some(&digest) {
+                let ours = profiles_digest(owner, &lock_profiles(&session.membership.profiles));
+                if ours != digest && session.membership.profiles_walked.get(&pending.peer) != Some(&digest) {
                     start_profile_pull(session, pending.peer, None, digest);
                 }
             }
@@ -1286,67 +1286,20 @@ pub(super) fn bare_test_session(workspace: impl Into<Arc<arachne_security::Works
         ))
         .unwrap();
     let committed = super::committed_view::Published::new(None);
-    Session {
-        resources: resources::Jobs::default(),
-        presence: presence::Presence::new().unwrap(),
-        interests: interest::Updates::default(),
-        records: None,
-        membership_update: None,
-        membership_offer: None,
-        membership_offer_requires_adoption: false,
-        membership_peer_failures: BTreeMap::new(),
-        staged_step_received: false,
-        gossip_steps_ahead: BTreeMap::new(),
-        membership_head: None,
-        range_pull: None,
-        gossip_counts: Arc::default(),
-        profile_pull: None,
-        profiles_walked: BTreeMap::new(),
-        gossip_profiles_pending: Default::default(),
-        cutoff: None,
-        current_view: None,
-        ready_current_view: None,
-        range: None,
-        ready_range: None,
-        direct_range: None,
-        ready_direct_range: None,
-        direct_miss: None,
-        publisher: None,
-        inbox: None,
-        inbound_admission: None,
-        admission_queue: arachne_security::AdmissionQueue::new(),
-        admission_metadata: BTreeMap::new(),
-        admission_waiters: super::admission_waiters::AdmissionWaiters::new(
-            super::MAX_ADMISSION_WAITERS,
-        ),
-        admission_pushes: Vec::new(),
-        pending_approvals: BTreeMap::new(),
-        staged_approval_id: None,
-        queued_admission_in_flight: Vec::new(),
-        admission_reads_since_stage: 0,
-        nearby_workspaces: BTreeMap::new(),
-        nearby_identity: None,
-        staged_workspace: None,
-        staged_removal: None,
-        profiles: committed.profiles(),
-        peer_profile_summaries: BTreeMap::new(),
-        workspace: Some(workspace.into()),
-        committed,
-        pending_join: None,
-        join_lifecycle: None,
-        checkpoint_exchange: None,
-        join_exchange: None,
-        activity: super::WorkspaceActivity {
-            phase: super::WorkspacePhase::Active,
-            reason: None,
-        },
-        join_history_prefix: Vec::new(),
-        storage_key: None,
-        overlay_paths: 0,
+    let mut session = Session::new(
         node,
         receiver,
         runtime,
-    }
+        committed,
+        None,
+        presence::Presence::new().unwrap(),
+    );
+    session.activity = super::WorkspaceActivity {
+        phase: super::WorkspacePhase::Active,
+        reason: None,
+    };
+    session.workspace = Some(workspace.into());
+    session
 }
 
 // FUT-37: the owner's in-session profile cache must retain every admitted
@@ -1480,7 +1433,7 @@ fn budget_pressure_never_fails_member_roster_or_poll_membership_update() {
         "profiles": [profiles[2].clone()],
     });
     let bytes = encode_reply(&peer_reply).unwrap();
-    session.membership_update = Some(PendingControl {
+    session.membership.update = Some(PendingControl {
         query: StateBasis {
             epoch: owner.epoch(),
             fingerprint: owner.epoch_fingerprint(),
@@ -1492,7 +1445,7 @@ fn budget_pressure_never_fails_member_roster_or_poll_membership_update() {
             .spawn(async move { Ok::<Vec<u8>, arachne_node::Error>(bytes) }),
     });
     while !session
-        .membership_update
+        .membership.update
         .as_ref()
         .unwrap()
         .task
@@ -1632,7 +1585,7 @@ fn missing_names_come_back_from_one_peer_in_pages() {
         owner.workspace_name_head().unwrap(),
     );
     let (digest, carried) = {
-        let mut set = lock_profiles(&requester.profiles);
+        let mut set = lock_profiles(&requester.membership.profiles);
         let own = requester.workspace.clone().unwrap();
         merge_into(&own, &mut set, &[], MAX_PROFILE_SET_BYTES).unwrap();
         (
@@ -1658,7 +1611,7 @@ fn missing_names_come_back_from_one_peer_in_pages() {
     .unwrap();
     let task = ready(&mut requester, reply);
     settle(&task);
-    requester.membership_update = Some(PendingControl {
+    requester.membership.update = Some(PendingControl {
         query: basis,
         peer: answerer_endpoint,
         task,
@@ -1669,7 +1622,7 @@ fn missing_names_come_back_from_one_peer_in_pages() {
     // Its page pulls, carried in-process: three pages hold 70 names.
     for _ in 0..usize::from(MEMBERS).div_ceil(wire::MAX_PAGE_PROFILES) + 1 {
         let Some(after) = requester
-            .profile_pull
+            .membership.profile_pull
             .as_ref()
             .map(|pending| pending.query.after)
         else {
@@ -1682,13 +1635,13 @@ fn missing_names_come_back_from_one_peer_in_pages() {
         .unwrap();
         let page = profile_page_reply(
             Some(&owner),
-            &lock_profiles(&answerer.profiles),
+            &lock_profiles(&answerer.membership.profiles),
             requester_endpoint,
             &query,
         );
         let task = ready(&mut requester, page);
         settle(&task);
-        requester.profile_pull.as_mut().unwrap().task = task;
+        requester.membership.profile_pull.as_mut().unwrap().task = task;
         stage_gossiped_step(&mut requester).unwrap();
     }
     let roster = roster(&mut requester, &[]).unwrap();
@@ -1703,7 +1656,7 @@ fn missing_names_come_back_from_one_peer_in_pages() {
         usize::from(MEMBERS),
         "missing names did not come back in pages"
     );
-    assert!(requester.profile_pull.is_none(), "the walk did not end");
+    assert!(requester.membership.profile_pull.is_none(), "the walk did not end");
 }
 
 #[test]
@@ -1877,7 +1830,7 @@ fn equal_epoch_needs_matching_fingerprint_and_malformed_claims_are_not_current()
 
 pub(super) fn stage_update(session: &mut Session, step: JoinStep) -> Result<Value, String> {
     check_epoch_transition(session)?;
-    session.staged_step_received = false;
+    session.membership.staged_step_received = false;
     let authorization = step.authorization()?;
     let owner = session
         .workspace
@@ -1941,14 +1894,14 @@ pub(super) fn stage_update(session: &mut Session, step: JoinStep) -> Result<Valu
     )?;
     let value = json!({"workspace":prepared.id(), "workspace_name":prepared.workspace_name().map_err(str::to_owned)?, "snapshot":snapshot,
             "state":"awaiting_save", "durable":false});
-    session.staged_workspace = Some(StagedWorkspace {
+    session.transition.staged = Some(StagedWorkspace {
         publisher,
         inbox,
         transition: WorkspaceTransition::Admission,
         workspace: prepared,
         snapshot,
     });
-    session.staged_step_received = true;
+    session.membership.staged_step_received = true;
     Ok(value)
 }
 
@@ -2005,7 +1958,7 @@ fn take_gossiped_profile(session: &mut Session, bytes: Vec<u8>) {
     if profile_id(session, &bytes).is_some() {
         let _ = merge_profiles_with_budget(session, &[bytes], MAX_PROFILE_SET_BYTES);
     } else {
-        hold_profile(&mut session.gossip_profiles_pending, bytes);
+        hold_profile(&mut session.membership.profiles_pending, bytes);
     }
 }
 
@@ -2016,7 +1969,7 @@ pub(super) fn retain_held_profiles(session: &mut Session) {
     let Some(owner) = session.workspace.as_ref() else {
         return;
     };
-    if session.gossip_profiles_pending.is_empty() {
+    if session.membership.profiles_pending.is_empty() {
         return;
     }
     let Ok(roster) = owner.member_roster() else {
@@ -2024,14 +1977,14 @@ pub(super) fn retain_held_profiles(session: &mut Session) {
     };
     let members: BTreeSet<[u8; 32]> = roster.into_iter().map(|member| member.id).collect();
     let (ready, waiting): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
-        std::mem::take(&mut session.gossip_profiles_pending)
+        std::mem::take(&mut session.membership.profiles_pending)
             .into_iter()
             .partition(|bytes| {
                 bytes
                     .get(37..69)
                     .is_some_and(|id| members.contains(<&[u8; 32]>::try_from(id).unwrap()))
             });
-    session.gossip_profiles_pending = waiting.into();
+    session.membership.profiles_pending = waiting.into();
     for chunk in ready.chunks(MAX_REQUEST_PROFILES) {
         let _ = merge_profiles_with_budget(session, chunk, MAX_PROFILE_SET_BYTES);
     }
@@ -2118,14 +2071,14 @@ pub(super) fn note_head(session: &mut Session, head: u64, author: [u8; 32]) {
     if head <= epoch || author == session.node.id() {
         return;
     }
-    match &mut session.membership_head {
+    match &mut session.membership.head {
         Some((known, _)) if head < *known => {}
         Some((known, authors)) if head == *known => {
             if !authors.contains(&author) && authors.len() < MAX_HEAD_AUTHORS {
                 authors.push(author);
             }
         }
-        _ => session.membership_head = Some((head, vec![author])),
+        _ => session.membership.head = Some((head, vec![author])),
     }
 }
 
@@ -2144,7 +2097,7 @@ pub(super) fn announce_head(session: &mut Session) {
     let send = session.node.broadcast_membership(owner.id(), payload);
     // A failed broadcast is not an error for the commit: members pull. The
     // outcome is counted (sent / no overlay or no member / failed).
-    let counts = session.gossip_counts.clone();
+    let counts = session.membership.gossip_counts.clone();
     session.runtime.spawn(async move {
         match send.await {
             Ok(true) => GossipCounts::add(&counts.sent),
@@ -2163,7 +2116,7 @@ pub(super) fn stage_gossiped_step(session: &mut Session) -> Result<Option<Value>
     };
     let id = session.workspace.as_ref().map(|owner| owner.id()).unwrap();
     while let Some((workspace, payload)) = session.node.poll_membership_gossip() {
-        GossipCounts::add(&session.gossip_counts.received);
+        GossipCounts::add(&session.membership.gossip_counts.received);
         if workspace == id
             && payload.len() > GOSSIP_PROFILE.len() + 32
             && payload.starts_with(GOSSIP_PROFILE)
@@ -2187,17 +2140,17 @@ pub(super) fn stage_gossiped_step(session: &mut Session) -> Result<Option<Value>
     finish_range_pull(session);
     finish_profile_pull(session);
     session
-        .gossip_steps_ahead
+        .membership.steps_ahead
         .retain(|after, _| *after >= epoch);
     if session
-        .membership_head
+        .membership.head
         .as_ref()
         .is_some_and(|(head, _)| *head <= epoch)
     {
-        session.membership_head = None;
+        session.membership.head = None;
     }
     start_range_pull(session, epoch);
-    let Some(bytes) = session.gossip_steps_ahead.remove(&epoch) else {
+    let Some(bytes) = session.membership.steps_ahead.remove(&epoch) else {
         return Ok(None);
     };
     let Ok(step) = serde_json::from_slice::<JoinStep>(&bytes) else {
@@ -2209,12 +2162,12 @@ pub(super) fn stage_gossiped_step(session: &mut Session) -> Result<Option<Value>
             // without sending a reply.
             value["queued"] = json!(true);
             value["gossip"] = json!(true);
-            GossipCounts::add(&session.gossip_counts.staged);
+            GossipCounts::add(&session.membership.gossip_counts.staged);
             Ok(Some(value))
         }
         // A step that does not verify is dropped; pull recovers.
         Err(_) => {
-            GossipCounts::add(&session.gossip_counts.rejected);
+            GossipCounts::add(&session.membership.gossip_counts.rejected);
             Ok(None)
         }
     }
@@ -2224,18 +2177,18 @@ pub(super) fn stage_gossiped_step(session: &mut Session) -> Result<Option<Value>
 /// in one exchange. That member is alive: it sent the head a
 /// moment ago. One pull at a time; its reply wakes the host.
 fn start_range_pull(session: &mut Session, epoch: u64) {
-    if session.range_pull.is_some() || session.gossip_steps_ahead.contains_key(&epoch) {
+    if session.membership.range_pull.is_some() || session.membership.steps_ahead.contains_key(&epoch) {
         return;
     }
     let Some(owner) = session.workspace.as_ref() else {
         return;
     };
-    let Some((head, authors)) = session.membership_head.as_mut() else {
+    let Some((head, authors)) = session.membership.head.as_mut() else {
         return;
     };
     authors.retain(|author| owner.member_id_for_endpoint(*author).is_ok());
     if *head <= epoch || authors.is_empty() {
-        session.membership_head = None;
+        session.membership.head = None;
         return;
     }
     let head = *head;
@@ -2271,7 +2224,7 @@ fn start_range_pull(session: &mut Session, epoch: u64) {
         wake.notify_one();
         reply
     });
-    session.range_pull = Some(PendingControl {
+    session.membership.range_pull = Some(PendingControl {
         query: epoch,
         peer: author,
         task,
@@ -2283,13 +2236,13 @@ fn start_range_pull(session: &mut Session, epoch: u64) {
 /// the next announcement, presence or the roster pull recovers.
 fn finish_range_pull(session: &mut Session) {
     if !session
-        .range_pull
+        .membership.range_pull
         .as_ref()
         .is_some_and(|pending| pending.task.is_finished())
     {
         return;
     }
-    let mut pending = session.range_pull.take().unwrap();
+    let mut pending = session.membership.range_pull.take().unwrap();
     let id = session.workspace.as_ref().map(|owner| owner.id());
     let reply = session
         .runtime
@@ -2305,13 +2258,13 @@ fn finish_range_pull(session: &mut Session) {
         && reply.after == pending.query
     {
         for (after, step) in (pending.query..).zip(reply.steps) {
-            if !session.gossip_steps_ahead.contains_key(&after)
-                && session.gossip_steps_ahead.len() >= MAX_GOSSIP_STEPS_AHEAD
+            if !session.membership.steps_ahead.contains_key(&after)
+                && session.membership.steps_ahead.len() >= MAX_GOSSIP_STEPS_AHEAD
             {
                 break;
             }
             session
-                .gossip_steps_ahead
+                .membership.steps_ahead
                 .entry(after)
                 .or_insert_with(|| step.to_vec());
             pulled += 1;
@@ -2320,15 +2273,15 @@ fn finish_range_pull(session: &mut Session) {
     tracing::info!(target: "data_fabric_transport", after = pending.query, peer = %hex_prefix(&pending.peer), pulled, error, "RANGE_PULL_END");
     if pulled == 0 {
         // Try the head's other authors; with none left, fall back to pull.
-        GossipCounts::add(&session.gossip_counts.range_failed);
-        if let Some((_, authors)) = session.membership_head.as_mut() {
+        GossipCounts::add(&session.membership.gossip_counts.range_failed);
+        if let Some((_, authors)) = session.membership.head.as_mut() {
             authors.retain(|author| *author != pending.peer);
             if authors.is_empty() {
-                session.membership_head = None;
+                session.membership.head = None;
             }
         }
     } else {
-        GossipCounts::add(&session.gossip_counts.range_pulled);
+        GossipCounts::add(&session.membership.gossip_counts.range_pulled);
     }
 }
 
@@ -2383,7 +2336,7 @@ fn start_profile_pull(
     after: Option<[u8; 32]>,
     digest: [u8; 32],
 ) {
-    if session.profile_pull.is_some() {
+    if session.membership.profile_pull.is_some() {
         return;
     }
     let Some(owner) = session.workspace.as_ref() else {
@@ -2404,7 +2357,7 @@ fn start_profile_pull(
         wake.notify_one();
         reply
     });
-    session.profile_pull = Some(PendingControl {
+    session.membership.profile_pull = Some(PendingControl {
         query: ProfilePull { after, digest },
         peer,
         task,
@@ -2416,13 +2369,13 @@ fn start_profile_pull(
 /// roster verifies. A peer cannot keep a member walking with made-up names.
 fn finish_profile_pull(session: &mut Session) {
     if !session
-        .profile_pull
+        .membership.profile_pull
         .as_ref()
         .is_some_and(|pending| pending.task.is_finished())
     {
         return;
     }
-    let mut pending = session.profile_pull.take().unwrap();
+    let mut pending = session.membership.profile_pull.take().unwrap();
     let bytes = session
         .runtime
         .block_on(&mut pending.task)
@@ -2463,13 +2416,13 @@ fn finish_profile_pull(session: &mut Session) {
             return;
         }
     }
-    if !session.profiles_walked.contains_key(&pending.peer)
-        && session.profiles_walked.len() >= MAX_PEER_PROFILE_SUMMARIES
+    if !session.membership.profiles_walked.contains_key(&pending.peer)
+        && session.membership.profiles_walked.len() >= MAX_PEER_PROFILE_SUMMARIES
     {
-        session.profiles_walked.pop_first();
+        session.membership.profiles_walked.pop_first();
     }
     session
-        .profiles_walked
+        .membership.profiles_walked
         .insert(pending.peer, pending.query.digest);
 }
 
@@ -2565,7 +2518,7 @@ pub(super) fn stage_prepared(
         inbox.as_ref(),
     )?;
     let value = json!({"workspace":prepared.workspace.id(), "workspace_name":prepared.workspace.workspace_name().map_err(str::to_owned)?, "snapshot":snapshot, "state":"awaiting_save", "durable":false});
-    session.staged_workspace = Some(StagedWorkspace {
+    session.transition.staged = Some(StagedWorkspace {
         publisher,
         inbox,
         transition: WorkspaceTransition::Management(prepared.action, prepared.commit),
@@ -2682,7 +2635,7 @@ pub(super) fn stage_removal(
     };
     let mut value = json!({"workspace":removed.workspace_id(), "snapshot":snapshot, "state":"awaiting_save", "removed":true, "durable":false});
     value["activity"] = super::activity_value(session);
-    session.staged_removal = Some((removed, snapshot));
+    session.transition.removal = Some((removed, snapshot));
     Ok(value)
 }
 

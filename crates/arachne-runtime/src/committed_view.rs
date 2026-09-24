@@ -227,7 +227,7 @@ fn a_membership_query_answer_is_the_host_answer() {
     .unwrap();
     let host_page = membership::profile_page_reply(
         host.workspace.as_deref(),
-        &membership::lock_profiles(&host.profiles),
+        &membership::lock_profiles(&host.membership.profiles),
         endpoints[0],
         &page,
     );

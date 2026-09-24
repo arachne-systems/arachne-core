@@ -300,25 +300,115 @@ struct TransportSummary {
     timeouts: Timeouts,
 }
 
+/// One endpoint session. Each subsystem owns its state in its own struct.
 struct Session {
+    // Transport and runtime.
+    node: Node,
+    receiver: arachne_node::MessageReceiver,
+    runtime: Runtime,
+    overlay_paths: usize,
+    // Committed workspace and durable state.
+    /// The committed workspace. Shared and never edited in place: a transition
+    /// works on a provisional copy, and `commit_workspace` replaces this.
+    workspace: Option<Arc<arachne_security::Workspace>>,
+    /// The same state, published for inquiries answered without the host.
+    committed: committed_view::Published,
+    activity: WorkspaceActivity,
+    storage_key: Option<arachne_security::StorageKey>,
+    records: Option<persistence::NativeStore>,
+    // Subsystems.
+    transition: TransitionState,
+    delivery: DeliveryState,
+    admission: AdmissionState,
+    join: JoinState,
+    membership: MembershipState,
+    recovery: RecoveryState,
+    nearby: NearbyState,
     resources: resources::Jobs,
     presence: presence::Presence,
     interests: interest::Updates,
-    records: Option<persistence::NativeStore>,
-    membership_update: Option<PendingControl<membership::StateBasis>>,
-    membership_offer: Option<PendingControl<u64>>,
-    membership_offer_requires_adoption: bool,
+}
+
+/// The one staged transition and the one inbound exchange that waits for it.
+#[derive(Default)]
+struct TransitionState {
+    /// A staged workspace candidate that awaits durable adoption.
+    staged: Option<StagedWorkspace>,
+    /// A staged removal (this member left or was removed) and its token.
+    removal: Option<(arachne_security::RemovedMembership, Vec<u8>)>,
+    /// A received control request (admission, leave, offer) that waits for
+    /// the staged transition before it is answered.
+    inbound: Option<arachne_node::ControlRequest>,
+}
+
+/// Object delivery state of the committed workspace.
+#[derive(Default)]
+struct DeliveryState {
+    publisher: Option<arachne_delivery::PublisherLog>,
+    inbox: Option<arachne_delivery::inbox::ObjectInbox>,
+}
+
+/// Owner-side admission intake.
+struct AdmissionState {
+    queue: arachne_security::AdmissionQueue,
+    metadata: BTreeMap<[u8; 32], QueuedAdmission>,
+    waiters: admission_waiters::AdmissionWaiters<arachne_node::ControlRequest>,
+    pushes: Vec<PendingControl<[u8; 32]>>,
+    pending_approvals: BTreeMap<[u8; 32], PendingAdmissionApproval>,
+    staged_approval_id: Option<[u8; 32]>,
+    // The bounded set of queued membership transitions handed to the durable
+    // stage/adopt boundary; retained replies remain independently retryable.
+    in_flight: Vec<arachne_security::AdmissionAttempt>,
+    // Forced-progress trigger for batch staging: admission packets read since
+    // the last staging attempt. Duplicate retries can keep the inbox non-empty
+    // for ever; a count of reads ends that without waiting on a clock.
+    reads_since_stage: usize,
+}
+
+impl Default for AdmissionState {
+    fn default() -> Self {
+        Self {
+            queue: arachne_security::AdmissionQueue::new(),
+            metadata: BTreeMap::new(),
+            waiters: admission_waiters::AdmissionWaiters::new(MAX_ADMISSION_WAITERS),
+            pushes: Vec::new(),
+            pending_approvals: BTreeMap::new(),
+            staged_approval_id: None,
+            in_flight: Vec::new(),
+            reads_since_stage: 0,
+        }
+    }
+}
+
+/// Joiner-side state of one pending join.
+#[derive(Default)]
+struct JoinState {
+    pending: Option<arachne_security::PendingJoin>,
+    lifecycle: Option<JoinLifecycle>,
+    checkpoint_exchange: Option<PendingCheckpointExchange>,
+    exchange: Option<PendingJoinExchange>,
+    /// History this session already fetched for the pending join, beyond the
+    /// last rollover boundary the host still carries. Untrusted until
+    /// `StageJoin` replays it through the verifier from the pinned checkpoint.
+    history_prefix: Vec<Value>,
+}
+
+/// Membership reconciliation: queries, offers, gossip and profiles.
+struct MembershipState {
+    update: Option<PendingControl<membership::StateBasis>>,
+    offer: Option<PendingControl<u64>>,
+    offer_requires_adoption: bool,
     /// Last failed membership query per peer, for the peer-choice cooldown.
-    membership_peer_failures: BTreeMap<[u8; 32], std::time::Instant>,
+    peer_failures: BTreeMap<[u8; 32], std::time::Instant>,
     /// The staged candidate came from a peer's step, not a local commit.
     staged_step_received: bool,
     /// Gossiped steps that skip ahead of this node's epoch, keyed by the
     /// epoch they extend. Bounded; applied in order as earlier steps land.
-    gossip_steps_ahead: BTreeMap<u64, Vec<u8>>,
+    steps_ahead: BTreeMap<u64, Vec<u8>>,
     /// The newest epoch heard by gossip or presence, and members that have it.
     /// A hint only: the steps are pulled and verified.
-    membership_head: Option<(u64, Vec<[u8; 32]>)>,
-    /// One range pull toward `membership_head`, keyed by the epoch it extends.
+    head: Option<(u64, Vec<[u8; 32]>)>,
+    /// One range pull toward `head`, keyed by the epoch it extends.
     range_pull: Option<PendingControl<u64>>,
     /// Membership gossip outcomes, for workspace_metrics.
     gossip_counts: Arc<membership::GossipCounts>,
@@ -327,7 +417,36 @@ struct Session {
     profile_pull: Option<PendingControl<membership::ProfilePull>>,
     profiles_walked: BTreeMap<[u8; 32], [u8; 32]>,
     /// Gossiped profiles of members not yet in this roster (bounded).
-    gossip_profiles_pending: std::collections::VecDeque<Vec<u8>>,
+    profiles_pending: VecDeque<Vec<u8>>,
+    /// Retained member profiles, shared with the inquiry responder.
+    profiles: membership::Profiles,
+    peer_profile_summaries: BTreeMap<[u8; 32], [u8; 32]>,
+}
+
+impl MembershipState {
+    fn new(profiles: membership::Profiles) -> Self {
+        Self {
+            update: None,
+            offer: None,
+            offer_requires_adoption: false,
+            peer_failures: BTreeMap::new(),
+            staged_step_received: false,
+            steps_ahead: BTreeMap::new(),
+            head: None,
+            range_pull: None,
+            gossip_counts: Arc::default(),
+            profile_pull: None,
+            profiles_walked: BTreeMap::new(),
+            profiles_pending: VecDeque::new(),
+            profiles,
+            peer_profile_summaries: BTreeMap::new(),
+        }
+    }
+}
+
+/// Recovery, direct recovery and current-view repair jobs.
+#[derive(Default)]
+struct RecoveryState {
     cutoff: Option<PendingControl<arachne_delivery::wire::CutoffQuery>>,
     current_view: Option<PendingCurrentView>,
     ready_current_view: Option<ReadyCurrentView>,
@@ -336,48 +455,48 @@ struct Session {
     direct_range: Option<PendingDirectRange>,
     ready_direct_range: Option<ReadyDirectRange>,
     direct_miss: Option<arachne_delivery::wire::DirectRangeQuery>,
-    publisher: Option<arachne_delivery::PublisherLog>,
-    inbox: Option<arachne_delivery::inbox::ObjectInbox>,
-    inbound_admission: Option<arachne_node::ControlRequest>,
-    admission_queue: arachne_security::AdmissionQueue,
-    admission_metadata: BTreeMap<[u8; 32], QueuedAdmission>,
-    admission_waiters: admission_waiters::AdmissionWaiters<arachne_node::ControlRequest>,
-    admission_pushes: Vec<PendingControl<[u8; 32]>>,
-    pending_approvals: BTreeMap<[u8; 32], PendingAdmissionApproval>,
-    staged_approval_id: Option<[u8; 32]>,
-    // The bounded set of queued membership transitions handed to the durable
-    // stage/adopt boundary; retained replies remain independently retryable.
-    queued_admission_in_flight: Vec<arachne_security::AdmissionAttempt>,
-    // Forced-progress trigger for batch staging: admission packets read since
-    // the last staging attempt. Duplicate retries can keep the inbox non-empty
-    // for ever; a count of reads ends that without waiting on a clock.
-    admission_reads_since_stage: usize,
-    nearby_workspaces: BTreeMap<[u8; 32], Vec<u8>>,
-    nearby_identity: Option<String>,
-    staged_workspace: Option<StagedWorkspace>,
-    /// Retained member profiles, shared with the inquiry responder.
-    profiles: membership::Profiles,
-    peer_profile_summaries: BTreeMap<[u8; 32], [u8; 32]>,
-    staged_removal: Option<(arachne_security::RemovedMembership, Vec<u8>)>,
-    /// The committed workspace. Shared and never edited in place: a transition
-    /// works on a provisional copy, and `commit_workspace` replaces this.
-    workspace: Option<Arc<arachne_security::Workspace>>,
-    /// The same state, published for inquiries answered without the host.
-    committed: committed_view::Published,
-    pending_join: Option<arachne_security::PendingJoin>,
-    join_lifecycle: Option<JoinLifecycle>,
-    checkpoint_exchange: Option<PendingCheckpointExchange>,
-    join_exchange: Option<PendingJoinExchange>,
-    activity: WorkspaceActivity,
-    /// History this session already fetched for the pending join, beyond the
-    /// last rollover boundary the host still carries. Untrusted until
-    /// `StageJoin` replays it through the verifier from the pinned checkpoint.
-    join_history_prefix: Vec<Value>,
-    storage_key: Option<arachne_security::StorageKey>,
-    overlay_paths: usize,
-    node: Node,
-    receiver: arachne_node::MessageReceiver,
-    runtime: Runtime,
+}
+
+/// Device-level nearby advertisement.
+#[derive(Default)]
+struct NearbyState {
+    workspaces: BTreeMap<[u8; 32], Vec<u8>>,
+    identity: Option<String>,
+}
+
+impl Session {
+    /// The one constructor: an empty session around a bound node.
+    fn new(
+        node: Node,
+        receiver: arachne_node::MessageReceiver,
+        runtime: Runtime,
+        committed: committed_view::Published,
+        storage_key: Option<arachne_security::StorageKey>,
+        presence: presence::Presence,
+    ) -> Self {
+        let profiles = committed.profiles();
+        Self {
+            node,
+            receiver,
+            runtime,
+            overlay_paths: 0,
+            workspace: None,
+            committed,
+            activity: WorkspaceActivity::default(),
+            storage_key,
+            records: None,
+            transition: TransitionState::default(),
+            delivery: DeliveryState::default(),
+            admission: AdmissionState::default(),
+            join: JoinState::default(),
+            membership: MembershipState::new(profiles),
+            recovery: RecoveryState::default(),
+            nearby: NearbyState::default(),
+            resources: resources::Jobs::default(),
+            presence,
+            interests: interest::Updates::default(),
+        }
+    }
 }
 
 struct Registry {
@@ -658,65 +777,18 @@ fn create_endpoint(secret: Option<&[u8; 32]>, options: NodeOptions) -> Result<i6
     });
     let cancellation = node.control_cancellation();
     let presence = presence::Presence::new()?;
-    let shared = Arc::new(Mutex::new(Some(Session {
-            resources: resources::Jobs::default(),
-            presence,
-            interests: interest::Updates::default(),
-            records: None,
-            membership_update: None,
-            membership_offer: None,
-            membership_offer_requires_adoption: false,
-            membership_peer_failures: BTreeMap::new(),
-            staged_step_received: false,
-            gossip_steps_ahead: BTreeMap::new(),
-            membership_head: None,
-            range_pull: None,
-            gossip_counts: Arc::default(),
-            profile_pull: None,
-            profiles_walked: BTreeMap::new(),
-            gossip_profiles_pending: Default::default(),
-            cutoff: None,
-            current_view: None,
-            ready_current_view: None,
-            range: None,
-            ready_range: None,
-            direct_range: None,
-            ready_direct_range: None,
-            direct_miss: None,
-            publisher: None,
-            inbox: None,
-            inbound_admission: None,
-            admission_queue: arachne_security::AdmissionQueue::new(),
-            admission_metadata: BTreeMap::new(),
-            admission_waiters: admission_waiters::AdmissionWaiters::new(MAX_ADMISSION_WAITERS),
-            admission_pushes: Vec::new(),
-            pending_approvals: BTreeMap::new(),
-            staged_approval_id: None,
-            queued_admission_in_flight: Vec::new(),
-            admission_reads_since_stage: 0,
-            nearby_workspaces: BTreeMap::new(),
-            nearby_identity: None,
-            staged_workspace: None,
-            staged_removal: None,
-            profiles: committed.profiles(),
-            peer_profile_summaries: BTreeMap::new(),
-            workspace: None,
-            committed,
-            pending_join: None,
-            join_lifecycle: None,
-            checkpoint_exchange: None,
-            join_exchange: None,
-            activity: WorkspaceActivity::default(),
-            join_history_prefix: Vec::new(),
-            storage_key: secret
-                .map(arachne_security::StorageKey::derive)
-                .transpose()
-                .map_err(str::to_owned)?,
-            overlay_paths: 0,
-            node,
-            receiver,
-            runtime,
-        })));
+    let storage_key = secret
+        .map(arachne_security::StorageKey::derive)
+        .transpose()
+        .map_err(str::to_owned)?;
+    let shared = Arc::new(Mutex::new(Some(Session::new(
+        node,
+        receiver,
+        runtime,
+        committed,
+        storage_key,
+        presence,
+    ))));
     let mut registry = REGISTRY.lock().map_err(|_| "node registry unavailable")?;
     registry.signals.insert(handle, signal);
     registry.cancellations.insert(handle, cancellation);
@@ -733,14 +805,14 @@ fn commit_workspace(session: &mut Session, workspace: arachne_security::Workspac
     // Object delivery is the only receive path: an active member always has
     // an inbox and a publisher log.
     if workspace.member().is_some() {
-        if session.inbox.is_none() {
-            session.inbox = Some(arachne_delivery::inbox::ObjectInbox::new(
+        if session.delivery.inbox.is_none() {
+            session.delivery.inbox = Some(arachne_delivery::inbox::ObjectInbox::new(
                 workspace.id(),
                 workspace.epoch(),
             ));
         }
-        if session.publisher.is_none() {
-            session.publisher = arachne_delivery::PublisherLog::new(&workspace).ok();
+        if session.delivery.publisher.is_none() {
+            session.delivery.publisher = arachne_delivery::PublisherLog::new(&workspace).ok();
         }
     }
     let workspace = Arc::new(workspace);
@@ -861,12 +933,12 @@ fn shutdown_session(mut session: Session) -> Result<(), String> {
     session.overlay_paths = 0;
     session.presence.cancel();
     session.interests.cancel();
-    drop(session.join_exchange.take());
-    drop(session.checkpoint_exchange.take());
-    drop(session.cutoff.take());
-    drop(session.current_view.take());
-    session.ready_current_view = None;
-    drop(session.range.take());
+    drop(session.join.exchange.take());
+    drop(session.join.checkpoint_exchange.take());
+    drop(session.recovery.cutoff.take());
+    drop(session.recovery.current_view.take());
+    session.recovery.ready_current_view = None;
+    drop(session.recovery.range.take());
     session.resources = resources::Jobs::default();
     let result = session.runtime.block_on(async {
         tokio::time::timeout(Duration::from_secs(5), session.node.close()).await
@@ -1467,14 +1539,14 @@ fn check_epoch_transition(session: &mut Session) -> Result<(), String> {
     // epoch invalidates its query anyway; cancel it instead of making normal
     // membership actions race the periodic history poller. Accepted inbox and
     // recovered deliveries above must still drain before this point.
-    drop(session.cutoff.take());
-    drop(session.range.take());
-    session.ready_range = None;
-    drop(session.direct_range.take());
-    session.ready_direct_range = None;
-    session.direct_miss = None;
-    drop(session.current_view.take());
-    session.ready_current_view = None;
+    drop(session.recovery.cutoff.take());
+    drop(session.recovery.range.take());
+    session.recovery.ready_range = None;
+    drop(session.recovery.direct_range.take());
+    session.recovery.ready_direct_range = None;
+    session.recovery.direct_miss = None;
+    drop(session.recovery.current_view.take());
+    session.recovery.ready_current_view = None;
     Ok(())
 }
 
@@ -1498,7 +1570,7 @@ fn carry_delivery(
     if next.member().is_none() {
         return Ok((None, None));
     }
-    let inbox = match &session.inbox {
+    let inbox = match &session.delivery.inbox {
         Some(inbox) => inbox.advance(previous, next),
         None => Ok(arachne_delivery::inbox::ObjectInbox::new(
             next.id(),
@@ -1506,7 +1578,7 @@ fn carry_delivery(
         )),
     }
     .map_err(str::to_owned)?;
-    let publisher = match &session.publisher {
+    let publisher = match &session.delivery.publisher {
         Some(publisher) => publisher.advance(previous, next),
         None => arachne_delivery::PublisherLog::new(next),
     }
@@ -1572,7 +1644,7 @@ fn stage_admission_workspace(
     )?;
     let value = json!({"workspace": workspace.id(), "snapshot": snapshot, "state":"awaiting_save", "durable":false,
         "admissions": admission_count});
-    session.staged_workspace = Some(StagedWorkspace {
+    session.transition.staged = Some(StagedWorkspace {
         inbox,
         publisher,
         transition: WorkspaceTransition::Admission,
@@ -2032,7 +2104,7 @@ fn admission_reply(
 
 fn send_inbound_admission_reply(session: &mut Session) -> Result<Value, String> {
     let incoming = session
-        .inbound_admission
+        .transition.inbound
         .take()
         .ok_or("session has no received admission")?;
     let workspace = session
@@ -2171,7 +2243,7 @@ fn parse_admission_offer(packet: &[u8]) -> Result<(Vec<JoinStep>, Vec<u8>), Stri
 
 fn reap_admission_pushes(session: &mut Session) {
     session
-        .admission_pushes
+        .admission.pushes
         .retain(|push| !push.task.is_finished());
 }
 
@@ -2208,7 +2280,7 @@ fn queue_admission_push(
         wake.notify_one();
         result
     });
-    session.admission_pushes.push(PendingControl {
+    session.admission.pushes.push(PendingControl {
         query: attempt.id(),
         peer,
         task,
@@ -2249,9 +2321,9 @@ fn enqueue_admission(
     validated: arachne_security::ValidatedAdmission,
 ) -> Result<arachne_security::AdmissionEnqueue, arachne_security::AdmissionQueueError> {
     let id = attempt.id();
-    let result = session.admission_queue.enqueue(attempt)?;
+    let result = session.admission.queue.enqueue(attempt)?;
     if result == arachne_security::AdmissionEnqueue::Added {
-        session.admission_metadata.insert(
+        session.admission.metadata.insert(
             id,
             QueuedAdmission {
                 checkpoint,
@@ -2273,7 +2345,7 @@ fn hold_admission_exchange(
     checkpoint: Option<Vec<u8>>,
 ) {
     if let Some(overflow) = session
-        .admission_waiters
+        .admission.waiters
         .hold(attempt, incoming, checkpoint)
     {
         let _ = overflow.respond(b"{\"state\":\"admission_queued\"}".to_vec());
@@ -2284,7 +2356,7 @@ fn queue_admission(
     session: &mut Session,
     incoming: arachne_node::ControlRequest,
 ) -> Result<Value, String> {
-    session.admission_reads_since_stage = session.admission_reads_since_stage.saturating_add(1);
+    session.admission.reads_since_stage = session.admission.reads_since_stage.saturating_add(1);
     let peer = incoming.peer();
     let packet = incoming.payload().to_vec();
     if packet.starts_with(ADMISSION_HISTORY_PAGE_REQUEST) {
@@ -2346,15 +2418,15 @@ fn queue_admission(
             let accepted = incoming.respond(reply).is_ok();
             if accepted {
                 session
-                    .queued_admission_in_flight
+                    .admission.in_flight
                     .retain(|queued| queued != &attempt);
             }
             return Ok(json!({"state":"admission_replied", "accepted":accepted}));
         }
     }
-    if session.admission_queue.contains(&attempt)
+    if session.admission.queue.contains(&attempt)
         || session
-            .queued_admission_in_flight
+            .admission.in_flight
             .iter()
             .any(|queued| queued == &attempt)
     {
@@ -2367,7 +2439,7 @@ fn queue_admission(
         .as_ref()
         .ok_or("session has no workspace")?
         .assess_admission(peer, &request);
-    if session.pending_approvals.contains_key(&attempt.id()) {
+    if session.admission.pending_approvals.contains_key(&attempt.id()) {
         let still_needs_approval = matches!(
             &assessment,
             Ok(arachne_security::AdmissionAssessment::ApprovalRequired(_))
@@ -2379,7 +2451,7 @@ fn queue_admission(
         }
         // A workspace transition applied elsewhere may have approved or
         // declined this request. The next retry must observe that state.
-        session.pending_approvals.remove(&attempt.id());
+        session.admission.pending_approvals.remove(&attempt.id());
     }
     let (validated, approval_automatic) = match assessment {
         Ok(arachne_security::AdmissionAssessment::Ready(request)) => (request, None),
@@ -2465,20 +2537,20 @@ fn queue_admission(
 /// full batch, or a full batch's worth of reads since the last attempt. Both
 /// are counts. Nothing on this path waits for time to pass.
 fn should_stage_queued_admission(session: &Session) -> bool {
-    !session.admission_queue.is_empty()
-        && (session.admission_queue.len() >= MAX_RUNTIME_ADMISSION_BATCH
-            || session.admission_reads_since_stage >= MAX_RUNTIME_ADMISSION_BATCH)
+    !session.admission.queue.is_empty()
+        && (session.admission.queue.len() >= MAX_RUNTIME_ADMISSION_BATCH
+            || session.admission.reads_since_stage >= MAX_RUNTIME_ADMISSION_BATCH)
 }
 
 fn stage_queued_admission(session: &mut Session) -> Result<Option<Value>, String> {
-    session.admission_reads_since_stage = 0;
+    session.admission.reads_since_stage = 0;
     let mut ready = Vec::new();
     let mut deferred = Vec::new();
     while ready.len() < MAX_RUNTIME_ADMISSION_BATCH {
-        let Some(attempt) = session.admission_queue.pop() else {
+        let Some(attempt) = session.admission.queue.pop() else {
             break;
         };
-        let Some(queued) = session.admission_metadata.remove(&attempt.id()) else {
+        let Some(queued) = session.admission.metadata.remove(&attempt.id()) else {
             continue;
         };
         if queued.approval_automatic.is_some() {
@@ -2513,7 +2585,7 @@ fn stage_queued_admission(session: &mut Session) -> Result<Option<Value>, String
         }
         let id = attempt.id();
         let pending = session
-            .pending_approvals
+            .admission.pending_approvals
             .entry(id)
             .or_insert(PendingAdmissionApproval {
                 attempt,
@@ -2589,7 +2661,7 @@ fn stage_queued_admission(session: &mut Session) -> Result<Option<Value>, String
         }
     };
     let attempts = ready.into_iter().map(|(attempt, _)| attempt).collect();
-    session.queued_admission_in_flight = attempts;
+    session.admission.in_flight = attempts;
     value["queued"] = json!(true);
     Ok(Some(value))
 }
@@ -2601,10 +2673,10 @@ fn requeue_admission(
 ) -> Result<(), String> {
     let id = attempt.id();
     session
-        .admission_queue
+        .admission.queue
         .enqueue(attempt)
         .map_err(|_| "admission queue is full".to_owned())?;
-    session.admission_metadata.insert(id, queued);
+    session.admission.metadata.insert(id, queued);
     Ok(())
 }
 
@@ -2615,7 +2687,7 @@ fn pending_approval_id(
 ) -> Result<Option<[u8; 32]>, String> {
     if let Some(id) = requested {
         let pending = session
-            .pending_approvals
+            .admission.pending_approvals
             .get(&id)
             .ok_or("admission approval is no longer pending")?;
         if pending.attempt.request() != request {
@@ -2624,7 +2696,7 @@ fn pending_approval_id(
         return Ok(Some(id));
     }
     Ok(session
-        .pending_approvals
+        .admission.pending_approvals
         .iter()
         .find(|(_, pending)| pending.attempt.request() == request)
         .map(|(id, _)| *id))
@@ -2640,7 +2712,7 @@ fn list_pending_approvals(
         return Err("approval page limit must be between 1 and 64".into());
     }
     let rows: Vec<_> = session
-        .pending_approvals
+        .admission.pending_approvals
         .iter()
         .filter(|(id, _)| after.is_none_or(|after| **id > after))
         .take(limit + 1)
@@ -2785,14 +2857,14 @@ fn execute_request(handle: i64, request: Request) -> Result<Value, String> {
     // signal on arrival, and the host already found nothing it could serve.
     // Wake it again now that they can be served.
     if let Some(session) = guard.as_mut()
-        && session.staged_workspace.is_none()
+        && session.transition.staged.is_none()
     {
-        session.staged_step_received = false;
+        session.membership.staged_step_received = false;
     }
     if let Some(session) = guard.as_ref()
-        && session.staged_workspace.is_none()
-        && session.inbound_admission.is_none()
-        && !session.admission_queue.is_empty()
+        && session.transition.staged.is_none()
+        && session.transition.inbound.is_none()
+        && !session.admission.queue.is_empty()
     {
         // Intake replies leave the request held while the host commits the
         // next admission. Wake the host for that second, local staging pass.
@@ -2812,7 +2884,7 @@ fn execute_request(handle: i64, request: Request) -> Result<Value, String> {
         && session
             .workspace
             .as_ref()
-            .is_some_and(|owner| session.gossip_steps_ahead.contains_key(&owner.epoch()))
+            .is_some_and(|owner| session.membership.steps_ahead.contains_key(&owner.epoch()))
     {
         session.node.rearm_control_signal();
     }
@@ -2826,12 +2898,12 @@ fn execute_request(handle: i64, request: Request) -> Result<Value, String> {
 }
 
 fn admission_busy(session: &Session) -> bool {
-    session.staged_workspace.is_some() || session.inbound_admission.is_some()
+    session.transition.staged.is_some() || session.transition.inbound.is_some()
 }
 
 fn reset_workspace(session: &mut Session) -> Result<Value, String> {
     let changed = session.workspace.is_some()
-        || session.pending_join.is_some()
+        || session.join.pending.is_some()
         || session.records.is_some()
         || session.activity.phase != WorkspacePhase::Empty;
     let mut resetting = session.activity.clone();
@@ -2847,48 +2919,48 @@ fn reset_workspace(session: &mut Session) -> Result<Value, String> {
     session.presence = reset_presence;
     session.resources = resources::Jobs::default();
     session.interests.cancel();
-    session.membership_update = None;
-    session.membership_offer = None;
-    session.membership_offer_requires_adoption = false;
-    session.membership_peer_failures.clear();
-    session.staged_step_received = false;
-    session.gossip_steps_ahead.clear();
-    session.membership_head = None;
-    session.range_pull = None;
-    session.gossip_counts = Arc::default();
-    session.profile_pull = None;
-    session.profiles_walked.clear();
-    session.gossip_profiles_pending.clear();
-    session.cutoff = None;
-    session.current_view = None;
-    session.ready_current_view = None;
-    session.range = None;
-    session.ready_range = None;
-    session.direct_range = None;
-    session.ready_direct_range = None;
-    session.direct_miss = None;
-    session.publisher = None;
-    session.inbox = None;
-    session.inbound_admission = None;
-    session.admission_queue = arachne_security::AdmissionQueue::new();
-    session.admission_metadata.clear();
-    session.admission_waiters = admission_waiters::AdmissionWaiters::new(MAX_ADMISSION_WAITERS);
-    session.admission_pushes.clear();
-    session.pending_approvals.clear();
-    session.staged_approval_id = None;
-    session.queued_admission_in_flight.clear();
-    session.admission_reads_since_stage = 0;
-    session.nearby_workspaces.clear();
-    session.staged_workspace = None;
-    session.peer_profile_summaries.clear();
-    session.staged_removal = None;
+    session.membership.update = None;
+    session.membership.offer = None;
+    session.membership.offer_requires_adoption = false;
+    session.membership.peer_failures.clear();
+    session.membership.staged_step_received = false;
+    session.membership.steps_ahead.clear();
+    session.membership.head = None;
+    session.membership.range_pull = None;
+    session.membership.gossip_counts = Arc::default();
+    session.membership.profile_pull = None;
+    session.membership.profiles_walked.clear();
+    session.membership.profiles_pending.clear();
+    session.recovery.cutoff = None;
+    session.recovery.current_view = None;
+    session.recovery.ready_current_view = None;
+    session.recovery.range = None;
+    session.recovery.ready_range = None;
+    session.recovery.direct_range = None;
+    session.recovery.ready_direct_range = None;
+    session.recovery.direct_miss = None;
+    session.delivery.publisher = None;
+    session.delivery.inbox = None;
+    session.transition.inbound = None;
+    session.admission.queue = arachne_security::AdmissionQueue::new();
+    session.admission.metadata.clear();
+    session.admission.waiters = admission_waiters::AdmissionWaiters::new(MAX_ADMISSION_WAITERS);
+    session.admission.pushes.clear();
+    session.admission.pending_approvals.clear();
+    session.admission.staged_approval_id = None;
+    session.admission.in_flight.clear();
+    session.admission.reads_since_stage = 0;
+    session.nearby.workspaces.clear();
+    session.transition.staged = None;
+    session.membership.peer_profile_summaries.clear();
+    session.transition.removal = None;
     session.workspace = None;
     session.committed.clear();
-    session.checkpoint_exchange = None;
-    session.join_exchange = None;
-    session.pending_join = None;
-    session.join_lifecycle = None;
-    session.join_history_prefix.clear();
+    session.join.checkpoint_exchange = None;
+    session.join.exchange = None;
+    session.join.pending = None;
+    session.join.lifecycle = None;
+    session.join.history_prefix.clear();
     session.records = None;
     session.activity = WorkspaceActivity::default();
 
@@ -2902,16 +2974,16 @@ fn reset_workspace(session: &mut Session) -> Result<Value, String> {
 }
 
 fn discard_workspace_candidate(session: &mut Session) -> Result<Value, String> {
-    if session.staged_removal.is_some() {
+    if session.transition.removal.is_some() {
         return Err("removed membership awaits durable adoption".into());
     }
-    if session.inbound_admission.is_some() {
+    if session.transition.inbound.is_some() {
         return Err("received admission awaits adoption or reply".into());
     }
-    let discarded = session.staged_workspace.take().is_some();
-    let offer_cancelled = session.membership_offer.take().is_some();
-    session.membership_offer_requires_adoption = false;
-    session.staged_step_received = false;
+    let discarded = session.transition.staged.take().is_some();
+    let offer_cancelled = session.membership.offer.take().is_some();
+    session.membership.offer_requires_adoption = false;
+    session.membership.staged_step_received = false;
     Ok(json!({
         "state": "workspace_candidate_discarded",
         "discarded": discarded,
@@ -2945,7 +3017,7 @@ fn execute_in_session(
                 && guard
                     .as_ref()
                     .ok_or("node is closed")?
-                    .inbound_admission
+                    .transition.inbound
                     .is_some()
             {
                 let reply = execute_in_session(guard, Request::SendAdmissionReply {}, ended)?;
@@ -3028,7 +3100,7 @@ fn execute_in_session(
         if guard
             .as_ref()
             .ok_or("node is closed")?
-            .inbound_admission
+            .transition.inbound
             .is_some()
         {
             let reply = execute_in_session(guard, Request::SendAdmissionReply {}, ended)?;
@@ -3052,7 +3124,7 @@ fn execute_in_session(
             let allowed = guard
                 .as_ref()
                 .ok_or("node is closed")?
-                .join_lifecycle
+                .join.lifecycle
                 .as_ref()
                 .is_some_and(|lifecycle| {
                     lifecycle.peers.contains(&peer)
@@ -3066,7 +3138,7 @@ fn execute_in_session(
             if let Some(exchange) = guard
                 .as_mut()
                 .ok_or("node is closed")?
-                .join_exchange
+                .join.exchange
                 .take()
             {
                 exchange.task.abort();
@@ -3095,25 +3167,25 @@ fn execute_in_session(
             guard
                 .as_mut()
                 .ok_or("node is closed")?
-                .inbound_admission = Some(incoming);
+                .transition.inbound = Some(incoming);
             return Ok(staged);
         }
         let compact_pending = guard
             .as_ref()
             .ok_or("node is closed")?
-            .pending_join
+            .join.pending
             .as_ref()
             .is_some_and(|pending| pending.admission_request().is_err());
         if compact_pending {
             if let Some(mut exchange) = guard
                 .as_mut()
                 .ok_or("node is closed")?
-                .checkpoint_exchange
+                .join.checkpoint_exchange
                 .take()
             {
                 if !exchange.task.is_finished() {
                     let peer = exchange.peer;
-                    guard.as_mut().ok_or("node is closed")?.checkpoint_exchange = Some(exchange);
+                    guard.as_mut().ok_or("node is closed")?.join.checkpoint_exchange = Some(exchange);
                     return Ok(
                         json!({"state":"admission_pending", "phase":"checkpoint", "peer":peer}),
                     );
@@ -3133,13 +3205,13 @@ fn execute_in_session(
                             .map_err(|_| "checkpoint peer is invalid")?;
                         let session = guard.as_mut().ok_or("node is closed")?;
                         session
-                            .pending_join
+                            .join.pending
                             .as_mut()
                             .ok_or("session has no pending join")?
                             .complete_checkpoint(&checkpoint)
                             .map_err(str::to_owned)?;
                         let lifecycle = session
-                            .join_lifecycle
+                            .join.lifecycle
                             .as_mut()
                             .ok_or("join lifecycle has no persisted Iroh peers")?;
                         lifecycle.selected = Some(peer);
@@ -3153,7 +3225,7 @@ fn execute_in_session(
                     Err(reason) => {
                         let session = guard.as_mut().ok_or("node is closed")?;
                         let lifecycle = session
-                            .join_lifecycle
+                            .join.lifecycle
                             .as_mut()
                             .ok_or("join lifecycle has no persisted Iroh peers")?;
                         if lifecycle.selected == Some(exchange.peer) {
@@ -3174,7 +3246,7 @@ fn execute_in_session(
                 let (peers, invitation, selected) = {
                     let session = guard.as_mut().ok_or("node is closed")?;
                     let lifecycle = session
-                        .join_lifecycle
+                        .join.lifecycle
                         .as_ref()
                         .ok_or("join lifecycle has no persisted Iroh peers")?;
                     let mut peers = Vec::with_capacity(lifecycle.peers.len());
@@ -3188,7 +3260,7 @@ fn execute_in_session(
                     }
                     let selected = *peers.first().ok_or("no reachable workspace member")?;
                     let invitation = session
-                        .pending_join
+                        .join.pending
                         .as_ref()
                         .ok_or("session has no pending join")?
                         .deferred_invitation()
@@ -3199,7 +3271,7 @@ fn execute_in_session(
                 {
                     let session = guard.as_mut().ok_or("node is closed")?;
                     let lifecycle = session
-                        .join_lifecycle
+                        .join.lifecycle
                         .as_mut()
                         .ok_or("join lifecycle has no persisted Iroh peers")?;
                     lifecycle.selected = Some(selected);
@@ -3227,7 +3299,7 @@ fn execute_in_session(
                         wake.notify_one();
                         outcome
                     });
-                guard.as_mut().ok_or("node is closed")?.checkpoint_exchange =
+                guard.as_mut().ok_or("node is closed")?.join.checkpoint_exchange =
                     Some(PendingCheckpointExchange {
                         peer: selected,
                         task,
@@ -3238,10 +3310,10 @@ fn execute_in_session(
             }
         }
         let mut reply = None;
-        if let Some(mut exchange) = guard.as_mut().ok_or("node is closed")?.join_exchange.take() {
+        if let Some(mut exchange) = guard.as_mut().ok_or("node is closed")?.join.exchange.take() {
             if !exchange.task.is_finished() {
                 let peer = exchange.peer;
-                guard.as_mut().ok_or("node is closed")?.join_exchange = Some(exchange);
+                guard.as_mut().ok_or("node is closed")?.join.exchange = Some(exchange);
                 return Ok(json!({"state":"admission_pending", "peer":peer}));
             }
             let outcome = guard
@@ -3254,7 +3326,7 @@ fn execute_in_session(
                 JoinAttemptOutcome::NotSent => {
                     let session = guard.as_mut().ok_or("node is closed")?;
                     let lifecycle = session
-                        .join_lifecycle
+                        .join.lifecycle
                         .as_mut()
                         .ok_or("join lifecycle has no persisted Iroh peers")?;
                     if lifecycle.selected == Some(exchange.peer) {
@@ -3280,7 +3352,7 @@ fn execute_in_session(
                     history_prefix,
                 } => {
                     let session = guard.as_mut().ok_or("node is closed")?;
-                    session.join_history_prefix = history_prefix;
+                    session.join.history_prefix = history_prefix;
                     reply = Some(value);
                 }
             }
@@ -3316,7 +3388,7 @@ fn execute_in_session(
         let (peer, request, name) = {
             let session = guard.as_mut().ok_or("node is closed")?;
             let lifecycle = session
-                .join_lifecycle
+                .join.lifecycle
                 .as_mut()
                 .ok_or("join lifecycle has no persisted Iroh peers")?;
             let peer = lifecycle
@@ -3331,7 +3403,7 @@ fn execute_in_session(
                 persistence::commit_pending_join(session)?;
             }
             let pending = session
-                .pending_join
+                .join.pending
                 .as_ref()
                 .ok_or("session has no pending join")?;
             (
@@ -3359,7 +3431,7 @@ fn execute_in_session(
                 wake.notify_one();
                 outcome
             });
-        guard.as_mut().ok_or("node is closed")?.join_exchange =
+        guard.as_mut().ok_or("node is closed")?.join.exchange =
             Some(PendingJoinExchange { peer, task });
         return Ok(json!({"state":"admission_pending", "peer":peer}));
     }
@@ -3372,7 +3444,7 @@ fn execute_in_session(
         });
         if let Some(owner) = &session.workspace {
             value["workspace"] = json!(owner.id());
-        } else if let Some(pending) = &session.pending_join {
+        } else if let Some(pending) = &session.join.pending {
             value["workspace"] = json!(pending.workspace_id());
         }
         return Ok(value);
@@ -3398,20 +3470,20 @@ fn execute_in_session(
             "workspace":owner.id(), "session":session.node.id(),
             "received_bytes":metrics.received_bytes, "sent_bytes":metrics.sent_bytes,
             "receive_queue":metrics.receive_queue,
-            "admission_queue":session.admission_queue.len(),
-            "admission_queue_bytes":session.admission_queue.bytes(),
-            "admission_waiters":session.admission_waiters.len(),
+            "admission_queue":session.admission.queue.len(),
+            "admission_queue_bytes":session.admission.queue.bytes(),
+            "admission_waiters":session.admission.waiters.len(),
             "control_timing":session.node.control_timing(),
-            "membership_gossip":session.gossip_counts.json(),
+            "membership_gossip":session.membership.gossip_counts.json(),
             "connection_capacity":session.node.connection_capacity(),
             "gossip_neighbors":session.runtime.block_on(session.node.live_neighbors(owner.id())).len(),
-            "admission_in_flight":session.queued_admission_in_flight.len(),
-            "approval_pending":session.pending_approvals.len(),
+            "admission_in_flight":session.admission.in_flight.len(),
+            "approval_pending":session.admission.pending_approvals.len(),
             "activity":activity_value(session),
-            "pending_objects":session.inbox.as_ref().map(|inbox| inbox.pending_count()).unwrap_or(0),
-            "repair_jobs":usize::from(session.cutoff.is_some()) + usize::from(session.range.is_some() || session.ready_range.is_some())
-                + usize::from(session.direct_range.is_some() || session.ready_direct_range.is_some())
-                + usize::from(session.current_view.is_some() || session.ready_current_view.is_some()),
+            "pending_objects":session.delivery.inbox.as_ref().map(|inbox| inbox.pending_count()).unwrap_or(0),
+            "repair_jobs":usize::from(session.recovery.cutoff.is_some()) + usize::from(session.recovery.range.is_some() || session.recovery.ready_range.is_some())
+                + usize::from(session.recovery.direct_range.is_some() || session.recovery.ready_direct_range.is_some())
+                + usize::from(session.recovery.current_view.is_some() || session.recovery.ready_current_view.is_some()),
             "paths":paths, "paths_limited":metrics.paths_limited
         }));
     }
@@ -3533,18 +3605,18 @@ fn execute_in_session(
         };
         if let Some(encoded) = encoded {
             let key = nearby_workspace_key(*workspace, invitation);
-            if !session.nearby_workspaces.contains_key(&key)
-                && session.nearby_workspaces.len() >= MAX_NEARBY_WORKSPACES
+            if !session.nearby.workspaces.contains_key(&key)
+                && session.nearby.workspaces.len() >= MAX_NEARBY_WORKSPACES
             {
                 return Err("nearby workspace advertisement limit reached".into());
             }
-            session.nearby_workspaces.insert(key, encoded);
+            session.nearby.workspaces.insert(key, encoded);
         } else if let Some(workspace) = workspace {
-            session.nearby_workspaces.remove(workspace);
+            session.nearby.workspaces.remove(workspace);
         } else {
-            session.nearby_workspaces.clear();
+            session.nearby.workspaces.clear();
         }
-        return Ok(json!({"state":if session.nearby_workspaces.is_empty() {
+        return Ok(json!({"state":if session.nearby.workspaces.is_empty() {
             "nearby_workspace_private"
         } else {
             "nearby_workspace_advertised"
@@ -3552,7 +3624,7 @@ fn execute_in_session(
     }
     if let Request::SetNearbyIdentity { name } = &request {
         arachne_security::validate_workspace_name(name).map_err(str::to_owned)?;
-        session.nearby_identity = Some(name.trim().to_owned());
+        session.nearby.identity = Some(name.trim().to_owned());
         return Ok(json!({"state":"nearby_identity_set"}));
     }
     if let Request::SendNearbyInvitation { peer, invitation } = &request {
@@ -3571,7 +3643,7 @@ fn execute_in_session(
         }
         return Ok(json!({"state":"nearby_invitation_sent","peer":peer}));
     }
-    if let Some((removed, expected)) = &session.staged_removal {
+    if let Some((removed, expected)) = &session.transition.removal {
         let Request::AdoptAdmission { snapshot } = request else {
             return Err("removed membership awaits durable adoption".into());
         };
@@ -3587,7 +3659,7 @@ fn execute_in_session(
         *ended = Some(guard.take().ok_or("node is closed")?);
         return Ok(value);
     }
-    if session.staged_workspace.is_some()
+    if session.transition.staged.is_some()
         && !matches!(
             request,
             Request::AdoptAdmission { .. }
@@ -3607,7 +3679,7 @@ fn execute_in_session(
                 .into(),
         );
     }
-    if session.inbound_admission.is_some()
+    if session.transition.inbound.is_some()
         && !matches!(
             request,
             Request::AdoptAdmission { .. }
@@ -3686,13 +3758,13 @@ fn execute_in_session(
         through,
     } = request
     {
-        if session.cutoff.is_some()
-            || session.range.is_some()
-            || session.ready_range.is_some()
-            || session.direct_range.is_some()
-            || session.ready_direct_range.is_some()
-            || session.current_view.is_some()
-            || session.ready_current_view.is_some()
+        if session.recovery.cutoff.is_some()
+            || session.recovery.range.is_some()
+            || session.recovery.ready_range.is_some()
+            || session.recovery.direct_range.is_some()
+            || session.recovery.ready_direct_range.is_some()
+            || session.recovery.current_view.is_some()
+            || session.recovery.ready_current_view.is_some()
         {
             return Err("recovery operation already pending".into());
         }
@@ -3728,7 +3800,7 @@ fn execute_in_session(
         let after = match after {
             Some(after) => after,
             None => session
-                .inbox
+                .delivery.inbox
                 .as_ref()
                 .ok_or("automatic recovery requires object delivery")?
                 .recovery_progress(author, owner.epoch(), &topics),
@@ -3830,7 +3902,7 @@ fn execute_in_session(
                 }
             }
         });
-        session.range = Some(PendingRange {
+        session.recovery.range = Some(PendingRange {
             query,
             available,
             automatic,
@@ -3842,11 +3914,11 @@ fn execute_in_session(
         json!({"state":"recovery_range_pending", "candidate_count":candidate_count,
             "automatic_source":automatic, "accepted_progress":false})
     } else if matches!(request, Request::CancelRecoveryRange {}) {
-        drop(session.range.take());
-        session.ready_range = None;
+        drop(session.recovery.range.take());
+        session.recovery.ready_range = None;
         json!({"state":"recovery_range_cancelled", "accepted_progress":false})
     } else if matches!(request, Request::PollRecoveryRange {}) {
-        let Some(active) = session.range.as_mut() else {
+        let Some(active) = session.recovery.range.as_mut() else {
             return Ok(Value::Null);
         };
         let (peer, reply) = match active.replies.try_recv() {
@@ -3855,7 +3927,7 @@ fn execute_in_session(
                 return Ok(Value::Null);
             }
             Err(_) => {
-                let mut pending = session.range.take().unwrap();
+                let mut pending = session.recovery.range.take().unwrap();
                 if pending.automatic {
                     return Ok(json!({"state":"recovery_source_unavailable",
                         "attempted":pending.attempted,
@@ -3878,7 +3950,7 @@ fn execute_in_session(
             .as_ref()
             .ok_or("session has no workspace")?;
         if !automatic {
-            drop(session.range.take());
+            drop(session.recovery.range.take());
             check_recovery_policy(
                 session,
                 peer,
@@ -3898,14 +3970,14 @@ fn execute_in_session(
                 arachne_delivery::wire::RangeReply::Offered(range) => {
                     let packet_count = range.packets().len();
                     drop(range);
-                    session.ready_range = Some(ReadyRange {
+                    session.recovery.ready_range = Some(ReadyRange {
                         query,
                         peer,
                         reply,
                         packet_count,
                         automatic: false,
                     });
-                    let ready = session.ready_range.as_ref().unwrap();
+                    let ready = session.recovery.ready_range.as_ref().unwrap();
                     json!({"state":"recovery_range_ready", "workspace":ready.query.workspace, "author":ready.query.author,
                         "peer":ready.peer, "epoch":ready.query.epoch, "revision":ready.query.policy_revision,
                         "after":ready.query.after, "through":ready.query.through, "packet_count":ready.packet_count,
@@ -3948,28 +4020,28 @@ fn execute_in_session(
                     })
             });
             if let Ok((query, reply, packet_count)) = result {
-                drop(session.range.take());
-                session.ready_range = Some(ReadyRange {
+                drop(session.recovery.range.take());
+                session.recovery.ready_range = Some(ReadyRange {
                     query,
                     peer,
                     reply,
                     packet_count,
                     automatic: true,
                 });
-                let ready = session.ready_range.as_ref().unwrap();
+                let ready = session.recovery.ready_range.as_ref().unwrap();
                 json!({"state":"recovery_range_ready", "workspace":ready.query.workspace, "author":ready.query.author,
                     "peer":ready.peer, "epoch":ready.query.epoch, "revision":ready.query.policy_revision,
                     "after":ready.query.after, "through":ready.query.through, "packet_count":ready.packet_count,
                     "retained_bytes":ready.reply.len(), "automatic_source":true, "attempted":attempted,
                     "accepted_progress":false})
             } else {
-                session.range.as_mut().unwrap().reason = result.err();
+                session.recovery.range.as_mut().unwrap().reason = result.err();
                 Value::Null
             }
         }
     } else if matches!(request, Request::NextDirectGap {}) {
         match session
-            .inbox
+            .delivery.inbox
             .as_ref()
             .ok_or("object delivery not enabled")?
             .next_direct_gap(
@@ -3994,13 +4066,13 @@ fn execute_in_session(
         through,
     } = request
     {
-        if session.cutoff.is_some()
-            || session.range.is_some()
-            || session.ready_range.is_some()
-            || session.direct_range.is_some()
-            || session.ready_direct_range.is_some()
-            || session.current_view.is_some()
-            || session.ready_current_view.is_some()
+        if session.recovery.cutoff.is_some()
+            || session.recovery.range.is_some()
+            || session.recovery.ready_range.is_some()
+            || session.recovery.direct_range.is_some()
+            || session.recovery.ready_direct_range.is_some()
+            || session.recovery.current_view.is_some()
+            || session.recovery.ready_current_view.is_some()
         {
             return Err("continuity operation already pending".into());
         }
@@ -4009,7 +4081,7 @@ fn execute_in_session(
             .as_ref()
             .ok_or("session has no workspace")?;
         let local = owner.member().ok_or("member required")?.id();
-        if session.inbox.is_none()
+        if session.delivery.inbox.is_none()
             || !recipients.contains(&local)
             || recipients.len() > 64
             || recipients.windows(2).any(|pair| pair[0] >= pair[1])
@@ -4026,7 +4098,7 @@ fn execute_in_session(
             after,
             through,
         };
-        session.direct_miss = None;
+        session.recovery.direct_miss = None;
         let wire = query.to_wire().map_err(str::to_owned)?;
         let topics = BTreeSet::from([query.topic.clone()]);
         let mut candidates = owner
@@ -4075,7 +4147,7 @@ fn execute_in_session(
                 }
             }
         });
-        session.direct_range = Some(PendingDirectRange {
+        session.recovery.direct_range = Some(PendingDirectRange {
             query,
             replies,
             task,
@@ -4085,12 +4157,12 @@ fn execute_in_session(
         json!({"state":"direct_recovery_pending", "candidate_count":candidate_count,
             "accepted_progress":false})
     } else if matches!(request, Request::CancelDirectRecovery {}) {
-        drop(session.direct_range.take());
-        session.ready_direct_range = None;
-        session.direct_miss = None;
+        drop(session.recovery.direct_range.take());
+        session.recovery.ready_direct_range = None;
+        session.recovery.direct_miss = None;
         json!({"state":"direct_recovery_cancelled", "accepted_progress":false})
     } else if matches!(request, Request::PollDirectRecovery {}) {
-        let Some(active) = session.direct_range.as_mut() else {
+        let Some(active) = session.recovery.direct_range.as_mut() else {
             return Ok(Value::Null);
         };
         let (peer, reply) = match active.replies.try_recv() {
@@ -4099,8 +4171,8 @@ fn execute_in_session(
                 return Ok(Value::Null);
             }
             Err(_) => {
-                let mut pending = session.direct_range.take().unwrap();
-                session.direct_miss = Some(pending.query.clone());
+                let mut pending = session.recovery.direct_range.take().unwrap();
+                session.recovery.direct_miss = Some(pending.query.clone());
                 return Ok(json!({"state":"direct_recovery_source_unavailable",
                     "attempted":pending.attempted,
                     "reason":pending.reason.take().unwrap_or_else(||
@@ -4137,14 +4209,14 @@ fn execute_in_session(
             }
         });
         if let Ok((reply, packet_count)) = result {
-            drop(session.direct_range.take());
-            session.ready_direct_range = Some(ReadyDirectRange {
+            drop(session.recovery.direct_range.take());
+            session.recovery.ready_direct_range = Some(ReadyDirectRange {
                 query,
                 peer,
                 reply,
                 packet_count,
             });
-            let ready = session.ready_direct_range.as_ref().unwrap();
+            let ready = session.recovery.ready_direct_range.as_ref().unwrap();
             json!({"state":"direct_recovery_ready", "workspace":ready.query.workspace,
                 "author":ready.query.author, "peer":ready.peer, "epoch":ready.query.epoch,
                 "revision":ready.query.policy_revision, "topic":ready.query.topic.as_str(),
@@ -4152,7 +4224,7 @@ fn execute_in_session(
                 "packet_count":ready.packet_count, "retained_bytes":ready.reply.len(),
                 "attempted":attempted, "accepted_progress":false})
         } else {
-            session.direct_range.as_mut().unwrap().reason = result.err();
+            session.recovery.direct_range.as_mut().unwrap().reason = result.err();
             Value::Null
         }
     } else if matches!(request, Request::StageDirectRecovery {}) {
@@ -4167,17 +4239,17 @@ fn execute_in_session(
         selector,
     } = request
     {
-        if session.current_view.is_some()
-            || session.ready_current_view.is_some()
-            || session.cutoff.is_some()
-            || session.range.is_some()
-            || session.ready_range.is_some()
-            || session.direct_range.is_some()
-            || session.ready_direct_range.is_some()
+        if session.recovery.current_view.is_some()
+            || session.recovery.ready_current_view.is_some()
+            || session.recovery.cutoff.is_some()
+            || session.recovery.range.is_some()
+            || session.recovery.ready_range.is_some()
+            || session.recovery.direct_range.is_some()
+            || session.recovery.ready_direct_range.is_some()
         {
             return Err("continuity operation already pending".into());
         }
-        if peer == Some(session.node.id()) || session.inbox.is_none() {
+        if peer == Some(session.node.id()) || session.delivery.inbox.is_none() {
             return Err("invalid current-view request".into());
         }
         let owner = session
@@ -4264,7 +4336,7 @@ fn execute_in_session(
                 }
             }
         });
-        session.current_view = Some(PendingCurrentView {
+        session.recovery.current_view = Some(PendingCurrentView {
             query,
             automatic,
             replies,
@@ -4276,7 +4348,7 @@ fn execute_in_session(
         json!({"state":"current_view_pending", "candidate_count":candidate_count,
             "automatic_source":automatic, "accepted_progress":false})
     } else if matches!(request, Request::PollCurrentView {}) {
-        let Some(mut active) = session.current_view.take() else {
+        let Some(mut active) = session.recovery.current_view.take() else {
             return Ok(Value::Null);
         };
         let query = active.query.clone();
@@ -4327,7 +4399,7 @@ fn execute_in_session(
                     }
                 }
                 Err(mpsc::error::TryRecvError::Empty) if !active.task.is_finished() => {
-                    session.current_view = Some(active);
+                    session.recovery.current_view = Some(active);
                     return Ok(Value::Null);
                 }
                 Err(_) => break,
@@ -4337,7 +4409,7 @@ fn execute_in_session(
         if let Some(ready) = active.best.take() {
             let cut = ready.cut;
             let value_count = ready.value_count;
-            session.ready_current_view = Some(ready);
+            session.recovery.ready_current_view = Some(ready);
             json!({"state":"current_view_ready", "cut":cut,
                 "value_count":value_count, "automatic_source":automatic,
                 "attempted":attempted, "accepted_progress":false})
@@ -4357,7 +4429,7 @@ fn execute_in_session(
     } else if matches!(request, Request::StageCurrentView {}) {
         let (query, peer, reply, cut) = {
             let ready = session
-                .ready_current_view
+                .recovery.ready_current_view
                 .as_ref()
                 .ok_or("no current view ready")?;
             (
@@ -4387,7 +4459,7 @@ fn execute_in_session(
             .ok_or("session has no protected root key")?;
         let now = arachne_delivery::UnixSeconds::now()?;
         let (mut inbox, pending, stale) = session
-            .inbox
+            .delivery.inbox
             .as_ref()
             .ok_or("object delivery not enabled")?
             .accept_current_view(owner, &query, &reply, now)
@@ -4404,7 +4476,7 @@ fn execute_in_session(
                 .retain_current_view(owner, &query, &reply, now)
                 .map_err(str::to_owned)?;
         }
-        let publisher = match &session.publisher {
+        let publisher = match &session.delivery.publisher {
             Some(publisher) => publisher.clone(),
             None => arachne_delivery::PublisherLog::new(owner).map_err(str::to_owned)?,
         };
@@ -4416,7 +4488,7 @@ fn execute_in_session(
             Some(&inbox),
         )?;
         let candidate = owner.provisional_copy().map_err(str::to_owned)?;
-        session.staged_workspace = Some(StagedWorkspace {
+        session.transition.staged = Some(StagedWorkspace {
             publisher: Some(publisher),
             inbox: Some(inbox),
             transition: WorkspaceTransition::CurrentView {
@@ -4427,14 +4499,14 @@ fn execute_in_session(
             workspace: candidate,
             snapshot: snapshot.clone(),
         });
-        session.ready_current_view = None;
+        session.recovery.ready_current_view = None;
         json!({"workspace":owner.id(), "snapshot":snapshot,
             "state":"awaiting_current_view_save", "cut":cut,
             "pending":pending, "stale":stale, "durable":false,
             "accepted_progress":false})
     } else if matches!(request, Request::CancelCurrentView {}) {
-        drop(session.current_view.take());
-        session.ready_current_view = None;
+        drop(session.recovery.current_view.take());
+        session.recovery.ready_current_view = None;
         json!({"state":"current_view_cancelled", "accepted_progress":false})
     } else if let Request::DiscoverRecoveryCutoff {
         peer,
@@ -4442,13 +4514,13 @@ fn execute_in_session(
         topics,
     } = request
     {
-        if session.cutoff.is_some()
-            || session.range.is_some()
-            || session.ready_range.is_some()
-            || session.direct_range.is_some()
-            || session.ready_direct_range.is_some()
-            || session.current_view.is_some()
-            || session.ready_current_view.is_some()
+        if session.recovery.cutoff.is_some()
+            || session.recovery.range.is_some()
+            || session.recovery.ready_range.is_some()
+            || session.recovery.direct_range.is_some()
+            || session.recovery.ready_direct_range.is_some()
+            || session.recovery.current_view.is_some()
+            || session.recovery.ready_current_view.is_some()
         {
             return Err("recovery operation already pending".into());
         }
@@ -4496,18 +4568,18 @@ fn execute_in_session(
                 .node
                 .request_control(peer, &query.to_wire().map_err(str::to_owned)?),
         );
-        session.cutoff = Some(PendingControl { query, peer, task });
+        session.recovery.cutoff = Some(PendingControl { query, peer, task });
         json!({"state":"recovery_cutoff_pending", "accepted_progress":false})
     } else if matches!(request, Request::PollRecoveryCutoff {}) {
         if !session
-            .cutoff
+            .recovery.cutoff
             .as_ref()
             .is_some_and(|pending| pending.task.is_finished())
         {
             return Ok(Value::Null);
         }
         // Consume once, including errors. No session lock was held by the task.
-        let mut pending = session.cutoff.take().unwrap();
+        let mut pending = session.recovery.cutoff.take().unwrap();
         check_recovery_policy(
             session,
             pending.peer,
@@ -4542,7 +4614,7 @@ fn execute_in_session(
         match head {
             Some((after, head)) => {
                 let accepted_through = session
-                    .inbox
+                    .delivery.inbox
                     .as_ref()
                     .map_or(0, |inbox| {
                         inbox.recovery_progress(query.author, query.epoch, &query.topics)
@@ -4572,7 +4644,7 @@ fn execute_in_session(
         ));
     } else if let Request::JoinViaPeer { peer } = request {
         let pending = session
-            .pending_join
+            .join.pending
             .as_ref()
             .ok_or("session has no pending join")?;
         let request = pending.admission_request().map_err(str::to_owned)?;
@@ -4683,9 +4755,9 @@ fn execute_in_session(
             let carried = Value::Array(commits[split..].to_vec());
             reply["commits"] = carried;
             reply["history_verified_prefix"] = json!(split);
-            session.join_history_prefix = prefix;
+            session.join.history_prefix = prefix;
         } else {
-            session.join_history_prefix.clear();
+            session.join.history_prefix.clear();
         }
         if reply.get("commits").is_some() {
             // Only a reply that actually served history reports page sizes; a
@@ -4697,7 +4769,7 @@ fn execute_in_session(
         list_pending_approvals(session, after, limit)?
     } else if let Request::AcknowledgeAdmissionApproval { attempt_id } = request {
         let pending = session
-            .pending_approvals
+            .admission.pending_approvals
             .get_mut(&attempt_id)
             .ok_or("admission approval is no longer pending")?;
         pending.acknowledged = true;
@@ -4742,7 +4814,7 @@ fn execute_in_session(
         }
         // Drain an already-arrived admission retry before staging another
         // membership transition. The owner has one durable candidate slot.
-        let incoming = if admission_busy || !session.admission_queue.is_empty() {
+        let incoming = if admission_busy || !session.admission.queue.is_empty() {
             session
                 .node
                 .poll_control_matching(admission_packet_candidate)
@@ -4771,7 +4843,7 @@ fn execute_in_session(
             incoming
                 .respond(
                     session
-                        .nearby_identity
+                        .nearby.identity
                         .as_deref()
                         .unwrap_or("Unnamed Arachne device")
                         .as_bytes()
@@ -4782,7 +4854,7 @@ fn execute_in_session(
         }
         if incoming.payload() == NEARBY_WORKSPACE {
             incoming
-                .respond(nearby_workspace_reply(&session.nearby_workspaces))
+                .respond(nearby_workspace_reply(&session.nearby.workspaces))
                 .map_err(|error| error.to_string())?;
             return Ok(json!({"state":"nearby_workspace_replied"}));
         }
@@ -4829,14 +4901,14 @@ fn execute_in_session(
                         return Ok(json!({"state":"membership_replied"}));
                     }
                 };
-            session.inbound_admission = Some(incoming);
+            session.transition.inbound = Some(incoming);
             return Ok(value);
         }
         if incoming.payload().starts_with(b"DFMO") {
             let offered = membership::receive_offer(session, incoming.payload());
             return match offered {
                 Ok(value) => {
-                    session.inbound_admission = Some(incoming);
+                    session.transition.inbound = Some(incoming);
                     Ok(value)
                 }
                 Err(_) => {
@@ -4869,7 +4941,7 @@ fn execute_in_session(
         {
             let reply = membership::profile_page_reply(
                 session.workspace.as_deref(),
-                &membership::lock_profiles(&session.profiles),
+                &membership::lock_profiles(&session.membership.profiles),
                 incoming.peer(),
                 incoming.payload(),
             );
@@ -4909,7 +4981,7 @@ fn execute_in_session(
                         .block_on(session.node.with_routing_policy(|policy| {
                             if incoming.payload().starts_with(b"DFDQ") {
                                 match (
-                                    session.inbox.as_ref(),
+                                    session.delivery.inbox.as_ref(),
                                     arachne_delivery::wire::DirectRangeQuery::from_wire(
                                         incoming.payload(),
                                     ),
@@ -4924,7 +4996,7 @@ fn execute_in_session(
                                 }
                             } else if incoming.payload().starts_with(b"DFVQ") {
                                 match (
-                                    session.inbox.as_ref(),
+                                    session.delivery.inbox.as_ref(),
                                     arachne_delivery::current::CurrentViewQuery::from_wire(
                                         incoming.payload(),
                                     ),
@@ -4940,7 +5012,7 @@ fn execute_in_session(
                                 }
                             } else if incoming.payload().starts_with(b"DFCQ") {
                                 match (
-                                    session.publisher.as_ref(),
+                                    session.delivery.publisher.as_ref(),
                                     arachne_delivery::wire::CutoffQuery::from_wire(
                                         incoming.payload(),
                                     ),
@@ -4965,7 +5037,7 @@ fn execute_in_session(
                                     );
                                 };
                                 if owner.member().map(|member| member.id()) == Some(query.author) {
-                                    match session.publisher.as_ref() {
+                                    match session.delivery.publisher.as_ref() {
                                         Some(log) => arachne_delivery::wire::serve_available_range(
                                             log,
                                             owner,
@@ -4978,7 +5050,7 @@ fn execute_in_session(
                                         ),
                                     }
                                 } else {
-                                    match session.inbox.as_ref() {
+                                    match session.delivery.inbox.as_ref() {
                                         Some(inbox) => inbox.serve_available_range(
                                             owner,
                                             policy,
@@ -4998,7 +5070,7 @@ fn execute_in_session(
                                     return Ok(arachne_delivery::wire::denied_reply());
                                 };
                                 if owner.member().map(|member| member.id()) == Some(query.author) {
-                                    match session.publisher.as_ref() {
+                                    match session.delivery.publisher.as_ref() {
                                         Some(log) => arachne_delivery::wire::serve_range(
                                             log,
                                             owner,
@@ -5009,7 +5081,7 @@ fn execute_in_session(
                                         None => Ok(arachne_delivery::wire::denied_reply()),
                                     }
                                 } else {
-                                    match session.inbox.as_ref() {
+                                    match session.delivery.inbox.as_ref() {
                                         Some(inbox) => inbox.serve_range(
                                             owner,
                                             policy,
@@ -5120,7 +5192,7 @@ fn execute_in_session(
                 return Ok(response);
             }
         };
-        session.inbound_admission = Some(incoming);
+        session.transition.inbound = Some(incoming);
         value
     } else if matches!(request, Request::SendAdmissionReply {}) {
         send_inbound_admission_reply(session)?
@@ -5129,7 +5201,7 @@ fn execute_in_session(
             return Err("join history exceeds step bounds".into());
         }
         let pending = session
-            .pending_join
+            .join.pending
             .as_ref()
             .ok_or("session has no pending join")?;
         let key = session
@@ -5141,7 +5213,7 @@ fn execute_in_session(
         // chunk the host carried back. Nothing is accepted on the strength of
         // having been fetched earlier: a truncated or tampered prefix fails
         // here exactly as it would on a first, unrolled verification.
-        for value in &session.join_history_prefix {
+        for value in &session.join.history_prefix {
             let step: JoinStep =
                 serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
             proof
@@ -5158,7 +5230,7 @@ fn execute_in_session(
             .map_err(str::to_owned)?;
         let snapshot = seal_state(session.records.is_some(), &workspace, key, None, None)?;
         let value = json!({"workspace":workspace.id(), "workspace_name":workspace.workspace_name().map_err(str::to_owned)?, "snapshot":snapshot, "state":"awaiting_join_save", "durable":false});
-        session.staged_workspace = Some(StagedWorkspace {
+        session.transition.staged = Some(StagedWorkspace {
             publisher: None,
                 inbox: None,
             transition: WorkspaceTransition::Join,
@@ -5172,7 +5244,7 @@ fn execute_in_session(
     } else if let Request::MemberRoster { profiles } = request {
         membership::roster(session, &profiles)?
     } else if matches!(request, Request::UseServiceProfile {}) {
-        membership::lock_profiles(&session.profiles).service = true;
+        membership::lock_profiles(&session.membership.profiles).service = true;
         json!({"state":"service_profile"})
     } else if matches!(
         request,
@@ -5204,8 +5276,8 @@ fn execute_in_session(
                 .storage_key
                 .as_ref()
                 .ok_or("session has no protected root key")?,
-            session.publisher.as_ref(),
-            session.inbox.as_ref(),
+            session.delivery.publisher.as_ref(),
+            session.delivery.inbox.as_ref(),
         )?;
         let mut value = json!({"workspace":workspace.id(),"workspace_name":workspace.workspace_name().map_err(str::to_owned)?,
             "snapshot":snapshot,"state":"awaiting_save","durable":false});
@@ -5217,9 +5289,9 @@ fn execute_in_session(
                     .map_err(str::to_owned)?
             );
         }
-        session.staged_workspace = Some(StagedWorkspace {
-            publisher: session.publisher.clone(),
-            inbox: session.inbox.clone(),
+        session.transition.staged = Some(StagedWorkspace {
+            publisher: session.delivery.publisher.clone(),
+            inbox: session.delivery.inbox.clone(),
             transition: WorkspaceTransition::WorkspaceName,
             workspace,
             snapshot,
@@ -5249,7 +5321,7 @@ fn execute_in_session(
         let action = prepared.action;
         let commit = prepared.commit.clone();
         let value = membership::stage_prepared(session, prepared)?;
-        session.staged_workspace.as_mut().unwrap().transition =
+        session.transition.staged.as_mut().unwrap().transition =
             WorkspaceTransition::Invitation(Box::new(invitation), checkpoint, action, commit);
         value
     } else if let Request::StageInvitationApproval {
@@ -5266,7 +5338,7 @@ fn execute_in_session(
             .prepare_invitation_approval(&request)
             .map_err(str::to_owned)?;
         let value = membership::stage_prepared(session, prepared)?;
-        session.staged_approval_id = pending_id;
+        session.admission.staged_approval_id = pending_id;
         value
     } else if let Request::StageInvitationDecline {
         request,
@@ -5282,7 +5354,7 @@ fn execute_in_session(
             .prepare_invitation_decline(&request)
             .map_err(str::to_owned)?;
         let value = membership::stage_prepared(session, prepared)?;
-        session.staged_approval_id = pending_id;
+        session.admission.staged_approval_id = pending_id;
         value
     } else if matches!(request, Request::InvitationControls {}) {
         let owner = session
@@ -5322,7 +5394,7 @@ fn execute_in_session(
             | Request::AdoptCurrentView { .. }
     ) {
         let staged = session
-            .staged_workspace
+            .transition.staged
             .as_ref()
             .ok_or("session has no workspace candidate")?;
         let valid_phase = matches!(
@@ -5371,21 +5443,21 @@ fn execute_in_session(
         if let Some(store) = &session.records {
             store.require_committed(&snapshot)?;
         }
-        let staged = session.staged_workspace.take().unwrap();
+        let staged = session.transition.staged.take().unwrap();
         let joined = matches!(&staged.transition, WorkspaceTransition::Join);
         let mut value = json!({"workspace":staged.workspace.id(), "workspace_name":staged.workspace.workspace_name().map_err(str::to_owned)?, "epoch":staged.workspace.epoch(),
             "workspace_name_missing_history":staged.workspace.workspace_name_missing_history().map_err(str::to_owned)?,
             "members":staged.workspace.member_count(), "durable":session.records.is_some()});
-        session.publisher = staged.publisher;
-        session.inbox = staged.inbox;
+        session.delivery.publisher = staged.publisher;
+        session.delivery.inbox = staged.inbox;
         if matches!(&staged.transition, WorkspaceTransition::Join) {
             transition_activity(session, WorkspacePhase::Synchronizing, None)?;
         }
         commit_workspace(session, staged.workspace);
-        let staged_approval_id = session.staged_approval_id;
+        let staged_approval_id = session.admission.staged_approval_id;
         // A step this node committed goes out by gossip. A step it
         // received from a peer is already travelling; gossip relays it.
-        let received = std::mem::take(&mut session.staged_step_received);
+        let received = std::mem::take(&mut session.membership.staged_step_received);
         let committed_here =
             matches!(staged.transition, WorkspaceTransition::Admission) && !received;
         match staged.transition {
@@ -5480,12 +5552,12 @@ fn execute_in_session(
                 value["step"] = step;
             }
             WorkspaceTransition::Admission => {
-                let admitted = std::mem::take(&mut session.queued_admission_in_flight);
+                let admitted = std::mem::take(&mut session.admission.in_flight);
                 let mut delivered = 0usize;
                 let mut pushed = 0usize;
                 if let Some(workspace) = session.workspace.clone() {
                     for attempt in &admitted {
-                        let held = session.admission_waiters.take(&attempt.id());
+                        let held = session.admission.waiters.take(&attempt.id());
                         let checkpoint = held.as_ref().and_then(|(_, checkpoint)| checkpoint.as_deref());
                         let Ok(reply) = admission_reply_page(
                             &workspace,
@@ -5517,27 +5589,27 @@ fn execute_in_session(
             }
             WorkspaceTransition::WorkspaceName => {}
             WorkspaceTransition::Join => {
-                session.pending_join = None;
-                session.join_lifecycle = None;
-                session.join_history_prefix.clear();
+                session.join.pending = None;
+                session.join.lifecycle = None;
+                session.join.history_prefix.clear();
                 transition_activity(session, WorkspacePhase::Active, None)?;
             }
         }
-        if joined && session.inbound_admission.is_some() {
+        if joined && session.transition.inbound.is_some() {
             let reply = send_inbound_admission_reply(session)?;
             value["reply_queued"] = json!(reply["queued"]);
         }
         if let Some(id) = staged_approval_id {
-            session.pending_approvals.remove(&id);
-            session.staged_approval_id = None;
+            session.admission.pending_approvals.remove(&id);
+            session.admission.staged_approval_id = None;
         }
         // A member that just reached the newest head it heard announces it
         // too, so members that are behind pull from many members.
         let reached_head = received
             && session.workspace.as_ref().is_some_and(|owner| {
-                !session.gossip_steps_ahead.contains_key(&owner.epoch())
+                !session.membership.steps_ahead.contains_key(&owner.epoch())
                     && session
-                        .membership_head
+                        .membership.head
                         .as_ref()
                         .is_none_or(|(head, _)| *head <= owner.epoch())
             });
@@ -5569,7 +5641,7 @@ fn execute_in_session(
         peers,
     } = request
     {
-        if session.workspace.is_some() || session.pending_join.is_some() {
+        if session.workspace.is_some() || session.join.pending.is_some() {
             return Err("session already owns workspace state".into());
         }
         let invitation =
@@ -5593,17 +5665,17 @@ fn execute_in_session(
         let value = pending_metadata(&pending, session.node.id())?;
         let mut value = value;
         value["activity"] = activity_value(session);
-        session.pending_join = Some(pending);
-        session.join_lifecycle = if peers.is_empty() {
+        session.join.pending = Some(pending);
+        session.join.lifecycle = if peers.is_empty() {
             None
         } else {
             Some(JoinLifecycle::new(peers)?)
         };
-        session.join_history_prefix.clear();
+        session.join.history_prefix.clear();
         value
     } else if matches!(request, Request::SealPendingJoin {}) {
         let pending = session
-            .pending_join
+            .join.pending
             .as_ref()
             .ok_or("session has no pending join")?;
         let key = session
@@ -5616,7 +5688,7 @@ fn execute_in_session(
         snapshot,
     } = request
     {
-        if session.workspace.is_some() || session.pending_join.is_some() {
+        if session.workspace.is_some() || session.join.pending.is_some() {
             return Err("session already owns workspace state".into());
         }
         let key = session
@@ -5630,16 +5702,16 @@ fn execute_in_session(
         transition_activity(session, WorkspacePhase::Joining, None)?;
         let mut value = value;
         value["activity"] = activity_value(session);
-        session.pending_join = Some(pending);
-        session.join_lifecycle = None;
-        session.join_history_prefix.clear();
+        session.join.pending = Some(pending);
+        session.join.lifecycle = None;
+        session.join.history_prefix.clear();
         value
     } else if let Request::CreateWorkspace {
         display_name,
         workspace_name,
     } = request
     {
-        if session.workspace.is_some() || session.pending_join.is_some() {
+        if session.workspace.is_some() || session.join.pending.is_some() {
             return Err("session already owns a workspace".into());
         }
         transition_activity(session, WorkspacePhase::Creating, None)?;
@@ -5665,9 +5737,9 @@ fn execute_in_session(
                 "native records already own persistence; save staged candidates directly".into(),
             );
         }
-        if session.staged_workspace.is_some()
-            || session.inbound_admission.is_some()
-            || !session.queued_admission_in_flight.is_empty()
+        if session.transition.staged.is_some()
+            || session.transition.inbound.is_some()
+            || !session.admission.in_flight.is_empty()
         {
             return Err("admission candidate awaits durable adoption or reply".into());
         }
@@ -5683,8 +5755,8 @@ fn execute_in_session(
             session.records.is_some(),
             workspace,
             key,
-            session.publisher.as_ref(),
-            session.inbox.as_ref(),
+            session.delivery.publisher.as_ref(),
+            session.delivery.inbox.as_ref(),
         )?;
         json!({"workspace": workspace.id(), "snapshot": snapshot})
     } else if let Request::RestoreWorkspace {
@@ -5692,7 +5764,7 @@ fn execute_in_session(
         snapshot,
     } = request
     {
-        if session.workspace.is_some() || session.pending_join.is_some() {
+        if session.workspace.is_some() || session.join.pending.is_some() {
             return Err("session already owns a workspace".into());
         }
         let key = session
@@ -5737,8 +5809,8 @@ fn execute_in_session(
         let value = json!({"workspace": restored.id(), "workspace_name":restored.workspace_name().map_err(str::to_owned)?, "epoch": restored.epoch(),
             "workspace_name_missing_history":restored.workspace_name_missing_history().map_err(str::to_owned)?,
             "members": restored.member_count(), "member": member_metadata(&restored), "durable": false});
-        session.publisher = publisher;
-        session.inbox = inbox;
+        session.delivery.publisher = publisher;
+        session.delivery.inbox = inbox;
         commit_workspace(session, restored);
         let mut value = value;
         value["activity"] = activity_value(session);
@@ -6428,7 +6500,7 @@ mod tests {
             let shared = session(handle).unwrap();
             let mut locked = shared.lock().unwrap();
             let owner = locked.as_mut().unwrap();
-            assert_eq!(owner.inbox.as_ref().unwrap().pending_count(), 1);
+            assert_eq!(owner.delivery.inbox.as_ref().unwrap().pending_count(), 1);
             check_epoch_transition(owner).unwrap();
         }
         close(handle).unwrap();
@@ -6532,7 +6604,7 @@ mod tests {
             let session = guard.as_ref().unwrap();
             assert_eq!(
                 session
-                    .inbox
+                    .delivery.inbox
                     .as_ref()
                     .unwrap()
                     .stage(session.workspace.as_ref().unwrap(), &late, &backdated)
@@ -6884,7 +6956,7 @@ mod tests {
         let (mut tampered_context, ciphertext) = {
             let shared = session(admin).unwrap();
             let guard = shared.lock().unwrap();
-            let log = guard.as_ref().unwrap().publisher.as_ref().unwrap();
+            let log = guard.as_ref().unwrap().delivery.publisher.as_ref().unwrap();
             let retained = log
                 .select(
                     0,
@@ -7001,9 +7073,9 @@ mod tests {
             let shared = session(admin).unwrap();
             let guard = shared.lock().unwrap();
             let session = guard.as_ref().unwrap();
-            assert_eq!(session.publisher.as_ref().unwrap().head(), 1);
+            assert_eq!(session.delivery.publisher.as_ref().unwrap().head(), 1);
             let log = session
-                .staged_workspace
+                .transition.staged
                 .as_ref()
                 .unwrap()
                 .publisher
@@ -7031,7 +7103,7 @@ mod tests {
         {
             let shared = session(admin).unwrap();
             let guard = shared.lock().unwrap();
-            let log = guard.as_ref().unwrap().publisher.as_ref().unwrap();
+            let log = guard.as_ref().unwrap().delivery.publisher.as_ref().unwrap();
             assert_eq!(log.head(), head);
             let range = log
                 .select(
@@ -7050,7 +7122,7 @@ mod tests {
             let log = guard
                 .as_ref()
                 .unwrap()
-                .staged_workspace
+                .transition.staged
                 .as_ref()
                 .unwrap()
                 .publisher
@@ -7339,7 +7411,7 @@ mod tests {
             let shared = session(joiner).unwrap();
             let guard = shared.lock().unwrap();
             let owner = guard.as_ref().unwrap();
-            let ready = owner.ready_range.as_ref().unwrap();
+            let ready = owner.recovery.ready_range.as_ref().unwrap();
             let arachne_delivery::wire::RangeReply::Offered(range) =
                 arachne_delivery::wire::verify_reply(
                     owner.workspace.as_ref().unwrap(),
@@ -7412,7 +7484,7 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .unwrap()
-                .ready_range
+                .recovery.ready_range
                 .is_none()
         );
         // Receiver still has revision 17; current publisher policy denies it.
@@ -7482,7 +7554,7 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .unwrap()
-                .ready_range
+                .recovery.ready_range
                 .is_none()
         );
         let mut cancelled_request = empty_request;
@@ -7494,7 +7566,7 @@ mod tests {
             guard
                 .as_ref()
                 .unwrap()
-                .range
+                .recovery.range
                 .as_ref()
                 .unwrap()
                 .task
@@ -7531,7 +7603,7 @@ mod tests {
         let head = {
             let shared = session(admin).unwrap();
             let guard = shared.lock().unwrap();
-            guard.as_ref().unwrap().publisher.as_ref().unwrap().head()
+            guard.as_ref().unwrap().delivery.publisher.as_ref().unwrap().head()
         };
         let recover = json!({"op":"fetch_recovery_range", "peer":peer, "revision":19,
             "topics":["streams/other"], "after":0, "through":head});
@@ -7645,7 +7717,7 @@ mod tests {
             guard
                 .as_ref()
                 .unwrap()
-                .cutoff
+                .recovery.cutoff
                 .as_ref()
                 .unwrap()
                 .task
@@ -7666,8 +7738,8 @@ mod tests {
             let shared = session(restored).unwrap();
             let guard = shared.lock().unwrap();
             let session = guard.as_ref().unwrap();
-            assert!(session.publisher.as_ref().unwrap().head() > 0);
-            assert_eq!(session.inbox.as_ref().unwrap().pending_count(), 0);
+            assert!(session.delivery.publisher.as_ref().unwrap().head() > 0);
+            assert_eq!(session.delivery.inbox.as_ref().unwrap().pending_count(), 0);
         }
         assert!(call(restored, json!({"op":"poll_pending_object"})).unwrap().is_null());
         call(
@@ -7964,7 +8036,7 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .unwrap()
-                .inbox
+                .delivery.inbox
                 .as_ref()
                 .unwrap()
                 .pending_count()

@@ -86,7 +86,7 @@ pub fn harness_presence_packet(
 fn packet(session: &mut Session, peer: [u8; 32], announce: bool) -> Result<Vec<u8>, String> {
     let owner = session.workspace.as_ref().ok_or("no workspace")?;
     let recipient = owner.member_id_for_endpoint(peer).map_err(str::to_owned)?;
-    let mut heads = match session.inbox.as_ref() {
+    let mut heads = match session.delivery.inbox.as_ref() {
         Some(inbox) => inbox
             .direct_heads_for(owner, recipient)
             .map_err(str::to_owned)?,
@@ -176,7 +176,7 @@ fn observe(session: &mut Session, peer: [u8; 32], bytes: &[u8]) -> Result<bool, 
     if cursor != bytes.len() {
         return Err("invalid workspace presence".into());
     }
-    let next_inbox = session.inbox.clone().map(|mut next| {
+    let next_inbox = session.delivery.inbox.clone().map(|mut next| {
         // Heads are advisory gap triggers. A peer can still have an older
         // subscription view, so a stale or revoked head must not poison the
         // authenticated presence/name response.
@@ -203,7 +203,7 @@ fn observe(session: &mut Session, peer: [u8; 32], bytes: &[u8]) -> Result<bool, 
         next
     });
     if let Some(next) = next_inbox {
-        session.inbox = Some(next);
+        session.delivery.inbox = Some(next);
     }
     let restarted = announce
         || session
@@ -281,11 +281,11 @@ fn reconcile_seen(session: &mut Session) -> Result<Option<[u8; 32]>, String> {
         .filter(|(_, seen)| now.saturating_duration_since(seen.at) < FRESH && seen.epoch > epoch)
         .map(|(peer, seen)| (seen.epoch, *peer))
         .collect();
-    let before = session.membership_head.clone();
+    let before = session.membership.head.clone();
     for (head, peer) in ahead {
         super::membership::note_head(session, head, peer);
     }
-    if session.membership_head != before {
+    if session.membership.head != before {
         session.node.control_signal().notify_one();
     }
     let sync_peer = session
@@ -294,7 +294,7 @@ fn reconcile_seen(session: &mut Session) -> Result<Option<[u8; 32]>, String> {
         .iter()
         .find(|(_, seen)| {
             now.saturating_duration_since(seen.at) < FRESH
-                && ((seen.epoch > epoch && session.membership_head.is_none())
+                && ((seen.epoch > epoch && session.membership.head.is_none())
                     || (seen.epoch == epoch
                         && (seen.fingerprint != fingerprint || seen.name_head != name_head)))
         })
@@ -435,6 +435,6 @@ mod tests {
 
         receive(&mut session, peer, &packet).unwrap();
 
-        assert!(session.membership_update.is_some());
+        assert!(session.membership.update.is_some());
     }
 }
