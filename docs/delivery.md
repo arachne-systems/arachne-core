@@ -150,6 +150,11 @@ Group objects go to every subscriber of the topic.
   topic selection, after, through). Automatic recovery progress is per
   (author, epoch, selection). A holder may keep an exact author-signed range
   (`retain_until`) and serve only that range.
+- **Limit.** Authors and holders serve, and receivers verify, ranges for any
+  epoch in the receive window (`arachne-delivery` API). The runtime recovery
+  operations (`fetch_recovery_range`, `discover_recovery_cutoff`) request the
+  current epoch only. A gap in an older epoch closes by live receipt, not by
+  runtime-driven recovery.
 - **Ordering.** No order between authors. Objects of one scope come in author
   order when they are pending together; a late object can come after newer
   ones that were already delivered.
