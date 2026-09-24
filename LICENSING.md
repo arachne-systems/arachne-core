@@ -6,7 +6,8 @@ source in this repository. Each Arachne package declares the SPDX expression
 `LICENSE` symlink to the root text, so Cargo puts the full license text in each
 package archive. This license does not relicense third-party code.
 
-The vendored Iroh forks (`arachne-iroh-blobs`, `arachne-iroh-gossip`) and the
+The vendored Iroh forks (`arachne-iroh-blobs`, `arachne-iroh-gossip`,
+`arachne-iroh-tor-transport`) and the
 other vendored packages keep their upstream SPDX expressions (`MIT OR
 Apache-2.0`, `Apache-2.0` or `MIT`). They are not under MPL-2.0.
 

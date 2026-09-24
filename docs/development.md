@@ -18,7 +18,7 @@ Each crate has a short README. The root workspace pins direct dependency
 versions where interoperability or protocol behavior requires it and uses
 `Cargo.lock` to capture the resolved graph. Shared package metadata and
 registry-compatible versions for normal internal dependencies are configured.
-The six first-party packages and two Arachne-maintained Iroh forks are
+The six first-party packages and three Arachne-maintained Iroh forks are
 publishable workspace members. Check crates.io for current publication status;
 new crate names require a one-time manual first publish before Trusted
 Publishing can be enabled.
@@ -64,7 +64,8 @@ on a pinned nightly. It proves that the lower bounds in the Arachne crates build
 To keep that true, published crates use caret ranges whose lower bound is a
 version that builds (normally the locked version). Use `=` only where an exact
 match is required, and put a comment next to it: today that is `iroh` and
-`iroh-tor-transport` (unstable custom-transport API) and the renamed forks.
+the renamed forks, including `arachne-iroh-tor-transport` (unstable
+custom-transport API).
 That job takes the vendored Iroh forks out of `members`, because their upstream
 manifests have loose lower bounds that do not build at their minimums.
 
@@ -100,9 +101,10 @@ certification.
 
 ## Vendored dependency patches
 
-`vendor/` contains three Arachne-maintained, publishable renamed forks:
-`arachne-iroh-gossip`, `arachne-iroh-blobs` and `arachne-bao-tree`. Their Rust
-import names stay `iroh_gossip`, `iroh_blobs` and `bao_tree`; each retains
+`vendor/` contains four Arachne-maintained, publishable renamed forks:
+`arachne-iroh-gossip`, `arachne-iroh-blobs`, `arachne-iroh-tor-transport` and
+`arachne-bao-tree`. Their Rust import names stay `iroh_gossip`, `iroh_blobs`,
+`iroh_tor_transport` and `bao_tree`; each retains
 upstream provenance, notices, and MIT/Apache-2.0 terms. They are not official
 upstream releases. Because Arachne crates depend on them directly (with
 `package = "arachne-..."`), their fixes reach every downstream consumer.
@@ -156,7 +158,8 @@ deliberately excluded from publishing.
 dev-dependencies out of `Cargo.lock`), so release-plz does not publish it.
 Publish order for a fork change: `arachne-bao-tree` (by hand, `cargo publish
 --manifest-path vendor/bao-tree/Cargo.toml`), then `arachne-iroh-blobs`,
-`arachne-iroh-gossip`, `arachne-node`, `arachne-runtime`. Until
+`arachne-iroh-gossip`, `arachne-iroh-tor-transport`, `arachne-node`,
+`arachne-runtime`. Until
 `arachne-bao-tree` is on crates.io, `cargo package`/`cargo publish --dry-run`
 verification of `arachne-iroh-blobs`, `arachne-node` and `arachne-runtime`
 fails; use `cargo package --list` or `--no-verify` for a local check. A clean

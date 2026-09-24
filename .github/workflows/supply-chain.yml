@@ -67,9 +67,10 @@ jobs:
           import pathlib
           p = pathlib.Path("Cargo.toml")
           s = p.read_text()
-          s = s.replace('    "vendor/iroh-gossip",\n    "vendor/iroh-blobs",\n', "")
-          s = s.replace('exclude = ["vendor/bao-tree"', 'exclude = ["vendor/iroh-gossip", "vendor/iroh-blobs", "vendor/bao-tree"')
-          assert '"vendor/iroh-blobs", "vendor/bao-tree"' in s, "workspace layout changed; update this step"
+          s = s.replace('    "vendor/iroh-gossip",\n    "vendor/iroh-blobs",\n    "vendor/iroh-tor-transport",\n', "")
+          s = s.replace('exclude = ["vendor/bao-tree"', 'exclude = ["vendor/iroh-gossip", "vendor/iroh-blobs", "vendor/iroh-tor-transport", "vendor/bao-tree"')
+          assert '"vendor/iroh-tor-transport", "vendor/bao-tree"' in s, "workspace layout changed; update this step"
+          assert '    "vendor/' not in s, "a vendored fork is still a workspace member; update this step"
           p.write_text(s)
           EOF
       - run: cargo update -Z direct-minimal-versions
