@@ -51,6 +51,29 @@ cargo +1.98.0 test --locked -p arachne-node -- --test-threads=1
 cargo +1.98.0 test --locked -p arachne-runtime -- --test-threads=1
 ```
 
+Supply-chain checks (`.github/workflows/supply-chain.yml` runs the same on each
+PR, on `main` and weekly):
+
+```sh
+cargo +1.98.0 check --locked --workspace --all-targets --all-features
+cargo deny --all-features check   # policy in deny.toml
+```
+
+The CI job `minimal-versions` also runs `cargo update -Z direct-minimal-versions`
+on a pinned nightly. It proves that the lower bounds in the Arachne crates build.
+To keep that true, published crates use caret ranges whose lower bound is a
+version that builds (normally the locked version). Use `=` only where an exact
+match is required, and put a comment next to it: today that is `iroh` and
+`iroh-tor-transport` (unstable custom-transport API) and the renamed forks.
+That job takes the vendored Iroh forks out of `members`, because their upstream
+manifests have loose lower bounds that do not build at their minimums.
+
+`deny.toml` fails on any vulnerability advisory, on unmaintained crates, on a
+license outside the allowlist, on a non-crates.io source, and on a second
+version of a directly used crypto crate (for example `aes-gcm`, `openmls`,
+`sha2`). Existing duplicates and accepted advisories are listed there with a
+reason; review them when you change dependencies.
+
 For the simple transport example:
 
 ```sh

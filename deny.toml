@@ -1,0 +1,97 @@
+# cargo-deny policy for arachne-core. CI runs `cargo deny --all-features check`
+# (see .github/workflows/supply-chain.yml). Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Check the union of every feature (including `tor`) on every target, so the
+# SDK's Android and desktop graphs are both covered.
+all-features = true
+
+[advisories]
+# Vulnerability advisories always fail. Unmaintained advisories fail for the
+# whole graph unless listed below with a reason.
+unmaintained = "all"
+yanked = "deny"
+ignore = [
+    # `tor` feature only: arachne-node/tor -> iroh-tor-transport 0.1.0 ->
+    # torut 0.2.1 -> ed25519-dalek 1.0.1 / curve25519-dalek 3.2.0. Not in the
+    # default graph. Blocked on an upstream torut/iroh-tor-transport update.
+    # Re-check before `tor` is offered to users.
+    { id = "RUSTSEC-2022-0093", reason = "tor feature only (torut -> ed25519-dalek 1.0.1); no upstream fix in iroh-tor-transport 0.1" },
+    { id = "RUSTSEC-2024-0344", reason = "tor feature only (torut -> curve25519-dalek 3.2.0); no upstream fix in iroh-tor-transport 0.1" },
+    # Unmaintained, not a vulnerability. Only through the vendored
+    # arachne-iroh-blobs default `tickets` feature (iroh-tickets -> postcard
+    # default -> heapless 0.7) and dev-dependencies. arachne-node disables
+    # that feature, so the published arachne-runtime graph does not contain it.
+    { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill only via fork default `tickets` feature / dev-deps; not in the arachne-runtime graph" },
+]
+
+[licenses]
+# Every entry is a permissive or weak-copyleft license compatible with
+# distributing MPL-2.0 Arachne code, including in a cdylib/AAR. Dual-licensed
+# crates (for example `Apache-2.0 OR GPL-2.0-only`) pass through an allowed
+# alternative.
+allow = [
+    "Apache-2.0",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions are common in this graph (iroh, openmls and the Tor stack
+# each pin their own crypto generations). Warn in general; deny below for the
+# crypto crates that Arachne calls directly.
+multiple-versions = "warn"
+wildcards = "deny"
+# Path dependencies between workspace crates also carry a version.
+allow-wildcard-paths = true
+highlight = "all"
+
+deny = [
+    # A second copy of these crates in the graph means two implementations of
+    # the same primitive on the security path. Fail so that it is a decision.
+    { crate = "aes-gcm", deny-multiple-versions = true },
+    { crate = "sframe", deny-multiple-versions = true },
+    { crate = "openmls", deny-multiple-versions = true },
+    { crate = "openmls_traits", deny-multiple-versions = true },
+    { crate = "openmls_rust_crypto", deny-multiple-versions = true },
+    { crate = "ring", deny-multiple-versions = true },
+    { crate = "rustls", deny-multiple-versions = true },
+    { crate = "blake3", deny-multiple-versions = true },
+    { crate = "zeroize", deny-multiple-versions = true },
+    { crate = "subtle", deny-multiple-versions = true },
+    { crate = "sha2", deny-multiple-versions = true },
+    { crate = "hkdf", deny-multiple-versions = true },
+    { crate = "hmac", deny-multiple-versions = true },
+    # Not crypto, but the store's encryption-at-rest backend.
+    { crate = "rusqlite", deny-multiple-versions = true },
+    { crate = "libsqlite3-sys", deny-multiple-versions = true },
+]
+
+# Existing duplicates of the crates above. Each skip names one exact version,
+# so a new third copy still fails.
+skip = [
+    { crate = "sha2@0.9.9", reason = "tor feature only: torut -> ed25519-dalek 1.0.1" },
+    { crate = "sha2@0.11.0", reason = "RustCrypto 0.11 generation used by iroh/openmls-era deps; Arachne stays on 0.10 until an intentional bump" },
+    { crate = "hkdf@0.13.0", reason = "RustCrypto 0.13 generation from third-party deps; Arachne uses 0.12" },
+    { crate = "hmac@0.11.0", reason = "tor feature only: torut" },
+    { crate = "hmac@0.13.0", reason = "RustCrypto 0.13 generation from third-party deps" },
+]
+
+[sources]
+# Only crates.io. The vendored forks are path dependencies in this repository.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
