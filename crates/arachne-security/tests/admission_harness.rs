@@ -339,6 +339,73 @@ fn an_existing_member_follows_batch_adds_past_three_hundred_members() {
     assert_eq!(member.member_count(), owner.member_count());
 }
 
+/// Past ~250 members an administrator prepared a management commit (its own
+/// state uses the local bound), but every other member re-read its own state
+/// through the 64 KiB wire bound in `verify_management` and rejected the
+/// commit. The administrator advanced and the members did not: a fork (B3).
+#[test]
+fn an_existing_member_accepts_management_past_three_hundred_members() {
+    let mut owner = Workspace::create([205; 32], "Large workspace owner").unwrap();
+    let (invitation, checkpoint) = owner.issue_invitation().unwrap();
+    let joiner = |index: usize| {
+        PendingJoin::from_invitation(&invitation, &checkpoint, endpoint(index + 50_000), "Member").unwrap()
+    };
+    let early = joiner(0);
+    let request = early.admission_request().unwrap().to_vec();
+    let AdmissionAssessment::Ready(validated) = owner.assess_admission(endpoint(50_000), &request).unwrap() else {
+        panic!("open invitation needs no approval");
+    };
+    let prepared = owner.prepare_validated_admission_batch(&[(endpoint(50_000), request.as_slice(), &validated)]).unwrap();
+    let mut proof = early.join_proof().unwrap();
+    let authorization = arachne_security::MembershipAuthorization::Admission(prepared.replies[0].authorization.clone());
+    proof.apply_transition(&authorization, &prepared.commit).unwrap();
+    let mut member = early.prepare_workspace(&proof, &prepared.welcome).unwrap();
+    owner = prepared.workspace;
+    let mut next = 1;
+    while owner.member_count() < 310 {
+        let range = next..(next + MAX_ADMISSION_BATCH);
+        let joins: Vec<_> = range.clone().map(joiner).collect();
+        let requests: Vec<_> = joins.iter().map(|join| join.admission_request().unwrap().to_vec()).collect();
+        let validated: Vec<_> = range.clone().zip(&requests).map(|(index, request)| {
+            match owner.assess_admission(endpoint(index + 50_000), request).unwrap() {
+                AdmissionAssessment::Ready(validated) => validated,
+                _ => panic!("open invitation needs no approval"),
+            }
+        }).collect();
+        let entries: Vec<_> = range.clone().zip(requests.iter().zip(&validated))
+            .map(|(index, (request, validated))| (endpoint(index + 50_000), request.as_slice(), validated)).collect();
+        let prepared = owner.prepare_validated_admission_batch(&entries).unwrap();
+        let authorizations: Vec<_> = prepared.replies.iter().map(|reply| reply.authorization.clone()).collect();
+        member = member.prepare_admission_batch_update(&authorizations, &prepared.commit).unwrap();
+        owner = prepared.workspace;
+        next = range.end;
+    }
+    let own_id = member.member().unwrap().id();
+    let target = owner
+        .member_roster()
+        .unwrap()
+        .into_iter()
+        .find(|m| !m.administrator && m.id != own_id)
+        .unwrap()
+        .id;
+    let action = arachne_security::ManagementAction::Remove(target);
+    let prepared = owner.prepare_management(action).unwrap();
+    member.verify_management(action, &prepared.commit).unwrap_or_else(|error| {
+        panic!("member at {} members rejected the management commit: {error}", member.member_count())
+    });
+    let arachne_security::PreparedManagementUpdate::Active(member) =
+        member.prepare_management_update(action, &prepared.commit).unwrap()
+    else {
+        panic!("removal of another member removed this member")
+    };
+    assert_eq!(member.epoch(), prepared.workspace.epoch());
+    assert_eq!(member.member_count(), prepared.workspace.member_count());
+    // The runtime saves the accepted state before it adopts it.
+    let records = member.export_records().unwrap();
+    let restored = Workspace::restore_records(endpoint(50_000), member.id(), &records).unwrap();
+    assert_eq!(restored.epoch(), prepared.workspace.epoch());
+}
+
 /// Known limit: a new invitation's checkpoint is signed GroupInfo with the
 /// ratchet tree and crosses the network, so it keeps the 64 KiB wire bound.
 /// Past ~250 members an administrator cannot issue a new invitation. An
