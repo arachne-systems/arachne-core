@@ -511,7 +511,8 @@ impl Workspace {
                     Err("admission history requires membership support")
                 }
                 MembershipAuthorization::Management(_)
-                | MembershipAuthorization::Revocation(_) => {
+                | MembershipAuthorization::Revocation(_)
+                | MembershipAuthorization::SelfUpdate => {
                     Err("membership history requires management support")
                 }
             })

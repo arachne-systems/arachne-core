@@ -31,6 +31,8 @@ mod order;
 pub use order::{
     AnchorProof, MAX_ANCHOR_PROOF, ORDER_WINDOW, OrderStep, RevocationKind, RevocationOrder,
 };
+mod self_update;
+pub use self_update::PreparedSelfUpdate;
 mod step;
 pub use step::{FORMAT_NOT_SUPPORTED, decode_membership_step, encode_membership_step};
 mod removed;

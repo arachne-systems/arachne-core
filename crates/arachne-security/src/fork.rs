@@ -18,7 +18,7 @@ pub enum ForkClass {
     Management = 2,
     /// Admission, AdmissionBatch: adds keys.
     Admission = 3,
-    /// Member self-update. No authorization variant produces it yet (ADR step 5).
+    /// Member self-update (`MembershipAuthorization::SelfUpdate`).
     SelfUpdate = 4,
 }
 
@@ -50,10 +50,11 @@ impl ForkClass {
 
     /// Class of one verified membership authorization.
     pub fn of(authorization: &MembershipAuthorization) -> Self {
-        // Exhaustive on purpose: ADR step 5 adds SelfUpdate here.
+        // Exhaustive on purpose: a new authorization must pick its class.
         match authorization {
             MembershipAuthorization::Management(action) => Self::of_action(action),
             MembershipAuthorization::Revocation(step) => Self::of_revocation(step.order.kind),
+            MembershipAuthorization::SelfUpdate => Self::SelfUpdate,
             MembershipAuthorization::Admission(_) | MembershipAuthorization::AdmissionBatch(_) => {
                 Self::Admission
             }
@@ -263,6 +264,10 @@ mod tests {
         ] {
             assert_eq!(ForkClass::of(&revocation(kind)), class, "{kind:?}");
         }
+        assert_eq!(
+            ForkClass::of(&MembershipAuthorization::SelfUpdate),
+            ForkClass::SelfUpdate
+        );
         assert_eq!(
             ForkClass::of(&MembershipAuthorization::Admission(admission())),
             ForkClass::Admission

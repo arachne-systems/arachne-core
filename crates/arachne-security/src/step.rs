@@ -80,6 +80,7 @@ pub(super) fn write_step(
                 put_auth(out, auth);
             }
         }
+        MembershipAuthorization::SelfUpdate => out.extend([12, class]),
         MembershipAuthorization::Revocation(step) => {
             out.extend([revocation_tag(step.order.kind), class]);
             super::order::write_order_step(out, step)?;
@@ -140,6 +141,7 @@ pub(super) fn read_step(
                     .collect::<Result<Vec<_>, _>>()?,
             )
         }
+        12 => MembershipAuthorization::SelfUpdate,
         2 | 3 | 4 | 6 => {
             let step = super::order::read_order_step(&mut bytes)?;
             if revocation_tag(step.order.kind) != tag {
@@ -223,6 +225,7 @@ mod tests {
     fn every_authorization() -> Vec<MembershipAuthorization> {
         let id = [4; 32];
         let mut all = vec![
+            MembershipAuthorization::SelfUpdate,
             MembershipAuthorization::Admission(admission(1)),
             MembershipAuthorization::AdmissionBatch(vec![admission(1), admission(9)]),
         ];

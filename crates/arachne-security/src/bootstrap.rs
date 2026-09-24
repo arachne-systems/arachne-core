@@ -258,6 +258,11 @@ pub enum MembershipAuthorization {
     /// Remove, Leave, Demote, DisableInvitation (ADR A2 step 4). Any member
     /// may commit a valid order.
     Revocation(super::OrderStep),
+    /// A member's own update path (ADR A2 step 5): an empty commit with an
+    /// update path, no proposals, no extension change and the same
+    /// credential, key, capabilities and leaf extensions. It gives members
+    /// post-compromise security and merges their unmerged tree nodes.
+    SelfUpdate,
 }
 
 impl MembershipAuthorization {
@@ -492,6 +497,13 @@ impl MembershipVerifier {
             MembershipAuthorization::Admission(auth) => self.apply_add(auth, commit),
             MembershipAuthorization::AdmissionBatch(auths) => self.apply_add_batch(auths, commit),
             MembershipAuthorization::Management(action) => self.apply_management(*action, commit),
+            MembershipAuthorization::SelfUpdate => {
+                let staged = self.self_update_commit(commit)?;
+                self.group
+                    .merge_commit(self.provider.storage(), staged)
+                    .map_err(|_| "public self-update merge failed")?;
+                Ok(())
+            }
             MembershipAuthorization::Revocation(step) => {
                 let staged = self.revocation_commit(step, commit)?;
                 self.group
@@ -512,6 +524,50 @@ impl MembershipVerifier {
             .merge_commit(self.provider.storage(), staged)
             .map_err(|_| "public management merge failed")?;
         Ok(())
+    }
+
+    /// Verify one member self-update against this parent state (ADR A2 step 5).
+    fn self_update_commit(&self, commit: &[u8]) -> Result<StagedCommit, &'static str> {
+        if commit.is_empty() || commit.len() > MAX_BYTES {
+            return Err("self update commit exceeds bounds");
+        }
+        let message = MlsMessageIn::tls_deserialize_exact(commit)
+            .map_err(|_| "invalid self update commit")?
+            .try_into_protocol_message()
+            .map_err(|_| "expected self update commit")?;
+        let processed = self
+            .group
+            .process_message(self.provider.crypto(), message)
+            .map_err(|_| "invalid self update signature or epoch")?;
+        let Sender::Member(index) = *processed.sender() else {
+            return Err("self update sender is not a member");
+        };
+        if !processed.aad().is_empty() {
+            return Err("self update carries authenticated data");
+        }
+        let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
+            return Err("not a self update commit");
+        };
+        // RFC 9420 does not let a committer include its own Update; the
+        // commit is empty and carries only the path.
+        if staged.queued_proposals().next().is_some() {
+            return Err("self update carries proposals");
+        }
+        let leaf = staged
+            .update_path_leaf_node()
+            .ok_or("self update requires an update path")?;
+        let old = self.group.leaf(index).ok_or("unknown self update sender")?;
+        if leaf.credential() != old.credential()
+            || leaf.signature_key() != old.signature_key()
+            || leaf.capabilities() != old.capabilities()
+            || leaf.extensions() != old.extensions()
+        {
+            return Err("self update changed the member leaf");
+        }
+        if staged.group_context().extensions() != self.group.group_context().extensions() {
+            return Err("self update changed group policy");
+        }
+        Ok(*staged)
     }
 
     /// Verify one revocation step against this parent state (ADR A2 step 4).
@@ -890,7 +946,7 @@ impl JoinProof {
                 Ok(())
             }
             MembershipAuthorization::Management(action) => self.apply_management(*action, commit),
-            MembershipAuthorization::Revocation(_) => {
+            MembershipAuthorization::Revocation(_) | MembershipAuthorization::SelfUpdate => {
                 let appended = self.appended_history(authorization, commit)?;
                 self.verifier.apply_transition(authorization, commit)?;
                 self.adopt_history(appended);
