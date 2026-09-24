@@ -315,12 +315,12 @@ struct Session {
     /// Gossiped steps that skip ahead of this node's epoch, keyed by the
     /// epoch they extend. Bounded; applied in order as earlier steps land.
     gossip_steps_ahead: BTreeMap<u64, Vec<u8>>,
-    /// The newest epoch heard by gossip or presence, and members that have it
-    /// (ADR 0009). A hint only: the steps are pulled and verified.
+    /// The newest epoch heard by gossip or presence, and members that have it.
+    /// A hint only: the steps are pulled and verified.
     membership_head: Option<(u64, Vec<[u8; 32]>)>,
     /// One range pull toward `membership_head`, keyed by the epoch it extends.
     range_pull: Option<PendingControl<u64>>,
-    /// Membership gossip outcomes, for workspace_metrics (ADR 0008).
+    /// Membership gossip outcomes, for workspace_metrics.
     gossip_counts: Arc<membership::GossipCounts>,
     /// One page pull of a peer's retained names, and the peer sets already
     /// walked to the end (peer -> its profile digest), bounded.
@@ -752,7 +752,7 @@ fn commit_workspace(session: &mut Session, workspace: arachne_security::Workspac
     // advertised on the next native presence drain.  Otherwise peers keep
     // querying the old head until the periodic refresh interval elapses.
     session.presence.announce_next();
-    // Names held for members this step admits (ADR 0008).
+    // Names held for members this step admits.
     membership::retain_held_profiles(session);
 }
 
@@ -4628,7 +4628,7 @@ fn execute_in_session(
         reap_admission_pushes(session);
         // A range pull is a short read of committed steps. Serve it before
         // the rest of the queue: behind a join wave's profile-page queries it
-        // waited past the puller's limit (tablets, fix16; ADR 0009).
+        // waited past the puller's limit (tablets, fix16).
         if let Some(incoming) = session
             .node
             .poll_control_first(|payload| payload.starts_with(b"DFMS"), RANGE_SCAN_DEPTH)
@@ -4648,7 +4648,7 @@ fn execute_in_session(
         membership::send_queued_profiles(session);
         let admission_busy = admission_busy(session);
         // A membership step received by gossip moves this member to the next
-        // epoch before anything else is staged (ADR 0008).
+        // epoch before anything else is staged.
         if !admission_busy && let Some(staged) = membership::stage_gossiped_step(session)? {
             return Ok(staged);
         }
@@ -4686,7 +4686,7 @@ fn execute_in_session(
         });
         let Some(incoming) = incoming else {
             // Membership queries the committed view answered: tell the host
-            // once, when it has nothing else to do (ADR 0010).
+            // once, when it has nothing else to do.
             return Ok(membership::take_answered(session).unwrap_or(Value::Null));
         };
         if incoming.payload() == NEARBY_IDENTITY {
@@ -5303,7 +5303,7 @@ fn execute_in_session(
         }
         commit_workspace(session, staged.workspace);
         let staged_approval_id = session.staged_approval_id;
-        // A step this node committed goes out by gossip (ADR 0008). A step it
+        // A step this node committed goes out by gossip. A step it
         // received from a peer is already travelling; gossip relays it.
         let received = std::mem::take(&mut session.staged_step_received);
         let committed_here =
@@ -5452,7 +5452,7 @@ fn execute_in_session(
             session.staged_approval_id = None;
         }
         // A member that just reached the newest head it heard announces it
-        // too, so members that are behind pull from many members (ADR 0009).
+        // too, so members that are behind pull from many members.
         let reached_head = received
             && session.workspace.as_ref().is_some_and(|owner| {
                 !session.gossip_steps_ahead.contains_key(&owner.epoch())
@@ -6654,7 +6654,7 @@ mod tests {
                 serde_json::to_vec(&json!({"op":"request_admission","peer":peer})).unwrap();
             serde_json::from_slice::<Value>(&execute(joiner, &request).unwrap()).unwrap()
         });
-        // The result is retained, so this request is an inquiry (ADR 0010): the
+        // The result is retained, so this request is an inquiry: the
         // committed view answers it and the host is never asked.
         let mut network_reply = requesting.join().unwrap();
         assert_eq!(

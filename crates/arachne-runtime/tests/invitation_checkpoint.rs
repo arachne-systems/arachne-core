@@ -75,7 +75,7 @@ fn fetches_only_the_exact_invitation_checkpoint_over_authenticated_iroh() {
             json!({"op":"fetch_invitation_checkpoint","peer":peer,"invitation":bearer}),
         )
     });
-    // An invitation checkpoint is an inquiry (ADR 0010): the committed view
+    // An invitation checkpoint is an inquiry: the committed view
     // answers it and the host sees no event.
     let fetched = fetch.join().unwrap().unwrap();
     assert_eq!(fetched["checkpoint"], invitation["checkpoint"]);
@@ -231,7 +231,7 @@ fn ordinary_member_serves_the_checkpoint_it_joined_from_after_issuer_closes() {
             json!({"op":"fetch_invitation_checkpoint","peer":peer,"invitation":bearer}),
         )
     });
-    // An invitation checkpoint is an inquiry (ADR 0010): the committed view
+    // An invitation checkpoint is an inquiry: the committed view
     // answers it and the host sees no event.
     let fetched = fetch.join().unwrap().unwrap();
     assert_eq!(fetched["checkpoint"], invitation["checkpoint"]);
@@ -257,7 +257,7 @@ fn ordinary_member_serves_the_checkpoint_it_joined_from_after_issuer_closes() {
     let retry = std::thread::spawn(move || {
         call(late, json!({"op":"request_admission","peer":retry_peer})).unwrap()
     });
-    // The result is retained, so this retry is an inquiry (ADR 0010): the
+    // The result is retained, so this retry is an inquiry: the
     // committed view answers it and the host sees no event.
     // The owner holds the request's exchange and writes the committed
     // result onto it after save and adopt (event-driven admission).
@@ -430,7 +430,7 @@ fn existing_member_serves_a_later_invitation_after_learning_it_and_restarting() 
             json!({"op":"fetch_invitation_checkpoint","peer":peer,"invitation":bearer}),
         )
     });
-    // An invitation checkpoint is an inquiry (ADR 0010): the committed view
+    // An invitation checkpoint is an inquiry: the committed view
     // answers it and the host sees no event.
     assert_eq!(
         fetch.join().unwrap().unwrap()["checkpoint"],

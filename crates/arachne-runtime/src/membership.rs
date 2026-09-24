@@ -335,7 +335,7 @@ fn merge_profiles_with_budget(
 }
 
 /// Retained signed member profiles. Shared by the host and the inquiry
-/// responder, so a membership query is answered without the host (ADR 0010).
+/// responder, so a membership query is answered without the host.
 /// Every holder takes the lock for one short, I/O-free step.
 #[derive(Default)]
 pub(super) struct ProfileSet {
@@ -550,7 +550,7 @@ pub(super) fn reply_with_profiles(session: &mut Session, peer: [u8; 32], bytes: 
     result
 }
 
-/// Gossip the profiles that membership queries retained first (ADR 0008).
+/// Gossip the profiles that membership queries retained first.
 pub(super) fn send_queued_profiles(session: &Session) {
     let queued = std::mem::take(&mut lock_profiles(&session.profiles).to_gossip);
     for bytes in queued {
@@ -570,7 +570,7 @@ pub(super) fn take_answered(session: &Session) -> Option<Value> {
 }
 
 /// Answer a membership query from one committed workspace and the shared
-/// profile set, with or without the host (ADR 0010). It writes only to
+/// profile set, with or without the host. It writes only to
 /// `set`: the querier's carried profiles, verified against this roster, the
 /// page cursor, and the gossip queue. Budget-parameterized for the same
 /// reason as `merge_profiles_with_budget`.
@@ -638,8 +638,8 @@ pub(super) fn answer_query(
         if merge_into(owner, set, &profiles, budget).is_err() {
             return json!({"state":"membership_denied"});
         }
-        // A name this node just learned travels on to every member by gossip
-        // (ADR 0008): replies carry only two names each, so pulled names lagged.
+        // A name this node just learned travels on to every member by gossip:
+        // replies carry only two names each, so pulled names lagged.
         for (bytes, before) in profiles.iter().zip(known) {
             let retained = id(bytes).is_some_and(|id| set.retained.get(&id) == Some(bytes));
             if retained && before.as_ref() != Some(bytes) {
@@ -1159,7 +1159,7 @@ fn poll_with_budget(
                 note_head(session, head, pending.peer);
             }
             // A peer at a lower epoch cannot extend ours: it is behind, not in
-            // conflict, and head gossip catches it up (ADR 0009). Reported as
+            // conflict, and head gossip catches it up. Reported as
             // unavailable, it raised "Membership differs" on the owner (fix16c).
             if value["state"] == "membership_unavailable"
                 && value["epoch"]
@@ -1952,7 +1952,7 @@ pub(super) fn stage_update(session: &mut Session, step: JoinStep) -> Result<Valu
     Ok(value)
 }
 
-/// Head announcement: workspace, epoch, committing member's endpoint (ADR 0009).
+/// Head announcement: workspace, epoch, committing member's endpoint.
 const GOSSIP_HEAD: &[u8] = b"DFMH\x01";
 /// A range pull that gets no reply gives up after this; pull still recovers.
 /// Longer than the 5 s connect limit, so the logs tell the two apart.
@@ -2129,7 +2129,7 @@ pub(super) fn note_head(session: &mut Session, head: u64, author: [u8; 32]) {
     }
 }
 
-/// Announce this node's epoch (ADR 0009): after it commits, and after it
+/// Announce this node's epoch after it commits, and after it
 /// reaches the newest head it heard, so members that are behind pull from
 /// many members, not all from the owner. Only the head travels by gossip: a
 /// lost announcement is replaced by the next one. Best effort; never blocks.
@@ -2221,7 +2221,7 @@ pub(super) fn stage_gossiped_step(session: &mut Session) -> Result<Option<Value>
 }
 
 /// Pull the steps toward an announced head from the member that committed it,
-/// in one exchange (ADR 0009). That member is alive: it sent the head a
+/// in one exchange. That member is alive: it sent the head a
 /// moment ago. One pull at a time; its reply wakes the host.
 fn start_range_pull(session: &mut Session, epoch: u64) {
     if session.range_pull.is_some() || session.gossip_steps_ahead.contains_key(&epoch) {
@@ -2342,8 +2342,8 @@ pub(super) struct ProfilePull {
 }
 
 /// Serve retained signed names after one member id, in id order, to a current
-/// member. A pure read of the shared set, answered without the host
-/// (ADR 0010). Refusal is an empty page: it reveals nothing.
+/// member. A pure read of the shared set, answered without the host.
+/// Refusal is an empty page: it reveals nothing.
 pub(super) fn profile_page_reply(
     owner: Option<&arachne_security::Workspace>,
     set: &ProfileSet,

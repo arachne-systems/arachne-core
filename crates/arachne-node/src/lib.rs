@@ -835,7 +835,7 @@ impl Node {
     }
 
     /// Next membership step received by gossip, as (workspace, opaque bytes).
-    /// Delivered without a policy revision check (ADR 0008): the caller must
+    /// Delivered without a policy revision check: the caller must
     /// verify the step itself against its own saved state before using it.
     pub fn poll_membership_gossip(&self) -> Option<(WorkspaceId, Vec<u8>)> {
         self.membership.pop()
@@ -994,7 +994,7 @@ impl Node {
             }
             self.connections.authorize_gossip(tag, peers.clone());
             // An epoch that only adds members keeps the swarm: rebuilding it on
-            // every admission dropped all neighbors mid-broadcast (ADR 0008).
+            // every admission dropped all neighbors mid-broadcast.
             if existing.advance(revision, &peers) {
                 return Ok(());
             }

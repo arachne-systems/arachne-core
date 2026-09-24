@@ -448,7 +448,7 @@ impl Node {
 
     /// Take the first matching request from up to `depth` newly queued ones
     /// plus those already set aside; the rest keep their order. For short
-    /// requests that must not wait behind a long queue (ADR 0009).
+    /// requests that must not wait behind a long queue.
     pub fn poll_control_first(
         &mut self,
         matches: impl Fn(&[u8]) -> bool,

@@ -252,7 +252,7 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
     let retry = std::thread::spawn(move || {
         call(late, json!({"op":"request_admission","peer":retry_peer})).unwrap()
     });
-    // The result is retained, so this retry is an inquiry (ADR 0010): the
+    // The result is retained, so this retry is an inquiry: the
     // committed view answers it and the host sees no event.
     let reply = retry.join().unwrap();
     let steps = reply.get("commits").expect("complete authorized history");

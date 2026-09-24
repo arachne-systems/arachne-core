@@ -387,8 +387,8 @@ pub(super) fn poll(session: &mut Session, announce: bool) -> Result<Value, Strin
     if session.presence.queued.is_empty() {
         session.presence.announce = false;
     }
-    // A fresh peer at a newer epoch has the steps: pull the range from it
-    // (ADR 0009). Same-epoch name/profile changes start an authenticated query
+    // A fresh peer at a newer epoch has the steps: pull the range from it.
+    // Same-epoch name/profile changes start an authenticated query
     // from this Rust-side observation, not from a host refresh timer.
     let sync_peer = reconcile_seen(session)?;
     Ok(json!({"state":"workspace_presence", "sync_peer":sync_peer,

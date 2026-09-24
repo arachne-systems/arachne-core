@@ -170,7 +170,7 @@ fn old_invitation_redeems_through_an_ordinary_member_with_issuer_closed() {
         )
         .unwrap()
     });
-    // The result is retained, so this retry is an inquiry (ADR 0010): the
+    // The result is retained, so this retry is an inquiry: the
     // committed view answers it and the host sees no event.
     let reply = retry.join().unwrap();
     let steps = reply.get("commits").expect("complete authorized history");

@@ -10,7 +10,7 @@ const RANGE_QUERY: &[u8] = b"DFMS\x01";
 const RANGE_REPLY: &[u8] = b"DFMT\x01";
 const MAX_RANGE_QUERY: usize = 64;
 /// Steps in one range reply. Matches the held-step bound, so a whole reply
-/// always fits where steps wait for their turn (ADR 0009).
+/// always fits where steps wait for their turn.
 pub(super) const MAX_RANGE_STEPS: usize = 32;
 
 const PROFILE_QUERY: &[u8] = b"DFPQ\x01";

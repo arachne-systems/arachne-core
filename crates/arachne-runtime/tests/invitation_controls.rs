@@ -326,7 +326,7 @@ fn overlapping_manual_approval_is_queued_until_the_owner_is_ready() {
     let final_retry = std::thread::spawn(move || {
         call(requester, json!({"op":"request_admission","peer":retry_peer})).unwrap()
     });
-    // The result is retained, so this retry is an inquiry (ADR 0010): the
+    // The result is retained, so this retry is an inquiry: the
     // committed view answers it and the host sees no event.
     let reply = final_retry.join().unwrap();
     assert!(reply.get("welcome").is_some());
@@ -515,7 +515,7 @@ fn approved_personal_join_survives_restart_and_uses_peer_while_admin_is_closed()
     let final_retry = std::thread::spawn(move || {
         call(person, json!({"op":"request_admission","peer":helper_peer})).unwrap()
     });
-    // The result is retained, so this retry is an inquiry (ADR 0010): the
+    // The result is retained, so this retry is an inquiry: the
     // committed view answers it and the host sees no event.
     let reply = final_retry.join().unwrap();
     let staged = call(

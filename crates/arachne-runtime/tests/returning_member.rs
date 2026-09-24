@@ -229,8 +229,8 @@ fn group_presence_announces_new_members_and_returning_peers_without_application_
     assert_eq!(call(b, json!({"op":"member_roster"}))["members"].as_array().unwrap().len(), 2);
     call(a, json!({"op":"poll_workspace_presence","announce":true}));
     assert_eq!(poll(b, "poll_admission")["state"], "presence_replied");
-    // A newer epoch in a presence reply starts the runtime's range pull
-    // (ADR 0009); the host is not asked to sync as well.
+    // A newer epoch in a presence reply starts the runtime's range pull;
+    // the host is not asked to sync as well.
     let observed = call(b, json!({"op":"poll_workspace_presence"}));
     assert!(observed["sync_peer"].is_null(), "{observed}");
     // An authenticated announcement prompts synchronization but never grants membership.

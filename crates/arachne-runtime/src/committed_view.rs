@@ -15,7 +15,8 @@ pub(super) struct CommittedView {
 
 /// The published view of one session. `None` until a workspace is committed.
 /// It also carries the session's retained member profiles: a membership
-/// query reads and extends them without the host (ADR 0010).
+/// query reads and extends them without the host (see
+/// docs/architecture.md#membership-gossip-vocabulary, "inquiry").
 #[derive(Clone, Default)]
 pub(super) struct Published {
     view: Arc<RwLock<Option<Arc<CommittedView>>>>,
@@ -137,7 +138,7 @@ impl CommittedView {
             );
             return Some(page.unwrap_or_else(|| UNAVAILABLE.to_vec()));
         }
-        // A range pull reads committed steps only (ADR 0009).
+        // A range pull reads committed steps only.
         if payload.starts_with(b"DFMS") {
             return Some(membership::range_reply(
                 Some(&self.workspace),

@@ -36,8 +36,9 @@ const BOOTSTRAP_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(70),
     Duration::from_secs(120),
 ];
-/// The one overlay topic delivered across policy revisions (ADR 0008). Only
-/// self-authenticating membership steps may use it.
+/// The one overlay topic delivered across policy revisions, so a policy
+/// change never rebuilds the gossip swarm (see docs/architecture.md#membership-gossip-vocabulary).
+/// Only self-authenticating membership steps may use it.
 pub(super) const MEMBERSHIP_TOPIC: &str = "arachne/membership/1";
 /// Membership steps queued per (workspace, author). A flooding member fills
 /// only its own queue; steps are taken round-robin across authors.

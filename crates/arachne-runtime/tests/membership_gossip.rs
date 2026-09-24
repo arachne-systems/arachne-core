@@ -47,9 +47,9 @@ fn hint(from: i64, to: i64) {
 }
 
 /// A member at epoch N must receive the owner's step to N+1 by gossip, with no
-/// pull. Before ADR 0008 the overlay dropped any envelope from another policy
-/// revision, so behind members learned of new members only by polling peers
-/// one at a time (12-141 s lag on tablets, 2026-09-18).
+/// pull. Guards against the overlay dropping any envelope from another policy
+/// revision, which left behind members to learn of new members only by
+/// polling peers one at a time (12-141 s lag on tablets, 2026-09-18).
 #[test]
 fn a_committed_step_reaches_a_member_by_gossip_across_the_epoch() {
     let _nodes = NODES.lock().unwrap_or_else(|error| error.into_inner());
@@ -248,8 +248,8 @@ fn a_new_members_name_reaches_existing_members_by_gossip() {
         std::thread::sleep(Duration::from_millis(10));
     }
     // The existing member never queries; the name must arrive by gossip.
-    // The admin's committed view answered the query without its host
-    // (ADR 0010); the name leaves on the host's next poll, which the work
+    // The admin's committed view answered the query without its host;
+    // the name leaves on the host's next poll, which the work
     // signal wakes on a device.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -332,7 +332,7 @@ fn a_held_step_wakes_the_host_when_its_turn_comes() {
 }
 
 /// A member that missed several steps must catch up from the next head it
-/// hears, in one exchange with the author. Before ADR 0009 gossip carried full
+/// hears, in one exchange with the author. Guards against gossip carrying full
 /// steps: a member that missed one held every later step and waited for the
 /// slow roster pull (tablet BIG RED held epochs 7-8 for 47 s, 2026-09-18).
 #[test]
@@ -409,7 +409,7 @@ fn a_member_that_missed_steps_catches_up_from_the_next_head() {
 
 /// Presence alone must start the range pull: a member with no overlay that
 /// hears a newer epoch in a presence reply catches up in one exchange, not
-/// one step per 5 s roster query (ADR 0009).
+/// one step per 5 s roster query.
 #[test]
 fn presence_of_a_newer_epoch_starts_the_range_pull() {
     let _nodes = NODES.lock().unwrap_or_else(|error| error.into_inner());
@@ -507,7 +507,7 @@ fn a_peer_that_is_behind_is_reported_as_behind_not_as_a_conflict() {
     assert_eq!(result["state"], "membership_peer_behind", "{result}");
 }
 
-/// The range pull is an inquiry (ADR 0010): the owner answers it from its
+/// The range pull is an inquiry: the owner answers it from its
 /// committed view, so a member catches up while the owner's host is busy and
 /// never polls its control queue.
 #[test]

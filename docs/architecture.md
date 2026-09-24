@@ -20,6 +20,30 @@ These distinctions matter: a successful network connection does not admit a
 member, workspace membership does not establish real-world identity, and topic
 filtering does not create cryptographic isolation between topics.
 
+## Membership gossip vocabulary
+
+A few rules recur across `arachne-node` and `arachne-runtime` membership code;
+comments below point here instead of repeating the reasoning:
+
+- **Overlay topic.** Every workspace gossips membership steps on one fixed
+  topic that stays the same across policy/epoch revisions, so a policy change
+  never has to renegotiate or rebuild the gossip swarm mid-broadcast. Because
+  the topic itself carries no per-message policy check, only self-authenticating
+  membership steps may use it: each recipient must verify a step against its
+  own saved state before acting on it.
+- **Head gossip and range pull.** Members gossip a small "head" announcement
+  (workspace, epoch, committing member) rather than the full step history, so
+  a lost announcement costs nothing beyond waiting for the next one. A member
+  that is behind pulls the actual steps for that head from the member that
+  committed it, in one direct exchange, instead of the owner having to push
+  history to everyone.
+- **Inquiry.** A read (a membership query, checkpoint, or profile page
+  request) that is answered from the session's already-committed, retained
+  state, without taking the host or the control queue. Because the answer
+  only reflects state that has already been saved and adopted, and never
+  blocks other work, inquiries can be served independently and are safe to
+  retry.
+
 ## Crate map
 
 | Crate | Owns | Does not own |
