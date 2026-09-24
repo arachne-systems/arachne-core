@@ -190,6 +190,79 @@ fn fair_scheduling_gap_fill_and_cross_epoch_dedup() {
 }
 
 #[test]
+fn per_author_quota_and_binary_pending_storage() {
+    let (a, b, _, _) = admit(Workspace::create([1; 32], "A").unwrap(), [2; 32], "B");
+    let (mut a, c, registered, admission) = admit(a, [3; 32], "C");
+    let mut b = active(
+        b.prepare_management_update(registered.action, &registered.commit)
+            .unwrap(),
+    )
+    .prepare_admission_update(&admission.authorization, &admission.commit)
+    .unwrap();
+    let mut a_log = PublisherLog::new(&a).unwrap();
+    let mut b_log = PublisherLog::new(&b).unwrap();
+    let c_log = PublisherLog::new(&c).unwrap();
+    let mut inbox = ObjectInbox::new(c.id(), c.epoch());
+    let size = |inbox: &ObjectInbox| inbox.snapshot_with_publisher(&c, &c_log).unwrap().len();
+
+    // Pending payloads are stored as bytes: a 12 KiB payload costs about
+    // 12 KiB, not 3.5 times that.
+    let payload = vec![0xa5; arachne_security::MAX_APPLICATION_PAYLOAD];
+    let big = |author: &mut Workspace, log: &mut PublisherLog, id: u8| {
+        let context = context(author.id(), log.head() + 1, id);
+        let object = author
+            .protect_object(b"chat", &context.authenticated_bytes(), &payload)
+            .unwrap();
+        log.append(context.clone(), object.clone()).unwrap();
+        (context, object)
+    };
+    let empty = size(&inbox);
+    let (context, object) = big(&mut a, &mut a_log, 1);
+    inbox = stage(&inbox, &c, &context, &object);
+    let grown = size(&inbox) - empty;
+    assert!(
+        grown < payload.len() + 512,
+        "one pending object costs {grown} bytes"
+    );
+
+    // One author cannot fill the inbox: its quota ends first...
+    let mut accepted = 1;
+    let refused = loop {
+        let (context, object) = big(&mut a, &mut a_log, 1 + accepted as u8);
+        match inbox.stage(&c, &context, &object) {
+            Ok(InboxStage::Prepared(next)) => {
+                inbox = *next;
+                accepted += 1;
+            }
+            Ok(_) => panic!("fresh object was not new"),
+            Err(error) => break (error, context, object),
+        }
+    };
+    assert_eq!(refused.0, "author pending quota exhausted");
+    assert_eq!(
+        accepted,
+        arachne_delivery::inbox::MAX_PENDING_BYTES_PER_AUTHOR / payload.len()
+    );
+    // ...while another author still gets in.
+    let (context, object) = big(&mut b, &mut b_log, 90);
+    inbox = stage(&inbox, &c, &context, &object);
+    // The refused object was not recorded: after the application drains
+    // some work, the same object is accepted.
+    let (drained, _) = acknowledge(&inbox, &c);
+    inbox = stage(&drained, &c, &refused.1, &refused.2);
+    // The binary codec round-trips and rejects truncation and trailing bytes.
+    let bytes = inbox.snapshot_with_publisher(&c, &c_log).unwrap();
+    let (_, restored) = ObjectInbox::restore_snapshot(&c, &bytes).unwrap();
+    assert_eq!(restored.snapshot_with_publisher(&c, &c_log).unwrap(), bytes);
+    for cut in (0..bytes.len()).step_by(997) {
+        assert!(ObjectInbox::restore_snapshot(&c, &bytes[..cut]).is_err());
+    }
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(ObjectInbox::restore_snapshot(&c, &trailing).is_err());
+}
+
+#[test]
 fn members_at_different_epochs_exchange_data_after_a_partition_heals() {
     // A and B share an epoch.
     let (mut a, mut b, _, _) = admit(Workspace::create([1; 32], "A").unwrap(), [2; 32], "B");

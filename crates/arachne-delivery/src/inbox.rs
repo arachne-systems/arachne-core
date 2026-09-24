@@ -14,6 +14,10 @@ const MAX_REPLAY_WINDOWS: usize = 4096;
 /// given up as lost.
 pub const REPLAY_ENTRIES: usize = 1024;
 const MAX_PENDING_OBJECTS: usize = 4096;
+/// Pending payload bytes one author may hold in this inbox.
+pub const MAX_PENDING_BYTES_PER_AUTHOR: usize = 64 * 1024;
+/// Pending payload bytes of all authors together.
+pub const MAX_PENDING_BYTES: usize = 256 * 1024;
 /// Recently accepted publication ids kept for cross-epoch dedup.
 pub const RECENT_IDS: usize = 256;
 const MAX_RETAINED_RANGES: usize = 4;
@@ -28,8 +32,7 @@ const MAX_DIRECT_RETAINED_BYTES: usize = 128 * 1024;
 
 /// Dedup for one author's sender counters in one epoch. Separate from pending
 /// storage: acknowledging an object never reopens its counter.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone)]
 struct Replay {
     author: [u8; 32],
     epoch: u64,
@@ -94,8 +97,7 @@ impl Replay {
 
 /// Authenticated plaintext waiting for the application. It no longer needs
 /// the epoch key, so it survives epoch changes and key eviction.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone)]
 struct Pending {
     author: [u8; 32],
     endpoint: [u8; 32],
@@ -105,20 +107,16 @@ struct Pending {
     topic: String,
     id: [u8; 16],
     sequence: u64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     recipients: Vec<[u8; 32]>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     current: Option<CurrentReceipt>,
     payload: Vec<u8>,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, PartialEq, Eq)]
 struct CurrentReceipt {
     selector: [u8; 32],
     replacement_key: [u8; 32],
     expires_at: u64,
-    #[serde(default)]
     tombstone: bool,
 }
 
@@ -158,8 +156,7 @@ struct RetainedCurrentView {
     expires_at: u64,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone)]
 struct SelectionProgress {
     author: [u8; 32],
     epoch: u64,
@@ -167,8 +164,7 @@ struct SelectionProgress {
     through: u64,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone)]
 struct CurrentProgress {
     authority: [u8; 32],
     revision: u64,
@@ -178,8 +174,7 @@ struct CurrentProgress {
     digest: [u8; 32],
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone)]
 struct DirectRecord {
     revision: u64,
     id: [u8; 16],
@@ -187,17 +182,14 @@ struct DirectRecord {
     object: Vec<u8>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone)]
 struct DirectStream {
     author: [u8; 32],
     revision: u64,
     topic: String,
     recipients: Vec<[u8; 32]>,
     floor: u64,
-    #[serde(default)]
     recovery_floor: u64,
-    #[serde(default)]
     known_head: u64,
     records: Vec<DirectRecord>,
 }
@@ -214,7 +206,7 @@ impl DirectStream {
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone)]
 pub struct ObjectInbox {
     workspace: [u8; 32],
     /// The local accepted epoch. Replay state and pending objects from the
@@ -232,22 +224,16 @@ pub struct ObjectInbox {
     /// has pending work.
     clock: u64,
     served: Vec<([u8; 32], u64)>,
-    #[serde(skip)]
     retained_ranges: Vec<RetainedRange>,
-    #[serde(skip)]
     retained_current_views: Vec<RetainedCurrentView>,
-    #[serde(skip)]
     current: Option<Box<current::CurrentViewIndex>>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     progress: Vec<SelectionProgress>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     current_progress: Vec<CurrentProgress>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     direct: Vec<DirectStream>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Decoded state part of an inbox snapshot. Binary, canonical, bounded:
+/// payloads and objects are raw bytes, not JSON number arrays.
 struct Snapshot {
     workspace: [u8; 32],
     epoch: u64,
@@ -256,12 +242,336 @@ struct Snapshot {
     recent: VecDeque<[u8; 16]>,
     clock: u64,
     served: Vec<([u8; 32], u64)>,
-    #[serde(default)]
     progress: Vec<SelectionProgress>,
-    #[serde(default)]
     current_progress: Vec<CurrentProgress>,
-    #[serde(default)]
     direct: Vec<DirectStream>,
+}
+
+mod codec {
+    //! Byte helpers for the inbox snapshot. Lengths are checked on read.
+    use super::super::{number64, take};
+
+    pub(super) fn u64(bytes: &mut Vec<u8>, value: u64) {
+        bytes.extend(value.to_be_bytes());
+    }
+    pub(super) fn count(bytes: &mut Vec<u8>, value: usize) {
+        bytes.extend((value as u32).to_be_bytes());
+    }
+    pub(super) fn blob(bytes: &mut Vec<u8>, value: &[u8]) {
+        count(bytes, value.len());
+        bytes.extend(value);
+    }
+    pub(super) fn text(bytes: &mut Vec<u8>, value: &str) {
+        bytes.push(value.len() as u8);
+        bytes.extend(value.as_bytes());
+    }
+    /// LEB128: sparse replay counters as small deltas.
+    pub(super) fn varint(bytes: &mut Vec<u8>, mut value: u64) {
+        while value >= 0x80 {
+            bytes.push(value as u8 | 0x80);
+            value >>= 7;
+        }
+        bytes.push(value as u8);
+    }
+
+    pub(super) fn read_u64(input: &mut &[u8]) -> Result<u64, &'static str> {
+        number64(input)
+    }
+    pub(super) fn read_count(input: &mut &[u8], limit: usize) -> Result<usize, &'static str> {
+        let value = u32::from_be_bytes(take(input, 4)?.try_into().unwrap()) as usize;
+        if value > limit {
+            return Err("inbox snapshot count exceeds bound");
+        }
+        Ok(value)
+    }
+    pub(super) fn read_blob(input: &mut &[u8], limit: usize) -> Result<Vec<u8>, &'static str> {
+        let length = read_count(input, limit)?;
+        Ok(take(input, length)?.to_vec())
+    }
+    pub(super) fn read_text(input: &mut &[u8]) -> Result<String, &'static str> {
+        let length = take(input, 1)?[0] as usize;
+        String::from_utf8(take(input, length)?.to_vec()).map_err(|_| "invalid inbox text")
+    }
+    pub(super) fn read_array<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], &'static str> {
+        Ok(take(input, N)?.try_into().unwrap())
+    }
+    pub(super) fn read_varint(input: &mut &[u8]) -> Result<u64, &'static str> {
+        let mut value = 0u64;
+        for shift in (0..64).step_by(7) {
+            let byte = take(input, 1)?[0];
+            value |= u64::from(byte & 0x7f)
+                .checked_shl(shift)
+                .filter(|part| part >> shift == u64::from(byte & 0x7f))
+                .ok_or("invalid varint")?;
+            if byte & 0x80 == 0 {
+                if byte == 0 && shift != 0 {
+                    return Err("noncanonical varint");
+                }
+                return Ok(value);
+            }
+        }
+        Err("invalid varint")
+    }
+}
+
+fn encode_recipients(bytes: &mut Vec<u8>, recipients: &[[u8; 32]]) {
+    bytes.push(recipients.len() as u8);
+    for recipient in recipients {
+        bytes.extend(recipient);
+    }
+}
+
+fn decode_recipients(input: &mut &[u8]) -> Result<Vec<[u8; 32]>, &'static str> {
+    let count = take(input, 1)?[0] as usize;
+    if count > 64 {
+        return Err("too many inbox recipients");
+    }
+    (0..count).map(|_| codec::read_array(input)).collect()
+}
+
+impl DirectStream {
+    fn encode(&self, bytes: &mut Vec<u8>) {
+        bytes.extend(self.author);
+        codec::u64(bytes, self.revision);
+        codec::text(bytes, &self.topic);
+        encode_recipients(bytes, &self.recipients);
+        codec::u64(bytes, self.floor);
+        codec::u64(bytes, self.recovery_floor);
+        codec::u64(bytes, self.known_head);
+        codec::count(bytes, self.records.len());
+        for record in &self.records {
+            codec::u64(bytes, record.revision);
+            bytes.extend(record.id);
+            codec::u64(bytes, record.sequence);
+            codec::blob(bytes, &record.object);
+        }
+    }
+
+    fn decode(input: &mut &[u8]) -> Result<Self, &'static str> {
+        let author = codec::read_array(input)?;
+        let revision = codec::read_u64(input)?;
+        let topic = codec::read_text(input)?;
+        let recipients = decode_recipients(input)?;
+        let floor = codec::read_u64(input)?;
+        let recovery_floor = codec::read_u64(input)?;
+        let known_head = codec::read_u64(input)?;
+        let count = codec::read_count(input, DIRECT_WINDOW)?;
+        let mut records = Vec::with_capacity(count);
+        for _ in 0..count {
+            records.push(DirectRecord {
+                revision: codec::read_u64(input)?,
+                id: codec::read_array(input)?,
+                sequence: codec::read_u64(input)?,
+                object: codec::read_blob(input, arachne_security::MAX_APPLICATION_CIPHERTEXT)?,
+            });
+        }
+        Ok(Self {
+            author,
+            revision,
+            topic,
+            recipients,
+            floor,
+            recovery_floor,
+            known_head,
+            records,
+        })
+    }
+
+    fn encoded_len(&self) -> usize {
+        32 + 8 + 1 + self.topic.len() + 1 + 32 * self.recipients.len() + 24 + 4
+            + self
+                .records
+                .iter()
+                .map(|record| 8 + 16 + 8 + 4 + record.object.len())
+                .sum::<usize>()
+    }
+}
+
+impl Snapshot {
+    fn encode(inbox: &ObjectInbox, bytes: &mut Vec<u8>) {
+        bytes.extend(inbox.workspace);
+        codec::u64(bytes, inbox.epoch);
+        codec::count(bytes, inbox.replay.len());
+        for replay in &inbox.replay {
+            bytes.extend(replay.author);
+            codec::u64(bytes, replay.epoch);
+            codec::u64(bytes, replay.lost_through);
+            codec::u64(bytes, replay.floor);
+            codec::count(bytes, replay.seen.len());
+            let mut previous = replay.floor;
+            for counter in &replay.seen {
+                codec::varint(bytes, counter - previous);
+                previous = *counter;
+            }
+        }
+        codec::count(bytes, inbox.pending.len());
+        for pending in &inbox.pending {
+            bytes.extend(pending.author);
+            bytes.extend(pending.endpoint);
+            codec::u64(bytes, pending.epoch);
+            codec::u64(bytes, pending.counter);
+            codec::u64(bytes, pending.revision);
+            codec::text(bytes, &pending.topic);
+            bytes.extend(pending.id);
+            codec::u64(bytes, pending.sequence);
+            encode_recipients(bytes, &pending.recipients);
+            match &pending.current {
+                None => bytes.push(0),
+                Some(current) => {
+                    bytes.push(1 + u8::from(current.tombstone));
+                    bytes.extend(current.selector);
+                    bytes.extend(current.replacement_key);
+                    codec::u64(bytes, current.expires_at);
+                }
+            }
+            codec::blob(bytes, &pending.payload);
+        }
+        codec::count(bytes, inbox.recent.len());
+        for identity in &inbox.recent {
+            bytes.extend(identity);
+        }
+        codec::u64(bytes, inbox.clock);
+        codec::count(bytes, inbox.served.len());
+        for (scope, tick) in &inbox.served {
+            bytes.extend(scope);
+            codec::u64(bytes, *tick);
+        }
+        codec::count(bytes, inbox.progress.len());
+        for progress in &inbox.progress {
+            bytes.extend(progress.author);
+            codec::u64(bytes, progress.epoch);
+            bytes.extend(progress.selection);
+            codec::u64(bytes, progress.through);
+        }
+        codec::count(bytes, inbox.current_progress.len());
+        for progress in &inbox.current_progress {
+            bytes.extend(progress.authority);
+            codec::u64(bytes, progress.revision);
+            codec::text(bytes, &progress.topic);
+            bytes.extend(progress.selector);
+            codec::u64(bytes, progress.cut);
+            bytes.extend(progress.digest);
+        }
+        codec::count(bytes, inbox.direct.len());
+        for stream in &inbox.direct {
+            stream.encode(bytes);
+        }
+    }
+
+    fn decode(input: &mut &[u8]) -> Result<Self, &'static str> {
+        let workspace = codec::read_array(input)?;
+        let epoch = codec::read_u64(input)?;
+        let count = codec::read_count(input, MAX_REPLAY_WINDOWS)?;
+        let mut replay = Vec::with_capacity(count);
+        for _ in 0..count {
+            let author = codec::read_array(input)?;
+            let epoch = codec::read_u64(input)?;
+            let lost_through = codec::read_u64(input)?;
+            let floor = codec::read_u64(input)?;
+            let seen_count = codec::read_count(input, REPLAY_ENTRIES)?;
+            let mut seen = BTreeSet::new();
+            let mut previous = floor;
+            for _ in 0..seen_count {
+                let delta = codec::read_varint(input)?;
+                previous = previous
+                    .checked_add(delta)
+                    .filter(|_| delta != 0)
+                    .ok_or("invalid replay counter")?;
+                seen.insert(previous);
+            }
+            replay.push(Replay {
+                author,
+                epoch,
+                lost_through,
+                floor,
+                seen,
+            });
+        }
+        let count = codec::read_count(input, MAX_PENDING_OBJECTS)?;
+        let mut pending = Vec::with_capacity(count);
+        for _ in 0..count {
+            let author = codec::read_array(input)?;
+            let endpoint = codec::read_array(input)?;
+            let epoch = codec::read_u64(input)?;
+            let counter = codec::read_u64(input)?;
+            let revision = codec::read_u64(input)?;
+            let topic = codec::read_text(input)?;
+            let id = codec::read_array(input)?;
+            let sequence = codec::read_u64(input)?;
+            let recipients = decode_recipients(input)?;
+            let current = match take(input, 1)?[0] {
+                0 => None,
+                flag @ (1 | 2) => Some(CurrentReceipt {
+                    selector: codec::read_array(input)?,
+                    replacement_key: codec::read_array(input)?,
+                    expires_at: codec::read_u64(input)?,
+                    tombstone: flag == 2,
+                }),
+                _ => return Err("invalid pending current marker"),
+            };
+            let payload = codec::read_blob(input, arachne_security::MAX_APPLICATION_PAYLOAD)?;
+            pending.push(Pending {
+                author,
+                endpoint,
+                epoch,
+                counter,
+                revision,
+                topic,
+                id,
+                sequence,
+                recipients,
+                current,
+                payload,
+            });
+        }
+        let count = codec::read_count(input, RECENT_IDS)?;
+        let recent = (0..count)
+            .map(|_| codec::read_array(input))
+            .collect::<Result<_, _>>()?;
+        let clock = codec::read_u64(input)?;
+        let count = codec::read_count(input, MAX_PENDING_OBJECTS)?;
+        let served = (0..count)
+            .map(|_| Ok((codec::read_array(input)?, codec::read_u64(input)?)))
+            .collect::<Result<_, &'static str>>()?;
+        let count = codec::read_count(input, MAX_RECOVERY_SELECTIONS)?;
+        let mut progress = Vec::with_capacity(count);
+        for _ in 0..count {
+            progress.push(SelectionProgress {
+                author: codec::read_array(input)?,
+                epoch: codec::read_u64(input)?,
+                selection: codec::read_array(input)?,
+                through: codec::read_u64(input)?,
+            });
+        }
+        let count = codec::read_count(input, current::MAX_CURRENT_SELECTIONS)?;
+        let mut current_progress = Vec::with_capacity(count);
+        for _ in 0..count {
+            current_progress.push(CurrentProgress {
+                authority: codec::read_array(input)?,
+                revision: codec::read_u64(input)?,
+                topic: codec::read_text(input)?,
+                selector: codec::read_array(input)?,
+                cut: codec::read_u64(input)?,
+                digest: codec::read_array(input)?,
+            });
+        }
+        let count = codec::read_count(input, MAX_DIRECT_STREAMS)?;
+        let direct = (0..count)
+            .map(|_| DirectStream::decode(input))
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            workspace,
+            epoch,
+            replay,
+            pending,
+            recent,
+            clock,
+            served,
+            progress,
+            current_progress,
+            direct,
+        })
+    }
 }
 
 pub enum InboxStage {
@@ -748,9 +1058,21 @@ impl ObjectInbox {
         if self.recent.contains(&identity) {
             return Ok(InboxStage::Duplicate);
         }
-        if self.pending.len() == MAX_PENDING_OBJECTS {
-            // Never discard an undelivered object to make room. The caller
-            // drains pending work; the unrecorded object can come again.
+        // Never discard an undelivered object to make room. The object is not
+        // recorded, so it can come again (live or by recovery) after the
+        // application drains work. One author cannot use up everyone's space.
+        let size = authenticated.message.payload.len();
+        let author_bytes: usize = self
+            .pending
+            .iter()
+            .filter(|pending| pending.author == author)
+            .map(|pending| pending.payload.len())
+            .sum();
+        if author_bytes + size > MAX_PENDING_BYTES_PER_AUTHOR {
+            return Err("author pending quota exhausted");
+        }
+        let total: usize = self.pending.iter().map(|pending| pending.payload.len()).sum();
+        if self.pending.len() == MAX_PENDING_OBJECTS || total + size > MAX_PENDING_BYTES {
             return Err("pending inbox full");
         }
         let mut next = self.clone();
@@ -1045,11 +1367,8 @@ impl ObjectInbox {
         if stream.records.len() > DIRECT_WINDOW {
             stream.floor = stream.records.remove(0).sequence;
         }
-        // ponytail: bounded JSON measurement matches the persisted byte budget;
-        // maintain incremental encoded weights if profiling warrants it.
-        while serde_json::to_vec(&self.direct)
-            .map_err(|_| "direct recovery encoding failed")?
-            .len()
+        // The encoded size is the persisted byte budget.
+        while self.direct.iter().map(DirectStream::encoded_len).sum::<usize>()
             > MAX_DIRECT_RETAINED_BYTES
         {
             let stream = self
@@ -1583,10 +1902,8 @@ impl ObjectInbox {
     }
 
     fn snapshot(&self) -> Result<Vec<u8>, &'static str> {
-        let json = serde_json::to_vec(self).map_err(|_| "inbox encoding failed")?;
         let mut bytes = CACHE_MAGIC.to_vec();
-        bytes.extend((json.len() as u32).to_be_bytes());
-        bytes.extend(json);
+        Snapshot::encode(self, &mut bytes);
         bytes.push(self.retained_ranges.len() as u8);
         for range in &self.retained_ranges {
             bytes.extend(range.expires_at.to_be_bytes());
@@ -1684,12 +2001,11 @@ impl ObjectInbox {
         }
         let length = u32::from_be_bytes(take(&mut bytes, 4)?.try_into().unwrap()) as usize;
         let publisher = PublisherLog::restore(owner, take(&mut bytes, length)?)?;
-        let (json, ranges, retained_current_views, current) = if bytes.starts_with(CACHE_MAGIC) {
+        let (parsed, ranges, retained_current_views, current) = if bytes.starts_with(CACHE_MAGIC) {
             let has_current = true;
             let has_retained_current = true;
             let mut input = &bytes[5..];
-            let length = u32::from_be_bytes(take(&mut input, 4)?.try_into().unwrap()) as usize;
-            let json = take(&mut input, length)?;
+            let parsed = Snapshot::decode(&mut input)?;
             let count = take(&mut input, 1)?[0] as usize;
             if count > MAX_RETAINED_RANGES {
                 return Err("retained range capacity exceeded");
@@ -1771,12 +2087,10 @@ impl ObjectInbox {
             if !input.is_empty() {
                 return Err("trailing retained range bytes");
             }
-            (json, ranges, retained_current_views, current)
+            (parsed, ranges, retained_current_views, current)
         } else {
             return Err("unsupported object inbox snapshot");
         };
-        let parsed: Snapshot =
-            serde_json::from_slice(json).map_err(|_| "invalid inbox snapshot")?;
         let inbox = Self {
             workspace: parsed.workspace,
             epoch: parsed.epoch,
@@ -2188,7 +2502,10 @@ fn repeated_direct_transfers_fit_storage_without_losing_pending_or_sequence() {
             inbox.pending(&sender).unwrap().unwrap().message.payload,
             b"keep pending"
         );
-        assert!(serde_json::to_vec(&inbox.direct).unwrap().len() <= MAX_DIRECT_RETAINED_BYTES);
+        assert!(
+            inbox.direct.iter().map(DirectStream::encoded_len).sum::<usize>()
+                <= MAX_DIRECT_RETAINED_BYTES
+        );
     }
     assert!(matches!(
         inbox
@@ -2658,9 +2975,8 @@ fn durable_pending_objects_and_bounded_topic_replay() {
         inbox.stage(&reader, &newer, &newer_object).unwrap(),
         InboxStage::Duplicate
     ));
-    // Replay state stays small after 1,025 acknowledged objects (JSON codec;
-    // the cross-epoch id ring is the largest part).
-    assert!(inbox.snapshot().unwrap().len() < 24 * 1024);
+    // Replay state stays small after 1,025 acknowledged objects.
+    assert!(inbox.snapshot().unwrap().len() < 6 * 1024);
     // Topic floors are independent; a feed does not retire chat receipts.
     let feed = Topic::new("feeds/opaque").unwrap();
     let first_feed = context(20_000, feed.clone());
