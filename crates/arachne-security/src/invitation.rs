@@ -1130,6 +1130,7 @@ impl Workspace {
         let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
             return Err("not an admission commit");
         };
+        super::object::retain_receive_epoch(&provider, &group)?;
         group
             .merge_staged_commit(&provider, *staged)
             .map_err(|_| "admission update merge failed")?;
@@ -1304,6 +1305,7 @@ impl Workspace {
             }
             return Err("Welcome exceeds bounds");
         }
+        super::object::retain_receive_epoch(&provider, &group)?;
         group
             .merge_pending_commit(&provider)
             .map_err(|_| "admission merge failed")?;

@@ -341,6 +341,7 @@ pub(super) fn prepare(
         .map_err(|_| "invitation control encoding failed")?;
     let mut proof = super::MembershipVerifier::from_workspace(owner)?;
     proof.apply_transition(&super::MembershipAuthorization::Management(action), &commit)?;
+    super::object::retain_receive_epoch(&candidate.provider, &candidate.group)?;
     candidate
         .group
         .merge_pending_commit(&candidate.provider)

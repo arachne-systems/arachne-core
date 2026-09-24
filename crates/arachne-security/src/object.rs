@@ -1,4 +1,5 @@
-//! Signed, independently decryptable current-epoch objects. Delivery owns replay
+//! Signed, independently decryptable epoch objects. Sent in the current epoch,
+//! received from a bounded window of recent epochs. Delivery owns replay
 //! records and application handoff; successful authentication is not delivery.
 use super::{
     ApplicationMessage, MAX_APPLICATION_CIPHERTEXT, MAX_APPLICATION_CONTEXT,
@@ -26,16 +27,25 @@ pub const MAX_OBJECT_NAMESPACE: usize = 128;
 // It is not an OpenMLS storage key or a second uncommitted state store.
 const COUNTER: &[u8] = b"data-fabric/object-sender-counter/v1\0";
 const CIPHER: CipherSuite = CipherSuite::AesGcm256Sha512;
+/// Receive-only object bases of past epochs: `(epoch u64 || base [32])*`,
+/// ascending. Same persistence as `COUNTER`.
+const RECEIVE_WINDOW: &[u8] = b"arachne/object-receive-window/v1\0";
+/// Past epochs whose objects still decrypt after the local epoch advances.
+/// Each retained base weakens forward secrecy for that epoch (docs/security.md).
+pub const RECEIVE_EPOCHS: u64 = 4;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct AuthenticatedObject {
     pub message: ApplicationMessage,
-    /// Scoped to the authenticated author and current workspace epoch.
+    /// The epoch the author protected this object in. It can be up to
+    /// `RECEIVE_EPOCHS` behind the local epoch.
+    pub epoch: u64,
+    /// Scoped to the authenticated author and `epoch`.
     pub counter: u64,
 }
 
 #[test]
-fn objects_are_independent_authenticated_and_current_epoch_only() {
+fn objects_are_independent_authenticated_and_epoch_scoped() {
     use super::{PendingJoin, StorageKey};
     let admin = Workspace::create([1; 32], "Publisher").unwrap();
     let (invite, checkpoint) = admin.issue_invitation().unwrap();
@@ -130,29 +140,29 @@ fn objects_are_independent_authenticated_and_current_epoch_only() {
         10_004
     );
 
-    // Accepted removal closes the old epoch for both live and catch-up objects.
-    sender
-        .group
-        .remove_members(
-            &sender.provider,
-            &sender._signer,
-            &[reader.group.own_leaf_index()],
-        )
+    // An accepted removal keeps the old epoch readable for objects from
+    // current members only; the removed member's backdated claims fail.
+    let removed_before = reader
+        .protect_object(b"app", b"old-claim", b"sent before removal")
         .unwrap();
-    sender.group.merge_pending_commit(&sender.provider).unwrap();
+    sender = sender
+        .prepare_management(super::ManagementAction::Remove(reader.member().unwrap().id()))
+        .unwrap()
+        .workspace;
     let backdated = reader
         .protect_object(b"app", b"old-claim", b"manufactured after removal")
         .unwrap();
-    assert_eq!(
-        sender
-            .unprotect_object(b"app", b"old-claim", &backdated)
-            .unwrap_err(),
-        "object epoch not current"
-    );
-    assert_eq!(
-        sender.unprotect_object(b"app", b"chat/first", &old).unwrap_err(),
-        "object epoch not current"
-    );
+    for claim in [&removed_before, &backdated] {
+        assert_eq!(
+            sender
+                .unprotect_object(b"app", b"old-claim", claim)
+                .unwrap_err(),
+            "object author not current"
+        );
+    }
+    let recent = sender.unprotect_object(b"app", b"chat/first", &old).unwrap();
+    assert_eq!(recent.message.payload, b"retained chat");
+    assert_eq!(recent.epoch, sender.epoch() - 1);
     let fresh = sender
         .protect_object(b"app", b"new-epoch", b"private to current members")
         .unwrap();
@@ -183,6 +193,134 @@ fn objects_are_independent_authenticated_and_current_epoch_only() {
         .insert(COUNTER.to_vec(), vec![0]);
     let malformed = sender.seal(&storage_key).unwrap();
     assert!(Workspace::restore(&storage_key, sender.endpoint(), sender.id(), &malformed).is_err());
+}
+
+#[test]
+fn recent_epochs_stay_readable_for_receive_only_then_expire() {
+    use super::{ManagementAction, PendingJoin, PreparedManagementUpdate, StorageKey};
+    let active = |update: PreparedManagementUpdate| match update {
+        PreparedManagementUpdate::Active(workspace) => *workspace,
+        PreparedManagementUpdate::Removed(_) => panic!("unexpected removal"),
+    };
+    let admin = Workspace::create([1; 32], "Publisher").unwrap();
+    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let pending = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let prepared = admin
+        .prepare_admission([2; 32], pending.admission_request().unwrap())
+        .unwrap();
+    let mut proof = pending.join_proof().unwrap();
+    proof
+        .apply_add(&prepared.authorization, &prepared.commit)
+        .unwrap();
+    let mut reader = pending
+        .prepare_workspace(&proof, &prepared.welcome)
+        .unwrap();
+    let mut admin = prepared.workspace;
+    let start = admin.epoch();
+    let from_admin = admin.protect_object(b"app", b"ctx", b"admin at start").unwrap();
+    let from_reader = reader.protect_object(b"app", b"ctx", b"reader at start").unwrap();
+    let lagging = reader.provisional_copy().unwrap();
+    let both_read = |admin: &Workspace, reader: &Workspace| {
+        assert_eq!(
+            admin.unprotect_object(b"app", b"ctx", &from_reader).unwrap().epoch,
+            start
+        );
+        assert_eq!(
+            reader.unprotect_object(b"app", b"ctx", &from_admin).unwrap().epoch,
+            start
+        );
+    };
+
+    // 1. Local admission (committer) and received admission update.
+    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let third = PendingJoin::from_invitation(&invite, &checkpoint, [3; 32], "Third").unwrap();
+    let added = admin
+        .prepare_admission([3; 32], third.admission_request().unwrap())
+        .unwrap();
+    reader = reader
+        .prepare_admission_update(&added.authorization, &added.commit)
+        .unwrap();
+    let mut proof = third.join_proof().unwrap();
+    proof.apply_add(&added.authorization, &added.commit).unwrap();
+    let newcomer = third.prepare_workspace(&proof, &added.welcome).unwrap();
+    admin = added.workspace;
+    both_read(&admin, &reader);
+    // A new member never gets keys for epochs before its join.
+    assert_eq!(
+        newcomer
+            .unprotect_object(b"app", b"ctx", &from_admin)
+            .unwrap_err(),
+        "object epoch expired"
+    );
+    // Never send with an old epoch; a lagging peer sees a future epoch.
+    let fresh = admin.protect_object(b"app", b"ctx", b"newer").unwrap();
+    assert_eq!(
+        admin.unprotect_object(b"app", b"ctx", &fresh).unwrap().epoch,
+        start + 1
+    );
+    assert_eq!(
+        lagging.unprotect_object(b"app", b"ctx", &fresh).unwrap_err(),
+        "object epoch ahead"
+    );
+
+    // 2. Local management and received management.
+    let promote = admin
+        .prepare_management(ManagementAction::Promote(reader.member().unwrap().id()))
+        .unwrap();
+    reader = active(
+        reader
+            .prepare_management_update(promote.action, &promote.commit)
+            .unwrap(),
+    );
+    admin = promote.workspace;
+    both_read(&admin, &reader);
+
+    // 3. Local invitation control and received update; the window survives
+    // seal and restore.
+    for _ in 0..2 {
+        let (control, _, _) = admin.prepare_invitation(u64::MAX, false, false).unwrap();
+        reader = active(
+            reader
+                .prepare_management_update(control.action, &control.commit)
+                .unwrap(),
+        );
+        admin = control.workspace;
+    }
+    assert_eq!(admin.epoch(), start + RECEIVE_EPOCHS);
+    let key = StorageKey::derive(&[4; 32]).unwrap();
+    let reader = Workspace::restore(&key, reader.endpoint(), reader.id(), &reader.seal(&key).unwrap())
+        .unwrap();
+    both_read(&admin, &reader);
+
+    // 4. One more epoch evicts the start secret (forward secrecy bound).
+    let (control, _, _) = admin.prepare_invitation(u64::MAX, false, false).unwrap();
+    let admin = control.workspace;
+    assert_eq!(
+        admin
+            .unprotect_object(b"app", b"ctx", &from_reader)
+            .unwrap_err(),
+        "object epoch expired"
+    );
+    assert_eq!(
+        admin.unprotect_object(b"app", b"ctx", &fresh).unwrap().epoch,
+        start + 1
+    );
+    let storage = admin.provider.storage().values.read().unwrap();
+    let window = storage.get(RECEIVE_WINDOW).unwrap();
+    assert_eq!(window.len(), RECEIVE_EPOCHS as usize * 40);
+    drop(storage);
+
+    // A malformed window record fails closed on restore.
+    let broken = admin.provisional_copy().unwrap();
+    broken
+        .provider
+        .storage()
+        .values
+        .write()
+        .unwrap()
+        .insert(RECEIVE_WINDOW.to_vec(), vec![1; 39]);
+    let sealed = broken.seal(&key).unwrap();
+    assert!(Workspace::restore(&key, broken.endpoint(), broken.id(), &sealed).is_err());
 }
 
 #[test]
@@ -272,7 +410,94 @@ fn key_id(epoch: u64, leaf: u32) -> u64 {
     (u64::from(leaf) << 16) | (epoch & 0xffff)
 }
 
+fn parse_window(bytes: Option<&Vec<u8>>) -> Result<Vec<(u64, [u8; 32])>, &'static str> {
+    let Some(bytes) = bytes else {
+        return Ok(Vec::new());
+    };
+    if bytes.len() % 40 != 0 || bytes.len() / 40 > RECEIVE_EPOCHS as usize {
+        return Err("invalid object receive window");
+    }
+    let window: Vec<(u64, [u8; 32])> = bytes
+        .chunks_exact(40)
+        .map(|entry| {
+            (
+                u64::from_be_bytes(entry[..8].try_into().unwrap()),
+                entry[8..].try_into().unwrap(),
+            )
+        })
+        .collect();
+    if window.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+        return Err("invalid object receive window");
+    }
+    Ok(window)
+}
+
+/// Keep the object base of the group's current epoch for receive only. Call
+/// on the candidate BEFORE each commit merge (every epoch advance). Entries
+/// older than `RECEIVE_EPOCHS` after the merge are deleted here.
+pub(super) fn retain_receive_epoch(
+    provider: &openmls_rust_crypto::OpenMlsRustCrypto,
+    group: &openmls::prelude::MlsGroup,
+) -> Result<(), &'static str> {
+    let epoch = group.epoch().as_u64();
+    let base = Zeroizing::new(
+        group
+            .export_secret(provider.crypto(), BASE_LABEL, b"", 32)
+            .map_err(|_| "object key unavailable")?,
+    );
+    let mut values = provider
+        .storage()
+        .values
+        .write()
+        .map_err(|_| "storage unavailable")?;
+    let mut window = parse_window(values.get(RECEIVE_WINDOW))?;
+    // After the merge the local epoch is `epoch + 1`.
+    window.retain(|(retained, _)| *retained < epoch && retained + RECEIVE_EPOCHS > epoch);
+    window.push((epoch, base.as_slice().try_into().unwrap()));
+    let mut bytes = Vec::with_capacity(window.len() * 40);
+    for (retained, secret) in &window {
+        bytes.extend(retained.to_be_bytes());
+        bytes.extend(secret);
+    }
+    values.insert(RECEIVE_WINDOW.to_vec(), bytes);
+    Ok(())
+}
+
 impl Workspace {
+    /// Validate the persisted receive window against the accepted epoch.
+    pub(super) fn object_receive_window(&self) -> Result<Vec<(u64, [u8; 32])>, &'static str> {
+        let values = self
+            .provider
+            .storage()
+            .values
+            .read()
+            .map_err(|_| "storage unavailable")?;
+        let window = parse_window(values.get(RECEIVE_WINDOW))?;
+        if window.iter().any(|(epoch, _)| *epoch >= self.epoch()) {
+            return Err("invalid object receive window");
+        }
+        Ok(window)
+    }
+
+    /// Oldest epoch whose objects this owner can still authenticate.
+    pub fn oldest_receive_epoch(&self) -> u64 {
+        self.epoch().saturating_sub(RECEIVE_EPOCHS)
+    }
+
+    fn receive_base(&self, epoch: u64) -> Result<Zeroizing<Vec<u8>>, &'static str> {
+        if epoch > self.epoch() {
+            return Err("object epoch ahead");
+        }
+        if epoch == self.epoch() {
+            return self.object_base();
+        }
+        self.object_receive_window()?
+            .into_iter()
+            .find(|(retained, _)| *retained == epoch && retained + RECEIVE_EPOCHS >= self.epoch())
+            .map(|(_, base)| Zeroizing::new(base.to_vec()))
+            .ok_or("object epoch expired")
+    }
+
     /// Current-epoch object base. Namespace keys are expanded from it.
     fn object_base(&self) -> Result<Zeroizing<Vec<u8>>, &'static str> {
         self.group
@@ -362,9 +587,14 @@ impl Workspace {
         Ok(object)
     }
 
-    /// Authenticate using the CURRENT accepted epoch/roster only. Does not import
-    /// historical epochs, mutate a ratchet or suppress replay. The delivery layer
-    /// must atomically record acceptance and pending application work before use.
+    /// Authenticate an object from the current epoch or one of the last
+    /// `RECEIVE_EPOCHS` epochs (receive only). The author must be in the
+    /// CURRENT roster at the same leaf with the same signature key, so a
+    /// removed member's objects, also backdated ones, fail. Future epochs fail
+    /// with "object epoch ahead" (retry after catching up); evicted epochs
+    /// with "object epoch expired". Does not mutate state or suppress replay.
+    /// The delivery layer must atomically record acceptance and pending
+    /// application work before use.
     pub fn unprotect_object(
         &self,
         namespace: &[u8],
@@ -380,9 +610,7 @@ impl Workspace {
             return Err("invalid object envelope");
         }
         let epoch = u64::from_be_bytes(object[37..45].try_into().unwrap());
-        if epoch != self.epoch() {
-            return Err("object epoch not current");
-        }
+        let base = self.receive_base(epoch)?;
         let leaf = u32::from_be_bytes(object[45..HEADER].try_into().unwrap());
         let author = self
             .group
@@ -407,7 +635,7 @@ impl Workspace {
         if frame.header().key_id() != key_id(epoch, leaf) || frame.header().counter() == 0 {
             return Err("object key or counter mismatch");
         }
-        let secret = namespace_key(&self.object_base()?, namespace)?;
+        let secret = namespace_key(&base, namespace)?;
         let key = DecryptionKey::derive_from(CIPHER, key_id(epoch, leaf), secret.as_slice())
             .map_err(|_| "object key unavailable")?;
         let plain = frame
@@ -417,6 +645,7 @@ impl Workspace {
             return Err("object payload exceeds bounds");
         }
         Ok(AuthenticatedObject {
+            epoch,
             counter: frame.header().counter(),
             message: ApplicationMessage {
                 member,

@@ -278,6 +278,7 @@ impl Workspace {
             .map_err(|_| "management encoding failed")?;
         let mut proof = super::MembershipVerifier::from_workspace(self)?;
         proof.apply_transition(&super::MembershipAuthorization::Management(action), &commit)?;
+        super::object::retain_receive_epoch(&candidate.provider, &candidate.group)?;
         candidate
             .group
             .merge_pending_commit(&candidate.provider)
@@ -318,6 +319,7 @@ impl Workspace {
         let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
             return Err("not a management commit");
         };
+        super::object::retain_receive_epoch(&candidate.provider, &candidate.group)?;
         candidate
             .group
             .merge_staged_commit(&candidate.provider, *staged)
