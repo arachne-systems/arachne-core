@@ -852,21 +852,21 @@ mod tests {
                 .contains(&removed.endpoint())
         );
         let fresh = admin
-            .protect_object(b"test", b"current members only")
+            .protect_object(b"app", b"test", b"current members only")
             .unwrap();
         assert_eq!(
             survivor
-                .unprotect_object(b"test", &fresh)
+                .unprotect_object(b"app", b"test", &fresh)
                 .unwrap()
                 .message
                 .payload,
             b"current members only"
         );
-        assert!(removed.unprotect_object(b"test", &fresh).is_err());
+        assert!(removed.unprotect_object(b"app", b"test", &fresh).is_err());
         let stale = removed
-            .protect_object(b"test", b"old admin publication")
+            .protect_object(b"app", b"test", b"old admin publication")
             .unwrap();
-        assert!(survivor.unprotect_object(b"test", &stale).is_err());
+        assert!(survivor.unprotect_object(b"app", b"test", &stale).is_err());
         assert_eq!(
             admin
                 .prepare_admission([4; 32], pending.admission_request().unwrap())
@@ -1118,19 +1118,19 @@ mod tests {
         assert_eq!(restored.epoch(), 3);
         let mut sender = prepared.workspace;
         let payload = sender
-            .protect_object(b"removal", b"surviving members")
+            .protect_object(b"app", b"removal", b"surviving members")
             .unwrap();
         assert_eq!(
             restored
-                .unprotect_object(b"removal", &payload)
+                .unprotect_object(b"app", b"removal", &payload)
                 .unwrap()
                 .message
                 .payload,
             b"surviving members"
         );
-        assert!(removed.unprotect_object(b"removal", &payload).is_err());
-        let stale = removed.protect_object(b"removal", b"old member").unwrap();
-        assert!(restored.unprotect_object(b"removal", &stale).is_err());
+        assert!(removed.unprotect_object(b"app", b"removal", &payload).is_err());
+        let stale = removed.protect_object(b"app", b"removal", b"old member").unwrap();
+        assert!(restored.unprotect_object(b"app", b"removal", &stale).is_err());
     }
     #[test]
     fn removed_record_is_context_bound_and_cannot_restore_active_keys() {
@@ -1255,7 +1255,7 @@ fn provisional_copy_exceeds_legacy_size_and_isolates_sender_state() {
     let mut candidate = owner.provisional_copy().unwrap();
     assert_eq!(candidate.export_records().unwrap(), before);
     candidate
-        .protect_object(b"stream", b"provisional output")
+        .protect_object(b"app", b"stream", b"provisional output")
         .unwrap();
     assert_eq!(candidate.object_counter().unwrap(), 1);
     assert_eq!(owner.object_counter().unwrap(), 0);

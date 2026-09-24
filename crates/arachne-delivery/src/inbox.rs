@@ -452,8 +452,11 @@ impl ObjectInbox {
                 expires_at: value.expires_at,
                 tombstone: value.tombstone,
             };
-            let authenticated =
-                owner.unprotect_object(&metadata.authenticated_context(&context), ciphertext)?;
+            let authenticated = owner.unprotect_object(
+                context.topic.namespace().as_bytes(),
+                &metadata.authenticated_context(&context),
+                ciphertext,
+            )?;
             if authenticated.message.member != query.authority
                 || authenticated.message.endpoint != expected_endpoint
             {
@@ -609,7 +612,8 @@ impl ObjectInbox {
         }
         let sequence = context.sequence.map_or(0, |n| n.get());
         let aad = receipt_aad(owner, context, recipients, current.as_ref())?;
-        let authenticated = owner.unprotect_object(&aad, object)?;
+        let authenticated =
+            owner.unprotect_object(context.topic.namespace().as_bytes(), &aad, object)?;
         let author = authenticated.message.member;
         let counter = authenticated.counter;
         let digest: [u8; 32] = Sha256::digest(object).into();
@@ -720,8 +724,11 @@ impl ObjectInbox {
             return Err("direct sender cannot be a recipient");
         }
         owner.endpoints_for_members(recipients)?;
-        let authenticated =
-            owner.unprotect_object(&context.direct_authenticated_bytes(recipients)?, object)?;
+        let authenticated = owner.unprotect_object(
+            context.topic.namespace().as_bytes(),
+            &context.direct_authenticated_bytes(recipients)?,
+            object,
+        )?;
         if authenticated.message.member != owner.member().unwrap().id()
             || authenticated.message.endpoint != owner.endpoint()
         {
@@ -1173,7 +1180,11 @@ impl ObjectInbox {
                         &receipt.recipients,
                         receipt.current.as_ref(),
                     )?;
-                    let authenticated = owner.unprotect_object(&aad, object)?;
+                    let authenticated = owner.unprotect_object(
+                        context.topic.namespace().as_bytes(),
+                        &aad,
+                        object,
+                    )?;
                     if authenticated.counter != receipt.counter
                         || authenticated.message.member != stream.author
                         || <[u8; 32]>::from(Sha256::digest(object)) != receipt.digest
@@ -1754,6 +1765,7 @@ impl ObjectInbox {
                     sequence: std::num::NonZeroU64::new(record.sequence),
                 };
                 let authenticated = owner.unprotect_object(
+                    topic.namespace().as_bytes(),
                     &context.direct_authenticated_bytes(&stream.recipients)?,
                     &record.object,
                 )?;
@@ -1793,7 +1805,11 @@ impl ObjectInbox {
                     return Err("rejected inbox object is still pending");
                 }
                 if let Some(object) = &receipt.pending {
-                    let message = owner.unprotect_object(&aad, object)?;
+                    let message = owner.unprotect_object(
+                        context.topic.namespace().as_bytes(),
+                        &aad,
+                        object,
+                    )?;
                     if message.counter != receipt.counter
                         || message.message.member != stream.author
                         || <[u8; 32]>::from(Sha256::digest(object)) != receipt.digest
@@ -1839,7 +1855,11 @@ fn current_value_survives_authenticated_delivery_bundle() {
         tombstone: false,
     };
     let object = owner
-        .protect_object(&metadata.authenticated_context(&context), b"latest")
+        .protect_object(
+            context.topic.namespace().as_bytes(),
+            &metadata.authenticated_context(&context),
+            b"latest",
+        )
         .unwrap();
     let packet = context.packet(&object).unwrap();
     let mut publisher = PublisherLog::new(owner.id(), owner.member().unwrap().id(), owner.epoch());
@@ -1977,7 +1997,7 @@ fn repeated_direct_transfers_fit_storage_without_losing_pending_or_sequence() {
             sequence.into(),
         );
         let object = sender
-            .protect_object(&ctx.authenticated_bytes(), &vec![5; 12 * 1024])
+            .protect_object(ctx.topic.namespace().as_bytes(), &ctx.authenticated_bytes(), &vec![5; 12 * 1024])
             .unwrap();
         log.append(ctx, object).unwrap();
     }
@@ -1985,6 +2005,7 @@ fn repeated_direct_transfers_fit_storage_without_losing_pending_or_sequence() {
     let audience = [sender.member().unwrap().id()];
     let pending_object = reader
         .protect_object(
+            pending_context.topic.namespace().as_bytes(),
             &pending_context
                 .direct_authenticated_bytes(&audience)
                 .unwrap(),
@@ -2017,6 +2038,7 @@ fn repeated_direct_transfers_fit_storage_without_losing_pending_or_sequence() {
         );
         let object = sender
             .protect_object(
+                ctx.topic.namespace().as_bytes(),
                 &ctx.direct_authenticated_bytes(&recipients).unwrap(),
                 &vec![7; 6 * 1024],
             )
@@ -2095,7 +2117,9 @@ fn deferred_streams_preserve_order_identity_and_restart() {
             vec![]
         };
         let aad = audience_aad(&reader, &context, &recipients).unwrap();
-        let object = sender.protect_object(&aad, &[number as u8]).unwrap();
+        let object = sender
+            .protect_object(context.topic.namespace().as_bytes(), &aad, &[number as u8])
+            .unwrap();
         let InboxStage::Prepared(next) = inbox
             .stage_with_recipients(&reader, &context, &recipients, &object)
             .unwrap()
@@ -2207,10 +2231,18 @@ fn permanent_rejection_is_durable_and_unblocks_the_next_object() {
     let first = context(1);
     let second = context(2);
     let first_object = sender
-        .protect_object(&first.authenticated_bytes(), b"invalid native bytes")
+        .protect_object(
+            first.topic.namespace().as_bytes(),
+            &first.authenticated_bytes(),
+            b"invalid native bytes",
+        )
         .unwrap();
     let second_object = sender
-        .protect_object(&second.authenticated_bytes(), b"valid later object")
+        .protect_object(
+            second.topic.namespace().as_bytes(),
+            &second.authenticated_bytes(),
+            b"valid later object",
+        )
         .unwrap();
     let InboxStage::Prepared(inbox) = ObjectInbox::new(reader.id(), reader.epoch())
         .stage(&reader, &first, &first_object)
@@ -2293,6 +2325,7 @@ fn durable_pending_objects_and_bounded_topic_replay() {
     let recipients = [reader.member().unwrap().id()];
     let object = sender
         .protect_object(
+            direct.topic.namespace().as_bytes(),
             &direct.direct_authenticated_bytes(&recipients).unwrap(),
             b"recipient only",
         )
@@ -2323,6 +2356,7 @@ fn durable_pending_objects_and_bounded_topic_replay() {
     let missing_tail = context(2, Topic::new("streams/private").unwrap());
     let missing_tail_object = sender
         .protect_object(
+            missing_tail.topic.namespace().as_bytes(),
             &missing_tail
                 .direct_authenticated_bytes(&recipients)
                 .unwrap(),
@@ -2359,16 +2393,16 @@ fn durable_pending_objects_and_bounded_topic_replay() {
     assert_eq!(pending.recipients, recipients);
     assert_eq!(pending.message.payload, b"recipient only");
     let older_object = sender
-        .protect_object(&older.authenticated_bytes(), b"missed chat")
+        .protect_object(b"chat", &older.authenticated_bytes(), b"missed chat")
         .unwrap();
     for _ in 0..10_000 {
         sender
-            .protect_object(b"unsubscribed/feed", b"opaque")
+            .protect_object(b"unsubscribed", b"unsubscribed/feed", b"opaque")
             .unwrap();
     }
     let newer = context(10_002, chat.clone());
     let newer_object = sender
-        .protect_object(&newer.authenticated_bytes(), b"live chat")
+        .protect_object(b"chat", &newer.authenticated_bytes(), b"live chat")
         .unwrap();
     let prepared = |inbox: &ObjectInbox, context: &PublicationContext, bytes: &[u8]| match inbox
         .stage(&reader, context, bytes)
@@ -2459,7 +2493,7 @@ fn durable_pending_objects_and_bounded_topic_replay() {
     for number in 10_003..11_027 {
         let ctx = context(number, chat.clone());
         let object = sender
-            .protect_object(&ctx.authenticated_bytes(), b"chat")
+            .protect_object(ctx.topic.namespace().as_bytes(), &ctx.authenticated_bytes(), b"chat")
             .unwrap();
         inbox = prepared(&inbox, &ctx, &object);
         let pending = inbox.pending(&reader).unwrap().unwrap();
@@ -2491,20 +2525,24 @@ fn durable_pending_objects_and_bounded_topic_replay() {
     let feed = Topic::new("feeds/opaque").unwrap();
     let first_feed = context(20_000, feed.clone());
     let first_feed_object = sender
-        .protect_object(&first_feed.authenticated_bytes(), b"pending")
+        .protect_object(
+            first_feed.topic.namespace().as_bytes(),
+            &first_feed.authenticated_bytes(),
+            b"pending",
+        )
         .unwrap();
     inbox = prepared(&inbox, &first_feed, &first_feed_object);
     for number in 20_001..20_032 {
         let ctx = context(number, feed.clone());
         let object = sender
-            .protect_object(&ctx.authenticated_bytes(), b"pending")
+            .protect_object(ctx.topic.namespace().as_bytes(), &ctx.authenticated_bytes(), b"pending")
             .unwrap();
         inbox = prepared(&inbox, &ctx, &object);
     }
     let full = inbox.snapshot().unwrap();
     let ctx = context(20_032, feed.clone());
     let object = sender
-        .protect_object(&ctx.authenticated_bytes(), b"would evict pending")
+        .protect_object(ctx.topic.namespace().as_bytes(), &ctx.authenticated_bytes(), b"would evict pending")
         .unwrap();
     assert!(matches!(
         inbox.stage(&reader, &ctx, &object),
@@ -2612,7 +2650,11 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         sequence: std::num::NonZeroU64::new(1),
     };
     let ciphertext = author
-        .protect_object(&context.authenticated_bytes(), b"retained")
+        .protect_object(
+            context.topic.namespace().as_bytes(),
+            &context.authenticated_bytes(),
+            b"retained",
+        )
         .unwrap();
     let mut author_log =
         PublisherLog::new(author.id(), author.member().unwrap().id(), author.epoch());
@@ -2677,7 +2719,11 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         tombstone: false,
     };
     let object = author
-        .protect_object(&metadata.authenticated_context(&current_context), b"latest")
+        .protect_object(
+            current_context.topic.namespace().as_bytes(),
+            &metadata.authenticated_context(&current_context),
+            b"latest",
+        )
         .unwrap();
     let packet = current_context.packet(&object).unwrap();
     let author_inbox = ObjectInbox::new(author.id(), author.epoch())

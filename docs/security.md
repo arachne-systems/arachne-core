@@ -39,6 +39,39 @@ create per-topic MLS key schedules. If members of one MLS workspace must not be
 able to decrypt one another's data, they must not share one cryptographic
 workspace merely because their subscriptions or routing policies differ.
 
+### Application namespaces (domain separation, not isolation)
+
+Each protected object is bound to an **application namespace**. The runtime
+uses the first topic segment: `chat` for `chat/room/1`, `atak` for
+`atak/cot`. The namespace is used in two places:
+
+- **Key.** The object key is
+  `HKDF-Expand(MLS-Exporter("arachne/object-base/v2", "", 32), "arachne/object-namespace/v2\0" || len || namespace)`.
+  Each namespace gets its own key in each epoch.
+- **Authenticated data.** The length-prefixed namespace is in the SFrame AAD
+  and in the signed bytes, together with the full publication context (topic,
+  id, sequence, recipients).
+
+What this gives:
+
+- An object made for one application is never accepted as another
+  application's object. The key, the AAD and the signature all fail.
+- A bug in one application (for example nonce or AAD misuse) stays in that
+  application's key domain.
+
+What this does **not** give:
+
+- **Confidentiality between applications.** Every member of the workspace can
+  compute every namespace key from the shared MLS exporter. An application
+  that runs on a member device, or a member who is not allowed to see an
+  application's topics, can still decrypt that application's objects if it
+  gets the ciphertext. Routing policy only limits distribution.
+- **Protection from a member.** A member can make valid objects in any
+  namespace under its own identity.
+
+If data must stay confidential from some members or from some applications,
+use a separate workspace (a separate MLS group) for each sensitivity level.
+
 The basic `publish`/`poll` API is a transport/pub-sub path, not protected MLS
 group messaging. For an admitted workspace, use the staged protected path and
 commit/adopt the candidate in the required order. See

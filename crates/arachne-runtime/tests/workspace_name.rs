@@ -100,12 +100,20 @@ fn rename_preserves_legacy_and_native_pending_delivery_across_interruption() {
         .append(
             context.clone(),
             creator
-                .protect_object(&context.authenticated_bytes(), b"Retained outbound chat")
+                .protect_object(
+                    context.topic.namespace().as_bytes(),
+                    &context.authenticated_bytes(),
+                    b"Retained outbound chat",
+                )
                 .unwrap(),
         )
         .unwrap();
     let packet = member
-        .protect_object(&context.authenticated_bytes(), b"Unread incoming chat")
+        .protect_object(
+            context.topic.namespace().as_bytes(),
+            &context.authenticated_bytes(),
+            b"Unread incoming chat",
+        )
         .unwrap();
     let InboxStage::Prepared(inbox) = ObjectInbox::new(workspace, creator.epoch())
         .stage(&creator, &context, &packet)

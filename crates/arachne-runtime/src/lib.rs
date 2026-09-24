@@ -6366,7 +6366,9 @@ mod tests {
             } else {
                 context.authenticated_bytes()
             };
-            let object = sender.protect_object(&aad, b"pending").unwrap();
+            let object = sender
+                .protect_object(context.topic.namespace().as_bytes(), &aad, b"pending")
+                .unwrap();
             let InboxStage::Prepared(next) = inbox
                 .stage_with_recipients(&reader, &context, &recipients, &object)
                 .unwrap()

@@ -1687,23 +1687,23 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
         2
     );
     let sample = joined
-        .protect_object(b"feed/opaque", b"third member sample")
+        .protect_object(b"app", b"feed/opaque", b"third member sample")
         .unwrap();
     assert_eq!(
         returning
-            .unprotect_object(b"feed/opaque", &sample)
+            .unprotect_object(b"app", b"feed/opaque", &sample)
             .unwrap()
             .message
             .payload,
         b"third member sample"
     );
     let reply = returning
-        .protect_object(b"chat", b"returning member reply")
+        .protect_object(b"app", b"chat", b"returning member reply")
         .unwrap();
     for reader in [&helper, &joined] {
         assert_eq!(
             reader
-                .unprotect_object(b"chat", &reply)
+                .unprotect_object(b"app", b"chat", &reply)
                 .unwrap()
                 .message
                 .payload,
@@ -1732,11 +1732,11 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
         .prepare_workspace(&fourth_proof, &fourth_add.welcome)
         .unwrap();
     let sample = fourth
-        .protect_object(b"feed/opaque", b"fourth member sample")
+        .protect_object(b"app", b"feed/opaque", b"fourth member sample")
         .unwrap();
     assert_eq!(
         helper_updated
-            .unprotect_object(b"feed/opaque", &sample)
+            .unprotect_object(b"app", b"feed/opaque", &sample)
             .unwrap()
             .message
             .payload,

@@ -198,12 +198,12 @@ fn hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots() 
     let mut owner =
         arachne_security::Workspace::restore_records(endpoint, workspace, &records).unwrap();
     let object = owner
-        .protect_object(b"counter check", b"test only")
+        .protect_object(b"counter", b"counter check", b"test only")
         .unwrap();
     assert_eq!(
         final_reader
             .unwrap()
-            .unprotect_object(b"counter check", &object)
+            .unprotect_object(b"counter", b"counter check", &object)
             .unwrap()
             .counter,
         3
@@ -267,7 +267,11 @@ fn migration_preserves_pending_inbox_and_removal_cannot_reopen_active_state() {
         sequence: std::num::NonZeroU64::new(1),
     };
     let object = admin
-        .protect_object(&context.authenticated_bytes(), b"pending chat")
+        .protect_object(
+            context.topic.namespace().as_bytes(),
+            &context.authenticated_bytes(),
+            b"pending chat",
+        )
         .unwrap();
     let InboxStage::Prepared(inbox) = ObjectInbox::new(workspace, reader.epoch())
         .stage(&reader, &context, &object)

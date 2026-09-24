@@ -140,7 +140,7 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
             // authenticated object envelope has independent sender counters and
             // is carried only on the selected Iroh connections.
             let ciphertext = if !recipients.is_empty() || inbox.is_some() {
-                candidate.protect_object(&aad, &payload)
+                candidate.protect_object(context.topic.namespace().as_bytes(), &aad, &payload)
             } else {
                 candidate.protect_application(&aad, &payload)
             }
@@ -258,7 +258,7 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
             };
             if let Some(active_inbox) = inbox.as_ref() {
                 let authenticated = owner
-                    .unprotect_object(&aad, ciphertext)
+                    .unprotect_object(context.topic.namespace().as_bytes(), &aad, ciphertext)
                     .map_err(str::to_owned)?;
                 if authenticated.message.endpoint != message.sender {
                     return Err("direct author mismatch".into());
@@ -305,7 +305,7 @@ pub(super) fn stage(session: &mut Session, request: Request) -> Result<Value, St
                         .map_err(str::to_owned)?
                 } else {
                     candidate
-                        .unprotect_object(&aad, ciphertext)
+                        .unprotect_object(context.topic.namespace().as_bytes(), &aad, ciphertext)
                         .map_err(str::to_owned)?
                         .message
                 };
@@ -435,7 +435,11 @@ pub(super) fn stage_recovery(session: &mut Session, retain_until: u64) -> Result
                 |live| live.metadata.authenticated_context(&packet.context),
             );
             let authenticated = owner
-                .unprotect_object(&aad, ciphertext)
+                .unprotect_object(
+                    packet.context.topic.namespace().as_bytes(),
+                    &aad,
+                    ciphertext,
+                )
                 .map_err(str::to_owned)?;
             offer
                 .verify_origin(&authenticated.message)

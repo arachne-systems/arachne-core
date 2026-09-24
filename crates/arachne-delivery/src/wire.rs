@@ -251,6 +251,7 @@ pub fn verify_direct_reply(
         };
         let object = take(&mut input, length)?.to_vec();
         let authenticated = owner.unprotect_object(
+            context.topic.namespace().as_bytes(),
             &context.direct_authenticated_bytes(&query.recipients)?,
             &object,
         )?;
