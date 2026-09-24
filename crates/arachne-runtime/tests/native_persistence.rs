@@ -119,6 +119,8 @@ fn hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots() 
     let legacy = call(handle, json!({"op":"seal_workspace"})).unwrap();
     enable_record_storage(handle, &path, &root).unwrap();
     let mut final_reader = None;
+    // Each join also registers its link (one commit); the policy revision is epoch + 1.
+    let mut revision = 0;
     for member in 1..100u8 {
         let staged = call(
             handle,
@@ -168,6 +170,7 @@ fn hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots() 
             handle = create(Some(&root)).unwrap();
             let restored = restore_record_storage(handle, &path, &root, workspace).unwrap();
             assert_eq!(restored["members"], u64::from(member) + 1);
+            revision = restored["epoch"].as_u64().unwrap() + 1;
             println!("runtime reopened members={}", member + 1);
         }
     }
@@ -175,10 +178,10 @@ fn hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots() 
     save(handle, &enabled, "adopt_reception");
     call(
         handle,
-        json!({"op":"install_workspace_policy","revision":100}),
+        json!({"op":"install_workspace_policy","revision":revision}),
     )
     .unwrap();
-    let staged=call(handle,json!({"op":"stage_network_publication","revision":100,"topic":"streams/opaque","id":vec![1;16],"payload":[9,8,7]})).unwrap();
+    let staged=call(handle,json!({"op":"stage_network_publication","revision":revision,"topic":"streams/opaque","id":vec![1;16],"payload":[9,8,7]})).unwrap();
     let token = bytes(&staged["snapshot"]);
     assert!(call(handle, json!({"op":"adopt_publication","snapshot":token})).is_err());
     save_candidate(handle, &token).unwrap();
@@ -189,10 +192,10 @@ fn hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots() 
     assert!(call(handle, json!({"op":"adopt_publication","snapshot":token})).is_err());
     call(
         handle,
-        json!({"op":"install_workspace_policy","revision":100}),
+        json!({"op":"install_workspace_policy","revision":revision}),
     )
     .unwrap();
-    let staged=call(handle,json!({"op":"stage_network_publication","revision":100,"topic":"streams/opaque","id":vec![2;16],"payload":[6]})).unwrap();
+    let staged=call(handle,json!({"op":"stage_network_publication","revision":revision,"topic":"streams/opaque","id":vec![2;16],"payload":[6]})).unwrap();
     let adopted = save(handle, &staged, "adopt_publication");
     assert_eq!(adopted["sequence"], 2);
     close(handle).unwrap();
