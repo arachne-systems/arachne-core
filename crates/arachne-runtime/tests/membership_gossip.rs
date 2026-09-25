@@ -1,6 +1,5 @@
 use arachne_runtime::{MemoryProvider, close, describe, execute};
 use serde_json::{Value, json};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 mod common;
@@ -10,9 +9,6 @@ mod common;
 fn node(secret: u8) -> i64 {
     common::stored(&[secret; 32], &MemoryProvider::default())
 }
-
-// The runtime allows 8 nodes per process; these tests each use several.
-static NODES: Mutex<()> = Mutex::new(());
 
 fn call(handle: i64, request: Value) -> Value {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap()).unwrap()).unwrap()
@@ -52,7 +48,6 @@ fn hint(from: i64, to: i64) {
 /// polling peers one at a time (12-141 s lag on tablets, 2026-09-18).
 #[test]
 fn a_committed_step_reaches_a_member_by_gossip_across_the_epoch() {
-    let _nodes = NODES.lock().unwrap_or_else(|error| error.into_inner());
     let admin = node(94);
     let member = node(95);
     let late = node(96);
@@ -118,7 +113,6 @@ fn a_committed_step_reaches_a_member_by_gossip_across_the_epoch() {
 /// every epoch change rebuilt the overlay from scratch (2026-09-18).
 #[test]
 fn steps_keep_arriving_while_every_epoch_reinstalls_policy() {
-    let _nodes = NODES.lock().unwrap_or_else(|error| error.into_inner());
     let admin = node(98);
     let member = node(99);
     call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));
@@ -184,7 +178,6 @@ fn steps_keep_arriving_while_every_epoch_reinstalls_policy() {
 /// verifies it against its own roster exactly as a pulled one.
 #[test]
 fn a_new_members_name_reaches_existing_members_by_gossip() {
-    let _nodes = NODES.lock().unwrap_or_else(|error| error.into_inner());
     let admin = node(110);
     let member = node(111);
     let late = node(112);
@@ -264,7 +257,6 @@ fn a_new_members_name_reaches_existing_members_by_gossip() {
 /// BIG RED, a held epoch-8 step picked up by the backup tick, 2026-09-18).
 #[test]
 fn a_held_step_wakes_the_host_when_its_turn_comes() {
-    let _nodes = NODES.lock().unwrap_or_else(|error| error.into_inner());
     let admin = node(120);
     let member = node(121);
     let late = node(122);
@@ -326,7 +318,6 @@ fn a_held_step_wakes_the_host_when_its_turn_comes() {
 /// slow roster pull (tablet BIG RED held epochs 7-8 for 47 s, 2026-09-18).
 #[test]
 fn a_member_that_missed_steps_catches_up_from_the_next_head() {
-    let _nodes = NODES.lock().unwrap_or_else(|error| error.into_inner());
     let admin = node(130);
     let member = node(131);
     call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));
@@ -398,7 +389,6 @@ fn a_member_that_missed_steps_catches_up_from_the_next_head() {
 /// one step per 5 s roster query.
 #[test]
 fn presence_of_a_newer_epoch_starts_the_range_pull() {
-    let _nodes = NODES.lock().unwrap_or_else(|error| error.into_inner());
     let admin = node(140);
     let member = node(141);
     call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));
@@ -451,7 +441,6 @@ fn presence_of_a_newer_epoch_starts_the_range_pull() {
 /// 2026-09-19). The peer is only behind, and the range pull catches it up.
 #[test]
 fn a_peer_that_is_behind_is_reported_as_behind_not_as_a_conflict() {
-    let _nodes = NODES.lock().unwrap_or_else(|error| error.into_inner());
     let admin = node(150);
     let member = node(151);
     call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));
@@ -495,7 +484,6 @@ fn a_peer_that_is_behind_is_reported_as_behind_not_as_a_conflict() {
 /// never polls its control queue.
 #[test]
 fn a_range_pull_is_answered_while_the_owner_host_never_polls() {
-    let _nodes = NODES.lock().unwrap_or_else(|error| error.into_inner());
     let admin = node(160);
     let member = node(161);
     call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));
@@ -557,7 +545,6 @@ fn a_range_pull_is_answered_while_the_owner_host_never_polls() {
 /// range replies; replaying the whole accepted history per step stalls this.
 #[test]
 fn a_member_catches_up_after_a_large_admission_wave() {
-    let _nodes = NODES.lock().unwrap_or_else(|error| error.into_inner());
     let admin = node(170);
     let member = node(171);
     call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));

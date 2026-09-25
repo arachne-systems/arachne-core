@@ -19,6 +19,8 @@ mod budget;
 mod connections;
 mod mdns;
 mod control;
+mod endpoint;
+pub use endpoint::IrohEndpointSigner;
 mod overlay;
 pub mod resources;
 mod wire;

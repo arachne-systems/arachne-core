@@ -17,11 +17,19 @@ fn removed_membership_restore_shuts_down_runtime_and_rejects_active_fallback() {
     let handle = common::stored(&seed, &provider);
     let info: Value = serde_json::from_str(&describe(handle).unwrap()).unwrap();
     let endpoint: [u8; 32] = serde_json::from_value(info["endpoint_key"].clone()).unwrap();
-    let admin = Workspace::create([91; 32], "Admin").unwrap();
+    let admin_key = arachne_security::EndpointKey::generate().unwrap();
+    let admin = Workspace::create(&admin_key, "Admin").unwrap();
     let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let admin = registered.workspace;
-    let join =
-        PendingJoin::from_invitation(&invite, &checkpoint, endpoint, "Former member").unwrap();
+    // The runtime node's own key signs the member's endpoint binding.
+    let secret = iroh::SecretKey::from_bytes(&seed);
+    let join = PendingJoin::from_invitation(
+        &invite,
+        &checkpoint,
+        &arachne_node::IrohEndpointSigner(&secret),
+        "Former member",
+    )
+    .unwrap();
     let admitted = admin
         .prepare_admission(endpoint, join.admission_request().unwrap())
         .unwrap();
@@ -38,7 +46,8 @@ fn removed_membership_restore_shuts_down_runtime_and_rejects_active_fallback() {
     call(handle, request.clone()).unwrap();
     let action = ManagementAction::Remove(member_id);
     let change = admitted.workspace.prepare_management(action).unwrap();
-    let step = json!({"commit":change.commit,"management":{"kind":"remove","member":member_id}});
+    // A Remove is a signed order: it travels in the binary membership step codec.
+    let step = json!({"step":arachne_security::encode_membership_step(&change.authorization, &change.commit).unwrap()});
     let staged = call(handle, json!({"op":"stage_admission_update","step":step})).unwrap();
     let adopted = call(
         handle,

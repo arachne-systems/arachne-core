@@ -154,7 +154,15 @@ fn ramp(seed: u8) -> Ramp {
             adopt(admin, "adopt_admission", &change);
         }
     }
-    let steps = 1 + 2 * RAMP_CYCLES as u64;
+    // Only administrators admit (ADR A2): end with the helper promoted, so
+    // it can redeem the old invitation while the issuer is offline.
+    let change = call(
+        admin,
+        json!({"op":"stage_management","action":{"kind":"promote","member":member}}),
+    )
+    .unwrap();
+    adopt(admin, "adopt_admission", &change);
+    let steps = 2 + 2 * RAMP_CYCLES as u64;
     assert!(
         steps > 64,
         "the scenario must exceed the 64-step ceiling it is about to test"
@@ -174,7 +182,7 @@ fn ramp(seed: u8) -> Ramp {
         // lands before the pinned checkpoint, so it is not one of `steps`
         // but still counts toward the helper's absolute epoch.
         json!(steps + 1),
-        "the ordinary member must be current before it serves an old invitation"
+        "the helper must be current before it serves an old invitation"
     );
 
     Ramp {
@@ -308,7 +316,7 @@ fn epoch_zero_invitation_redeems_through_the_issuer_after_a_hundred_epochs() {
 }
 
 #[test]
-fn epoch_zero_invitation_redeems_through_an_ordinary_member_with_the_issuer_offline() {
+fn epoch_zero_invitation_redeems_through_another_administrator_with_the_issuer_offline() {
     let ramp = ramp(181);
     let helper_peer = node(ramp.helper)["endpoint_key"].clone();
     close(ramp.admin).unwrap();
@@ -330,8 +338,12 @@ fn epoch_zero_invitation_redeems_through_an_ordinary_member_with_the_issuer_offl
     );
     let mut tampered = reply["commits"].as_array().unwrap().clone();
     let last = tampered.len() - 1;
-    let byte = tampered[last]["commit"][0].as_u64().unwrap() ^ 1;
-    tampered[last]["commit"][0] = json!(byte);
+    // Flip the first byte of the step's commit (its MLS version).
+    let step: Vec<u8> = serde_json::from_value(tampered[last]["step"].clone()).unwrap();
+    let (authorization, mut commit) = arachne_security::decode_membership_step(&step).unwrap();
+    commit[0] ^= 1;
+    tampered[last]["step"] =
+        json!(arachne_security::encode_membership_step(&authorization, &commit).unwrap());
     assert!(
         call(
             ramp.late,
@@ -345,7 +357,7 @@ fn epoch_zero_invitation_redeems_through_an_ordinary_member_with_the_issuer_offl
         ramp.late,
         json!({"op":"stage_join","welcome":reply["welcome"],"commits":reply["commits"]}),
     )
-    .expect("an ordinary member must serve the full authorized history");
+    .expect("another administrator must serve the full authorized history");
     let joined = adopt(ramp.late, "adopt_join", &staged);
     // +1 on top of the usual +1: the registration epoch that pinned this
     // invitation's checkpoint also lands before it, and late's own join adds

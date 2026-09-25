@@ -1,5 +1,7 @@
 //! A3: delivery state survives membership steps. Two members at different
 //! epochs during a partition exchange data after the partition heals.
+mod common;
+use common::{test_endpoint, test_key};
 use arachne_delivery::inbox::{InboxStage, ObjectInbox};
 use arachne_delivery::{PublisherLog, RangeQuery, RetrievalError, wire};
 use arachne_routing::{Permissions, PublicationContext, RoutingTable, Topic};
@@ -21,7 +23,7 @@ fn active(update: PreparedManagementUpdate) -> Workspace {
 /// Returns the admin after both steps, the invitation commit and the admission.
 fn admit(
     admin: Workspace,
-    endpoint: [u8; 32],
+    label: u64,
     name: &str,
 ) -> (
     Workspace,
@@ -31,7 +33,8 @@ fn admit(
 ) {
     let (registered, invite, checkpoint) = admin.prepare_invitation(u64::MAX, false, false).unwrap();
     let admin = registered.workspace.provisional_copy().unwrap();
-    let join = PendingJoin::from_invitation(&invite, &checkpoint, endpoint, name).unwrap();
+    let endpoint = test_endpoint(label);
+    let join = PendingJoin::from_invitation(&invite, &checkpoint, test_key(label), name).unwrap();
     let prepared = admin
         .prepare_admission(endpoint, join.admission_request().unwrap())
         .unwrap();
@@ -86,9 +89,9 @@ fn policy(workspace: [u8; 32]) -> RoutingTable {
             workspace,
             REVISION,
             BTreeMap::from([
-                ([1; 32], Permissions::AllTopics),
-                ([2; 32], Permissions::AllTopics),
-                ([3; 32], Permissions::AllTopics),
+                (test_endpoint(1), Permissions::AllTopics),
+                (test_endpoint(2), Permissions::AllTopics),
+                (test_endpoint(3), Permissions::AllTopics),
             ]),
         )
         .unwrap();
@@ -123,8 +126,8 @@ fn acknowledge(inbox: &ObjectInbox, owner: &Workspace) -> (ObjectInbox, u8) {
 #[test]
 fn fair_scheduling_gap_fill_and_cross_epoch_dedup() {
     // A (admin) and B both send to C.
-    let (a, b, _, _) = admit(Workspace::create([1; 32], "A").unwrap(), [2; 32], "B");
-    let (mut a, c, registered, admission) = admit(a, [3; 32], "C");
+    let (a, b, _, _) = admit(Workspace::create(test_key(1), "A").unwrap(), 2, "B");
+    let (mut a, c, registered, admission) = admit(a, 3, "C");
     let mut b = active(
         b.prepare_management_update(registered.action, &registered.commit)
             .unwrap(),
@@ -191,8 +194,8 @@ fn fair_scheduling_gap_fill_and_cross_epoch_dedup() {
 
 #[test]
 fn per_author_quota_and_binary_pending_storage() {
-    let (a, b, _, _) = admit(Workspace::create([1; 32], "A").unwrap(), [2; 32], "B");
-    let (mut a, c, registered, admission) = admit(a, [3; 32], "C");
+    let (a, b, _, _) = admit(Workspace::create(test_key(1), "A").unwrap(), 2, "B");
+    let (mut a, c, registered, admission) = admit(a, 3, "C");
     let mut b = active(
         b.prepare_management_update(registered.action, &registered.commit)
             .unwrap(),
@@ -287,7 +290,7 @@ fn per_author_quota_and_binary_pending_storage() {
 
 #[test]
 fn publisher_history_never_shrinks_to_make_room_for_inbox_state() {
-    let (mut a, mut b, _, _) = admit(Workspace::create([1; 32], "A").unwrap(), [2; 32], "B");
+    let (mut a, mut b, _, _) = admit(Workspace::create(test_key(1), "A").unwrap(), 2, "B");
     let mut a_log = PublisherLog::new(&a).unwrap();
     let payload = vec![7; arachne_security::MAX_APPLICATION_PAYLOAD];
     for id in 0..40u8 {
@@ -363,7 +366,7 @@ fn direct(
 
 #[test]
 fn state_that_names_a_removed_member_does_not_block_restore() {
-    let (mut a, mut b, _, _) = admit(Workspace::create([1; 32], "A").unwrap(), [2; 32], "B");
+    let (mut a, mut b, _, _) = admit(Workspace::create(test_key(1), "A").unwrap(), 2, "B");
     let a_member = a.member().unwrap().id();
     let b_member = b.member().unwrap().id();
     let mut a_log = PublisherLog::new(&a).unwrap();
@@ -412,7 +415,7 @@ fn state_that_names_a_removed_member_does_not_block_restore() {
 #[test]
 fn members_at_different_epochs_exchange_data_after_a_partition_heals() {
     // A and B share an epoch.
-    let (mut a, mut b, _, _) = admit(Workspace::create([1; 32], "A").unwrap(), [2; 32], "B");
+    let (mut a, mut b, _, _) = admit(Workspace::create(test_key(1), "A").unwrap(), 2, "B");
     let start = a.epoch();
     assert_eq!(b.epoch(), start);
     let mut a_log = PublisherLog::new(&a).unwrap();
@@ -440,7 +443,7 @@ fn members_at_different_epochs_exchange_data_after_a_partition_heals() {
 
     // Partition. A admits C: two epochs. B does not see the commits.
     let previous_a = a.provisional_copy().unwrap();
-    let (next_a, c, registered, admission) = admit(a, [3; 32], "C");
+    let (next_a, c, registered, admission) = admit(a, 3, "C");
     a = next_a;
     assert_eq!(a.epoch(), start + 2);
     // A's delivery state moves forward in the same steps it would be staged.
@@ -532,7 +535,7 @@ fn members_at_different_epochs_exchange_data_after_a_partition_heals() {
     // The carried state survives save and restore at the new epoch.
     let key = StorageKey::derive(&[9; 32]).unwrap();
     let sealed = b_inbox.seal(&b, &key, &b_log).unwrap();
-    let (b, b_log, b_inbox) = ObjectInbox::restore(&key, [2; 32], b.id(), &sealed).unwrap();
+    let (b, b_log, b_inbox) = ObjectInbox::restore(&key, test_endpoint(2), b.id(), &sealed).unwrap();
     assert_eq!(b_inbox.pending_count(), 2);
     assert_eq!(b_log.epochs(), vec![start, start + 1, start + 2]);
 

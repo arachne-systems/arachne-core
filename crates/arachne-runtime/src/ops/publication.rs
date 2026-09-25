@@ -350,6 +350,8 @@ pub(crate) fn stage(session: &mut Session, args: StagePublicationArgs) -> Result
         None => arachne_delivery::PublisherLog::new(owner).map_err(delivery(ErrorCode::Internal))?,
     };
     let inbox = inbox.expect("object delivery inbox");
+    // Self-update policy (B3c): count objects this member sends.
+    session.membership.self_update.record_sent(1);
     stage_object(
         session,
         candidate,

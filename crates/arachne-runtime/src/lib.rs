@@ -60,6 +60,14 @@ pub mod harness {
     pub use crate::membership::StateBasis;
     pub use crate::membership::wire::{Query, decode_reply, encode_query};
     pub use crate::presence::harness_presence_packet;
+    /// Read an admission reply from the wire as host JSON (binary since B3c).
+    pub use crate::ops::admission::decode_admission_reply;
+
+    /// One binary step (`DFMS\x03`) in the peer wire envelope a membership
+    /// offer carries, without an invitation checkpoint.
+    pub fn wire_step(step: &[u8]) -> Vec<u8> {
+        crate::membership::wire_step(step, None, usize::MAX).unwrap_or_default()
+    }
 
     /// The session workspace's gossip tag key, so a qualification harness can
     /// join raw nodes to the same overlay. The host already holds this state.
@@ -133,6 +141,9 @@ pub mod admission_state {
     pub const MEMBER_ALREADY_ADMITTED: &str = "member_already_admitted";
     pub const RECOVERY_REMOVE_AND_REINVITE: &str = "remove_and_reinvite";
     pub const NOT_SENT: &str = "admission_not_sent";
+    /// The asked member is not an administrator. Only administrators admit
+    /// members (ADR A2 section 7); ask another member.
+    pub const ADMINISTRATOR_REQUIRED: &str = "administrator_required";
     /// The request was sent and the exchange ended with no reply. Ask again at
     /// once: the result may already be retained.
     pub const WAITING: &str = "admission_waiting";
@@ -163,3 +174,24 @@ fn report_value(value: AdmissionReport) -> Value {
 #[cfg(test)]
 mod large_invitation_tests;
 
+
+/// A process-wide endpoint key per test label, for tests that name endpoints
+/// by index. The endpoint is the key's public key (ADR A2 step 6).
+#[cfg(test)]
+pub(crate) fn test_key(label: u64) -> &'static arachne_security::EndpointKey {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static KEYS: OnceLock<Mutex<HashMap<u64, &'static arachne_security::EndpointKey>>> =
+        OnceLock::new();
+    KEYS.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(label)
+        .or_insert_with(|| Box::leak(Box::new(arachne_security::EndpointKey::generate().unwrap())))
+}
+
+/// The endpoint of [`test_key`].
+#[cfg(test)]
+pub(crate) fn test_endpoint(label: u64) -> [u8; 32] {
+    arachne_security::EndpointSigner::endpoint(test_key(label))
+}

@@ -41,8 +41,9 @@ impl AdoptKind {
             (
                 AdoptKind::Admission,
                 WorkspaceTransition::Admission
-                    | WorkspaceTransition::Management(_, _)
+                    | WorkspaceTransition::Management(..)
                     | WorkspaceTransition::WorkspaceName
+                    | WorkspaceTransition::SelfUpdate(_)
                     | WorkspaceTransition::Invitation(..)
             ) | (AdoptKind::Join, WorkspaceTransition::Join)
                 | (
@@ -74,6 +75,7 @@ pub(crate) enum CandidateKind {
     Management,
     WorkspaceName,
     Invitation,
+    SelfUpdate,
     Removal,
     Join,
     Publication,
@@ -89,6 +91,7 @@ impl CandidateKind {
             WorkspaceTransition::Management(..) => CandidateKind::Management,
             WorkspaceTransition::WorkspaceName => CandidateKind::WorkspaceName,
             WorkspaceTransition::Invitation(..) => CandidateKind::Invitation,
+            WorkspaceTransition::SelfUpdate(_) => CandidateKind::SelfUpdate,
             WorkspaceTransition::Join => CandidateKind::Join,
             WorkspaceTransition::RoutedPublication(..) => CandidateKind::Publication,
             WorkspaceTransition::Inbox | WorkspaceTransition::InboxRejected => {
@@ -108,6 +111,7 @@ impl CandidateKind {
             | CandidateKind::Management
             | CandidateKind::WorkspaceName
             | CandidateKind::Invitation
+            | CandidateKind::SelfUpdate
             | CandidateKind::Removal => AdoptKind::Admission,
             CandidateKind::Join => AdoptKind::Join,
             CandidateKind::Publication => AdoptKind::Publication,
@@ -410,7 +414,10 @@ pub(crate) fn adopt(
     // A step this node committed goes out by gossip. A step it
     // received from a peer is already travelling; gossip relays it.
     let received = std::mem::take(&mut session.membership.staged_step_received);
-    let committed_here = matches!(staged.transition, WorkspaceTransition::Admission) && !received;
+    let committed_here = matches!(
+        staged.transition,
+        WorkspaceTransition::Admission | WorkspaceTransition::SelfUpdate(_)
+    ) && !received;
     match staged.transition {
         WorkspaceTransition::Inbox => value.state = Some("inbox_adopted"),
         WorkspaceTransition::InboxRejected => value.state = Some("inbox_rejection_adopted"),
@@ -485,11 +492,8 @@ pub(crate) fn adopt(
             }
             value.publication = Some(outcome);
         }
-        WorkspaceTransition::Management(action, commit) => {
-            value.step = Some(membership::step_json(
-                &arachne_security::MembershipAuthorization::Management(action),
-                &commit,
-            ));
+        WorkspaceTransition::Management(_, authorization, commit) => {
+            value.step = Some(membership::step_json(&authorization, &commit));
         }
         WorkspaceTransition::Invitation(invitation, checkpoint, action, commit) => {
             let issued = invitation_envelope(session, &invitation, checkpoint)?;
@@ -543,6 +547,12 @@ pub(crate) fn adopt(
             value.results_pushed = Some(pushed);
         }
         WorkspaceTransition::WorkspaceName => {}
+        WorkspaceTransition::SelfUpdate(commit) => {
+            value.step = Some(membership::step_json(
+                &arachne_security::MembershipAuthorization::SelfUpdate,
+                &commit,
+            ));
+        }
         WorkspaceTransition::Join => {
             session.join.pending = None;
             session.join.lifecycle = None;
@@ -587,14 +597,14 @@ mod tests {
     /// must never hold a state that live state did not take.
     #[test]
     fn an_adoption_that_cannot_complete_saves_nothing() {
-        let owner = arachne_security::Workspace::create([109; 32], "Owner").unwrap();
+        let owner = arachne_security::Workspace::create(&arachne_security::EndpointKey::generate().unwrap(), "Owner").unwrap();
         let mut session = crate::membership::bare_test_session(owner);
         let token = crate::persistence::candidate_token().unwrap();
         session.transition.staged = Some(StagedWorkspace {
             publisher: None,
             inbox: None,
             transition: WorkspaceTransition::Join,
-            workspace: arachne_security::Workspace::create([110; 32], "Joined").unwrap(),
+            workspace: arachne_security::Workspace::create(&arachne_security::EndpointKey::generate().unwrap(), "Joined").unwrap(),
             snapshot: token.clone(),
         });
         // Leaving -> Synchronizing is not a legal activity step.
@@ -610,7 +620,7 @@ mod tests {
 
     #[test]
     fn discard_returns_a_staged_admission_batch_to_intake() {
-        let owner = arachne_security::Workspace::create([107; 32], "Owner").unwrap();
+        let owner = arachne_security::Workspace::create(&arachne_security::EndpointKey::generate().unwrap(), "Owner").unwrap();
         let mut session = crate::membership::bare_test_session(owner);
         let staged = crate::ops::management::stage_workspace_name(
             &mut session,
@@ -648,16 +658,20 @@ mod tests {
                 .map_err(|error| error.to_string())
         };
         let description: Value = serde_json::from_str(&describe(handle).unwrap()).unwrap();
-        let endpoint = serde_json::from_value(description["endpoint_key"].clone()).unwrap();
+        let _: [u8; 32] = serde_json::from_value(description["endpoint_key"].clone()).unwrap();
         // The runtime session is the administrator; the sender is a member.
-        let admin = Workspace::create(endpoint, "Admin").unwrap();
+        let secret = iroh::SecretKey::from_bytes(&root);
+        let admin =
+            Workspace::create(&arachne_node::IrohEndpointSigner(&secret), "Admin").unwrap();
+        let sender_key = arachne_security::EndpointKey::generate().unwrap();
+        let sender_endpoint = arachne_security::EndpointSigner::endpoint(&sender_key);
         let (registered, invitation, checkpoint) =
             admin.prepare_invitation(u64::MAX, false, false).unwrap();
         let admin = registered.workspace;
         let join =
-            PendingJoin::from_invitation(&invitation, &checkpoint, [106; 32], "Sender").unwrap();
+            PendingJoin::from_invitation(&invitation, &checkpoint, &sender_key, "Sender").unwrap();
         let prepared = admin
-            .prepare_admission([106; 32], join.admission_request().unwrap())
+            .prepare_admission(sender_endpoint, join.admission_request().unwrap())
             .unwrap();
         let mut proof = join.join_proof().unwrap();
         proof

@@ -3,13 +3,11 @@ use arachne_runtime::{MemoryProvider, close, describe, execute, wait_for_work};
 use arachne_security::{Invitation, PendingJoin};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 mod common;
-
-static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn call(handle: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
@@ -118,7 +116,7 @@ async fn joiner(seed_index: u64, owner: &Owner) -> (Arc<Node>, Vec<u8>) {
         .unwrap();
     let invitation = Invitation::from_bytes(&owner.invitation).unwrap();
     let pending =
-        PendingJoin::from_invitation(&invitation, &owner.checkpoint, node.id(), "Joiner").unwrap();
+        PendingJoin::from_invitation(&invitation, &owner.checkpoint, &node, "Joiner").unwrap();
     let packet = admission_packet(pending.admission_request().unwrap(), "Joiner", &owner.checkpoint);
     node.add_address_hint(owner.peer, owner.address).await.unwrap();
     (Arc::new(node), packet)
@@ -144,7 +142,6 @@ fn drive(owner: i64, deadline: Instant, mut done: impl FnMut(&Value) -> bool) ->
 
 #[test]
 fn queued_admission_rearms_the_host_for_staging() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let owner = owner(83);
     let (reply_tx, reply_rx) = mpsc::channel();
     let peer = owner.peer;
@@ -162,7 +159,7 @@ fn queued_admission_rearms_the_host_for_staging() {
                 .unwrap();
             let invitation = Invitation::from_bytes(&invitation).unwrap();
             let pending =
-                PendingJoin::from_invitation(&invitation, &checkpoint, node.id(), "Joiner")
+                PendingJoin::from_invitation(&invitation, &checkpoint, &node, "Joiner")
                     .unwrap();
             let packet = admission_packet(
                 pending.admission_request().unwrap(),
@@ -203,7 +200,6 @@ fn queued_admission_rearms_the_host_for_staging() {
 
 #[test]
 fn rust_driver_commits_and_replies_without_host_candidate_steps() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let owner = owner(84);
     let (reply_tx, reply_rx) = mpsc::channel();
     let peer = owner.peer;
@@ -220,7 +216,7 @@ fn rust_driver_commits_and_replies_without_host_candidate_steps() {
                 .await
                 .unwrap();
             let invitation = Invitation::from_bytes(&invitation).unwrap();
-            let pending = PendingJoin::from_invitation(&invitation, &checkpoint, node.id(), "Joiner").unwrap();
+            let pending = PendingJoin::from_invitation(&invitation, &checkpoint, &node, "Joiner").unwrap();
             let packet = admission_packet(pending.admission_request().unwrap(), "Joiner", &checkpoint);
             node.add_address_hint(peer, address).await.unwrap();
             reply_tx.send(node.request_control(peer, &packet).await).unwrap();
@@ -237,7 +233,7 @@ fn rust_driver_commits_and_replies_without_host_candidate_steps() {
     };
     assert_eq!(committed["state"], "workspace_committed");
     assert_eq!(committed["members"], 2);
-    let reply: Value = serde_json::from_slice(&reply_rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap()).unwrap();
+    let reply: Value = arachne_runtime::harness::decode_admission_reply(&reply_rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap()).unwrap();
     assert!(reply.get("welcome").is_some());
     requester.join().unwrap();
 
@@ -249,7 +245,6 @@ fn rust_driver_commits_and_replies_without_host_candidate_steps() {
 
 #[test]
 fn rust_join_driver_persists_iroh_peer_and_adopts_the_welcome() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let owner = owner(86);
     let joiner_storage = MemoryProvider::default();
     let joiner = common::stored(&[87; 32], &joiner_storage);
@@ -295,7 +290,6 @@ fn rust_join_driver_persists_iroh_peer_and_adopts_the_welcome() {
 
 #[test]
 fn rust_join_driver_resumes_the_persisted_iroh_peer_after_restart() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let owner = owner(88);
     let joiner_storage = MemoryProvider::default();
     let joiner = common::stored(&[89; 32], &joiner_storage);
@@ -329,7 +323,6 @@ fn rust_join_driver_resumes_the_persisted_iroh_peer_after_restart() {
 
 #[test]
 fn fresh_pending_join_reports_remove_and_reinvite_recovery() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let owner = owner(91);
     let first = common::stored(&[92; 32], &MemoryProvider::default());
     let pending = call(
@@ -387,7 +380,6 @@ fn fresh_pending_join_reports_remove_and_reinvite_recovery() {
 
 #[test]
 fn rust_reset_invalidates_native_state_and_clears_the_projection() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let secret = [90; 32];
     let provider = MemoryProvider::default();
     let handle = common::stored(&secret, &provider);
@@ -435,7 +427,6 @@ fn a_busy_inbox_cannot_delay_a_small_batch_until_it_drains() {
     // old trigger (a 4 s clock, or an empty inbox) staged only after the owner
     // had read every duplicate. Counted in reads, not seconds, so the proof
     // does not depend on how fast this machine drains the inbox.
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let owner = owner(51);
     let (peer, address) = (owner.peer, owner.address);
     let (invitation, checkpoint) = (owner.invitation.clone(), owner.checkpoint.clone());
@@ -496,7 +487,6 @@ fn a_busy_inbox_cannot_delay_a_small_batch_until_it_drains() {
 
 #[test]
 fn one_request_is_enough_the_result_arrives_on_the_same_exchange() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let owner = owner(52);
     let (peer, address) = (owner.peer, owner.address);
     let (invitation, checkpoint) = (owner.invitation.clone(), owner.checkpoint.clone());
@@ -517,7 +507,7 @@ fn one_request_is_enough_the_result_arrives_on_the_same_exchange() {
             let (node, packet) = joiner(5200, &shadow).await;
             // Exactly one request. No retry loop.
             let reply = node.request_control(peer, &packet).await.unwrap();
-            serde_json::from_slice::<Value>(&reply).unwrap()
+            arachne_runtime::harness::decode_admission_reply(&reply).unwrap()
         })
     });
 
@@ -526,7 +516,7 @@ fn one_request_is_enough_the_result_arrives_on_the_same_exchange() {
     drive(owner.handle, Instant::now() + Duration::from_secs(20), |_| client.is_finished());
     let metrics = call(owner.handle, json!({"op":"workspace_metrics"})).unwrap();
     let reply = client.join().unwrap();
-    delivered += usize::from(reply["commit"].is_array());
+    delivered += usize::from(reply["commits"].is_array());
     close(owner.handle).unwrap();
 
     assert_eq!(delivered, 1, "the single request got {reply} instead of its result");
@@ -541,7 +531,6 @@ fn one_request_is_enough_the_result_arrives_on_the_same_exchange() {
 
 #[test]
 fn expired_admission_exchange_receives_a_pushed_result_without_retry() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let owner = owner(57);
     let (peer, address) = (owner.peer, owner.address);
     let (invitation, checkpoint) = (owner.invitation.clone(), owner.checkpoint.clone());
@@ -558,7 +547,7 @@ fn expired_admission_exchange_receives_a_pushed_result_without_retry() {
                 .await
                 .unwrap();
             let invitation = Invitation::from_bytes(&invitation).unwrap();
-            let pending = PendingJoin::from_invitation(&invitation, &checkpoint, node.id(), "Joiner").unwrap();
+            let pending = PendingJoin::from_invitation(&invitation, &checkpoint, &node, "Joiner").unwrap();
             let packet = admission_packet(pending.admission_request().unwrap(), "Joiner", &checkpoint);
             node.add_address_hint(peer, address).await.unwrap();
             let request = tokio::spawn(node.request_control(peer, &packet));
@@ -611,15 +600,14 @@ fn expired_admission_exchange_receives_a_pushed_result_without_retry() {
     assert_eq!(committed["members"], 2);
     commit_tx.send(()).unwrap();
     let pushed = client.join().unwrap();
-    let reply: Value = serde_json::from_slice(&pushed[9..]).unwrap();
+    let reply: Value = arachne_runtime::harness::decode_admission_reply(&pushed[9..]).unwrap();
     assert!(reply["welcome"].is_array());
-    assert!(reply["commit"].is_array() || reply["commits"].is_array());
+    assert!(reply["commits"].is_array());
     close(owner.handle).unwrap();
 }
 
 #[test]
 fn tampered_and_replayed_admission_pushes_are_rejected() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let owner = owner(59);
     let joiner = common::stored(&[60; 32], &MemoryProvider::default());
     let pending = call(
@@ -698,7 +686,6 @@ fn tampered_and_replayed_admission_pushes_are_rejected() {
 
 #[test]
 fn a_sent_request_with_no_reply_reports_waiting_not_an_error() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let owner = owner(53);
     let late = common::stored(&[54; 32], &MemoryProvider::default());
     let begun = call(
@@ -729,7 +716,6 @@ fn a_sent_request_with_no_reply_reports_waiting_not_an_error() {
 /// no signal in the preceding second, 2026-09-18).
 #[test]
 fn a_request_set_aside_during_a_commit_wakes_the_host_when_the_commit_lands() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let owner = owner(55);
     let (peer, address) = (owner.peer, owner.address);
     let (invitation, checkpoint) = (owner.invitation.clone(), owner.checkpoint.clone());
@@ -800,7 +786,6 @@ fn a_request_set_aside_during_a_commit_wakes_the_host_when_the_commit_lands() {
 /// passed every other test.
 #[test]
 fn waiting_requests_are_one_group_commit() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let owner = owner(56);
     let (peer, address) = (owner.peer, owner.address);
     let (invitation, checkpoint) = (owner.invitation.clone(), owner.checkpoint.clone());

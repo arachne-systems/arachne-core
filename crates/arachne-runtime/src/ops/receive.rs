@@ -278,11 +278,19 @@ mod tests {
         };
         let description: Value = serde_json::from_str(&describe(handle).unwrap()).unwrap();
         let endpoint = serde_json::from_value(description["endpoint_key"].clone()).unwrap();
-        let mut admin = Workspace::create([104; 32], "Publisher").unwrap();
+        let admin_key = arachne_security::EndpointKey::generate().unwrap();
+        let mut admin = Workspace::create(&admin_key, "Publisher").unwrap();
+        let secret = iroh::SecretKey::from_bytes(&root);
         let (registered, invitation, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
         admin = registered.workspace;
         let join =
-            PendingJoin::from_invitation(&invitation, &checkpoint, endpoint, "Reader").unwrap();
+            PendingJoin::from_invitation(
+                &invitation,
+                &checkpoint,
+                &arachne_node::IrohEndpointSigner(&secret),
+                "Reader",
+            )
+            .unwrap();
         let prepared = admin
             .prepare_admission(endpoint, join.admission_request().unwrap())
             .unwrap();

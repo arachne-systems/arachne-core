@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::errors::{self, security};
 use crate::membership::JoinStep;
 use crate::ops::admission::{
-    admission_history_page_packet, admission_offer_candidate, admission_request_packet, live,
+    admission_history_page_packet, decode_admission_reply, admission_offer_candidate, admission_request_packet, live,
     live_mut, parse_admission_offer,
 };
 use crate::ops::candidate::{self, AdoptArgs, MemberView};
@@ -199,14 +199,14 @@ pub(crate) fn begin(session: &mut Session, args: BeginJoinArgs) -> Result<Pendin
     let pending = if args.checkpoint.is_empty() {
         arachne_security::PendingJoin::from_compact_invitation(
             &invitation,
-            session.node.id(),
+            &session.node,
             &args.display_name,
         )
     } else {
         arachne_security::PendingJoin::from_invitation(
             &invitation,
             &args.checkpoint,
-            session.node.id(),
+            &session.node,
             &args.display_name,
         )
     }
@@ -267,8 +267,6 @@ pub(crate) fn stage(session: &mut Session, args: StageJoinArgs) -> Result<Staged
     let mut proof = pending
         .join_proof()
         .map_err(security(ErrorCode::InvitationInvalid))?;
-    let authorization =
-        |step: &JoinStep| step.authorization();
     // Replay the rolled-over prefix from the pinned checkpoint before the
     // chunk the host carried back. Nothing is accepted on the strength of
     // having been fetched earlier: a truncated or tampered prefix fails
@@ -276,13 +274,15 @@ pub(crate) fn stage(session: &mut Session, args: StageJoinArgs) -> Result<Staged
     for value in &session.join.history_prefix {
         let step: JoinStep = serde_json::from_value(value.clone())
             .map_err(|error| ApiError::internal(error.to_string()))?;
+        let (authorization, commit) = step.parts()?;
         proof
-            .apply_transition(&authorization(&step)?, &step.commit)
+            .apply_transition(&authorization, &commit)
             .map_err(security(ErrorCode::InvalidInput))?;
     }
     for step in commits {
+        let (authorization, commit) = step.parts()?;
         proof
-            .apply_transition(&authorization(&step)?, &step.commit)
+            .apply_transition(&authorization, &commit)
             .map_err(security(ErrorCode::InvalidInput))?;
     }
     let workspace = pending
@@ -350,7 +350,7 @@ pub(crate) fn request_admission(
     // history over many pages.
     let mut page_bytes = vec![reply.len()];
     let mut reply: Value =
-        serde_json::from_slice(&reply).map_err(|_| from_peer("invalid admission reply"))?;
+        decode_admission_reply(&reply).map_err(|_| from_peer("invalid admission reply"))?;
     if reply
         .get("history_complete")
         .is_some_and(|complete| !complete.as_bool().unwrap_or(false))
@@ -387,7 +387,7 @@ pub(crate) fn request_admission(
                 return Err(too_much("admission history exceeds transport bounds"));
             }
             page_bytes.push(page.len());
-            let page: Value = serde_json::from_slice(&page)
+            let page: Value = decode_admission_reply(&page)
                 .map_err(|_| from_peer("invalid admission history page"))?;
             // A served page carries the retained reply plus its paging
             // markers; only a refusal carries a `state`. Requiring both was
@@ -406,7 +406,10 @@ pub(crate) fn request_admission(
                 .as_u64()
                 .ok_or_else(|| from_peer("admission history page missing next offset"))?
                 as usize;
-            if page_commits.is_empty() || next <= offset {
+            // A page carries steps, except the final page that carries only
+            // the Welcome.
+            let complete = page["history_complete"].as_bool() == Some(true);
+            if (page_commits.is_empty() && !complete) || next < offset || (next == offset && !complete) {
                 return Err(from_peer("admission history page made no progress"));
             }
             if commits.len() + page_commits.len() > arachne_security::MAX_JOIN_HISTORY_STEPS {
@@ -423,28 +426,51 @@ pub(crate) fn request_admission(
     // encoding uses. The host still carries at most one chunk into its
     // StageJoin call; the rest stays here and is replayed -- never trusted
     // -- when the join is staged.
-    let total = reply["commits"].as_array().map_or(0, Vec::len);
-    if total > arachne_security::HISTORY_CHUNK_STEPS {
-        let trailing = match total % arachne_security::HISTORY_CHUNK_STEPS {
-            0 => arachne_security::HISTORY_CHUNK_STEPS,
-            remainder => remainder,
-        };
-        let split = total - trailing;
-        let commits = reply["commits"].as_array().unwrap();
-        let prefix = commits[..split].to_vec();
-        let carried = Value::Array(commits[split..].to_vec());
-        reply["commits"] = carried;
-        reply["history_verified_prefix"] = json!(split);
-        session.join.history_prefix = prefix;
-    } else {
-        session.join.history_prefix.clear();
-    }
+    session.join.history_prefix = roll_over(&mut reply);
     if reply.get("commits").is_some() {
         // Only a reply that actually served history reports page sizes; a
         // queued or refused attempt keeps its exact previous shape.
         reply["history_page_bytes"] = json!(page_bytes);
     }
     Ok(reply)
+}
+
+/// JSON bytes of history steps a host carries into one StageJoin request.
+/// The request is at most 128 KiB, and binary steps become JSON numbers
+/// there; the Welcome may ride along.
+const HOST_CARRY_BYTES: usize = 64 * 1024;
+
+/// Roll a fetched history over: the host carries at most one chunk of
+/// steps, within `HOST_CARRY_BYTES`, into its StageJoin call. The rest is
+/// returned and stays in the session, replayed -- never trusted -- when the
+/// join is staged. The split is at the chunk boundary the inline encoding
+/// uses when the chunk fits, else later.
+fn roll_over(reply: &mut Value) -> Vec<Value> {
+    let Some(commits) = reply["commits"].as_array() else {
+        return Vec::new();
+    };
+    let total = commits.len();
+    let chunk = arachne_security::HISTORY_CHUNK_STEPS;
+    let mut split = if total > chunk {
+        total - match total % chunk {
+            0 => chunk,
+            remainder => remainder,
+        }
+    } else {
+        0
+    };
+    let size = |steps: &[Value]| serde_json::to_vec(steps).map_or(usize::MAX, |bytes| bytes.len());
+    while split + 1 < total && size(&commits[split..]) > HOST_CARRY_BYTES {
+        split += 1;
+    }
+    if split == 0 {
+        return Vec::new();
+    }
+    let prefix = commits[..split].to_vec();
+    let carried = Value::Array(commits[split..].to_vec());
+    reply["commits"] = carried;
+    reply["history_verified_prefix"] = json!(split);
+    prefix
 }
 
 fn no_lifecycle() -> ApiError {
@@ -659,6 +685,14 @@ pub(crate) fn drive(session: &mut Session) -> Result<Value, ApiError> {
     }
     if let Some(reply) = reply {
         if reply.get("state").is_some() {
+            // Only administrators admit: a member that is not one cannot
+            // help this join, so ask the next member.
+            if reply["reason"] == admission_state::ADMINISTRATOR_REQUIRED {
+                let session = live_mut(session)?;
+                let lifecycle = session.join.lifecycle.as_mut().ok_or_else(no_lifecycle)?;
+                lifecycle.advance();
+                commit_pending_join(session)?;
+            }
             return Ok(reply);
         }
         let bad_reply = |detail: &str| ApiError::transport_failed(None, detail);
@@ -939,7 +973,7 @@ async fn request_join_exchange(
         Err(error) => return join_attempt_error(error, true),
     };
     let mut page_bytes = vec![first.len()];
-    let mut reply: Value = match serde_json::from_slice(&first) {
+    let mut reply: Value = match decode_admission_reply(&first) {
         Ok(value) => value,
         Err(_) => return JoinAttemptOutcome::Failed("invalid admission reply".into()),
     };
@@ -985,7 +1019,7 @@ async fn request_join_exchange(
                 );
             }
             page_bytes.push(page.len());
-            let page: Value = match serde_json::from_slice(&page) {
+            let page: Value = match decode_admission_reply(&page) {
                 Ok(value) => value,
                 Err(_) => {
                     return JoinAttemptOutcome::Failed("invalid admission history page".into());
@@ -1015,7 +1049,10 @@ async fn request_join_exchange(
                     );
                 }
             };
-            if page_commits.is_empty() || next <= offset {
+            // A page carries steps, except the final page that carries only
+            // the Welcome.
+            let complete = page["history_complete"].as_bool() == Some(true);
+            if (page_commits.is_empty() && !complete) || next < offset || (next == offset && !complete) {
                 return JoinAttemptOutcome::Failed(
                     "admission history page made no progress".into(),
                 );
@@ -1031,19 +1068,7 @@ async fn request_join_exchange(
         reply["history_complete"] = Value::Bool(true);
     }
 
-    let mut history_prefix = Vec::new();
-    let total = reply["commits"].as_array().map_or(0, Vec::len);
-    if total > arachne_security::HISTORY_CHUNK_STEPS {
-        let trailing = match total % arachne_security::HISTORY_CHUNK_STEPS {
-            0 => arachne_security::HISTORY_CHUNK_STEPS,
-            remainder => remainder,
-        };
-        let split = total - trailing;
-        let commits = reply["commits"].as_array().unwrap();
-        history_prefix = commits[..split].to_vec();
-        reply["commits"] = Value::Array(commits[split..].to_vec());
-        reply["history_verified_prefix"] = json!(split);
-    }
+    let history_prefix = roll_over(&mut reply);
     if reply.get("commits").is_some() {
         reply["history_page_bytes"] = json!(page_bytes);
     }

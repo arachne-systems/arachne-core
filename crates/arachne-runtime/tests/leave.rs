@@ -108,6 +108,25 @@ fn drive_until_work(handle: i64) -> Value {
     }
 }
 
+/// A new member's Rust driver first self-updates through its administrator
+/// (B3c policy). Serve that here, so each scenario starts settled.
+fn settle_self_update(member: i64, admin: i64) {
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let value = call(member, json!({"op":"drive_workspace"})).unwrap();
+        if value["state"] == "self_update_committed" {
+            return;
+        }
+        let served = call(admin, json!({"op":"poll_admission"})).unwrap();
+        if served["state"] == "awaiting_save" {
+            call(admin, json!({"op":"adopt_admission","candidate":served["candidate"]})).unwrap();
+            call(admin, json!({"op":"send_admission_reply"})).unwrap();
+        }
+        assert!(Instant::now() < until, "no self-update: {value}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn self_member_id(handle: i64) -> [u8; 32] {
     let roster = call(handle, json!({"op":"member_roster"})).unwrap();
     roster["members"]
@@ -167,6 +186,8 @@ fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave()
     let invite = issue_invitation(admin);
     join(admin, successor, &invite, "Successor");
     route(admin, successor);
+    route(successor, admin);
+    settle_self_update(successor, admin);
 
     let before_promotion = call(admin, json!({"op":"member_roster"})).unwrap();
     let successor_id = before_promotion["members"]
@@ -311,6 +332,20 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
     route(third, admin);
     route(successor, third);
     route(third, successor);
+    // B3c policy: the current third member self-updates through the admin
+    // (epoch 4 -> 5). The successor is stale on purpose; its own attempt is
+    // refused by the admin and then waits a minute, past this scenario.
+    settle_self_update(third, admin);
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let value = call(successor, json!({"op":"drive_workspace"})).unwrap();
+        if value["state"] == "self_update_refused" {
+            break;
+        }
+        call(admin, json!({"op":"poll_admission"})).unwrap();
+        assert!(Instant::now() < until, "stale self-update not refused: {value}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
 
     let successor_id = self_member_id(successor);
     let third_id = self_member_id(third);
@@ -343,8 +378,10 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
     // only the third member's join (epoch 3 -> 4) remains to reconcile here.
     // Admin's epoch after the second invite+join is 4 (not 2).
     offer_and_drive(admin, successor, 3);
+    // And the third member's self-update (epoch 4 -> 5).
+    offer_and_drive(admin, successor, 4);
     let before_promotion = call(admin, json!({"op":"member_roster"})).unwrap();
-    assert_eq!(before_promotion["epoch"], 4);
+    assert_eq!(before_promotion["epoch"], 5);
     let before_promotion_epoch = before_promotion["epoch"].as_u64().unwrap();
 
     let promotion = call(

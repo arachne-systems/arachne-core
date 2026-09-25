@@ -3,6 +3,8 @@
 //! This deliberately crosses only the lower security-owner seam. It does not
 //! claim transport, Android, ATAK, SQLite, or UI capacity.
 
+mod common;
+use common::{test_endpoint, test_key, test_key_for};
 use arachne_security::{
     AdmissionAssessment, AdmissionAttempt, AdmissionEnqueue, AdmissionQueue, MAX_ADMISSION_BATCH,
     PendingJoin, Workspace,
@@ -10,16 +12,13 @@ use arachne_security::{
 use std::time::Instant;
 
 fn endpoint(index: usize) -> [u8; 32] {
-    let mut value = [0; 32];
-    value[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
-    value[8..16].copy_from_slice(&(!(index as u64)).to_be_bytes());
-    value
+    test_endpoint(1_000_000 + index as u64)
 }
 
 fn run(member_count: usize) {
     assert!(member_count >= 32);
     let started = Instant::now();
-    let mut owner = Workspace::create([200; 32], "Admission harness owner").unwrap();
+    let mut owner = Workspace::create(test_key(200), "Admission harness owner").unwrap();
     let (registration, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
     owner = registration.workspace;
     let mut queue = AdmissionQueue::new();
@@ -29,7 +28,7 @@ fn run(member_count: usize) {
         let request_started = Instant::now();
         let remote_endpoint = endpoint(index);
         let pending =
-            PendingJoin::from_invitation(&invitation, &checkpoint, remote_endpoint, "Burst member")
+            PendingJoin::from_invitation(&invitation, &checkpoint, test_key_for(remote_endpoint), "Burst member")
                 .unwrap();
         let attempt = AdmissionAttempt::new(
             remote_endpoint,
@@ -74,7 +73,7 @@ fn run(member_count: usize) {
         if [16, 64, 128, 256].contains(&accepted) && accepted < member_count {
             let restore_started = Instant::now();
             let records = owner.export_records().unwrap();
-            owner = Workspace::restore_records([200; 32], owner.id(), &records).unwrap();
+            owner = Workspace::restore_records(test_endpoint(200), owner.id(), &records).unwrap();
             restore_time += restore_started.elapsed();
             restarts += 1;
         }
@@ -93,14 +92,14 @@ fn run(member_count: usize) {
 
     let restore_started = Instant::now();
     let records = owner.export_records().unwrap();
-    owner = Workspace::restore_records([200; 32], owner.id(), &records).unwrap();
+    owner = Workspace::restore_records(test_endpoint(200), owner.id(), &records).unwrap();
     restore_time += restore_started.elapsed();
     assert_eq!(owner.member_count(), member_count + 1);
 
     // A founding-epoch invitation must still produce verifiable history after
     // the burst and all simulated owner restarts.
     let late_endpoint = endpoint(member_count + 1);
-    let late = PendingJoin::from_invitation(&invitation, &checkpoint, late_endpoint, "Late member")
+    let late = PendingJoin::from_invitation(&invitation, &checkpoint, test_key_for(late_endpoint), "Late member")
         .unwrap();
     let history = owner
         .membership_history(
@@ -128,7 +127,7 @@ fn run(member_count: usize) {
 fn run_batched(member_count: usize) {
     assert!(member_count >= 2);
     let started = Instant::now();
-    let mut owner = Workspace::create([201; 32], "Batch harness owner").unwrap();
+    let mut owner = Workspace::create(test_key(201), "Batch harness owner").unwrap();
     let (registration, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
     owner = registration.workspace;
     let mut pending = Vec::with_capacity(member_count);
@@ -138,7 +137,7 @@ fn run_batched(member_count: usize) {
     for index in 0..member_count {
         let endpoint = endpoint(index + 10_000);
         let join =
-            PendingJoin::from_invitation(&invitation, &checkpoint, endpoint, "Batched member")
+            PendingJoin::from_invitation(&invitation, &checkpoint, test_key_for(endpoint), "Batched member")
                 .unwrap();
         let request = join.admission_request().unwrap().to_vec();
         let assessment = owner.assess_admission(endpoint, &request).unwrap();
@@ -235,12 +234,12 @@ fn run_batched(member_count: usize) {
         );
     }
     let records = owner.export_records().unwrap();
-    owner = Workspace::restore_records([201; 32], owner.id(), &records).unwrap();
+    owner = Workspace::restore_records(test_endpoint(201), owner.id(), &records).unwrap();
     assert_eq!(owner.member_count(), member_count + 1);
     let late = PendingJoin::from_invitation(
         &invitation,
         &checkpoint,
-        endpoint(member_count + 20_000),
+        test_key_for(endpoint(member_count + 20_000)),
         "Late batched member",
     )
     .unwrap();
@@ -300,11 +299,11 @@ fn admission_batch_harness_covers_shared_welcome_and_restart() {
 /// verifier re-read its own local state through the untrusted-input bound.
 #[test]
 fn an_existing_member_follows_batch_adds_past_three_hundred_members() {
-    let mut owner = Workspace::create([203; 32], "Large workspace owner").unwrap();
+    let mut owner = Workspace::create(test_key(203), "Large workspace owner").unwrap();
     let (registration, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
     owner = registration.workspace;
     let joiner = |index: usize| {
-        PendingJoin::from_invitation(&invitation, &checkpoint, endpoint(index + 30_000), "Member").unwrap()
+        PendingJoin::from_invitation(&invitation, &checkpoint, test_key_for(endpoint(index + 30_000)), "Member").unwrap()
     };
     // The early member: admitted alone in the first batch, then only follows.
     let early = joiner(0);
@@ -348,11 +347,11 @@ fn an_existing_member_follows_batch_adds_past_three_hundred_members() {
 /// commit. The administrator advanced and the members did not: a fork (B3).
 #[test]
 fn an_existing_member_accepts_management_past_three_hundred_members() {
-    let owner = Workspace::create([205; 32], "Large workspace owner").unwrap();
+    let owner = Workspace::create(test_key(205), "Large workspace owner").unwrap();
     let (registered, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
     let mut owner = registered.workspace;
     let joiner = |index: usize| {
-        PendingJoin::from_invitation(&invitation, &checkpoint, endpoint(index + 50_000), "Member").unwrap()
+        PendingJoin::from_invitation(&invitation, &checkpoint, test_key_for(endpoint(index + 50_000)), "Member").unwrap()
     };
     let early = joiner(0);
     let request = early.admission_request().unwrap().to_vec();
@@ -394,11 +393,11 @@ fn an_existing_member_accepts_management_past_three_hundred_members() {
         .id;
     let action = arachne_security::ManagementAction::Remove(target);
     let prepared = owner.prepare_management(action).unwrap();
-    member.verify_management(action, &prepared.commit).unwrap_or_else(|error| {
+    member.verify_step(&prepared.authorization, &prepared.commit).unwrap_or_else(|error| {
         panic!("member at {} members rejected the management commit: {error}", member.member_count())
     });
     let arachne_security::PreparedManagementUpdate::Active(member) =
-        member.prepare_management_update(action, &prepared.commit).unwrap()
+        member.prepare_step_update(&prepared.authorization, &prepared.commit).unwrap()
     else {
         panic!("removal of another member removed this member")
     };
@@ -415,14 +414,14 @@ fn an_existing_member_accepts_management_past_three_hundred_members() {
 /// administrator could not issue an invitation a joiner would accept.
 #[test]
 fn an_administrator_invites_past_three_hundred_members() {
-    let mut owner = Workspace::create([204; 32], "Large workspace owner").unwrap();
+    let mut owner = Workspace::create(test_key(204), "Large workspace owner").unwrap();
     let (registration, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
     owner = registration.workspace;
     let mut next = 0;
     while owner.member_count() < 310 {
         let range = next..(next + MAX_ADMISSION_BATCH);
         let joins: Vec<_> = range.clone()
-            .map(|index| PendingJoin::from_invitation(&invitation, &checkpoint, endpoint(index + 40_000), "Member").unwrap())
+            .map(|index| PendingJoin::from_invitation(&invitation, &checkpoint, test_key_for(endpoint(index + 40_000)), "Member").unwrap())
             .collect();
         let requests: Vec<_> = joins.iter().map(|join| join.admission_request().unwrap().to_vec()).collect();
         let validated: Vec<_> = range.clone().zip(&requests).map(|(index, request)| {
@@ -439,7 +438,7 @@ fn an_administrator_invites_past_three_hundred_members() {
     let (registration, late_invitation, late_checkpoint) =
         owner.prepare_invitation(0, false, false).unwrap();
     owner = registration.workspace;
-    let late = PendingJoin::from_invitation(&late_invitation, &late_checkpoint, endpoint(39_999), "Late member").unwrap();
+    let late = PendingJoin::from_invitation(&late_invitation, &late_checkpoint, test_key_for(endpoint(39_999)), "Late member").unwrap();
     let request = late.admission_request().unwrap().to_vec();
     let AdmissionAssessment::Ready(validated) = owner.assess_admission(endpoint(39_999), &request).unwrap() else {
         panic!("open invitation needs no approval");
@@ -455,14 +454,14 @@ fn an_administrator_invites_past_three_hundred_members() {
 
 /// Grow an owner to at least `size` members from one early invitation.
 fn grow(seed: u8, size: usize, base: usize) -> Workspace {
-    let owner = Workspace::create([seed; 32], "Large workspace owner").unwrap();
+    let owner = Workspace::create(test_key(u64::from(seed)), "Large workspace owner").unwrap();
     let (registration, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
     let mut owner = registration.workspace;
     let mut next = 0;
     while owner.member_count() < size {
         let range = next..(next + MAX_ADMISSION_BATCH);
         let joins: Vec<_> = range.clone()
-            .map(|index| PendingJoin::from_invitation(&invitation, &checkpoint, endpoint(index + base), "Member").unwrap())
+            .map(|index| PendingJoin::from_invitation(&invitation, &checkpoint, test_key_for(endpoint(index + base)), "Member").unwrap())
             .collect();
         let requests: Vec<_> = joins.iter().map(|join| join.admission_request().unwrap().to_vec()).collect();
         let validated: Vec<_> = range.clone().zip(&requests).map(|(index, request)| {
@@ -501,7 +500,7 @@ fn registered_invitation_admits_at(size: usize, seed: u8, base: usize) {
 
     // The joiner's pending state, with the checkpoint, survives a restart.
     let key = arachne_security::StorageKey::derive(&[seed; 32]).unwrap();
-    let late = PendingJoin::from_invitation(&invitation, &checkpoint, endpoint(base - 1), "Late member").unwrap();
+    let late = PendingJoin::from_invitation(&invitation, &checkpoint, test_key_for(endpoint(base - 1)), "Late member").unwrap();
     let sealed = late.seal(&key).unwrap();
     assert!(sealed.len() <= arachne_security::MAX_SEALED_PENDING_JOIN);
     let late = PendingJoin::restore(&key, endpoint(base - 1), owner.id(), &sealed).unwrap();
@@ -533,7 +532,7 @@ fn registered_invitation_admits_at(size: usize, seed: u8, base: usize) {
 
 /// Admit one member through `invitation`; returns the new member count.
 fn grow_one(owner: &mut Workspace, invitation: &arachne_security::Invitation, checkpoint: &[u8], index: usize) -> usize {
-    let join = PendingJoin::from_invitation(invitation, checkpoint, endpoint(index), "Filler").unwrap();
+    let join = PendingJoin::from_invitation(invitation, checkpoint, test_key_for(endpoint(index)), "Filler").unwrap();
     let request = join.admission_request().unwrap().to_vec();
     let AdmissionAssessment::Ready(validated) = owner.assess_admission(endpoint(index), &request).unwrap() else {
         panic!("open invitation needs no approval");

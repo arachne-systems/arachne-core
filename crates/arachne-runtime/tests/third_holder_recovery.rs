@@ -2,9 +2,6 @@ use arachne_runtime::{MemoryProvider, close, describe, execute};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-// Three four-node scenarios exceed the process-wide runtime budget if overlapped.
-static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 mod common;
 
 /// A node with its own in-memory record storage.
@@ -136,7 +133,6 @@ fn receive_one(handle: i64) -> Value {
 
 #[test]
 fn retained_replay_delivers_events_current_values_and_deletions() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let author = node(121);
     let reader = node(122);
     call(
@@ -219,7 +215,6 @@ fn retained_replay_delivers_events_current_values_and_deletions() {
 
 #[test]
 fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let author = node(111);
     let stale_holder = node(112);
     let fresh_holder = node(113);
@@ -449,7 +444,6 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
 
 #[test]
 fn intended_recipient_recovers_private_tail_from_restarted_holder() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let author = node(101);
     let holder_storage = MemoryProvider::default();
     let reader_storage = MemoryProvider::default();
@@ -640,7 +634,6 @@ fn intended_recipient_recovers_private_tail_from_restarted_holder() {
 
 #[test]
 fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let author_storage = MemoryProvider::default();
     let holder_storage = MemoryProvider::default();
     let reader_storage = MemoryProvider::default();

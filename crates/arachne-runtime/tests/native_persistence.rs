@@ -135,21 +135,24 @@ fn hundred_member_runtime_commits_and_reopens() {
         .unwrap()["issued_invitation"]
             .clone();
         let invitation = Invitation::from_bytes(&bytes(&invite["invitation"])).unwrap();
+        let _ = member;
+        let member_key = arachne_security::EndpointKey::generate().unwrap();
+        let member_endpoint = arachne_security::EndpointSigner::endpoint(&member_key);
         let pending = PendingJoin::from_invitation(
             &invitation,
             &bytes(&invite["checkpoint"]),
-            [member; 32],
+            &member_key,
             "Member",
         )
         .unwrap();
         let request = pending.admission_request().unwrap();
         let staged = call(
             handle,
-            json!({"op":"stage_admission","authenticated_endpoint":vec![member;32],"request":request}),
+            json!({"op":"stage_admission","authenticated_endpoint":member_endpoint,"request":request}),
         )
         .unwrap();
         adopt(handle, &staged, "adopt_admission");
-        let reply = call(handle,json!({"op":"retained_admission","authenticated_endpoint":vec![member;32],"request":request})).unwrap();
+        let reply = call(handle,json!({"op":"retained_admission","authenticated_endpoint":member_endpoint,"request":request})).unwrap();
         let auth = &reply["authorization"];
         let authorization = AdmissionAuthorization {
             invitation_key: bytes(&auth["invitation_key"]).try_into().unwrap(),
@@ -255,10 +258,18 @@ fn seeded_pending_inbox_survives_restart_and_removal_cannot_reopen_active_state(
     let description: Value =
         serde_json::from_str(&arachne_runtime::describe(handle).unwrap()).unwrap();
     let endpoint = serde_json::from_value(description["endpoint_key"].clone()).unwrap();
-    let admin = Workspace::create([104; 32], "Administrator").unwrap();
+    let admin_key = arachne_security::EndpointKey::generate().unwrap();
+    let admin = Workspace::create(&admin_key, "Administrator").unwrap();
     let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let admin = registered.workspace;
-    let pending = PendingJoin::from_invitation(&invite, &checkpoint, endpoint, "Receiver").unwrap();
+    let secret = iroh::SecretKey::from_bytes(&root);
+    let pending = PendingJoin::from_invitation(
+        &invite,
+        &checkpoint,
+        &arachne_node::IrohEndpointSigner(&secret),
+        "Receiver",
+    )
+    .unwrap();
     let prepared = admin
         .prepare_admission(endpoint, pending.admission_request().unwrap())
         .unwrap();
@@ -303,7 +314,8 @@ fn seeded_pending_inbox_survives_restart_and_removal_cannot_reopen_active_state(
     let removed = admin
         .prepare_management(ManagementAction::Remove(reader.member().unwrap().id()))
         .unwrap();
-    let step = json!({"commit":removed.commit,"management":{"kind":"remove","member":reader.member().unwrap().id()}});
+    // A Remove travels as a signed revocation order in the binary step codec.
+    let step = json!({"step":arachne_security::encode_membership_step(&removed.authorization, &removed.commit).unwrap()});
     // A pending object never delays a membership step (A3); this test acks
     // first only to check acknowledgement persistence before the removal.
     let ack=call(handle,json!({"op":"stage_object_acknowledgement","member":pending["member"],"topic":pending["topic"],"counter":pending["counter"],"id":pending["id"]})).unwrap();
@@ -338,7 +350,8 @@ fn native_pending_join_keeps_identity_until_atomic_admission_commit() {
     use arachne_security::Workspace;
     let root = [141; 32];
     let directory = common::directory();
-    let admin = Workspace::create([142; 32], "Administrator").unwrap();
+    let admin_key = arachne_security::EndpointKey::generate().unwrap();
+    let admin = Workspace::create(&admin_key, "Administrator").unwrap();
     let workspace = admin.id();
     let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let admin = registered.workspace;

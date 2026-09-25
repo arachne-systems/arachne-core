@@ -179,7 +179,7 @@ fn create_workspace_is_durable_before_any_adoption() {
 fn a_failed_first_save_does_not_block_a_retry() {
     use arachne_security::Workspace;
     let provider = MemoryProvider::default();
-    let admin = Workspace::create([48; 32], "Administrator").unwrap();
+    let admin = Workspace::create(&arachne_security::EndpointKey::generate().unwrap(), "Administrator").unwrap();
     let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     drop(registered);
     let handle = arachne_runtime::create(Some(&[49; 32])).unwrap();

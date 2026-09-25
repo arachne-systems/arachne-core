@@ -100,7 +100,7 @@ fn a_candidate_of_one_kind_never_adopts_as_another_over_json() {
 fn a_join_candidate_never_adopts_as_an_admission() {
     use arachne_security::Workspace;
     let provider = MemoryProvider::default();
-    let admin = Workspace::create([66; 32], "Administrator").unwrap();
+    let admin = Workspace::create(&arachne_security::EndpointKey::generate().unwrap(), "Administrator").unwrap();
     let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let admin = registered.workspace;
     let handle = arachne_runtime::create(Some(&[65; 32])).unwrap();
