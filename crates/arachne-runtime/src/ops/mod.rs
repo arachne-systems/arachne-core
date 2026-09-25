@@ -242,6 +242,13 @@ pub(crate) fn run<T>(
     let session = guard.as_mut().ok_or_else(errors::closed)?;
     let busy_before = admission_busy(session);
     let result = admit(session, op).and_then(|()| body(session));
+    // Cancel and deadlines act on the op in flight only (ADR step 4). Close
+    // removes the handle first; its cancel stays set, so an op queued on
+    // this lock cannot delay the close.
+    let closing = crate::registry::entry(handle).map_or(true, |entry| entry.signal.is_closed());
+    if !closing {
+        session.node.control_cancellation().send_replace(false);
+    }
     // Control requests set aside while a commit was pending raised their
     // signal on arrival, and the host already found nothing it could serve.
     // Wake it again now that they can be served.

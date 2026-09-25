@@ -9,7 +9,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
     },
     time::Duration,
 };
@@ -34,6 +34,66 @@ pub(crate) struct Entry {
     pub(crate) signal: Arc<work_signal::WorkSignal>,
     pub(crate) cancellation: watch::Sender<bool>,
     pub(crate) transport: TransportSummary,
+    /// Counts deadline timers, so a late timer never cancels a later op.
+    pub(crate) generation: Arc<Mutex<u64>>,
+}
+
+impl Entry {
+    /// Start a deadline for one op: at `deadline` it interrupts the op's
+    /// outbound control exchanges. `DeadlineTimer::finish` ends it.
+    pub(crate) fn arm_deadline(self: Arc<Self>, deadline: Duration) -> DeadlineTimer {
+        let token = {
+            let mut generation = self
+                .generation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            *generation += 1;
+            *generation
+        };
+        let fired = Arc::new(AtomicBool::new(false));
+        let generation = Arc::clone(&self.generation);
+        let cancellation = self.cancellation.clone();
+        let fire = Arc::clone(&fired);
+        let task = self.context.handle().spawn(async move {
+            tokio::time::sleep(deadline).await;
+            let current = generation.lock().unwrap_or_else(|error| error.into_inner());
+            if *current == token {
+                fire.store(true, Ordering::Release);
+                cancellation.send_replace(true);
+            }
+        });
+        DeadlineTimer {
+            entry: self,
+            fired,
+            task,
+        }
+    }
+}
+
+/// One op's deadline. Its task ends at `finish` or at the deadline.
+pub(crate) struct DeadlineTimer {
+    entry: Arc<Entry>,
+    fired: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl DeadlineTimer {
+    /// End the deadline. `true`: it fired while the op ran. The cancel it
+    /// sent is cleared unless the session is closing.
+    pub(crate) fn finish(self) -> bool {
+        // Under the generation lock, so a timer cannot fire after this.
+        *self
+            .entry
+            .generation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) += 1;
+        self.task.abort();
+        let fired = self.fired.load(Ordering::Acquire);
+        if fired && !self.entry.signal.is_closed() {
+            self.entry.cancellation.send_replace(false);
+        }
+        fired
+    }
 }
 
 /// Handle index over all contexts. It has no cap and no budget; each
@@ -201,6 +261,7 @@ pub(crate) fn open(
         signal,
         cancellation,
         transport,
+        generation: Arc::default(),
     });
     directory()?.insert(handle, entry);
     reservation.commit(handle);
@@ -270,8 +331,9 @@ pub(crate) fn close_session(handle: i64) -> Result<(), ApiError> {
     session.map(shutdown_session).unwrap_or(Ok(()))
 }
 
-/// Interrupt outbound control exchanges. The owner still calls `close` to
-/// release the endpoint once its serial JNI request returns.
+/// Interrupt the outbound control exchanges of the op in flight. Not
+/// sticky (ADR step 4): the latch clears when that op ends. The owner still
+/// calls `close` to release the endpoint.
 pub fn cancel(handle: i64) -> Result<(), String> {
     cancel_session(handle).map_err(errors::text)
 }
