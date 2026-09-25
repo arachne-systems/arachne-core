@@ -159,9 +159,9 @@ pub(crate) fn stage(session: &mut Session, args: StagePublicationArgs) -> Result
         .as_ref()
         .ok_or_else(errors::no_workspace)?;
     session
-        .storage_key
+        .records
         .as_ref()
-        .ok_or_else(errors::no_root_key)?;
+        .ok_or_else(crate::persistence::storage_required)?;
     // Reject before anything is staged so the session stays usable.
     check_workspace(session, args.workspace)?;
     let StagePublicationArgs {

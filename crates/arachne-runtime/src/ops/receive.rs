@@ -55,9 +55,9 @@ pub(crate) fn poll_protected(session: &mut Session) -> Result<Option<StagedObjec
         .as_ref()
         .ok_or_else(errors::no_workspace)?;
     session
-        .storage_key
+        .records
         .as_ref()
-        .ok_or_else(errors::no_root_key)?;
+        .ok_or_else(crate::persistence::storage_required)?;
     // Bounded drain of local echoes. ATAK already owns its own outgoing
     // event; MLS cannot decrypt its own sent application ciphertext.
     let mut incoming = None;
@@ -169,9 +169,9 @@ pub(crate) fn poll_pending(
         .as_ref()
         .ok_or_else(errors::no_workspace)?;
     session
-        .storage_key
+        .records
         .as_ref()
-        .ok_or_else(errors::no_root_key)?;
+        .ok_or_else(crate::persistence::storage_required)?;
     let Some(inbox) = session.delivery.inbox.as_ref() else {
         return Ok(None);
     };
@@ -218,9 +218,9 @@ fn resolve(session: &mut Session, args: ResolveArgs, rejected: bool) -> Result<S
         .as_ref()
         .ok_or_else(errors::no_workspace)?;
     session
-        .storage_key
+        .records
         .as_ref()
-        .ok_or_else(errors::no_root_key)?;
+        .ok_or_else(crate::persistence::storage_required)?;
     let inbox = session
         .delivery
         .inbox

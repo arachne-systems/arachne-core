@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use arachne_api::{ApiError, ErrorCode};
+use arachne_api::ApiError;
 use arachne_node::{ConnectionBudget, NetworkProfile, Node, NodeOptions, RelayOptions};
 use serde_json::{Value, json};
 use tokio::sync::watch;
@@ -212,16 +212,11 @@ pub(crate) fn open(secret: Option<&[u8; 32]>, options: NodeOptions) -> Result<i6
     });
     let cancellation = node.control_cancellation();
     let presence = presence::Presence::new()?;
-    let storage_key = secret
-        .map(arachne_security::StorageKey::derive)
-        .transpose()
-        .map_err(errors::security(ErrorCode::InvalidInput))?;
     let shared = Arc::new(Mutex::new(Some(Session::new(
         node,
         receiver,
         runtime,
         committed,
-        storage_key,
         presence,
     ))));
     let mut registry = REGISTRY
@@ -448,7 +443,7 @@ mod tests {
             .collect();
         assert_eq!(handles, (1..=MAX_SESSIONS as i64).collect::<Vec<_>>());
         let limit = registry.reserve().unwrap_err();
-        assert_eq!(limit.code(), ErrorCode::LimitReached);
+        assert_eq!(limit.code(), arachne_api::ErrorCode::LimitReached);
         assert_eq!(errors::text(limit), "node limit reached");
         // A failed startup returns its slot; handles are never reused.
         registry.release();

@@ -92,19 +92,37 @@ struct Records {
     values: BTreeMap<Vec<u8>, Zeroizing<Vec<u8>>>,
 }
 
-#[derive(Default)]
 struct Shared {
     stores: Mutex<BTreeMap<[u8; 32], Arc<Mutex<Records>>>>,
     fail_commit: AtomicBool,
     corrupt_reads: AtomicBool,
+    root: Zeroizing<[u8; 32]>,
 }
 
 /// Stores in process memory. Clones share the stores, so a test can close a
 /// client and restore the same state in a new one. Not durable.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct MemoryProvider(Arc<Shared>);
 
+impl Default for MemoryProvider {
+    fn default() -> Self {
+        let mut root = Zeroizing::new([0; 32]);
+        getrandom::fill(root.as_mut()).expect("randomness for a memory storage root");
+        Self(Arc::new(Shared {
+            stores: Mutex::default(),
+            fail_commit: AtomicBool::new(false),
+            corrupt_reads: AtomicBool::new(false),
+            root,
+        }))
+    }
+}
+
 impl MemoryProvider {
+    /// The storage root of these stores: random, shared by clones.
+    pub fn root(&self) -> [u8; 32] {
+        *self.0.root
+    }
+
     /// The next commit of any store fails and changes nothing.
     pub fn fail_next_commit(&self) {
         self.0.fail_commit.store(true, Ordering::SeqCst);

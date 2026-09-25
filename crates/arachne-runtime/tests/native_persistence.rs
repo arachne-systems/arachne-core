@@ -319,7 +319,7 @@ fn seeded_pending_inbox_survives_restart_and_removal_cannot_reopen_active_state(
     // A new join may reuse the store; a new workspace cannot resurrect it.
     let store = arachne_store::Store::open_existing(&provider.path(workspace), &root, workspace)
         .unwrap();
-    assert_eq!(store.keys(b"").count(), 2);
+    assert_eq!(store.keys(b"").count(), 3); // token, endpoint, removal
     assert_eq!(store.keys(b"security/").count(), 0);
     assert_eq!(store.keys(b"delivery/").count(), 0);
     drop(store);

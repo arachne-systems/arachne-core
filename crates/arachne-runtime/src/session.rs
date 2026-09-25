@@ -110,7 +110,6 @@ pub(crate) struct Session {
     /// The same state, published for inquiries answered without the host.
     pub(crate) committed: committed_view::Published,
     pub(crate) activity: WorkspaceActivity,
-    pub(crate) storage_key: Option<arachne_security::StorageKey>,
     /// Where this session keeps workspace records. Required to hold one.
     pub(crate) storage: Option<persistence::StorageConfig>,
     pub(crate) records: Option<persistence::NativeStore>,
@@ -272,7 +271,6 @@ impl Session {
         receiver: arachne_node::MessageReceiver,
         runtime: Runtime,
         committed: committed_view::Published,
-        storage_key: Option<arachne_security::StorageKey>,
         presence: presence::Presence,
     ) -> Self {
         let profiles = committed.profiles();
@@ -284,7 +282,6 @@ impl Session {
             workspace: None,
             committed,
             activity: WorkspaceActivity::default(),
-            storage_key,
             storage: None,
             records: None,
             transition: TransitionState::default(),

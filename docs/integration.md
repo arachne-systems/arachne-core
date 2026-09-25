@@ -78,7 +78,12 @@ Native record storage is the only persistence mode. The host attaches a
 `StorageConfig` to the session (`ClientConfig::storage`, or `attach_storage`
 for the JSON dispatcher) before it creates, joins or restores a workspace.
 `StorageConfig::sqlite(directory, root)` keeps one encrypted SQLite file per
-workspace in a private directory. `root` is the host's storage root key.
+workspace in a private directory. `root` is the host's storage root key. It is
+separate from the endpoint secret: a `Direct` client without an endpoint secret
+can persist, and a new endpoint identity does not change how the store is read.
+Workspace state itself is bound to the endpoint key (MLS membership), so a
+store written by one endpoint restores only under that endpoint; another
+endpoint gets `WrongState`, and the store stays intact.
 `StorageConfig::new` takes any `StorageProvider` implementation;
 `MemoryProvider` is for tests.
 

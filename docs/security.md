@@ -138,7 +138,9 @@ reach an offline peer.
 Native record storage is the only persistence mode. Core saves each staged
 candidate, reads it back, and only then adopts it; the host never handles
 state bytes. `arachne-store` encrypts values with AES-256-GCM using a derived
-key based on a root key supplied by the host and the workspace scope. It authenticates the
+key based on a storage root key supplied by the host and the workspace scope.
+The storage root is not derived from the endpoint secret; rotating the
+endpoint identity does not change the storage key. It authenticates the
 record index when opening the database and authenticates record ciphertext
 when each record is read. The host remains responsible for protecting the root
 key, filesystem access, backups, and concurrent-open lifecycle.

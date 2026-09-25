@@ -22,30 +22,46 @@ const ACTIVITY: &[u8] = b"runtime/activity";
 const RESET: &[u8] = b"runtime/reset";
 const REMOVED: &[u8] = b"runtime/removed";
 const INBOX: &[u8] = b"delivery/inbox";
+/// The endpoint key the stored state belongs to. Checked before any state
+/// record is read, so a new endpoint identity gets a clear error.
+const ENDPOINT: &[u8] = b"runtime/endpoint";
 
 // A pending join, with its checkpoint, is one record.
 const _: () = assert!(arachne_security::MAX_SEALED_PENDING_JOIN <= arachne_store::MAX_RECORD_BYTES);
 
 /// Where a session keeps its workspace records. One store per workspace.
+///
+/// `root` is the host's storage root key. It is not the endpoint secret:
+/// a session without an endpoint secret can persist, and a new endpoint
+/// identity does not change how the store is read.
 #[derive(Clone)]
 pub struct StorageConfig {
     provider: Arc<dyn StorageProvider>,
+    root: Arc<Zeroizing<[u8; 32]>>,
 }
 
 impl StorageConfig {
-    pub fn new(provider: Arc<dyn StorageProvider>) -> Self {
-        Self { provider }
+    pub fn new(provider: Arc<dyn StorageProvider>, root: [u8; 32]) -> Self {
+        Self {
+            provider,
+            root: Arc::new(Zeroizing::new(root)),
+        }
     }
 
-    /// Encrypted SQLite files in a private directory. `root` is the host's
-    /// storage root key.
+    /// Encrypted SQLite files in a private directory, all under `root`.
     pub fn sqlite(directory: &Path, root: [u8; 32]) -> Self {
-        Self::new(Arc::new(SqliteProvider::new(directory, root)))
+        Self::new(Arc::new(SqliteProvider::new(directory, root)), root)
     }
 
     /// Process memory (tests). Clones of `provider` share the stores.
     pub fn memory(provider: &MemoryProvider) -> Self {
-        Self::new(Arc::new(provider.clone()))
+        Self::new(Arc::new(provider.clone()), provider.root())
+    }
+
+    /// The key that seals the pending join and removal records.
+    fn record_key(&self) -> Result<arachne_security::StorageKey, ApiError> {
+        arachne_security::StorageKey::derive(&self.root)
+            .map_err(security(ErrorCode::StorageFailed))
     }
 }
 
@@ -64,6 +80,7 @@ impl Eq for StorageConfig {}
 
 pub(crate) struct NativeStore {
     store: Box<dyn Storage>,
+    endpoint: [u8; 32],
     committed: Vec<u8>,
     /// A commit failed or did not read back. The durable outcome is unknown,
     /// so live state must not advance: only close (then restore) or reset.
@@ -71,9 +88,10 @@ pub(crate) struct NativeStore {
 }
 
 impl NativeStore {
-    fn new(store: Box<dyn Storage>, committed: Vec<u8>) -> Self {
+    fn new(store: Box<dyn Storage>, endpoint: [u8; 32], committed: Vec<u8>) -> Self {
         Self {
             store,
+            endpoint,
             committed,
             uncertain: false,
         }
@@ -89,6 +107,7 @@ impl NativeStore {
             return Err(uncertain());
         }
         records.insert(TOKEN.to_vec(), Zeroizing::new(token.to_vec()));
+        records.insert(ENDPOINT.to_vec(), Zeroizing::new(self.endpoint.to_vec()));
         let deleted: Vec<Vec<u8>> = self
             .store
             .keys(b"")
@@ -204,8 +223,12 @@ fn active_records(
     Ok(records)
 }
 
-fn root_required() -> ApiError {
-    ApiError::wrong_state("protected root required")
+fn record_key(session: &Session) -> Result<arachne_security::StorageKey, ApiError> {
+    session
+        .storage
+        .as_ref()
+        .ok_or_else(storage_required)?
+        .record_key()
 }
 
 pub(crate) fn storage_required() -> ApiError {
@@ -217,7 +240,7 @@ fn pending_records(
     pending: &arachne_security::PendingJoin,
 ) -> Result<SecurityRecords, ApiError> {
     let bytes = pending
-        .seal(session.storage_key.as_ref().ok_or_else(root_required)?)
+        .seal(&record_key(session)?)
         .map_err(security(ErrorCode::StorageFailed))?;
     let mut records = BTreeMap::from([(PENDING.to_vec(), Zeroizing::new(bytes))]);
     if let Some(lifecycle) = &session.join.lifecycle {
@@ -275,8 +298,9 @@ fn open_new(session: &Session, workspace: [u8; 32]) -> Result<NativeStore, ApiEr
         return Err(ApiError::wrong_state("session already owns a record store"));
     }
     let provider = &session.storage.as_ref().ok_or_else(storage_required)?.provider;
+    let endpoint = session.node.id();
     if let Some(store) = provider.open(workspace).map_err(errors::store)? {
-        let store = NativeStore::new(store, Vec::new());
+        let store = NativeStore::new(store, endpoint, Vec::new());
         if !store.terminal()? {
             return Err(ApiError::wrong_state(
                 "record store already initialized; restore it",
@@ -286,6 +310,7 @@ fn open_new(session: &Session, workspace: [u8; 32]) -> Result<NativeStore, ApiEr
     }
     Ok(NativeStore::new(
         provider.create(workspace).map_err(errors::store)?,
+        endpoint,
         Vec::new(),
     ))
 }
@@ -357,7 +382,7 @@ pub(crate) fn commit_candidate(session: &mut Session, token: &[u8]) -> Result<()
             return Err(ApiError::candidate_stale("token does not match removal"));
         }
         let bytes = removed
-            .seal(session.storage_key.as_ref().ok_or_else(root_required)?)
+            .seal(&record_key(session)?)
             .map_err(security(ErrorCode::StorageFailed))?;
         BTreeMap::from([(REMOVED.to_vec(), Zeroizing::new(bytes))])
     } else {
@@ -470,15 +495,21 @@ pub(crate) fn restore(
     if get(RESET)?.is_some() {
         return Err(ApiError::wrong_state("native record store was reset"));
     }
+    let endpoint = session.node.id();
+    if get(ENDPOINT)?.as_deref().map(|bytes| bytes.as_slice()) != Some(endpoint.as_slice()) {
+        return Err(ApiError::wrong_state(
+            "the stored workspace belongs to a different endpoint key; restore it with that endpoint identity",
+        ));
+    }
     let keys = store.keys(b"");
     if let Some(bytes) = get(PENDING)? {
         if keys.iter().any(|name| {
-            ![PENDING, TOKEN, JOIN_LIFECYCLE, ACTIVITY].contains(&name.as_slice())
+            ![PENDING, TOKEN, ENDPOINT, JOIN_LIFECYCLE, ACTIVITY].contains(&name.as_slice())
         }) {
             return Err(corrupt("pending store contains other lifecycle state"));
         }
         let pending = arachne_security::PendingJoin::restore(
-            session.storage_key.as_ref().ok_or_else(root_required)?,
+            &record_key(session)?,
             session.node.id(),
             workspace,
             &bytes,
@@ -505,15 +536,15 @@ pub(crate) fn restore(
         session.activity = activity;
         session.join.lifecycle = lifecycle;
         session.join.pending = Some(pending);
-        session.records = Some(NativeStore::new(store, committed));
+        session.records = Some(NativeStore::new(store, endpoint, committed));
         return Ok(Restored::Pending(value));
     }
     if let Some(bytes) = get(REMOVED)? {
-        if keys.len() != 2 {
+        if keys.len() != 3 {
             return Err(corrupt("removed store contains active state"));
         }
         let removed = arachne_security::RemovedMembership::restore(
-            session.storage_key.as_ref().ok_or_else(root_required)?,
+            &record_key(session)?,
             session.node.id(),
             workspace,
             &bytes,
@@ -528,7 +559,9 @@ pub(crate) fn restore(
         }));
     }
     for name in &keys {
-        if !name.starts_with(b"security/") && ![TOKEN, INBOX, ACTIVITY].contains(&name.as_slice()) {
+        if !name.starts_with(b"security/")
+            && ![TOKEN, ENDPOINT, INBOX, ACTIVITY].contains(&name.as_slice())
+        {
             return Err(corrupt("unknown native runtime record"));
         }
     }
@@ -570,7 +603,7 @@ pub(crate) fn restore(
     session.delivery.inbox = inbox;
     commit_workspace(session, owner);
     value.activity = session.activity.view();
-    session.records = Some(NativeStore::new(store, committed));
+    session.records = Some(NativeStore::new(store, endpoint, committed));
     Ok(Restored::Opened(value))
 }
 
@@ -608,6 +641,7 @@ pub fn seed_workspace(
     };
     let mut store_records = records;
     store_records.insert(TOKEN.to_vec(), Zeroizing::new(candidate_token().map_err(errors::text)?));
+    store_records.insert(ENDPOINT.to_vec(), Zeroizing::new(owner.endpoint().to_vec()));
     let stale: Vec<Vec<u8>> = store
         .keys(b"")
         .into_iter()

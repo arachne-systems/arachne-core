@@ -150,10 +150,6 @@ pub(crate) fn no_workspace() -> ApiError {
     ApiError::wrong_state("session has no workspace")
 }
 
-pub(crate) fn no_root_key() -> ApiError {
-    ApiError::wrong_state("session has no protected root key")
-}
-
 pub(crate) fn no_pending_join() -> ApiError {
     ApiError::wrong_state("session has no pending join")
 }

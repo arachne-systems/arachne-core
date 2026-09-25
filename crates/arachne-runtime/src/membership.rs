@@ -1401,7 +1401,6 @@ pub(super) fn bare_test_session(workspace: impl Into<Arc<arachne_security::Works
         receiver,
         runtime,
         committed,
-        None,
         presence::Presence::new().unwrap(),
     );
     session.activity = super::WorkspaceActivity {
