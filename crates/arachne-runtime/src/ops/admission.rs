@@ -130,6 +130,9 @@ pub(crate) struct AdmissionArgs {
 /// Stage one admission from the host. The endpoint must be the
 /// authenticated transport identity of the requester.
 pub(crate) fn stage(session: &mut Session, args: AdmissionArgs) -> Result<StagedAdmission, ApiError> {
+    if !membership::is_administrator(session.workspace.as_deref().ok_or_else(errors::no_workspace)?) {
+        return Err(not_administrator());
+    }
     stage_admission(
         session,
         args.authenticated_endpoint,
@@ -1047,8 +1050,18 @@ pub(crate) fn queue_admission_push(
 
 /// The protocol reason a requester sees, from the security crate's exact
 /// texts (the same constants the error table uses).
+/// Security error for an Add from a non-administrator (ADR A2 step 2).
+const ONLY_ADMINISTRATORS_ADMIT: &str = "only an administrator may admit members";
+
+fn not_administrator() -> ApiError {
+    ApiError::not_authorized(
+        "Only an administrator can admit members. Ask an administrator of this workspace.",
+    )
+}
+
 fn admission_reason(error: &str) -> &'static str {
     match error {
+        ONLY_ADMINISTRATORS_ADMIT => admission_state::ADMINISTRATOR_REQUIRED,
         arachne_security::INVITATION_AUTOMATIC_APPROVAL_REQUIRED => "automatic_approval_required",
         arachne_security::INVITATION_APPROVAL_REQUIRED => "approval_required",
         arachne_security::INVITATION_DISABLED => "invitation_disabled",
@@ -1181,6 +1194,18 @@ fn queue_admission(
             }
             return Ok(json!({"state":"admission_replied", "accepted":accepted}));
         }
+    }
+    // Only administrators admit (ADR A2 section 7). Refuse before the
+    // request is queued or held for approval: a queued request would fail
+    // at staging and be retried forever. There is no forward path; the
+    // joiner asks its next member.
+    if !membership::is_administrator(session.workspace.as_deref().ok_or_else(errors::no_workspace)?) {
+        let _ = incoming.respond(feedback_bytes(&json!({
+            "state": admission_state::UNAVAILABLE,
+            "reason": admission_state::ADMINISTRATOR_REQUIRED,
+        }))?);
+        return Ok(json!({"state":admission_state::REPLIED,"accepted":false,
+            "reason":admission_state::ADMINISTRATOR_REQUIRED}));
     }
     if session.admission.queue.contains(&attempt)
         || session
@@ -1633,12 +1658,9 @@ mod tests {
         };
 
         for count in [8, MAX_RUNTIME_ADMISSION_BATCH] {
-            let endpoint = |index: usize| {
-                let mut value = [0; 32];
-                value[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
-                value
-            };
-            let mut owner = Workspace::create(endpoint(10_000), "Wire-size owner").unwrap();
+            let endpoint = |index: usize| crate::test_endpoint(index as u64);
+            let key = |index: usize| crate::test_key(index as u64);
+            let mut owner = Workspace::create(key(10_000), "Wire-size owner").unwrap();
             let (registered, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
             owner = registered.workspace;
             let mut joins = Vec::with_capacity(count);
@@ -1648,7 +1670,7 @@ mod tests {
                 let join = PendingJoin::from_invitation(
                     &invitation,
                     &checkpoint,
-                    endpoint(index + 20_000),
+                    key(index + 20_000),
                     "Wire-size member",
                 )
                 .unwrap();
@@ -1717,12 +1739,9 @@ mod tests {
         use arachne_security::{AdmissionAssessment, PendingJoin, Workspace};
 
         let started = std::time::Instant::now();
-        let endpoint = |index: usize| {
-            let mut value = [0; 32];
-            value[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
-            value
-        };
-        let mut owner = Workspace::create(endpoint(10_000), "500-member owner").unwrap();
+        let endpoint = |index: usize| crate::test_endpoint(index as u64);
+        let key = |index: usize| crate::test_key(index as u64);
+        let mut owner = Workspace::create(key(10_000), "500-member owner").unwrap();
         let (registered, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
         owner = registered.workspace;
         let mut joins = Vec::with_capacity(500);
@@ -1731,7 +1750,7 @@ mod tests {
         for index in 0..500 {
             let remote = endpoint(index + 20_000);
             let join =
-                PendingJoin::from_invitation(&invitation, &checkpoint, remote, "Burst member")
+                PendingJoin::from_invitation(&invitation, &checkpoint, key(index + 20_000), "Burst member")
                     .unwrap();
             let request = join.admission_request().unwrap().to_vec();
             let validated_request = match owner.assess_admission(remote, &request).unwrap() {
@@ -1799,9 +1818,8 @@ mod tests {
         let mut proof = target.join_proof().unwrap();
         for commit in commits {
             let step: JoinStep = serde_json::from_value(commit).unwrap();
-            proof
-                .apply_transition(&step.authorization().unwrap(), &step.commit)
-                .unwrap();
+            let (authorization, commit) = step.parts().unwrap();
+            proof.apply_transition(&authorization, &commit).unwrap();
         }
         let joined = target.prepare_workspace(&proof, &welcome).unwrap();
         assert_eq!(joined.member_count(), 501);

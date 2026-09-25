@@ -134,7 +134,7 @@ fn joiner(owner: &Owner, seed_index: u64) -> (mpsc::Sender<()>, mpsc::Receiver<V
                 .unwrap();
             let invitation = Invitation::from_bytes(&invitation).unwrap();
             let pending =
-                PendingJoin::from_invitation(&invitation, &checkpoint, node.id(), "Joiner").unwrap();
+                PendingJoin::from_invitation(&invitation, &checkpoint, &node, "Joiner").unwrap();
             let packet = admission_packet(pending.admission_request().unwrap(), "Joiner", &checkpoint);
             node.add_address_hint(peer, address).await.unwrap();
             while asked.recv().is_ok() {

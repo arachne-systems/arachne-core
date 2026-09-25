@@ -44,7 +44,13 @@ pub(crate) enum WorkspaceTransition {
         stale: usize,
     },
     Admission,
-    Management(arachne_security::ManagementAction, Vec<u8>),
+    /// A committed management step: the intent, the history authorization
+    /// receivers verify (a signed order for revocations) and the commit.
+    Management(
+        arachne_security::ManagementAction,
+        arachne_security::MembershipAuthorization,
+        Vec<u8>,
+    ),
     WorkspaceName,
     Invitation(
         Box<arachne_security::Invitation>,

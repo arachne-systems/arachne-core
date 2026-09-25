@@ -42,7 +42,7 @@ impl AdoptKind {
             (
                 AdoptKind::Admission,
                 WorkspaceTransition::Admission
-                    | WorkspaceTransition::Management(_, _)
+                    | WorkspaceTransition::Management(..)
                     | WorkspaceTransition::WorkspaceName
                     | WorkspaceTransition::Invitation(..)
             ) | (AdoptKind::Join, WorkspaceTransition::Join)
@@ -357,11 +357,8 @@ pub(crate) fn adopt(
             }
             value.publication = Some(outcome);
         }
-        WorkspaceTransition::Management(action, commit) => {
-            value.step = Some(membership::step_json(
-                &arachne_security::MembershipAuthorization::Management(action),
-                &commit,
-            ));
+        WorkspaceTransition::Management(_, authorization, commit) => {
+            value.step = Some(membership::step_json(&authorization, &commit));
         }
         WorkspaceTransition::Invitation(invitation, checkpoint, action, commit) => {
             let issued = invitation_envelope(session, &invitation, checkpoint)?;
@@ -471,16 +468,20 @@ mod tests {
                 .map_err(|error| error.to_string())
         };
         let description: Value = serde_json::from_str(&describe(handle).unwrap()).unwrap();
-        let endpoint = serde_json::from_value(description["endpoint_key"].clone()).unwrap();
+        let _: [u8; 32] = serde_json::from_value(description["endpoint_key"].clone()).unwrap();
         // The runtime session is the administrator; the sender is a member.
-        let admin = Workspace::create(endpoint, "Admin").unwrap();
+        let secret = iroh::SecretKey::from_bytes(&root);
+        let admin =
+            Workspace::create(&arachne_node::IrohEndpointSigner(&secret), "Admin").unwrap();
+        let sender_key = arachne_security::EndpointKey::generate().unwrap();
+        let sender_endpoint = arachne_security::EndpointSigner::endpoint(&sender_key);
         let (registered, invitation, checkpoint) =
             admin.prepare_invitation(u64::MAX, false, false).unwrap();
         let admin = registered.workspace;
         let join =
-            PendingJoin::from_invitation(&invitation, &checkpoint, [106; 32], "Sender").unwrap();
+            PendingJoin::from_invitation(&invitation, &checkpoint, &sender_key, "Sender").unwrap();
         let prepared = admin
-            .prepare_admission([106; 32], join.admission_request().unwrap())
+            .prepare_admission(sender_endpoint, join.admission_request().unwrap())
             .unwrap();
         let mut proof = join.join_proof().unwrap();
         proof

@@ -115,7 +115,7 @@ async fn joiner(seed_index: u64, owner: &Owner) -> (Arc<Node>, Vec<u8>) {
         .unwrap();
     let invitation = Invitation::from_bytes(&owner.invitation).unwrap();
     let pending =
-        PendingJoin::from_invitation(&invitation, &owner.checkpoint, node.id(), "Joiner").unwrap();
+        PendingJoin::from_invitation(&invitation, &owner.checkpoint, &node, "Joiner").unwrap();
     let packet = admission_packet(pending.admission_request().unwrap(), "Joiner", &owner.checkpoint);
     node.add_address_hint(owner.peer, owner.address).await.unwrap();
     (Arc::new(node), packet)
@@ -161,7 +161,7 @@ fn queued_admission_rearms_the_host_for_staging() {
                 .unwrap();
             let invitation = Invitation::from_bytes(&invitation).unwrap();
             let pending =
-                PendingJoin::from_invitation(&invitation, &checkpoint, node.id(), "Joiner")
+                PendingJoin::from_invitation(&invitation, &checkpoint, &node, "Joiner")
                     .unwrap();
             let packet = admission_packet(
                 pending.admission_request().unwrap(),
@@ -220,7 +220,7 @@ fn rust_driver_commits_and_replies_without_host_candidate_steps() {
                 .await
                 .unwrap();
             let invitation = Invitation::from_bytes(&invitation).unwrap();
-            let pending = PendingJoin::from_invitation(&invitation, &checkpoint, node.id(), "Joiner").unwrap();
+            let pending = PendingJoin::from_invitation(&invitation, &checkpoint, &node, "Joiner").unwrap();
             let packet = admission_packet(pending.admission_request().unwrap(), "Joiner", &checkpoint);
             node.add_address_hint(peer, address).await.unwrap();
             reply_tx.send(node.request_control(peer, &packet).await).unwrap();
@@ -564,7 +564,7 @@ fn expired_admission_exchange_receives_a_pushed_result_without_retry() {
                 .await
                 .unwrap();
             let invitation = Invitation::from_bytes(&invitation).unwrap();
-            let pending = PendingJoin::from_invitation(&invitation, &checkpoint, node.id(), "Joiner").unwrap();
+            let pending = PendingJoin::from_invitation(&invitation, &checkpoint, &node, "Joiner").unwrap();
             let packet = admission_packet(pending.admission_request().unwrap(), "Joiner", &checkpoint);
             node.add_address_hint(peer, address).await.unwrap();
             let request = tokio::spawn(node.request_control(peer, &packet));

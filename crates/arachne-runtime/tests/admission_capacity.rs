@@ -110,11 +110,10 @@ fn public_runtime_admission_path_handles_500_authenticated_joiners() {
             let packets: Vec<_> = nodes
                 .iter()
                 .map(|node| {
-                    let peer = node.id();
                     let pending = PendingJoin::from_invitation(
                         &invitation,
                         &checkpoint,
-                        peer,
+                        &**node,
                         "Burst member",
                     )
                     .unwrap();

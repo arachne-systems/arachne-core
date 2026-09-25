@@ -361,8 +361,10 @@ fn epoch_zero_invitation_redeems_through_an_ordinary_member_with_the_issuer_offl
     );
     let mut tampered = reply["commits"].as_array().unwrap().clone();
     let last = tampered.len() - 1;
-    let byte = tampered[last]["commit"][0].as_u64().unwrap() ^ 1;
-    tampered[last]["commit"][0] = json!(byte);
+    // The last byte of a binary step is the last byte of its commit.
+    let end = tampered[last]["step"].as_array().unwrap().len() - 1;
+    let byte = tampered[last]["step"][end].as_u64().unwrap() ^ 1;
+    tampered[last]["step"][end] = json!(byte);
     assert!(
         call(
             ramp.late,

@@ -180,12 +180,9 @@ fn old_invitation_redeems_through_an_ordinary_member_with_issuer_closed() {
     // that helper had to apply.
     assert_eq!(steps.as_array().unwrap().len(), 3);
     let mut altered = steps.clone();
-    altered[0]["authorization"]["grant_signature"][0] = json!(
-        steps[0]["authorization"]["grant_signature"][0]
-            .as_u64()
-            .unwrap()
-            ^ 1
-    );
+    // Byte 39 of a binary step lies in its authorization fields (after
+    // `DFMS\x03`, tag, class and a 32-byte key or id).
+    altered[0]["step"][39] = json!(steps[0]["step"][39].as_u64().unwrap() ^ 1);
     assert!(
         call(
             late,

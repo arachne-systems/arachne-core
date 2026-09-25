@@ -154,7 +154,7 @@ pub(crate) fn create(session: &mut Session, args: CreateArgs) -> Result<Workspac
     }
     transition_activity(session, WorkspacePhase::Creating, None)?;
     let workspace = arachne_security::Workspace::create_named(
-        session.node.id(),
+        &session.node,
         &args.display_name,
         args.workspace_name.as_deref(),
     )

@@ -69,9 +69,42 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
     );
     let invite = issue(admin);
     let first = add(admin, helper, &invite, vec![], "Helper");
+    // Only administrators admit (ADR A2): the helper admits while the admin
+    // is away, so the admin promotes it first and the helper applies that.
+    let roster = call(admin, json!({"op":"member_roster"}));
+    let helper_id = roster["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|member| member["self"] == false)
+        .unwrap()["id"]
+        .clone();
+    let promotion = call(
+        admin,
+        json!({"op":"stage_management","action":{"kind":"promote","member":helper_id}}),
+    );
+    let promoted = call(
+        admin,
+        json!({"op":"adopt_admission","snapshot":promotion["snapshot"]}),
+    );
+    let promote_step = promoted["step"].clone();
+    let applied = call(
+        helper,
+        json!({"op":"stage_admission_update","step":promote_step}),
+    );
+    call(
+        helper,
+        json!({"op":"adopt_admission","snapshot":applied["snapshot"]}),
+    );
     let saved = call(admin, json!({"op":"seal_workspace"}));
     close(admin).unwrap();
-    let second = add(helper, newer, &invite, vec![step(&first)], "New member");
+    let second = add(
+        helper,
+        newer,
+        &invite,
+        vec![step(&first), promote_step],
+        "New member",
+    );
     close(helper).unwrap();
     let admin = create(Some(&[71; 32])).unwrap();
     call(
@@ -114,8 +147,9 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
             .iter()
             .map(|v| v.as_u64().unwrap() as u8),
     );
-    // Epoch 2: the link registration and the helper's admission come first.
-    packet.extend(2u64.to_be_bytes());
+    // Epoch 3: the link registration, the helper's admission and its
+    // promotion come first.
+    packet.extend(3u64.to_be_bytes());
     packet.extend(serde_json::to_vec(&altered).unwrap());
     let peer: [u8; 32] = info["endpoint_key"]
         .as_array()
@@ -145,7 +179,7 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
         execute(
             newer,
             &serde_json::to_vec(
-                &json!({"op":"offer_membership_update","peer":([99;32]),"after":2})
+                &json!({"op":"offer_membership_update","peer":([99;32]),"after":3})
             )
             .unwrap()
         )
@@ -172,7 +206,7 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
     outsider.join().unwrap();
     call(
         newer,
-        json!({"op":"offer_membership_update","peer":info["endpoint_key"],"after":2}),
+        json!({"op":"offer_membership_update","peer":info["endpoint_key"],"after":3}),
     );
     let candidate = poll(admin, "poll_admission");
     assert_eq!(candidate["state"], "awaiting_save");
@@ -182,7 +216,7 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
         json!({"op":"adopt_admission","snapshot":candidate["snapshot"]}),
     );
     assert_eq!(saved["members"], 3);
-    assert_eq!(saved["epoch"], 3);
+    assert_eq!(saved["epoch"], 4);
     assert_eq!(
         call(admin, json!({"op":"send_admission_reply"}))["queued"],
         true
@@ -194,7 +228,7 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
     // Replayed transition receives only a generic rejection, never duplicate membership.
     call(
         newer,
-        json!({"op":"offer_membership_update","peer":info["endpoint_key"],"after":2}),
+        json!({"op":"offer_membership_update","peer":info["endpoint_key"],"after":3}),
     );
     assert_eq!(poll(admin, "poll_admission")["state"], "membership_replied");
     poll(newer, "poll_membership_offer");

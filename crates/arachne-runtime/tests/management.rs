@@ -98,7 +98,7 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
         json!({"op":"adopt_admission","snapshot":change["snapshot"]}),
     )
     .unwrap();
-    assert_eq!(adopted["step"]["management"]["kind"], "promote");
+    assert_eq!(adopted["step"]["kind"], "promote");
     let step = pull(admin, helper, invite["peer"].clone());
     let roster = call(admin, json!({"op":"member_roster"})).unwrap();
     assert!(
@@ -257,14 +257,11 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
     let reply = retry.join().unwrap();
     let steps = reply.get("commits").expect("complete authorized history");
     assert_eq!(steps.as_array().unwrap().len(), 3);
-    assert_eq!(steps[1]["management"]["kind"], "promote");
+    assert_eq!(steps[1]["kind"], "promote");
     let mut altered = steps.clone();
-    altered[0]["authorization"]["grant_signature"][0] = json!(
-        steps[0]["authorization"]["grant_signature"][0]
-            .as_u64()
-            .unwrap()
-            ^ 1
-    );
+    // Byte 39 of a binary step lies in its authorization fields (after
+    // `DFMS\x03`, tag, class and a 32-byte key or id).
+    altered[0]["step"][39] = json!(steps[0]["step"][39].as_u64().unwrap() ^ 1);
     assert!(
         call(
             late,
@@ -340,7 +337,7 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
     )
     .unwrap();
     let removed_step = pull(helper, late, helper_peer);
-    assert_eq!(removed_step["management"]["kind"], "remove");
+    assert_eq!(removed_step["kind"], "remove");
     let removed = call(
         late,
         json!({"op":"stage_admission_update","step":removed_step}),
@@ -381,7 +378,7 @@ fn pull(responder: i64, receiver: i64, peer: Value) -> Value {
         let value = call(receiver, json!({"op":"poll_membership_update"})).unwrap();
         if value != Value::Null {
             assert_eq!(value["state"], "membership_update_available");
-            if value["step"]["management"]["kind"] == "remove" {
+            if value["step"]["kind"] == "remove" {
                 assert_eq!(
                     value["epoch"].as_u64().unwrap(),
                     value["after"].as_u64().unwrap() + 1
@@ -391,5 +388,82 @@ fn pull(responder: i64, receiver: i64, peer: Value) -> Value {
         }
         assert!(Instant::now() < deadline, "Membership update timed out");
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// ADR A2 section 7: only administrators admit. A member refuses both a
+/// host-staged admission and a joiner's request, with a distinct reason the
+/// joiner uses to ask its next member.
+#[test]
+fn a_member_that_is_not_an_administrator_refuses_admissions() {
+    let admin = create(Some(&[84; 32])).unwrap();
+    let member = create(Some(&[85; 32])).unwrap();
+    let late = create(Some(&[86; 32])).unwrap();
+    call(admin, json!({"op":"create_workspace","display_name":"Coordinator"})).unwrap();
+    let invite = issue(admin);
+    let begin = |handle, name| {
+        call(
+            handle,
+            json!({"op":"begin_join","invitation":invite["invitation"],
+                "checkpoint":invite["checkpoint"],"display_name":name}),
+        )
+        .unwrap()
+    };
+    let joined = begin(member, "Plain member");
+    let staged = call(
+        admin,
+        json!({"op":"stage_admission","authenticated_endpoint":joined["endpoint"],
+            "request":joined["admission_request"]}),
+    )
+    .unwrap();
+    call(admin, json!({"op":"adopt_admission","snapshot":staged["snapshot"]})).unwrap();
+    let reply = call(
+        admin,
+        json!({"op":"retained_admission","authenticated_endpoint":joined["endpoint"],
+            "request":joined["admission_request"]}),
+    )
+    .unwrap();
+    let staged = call(
+        member,
+        json!({"op":"stage_join","welcome":reply["welcome"],
+            "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}),
+    )
+    .unwrap();
+    call(member, json!({"op":"adopt_join","snapshot":staged["snapshot"]})).unwrap();
+
+    let asking = begin(late, "Late joiner");
+    let refused = execute(
+        member,
+        &serde_json::to_vec(&json!({"op":"stage_admission",
+            "authenticated_endpoint":asking["endpoint"],"request":asking["admission_request"]}))
+        .unwrap(),
+    )
+    .unwrap_err();
+    assert!(refused.contains("Only an administrator can admit members"), "{refused}");
+
+    let info: Value = serde_json::from_str(&describe(member).unwrap()).unwrap();
+    let address = info["bound_address"].as_str().unwrap().replace("0.0.0.0:", "127.0.0.1:");
+    call(late, json!({"op":"add_address_hint","peer":info["endpoint_key"],"address":address}))
+        .unwrap();
+    let peer = info["endpoint_key"].clone();
+    let asked = std::thread::spawn(move || {
+        call(late, json!({"op":"request_admission","peer":peer})).unwrap()
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let served = loop {
+        let value = call(member, json!({"op":"poll_admission"})).unwrap();
+        if value != Value::Null {
+            break value;
+        }
+        assert!(Instant::now() < deadline, "the member never saw the request");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(served["accepted"], false, "{served}");
+    assert_eq!(served["reason"], "administrator_required", "{served}");
+    let answer = asked.join().unwrap();
+    assert_eq!(answer["state"], "admission_unavailable", "{answer}");
+    assert_eq!(answer["reason"], "administrator_required", "{answer}");
+    for handle in [admin, member, late] {
+        close(handle).unwrap();
     }
 }

@@ -177,7 +177,8 @@ async fn bind_joiner(seed_index: u64, invitation: &Invitation, checkpoint: &[u8]
         .unwrap();
     let node = Arc::new(node);
     let peer = node.id();
-    let pending = PendingJoin::from_invitation(invitation, checkpoint, peer, "Staging member")
+    let _ = peer;
+    let pending = PendingJoin::from_invitation(invitation, checkpoint, &*node, "Staging member")
         .unwrap();
     let packet = admission_packet(
         pending.admission_request().unwrap(),

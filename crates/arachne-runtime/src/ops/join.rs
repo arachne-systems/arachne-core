@@ -212,14 +212,14 @@ pub(crate) fn begin(session: &mut Session, args: BeginJoinArgs) -> Result<Pendin
     let pending = if args.checkpoint.is_empty() {
         arachne_security::PendingJoin::from_compact_invitation(
             &invitation,
-            session.node.id(),
+            &session.node,
             &args.display_name,
         )
     } else {
         arachne_security::PendingJoin::from_invitation(
             &invitation,
             &args.checkpoint,
-            session.node.id(),
+            &session.node,
             &args.display_name,
         )
     }
@@ -321,8 +321,6 @@ pub(crate) fn stage(session: &mut Session, args: StageJoinArgs) -> Result<Staged
     let mut proof = pending
         .join_proof()
         .map_err(security(ErrorCode::InvitationInvalid))?;
-    let authorization =
-        |step: &JoinStep| step.authorization();
     // Replay the rolled-over prefix from the pinned checkpoint before the
     // chunk the host carried back. Nothing is accepted on the strength of
     // having been fetched earlier: a truncated or tampered prefix fails
@@ -330,13 +328,15 @@ pub(crate) fn stage(session: &mut Session, args: StageJoinArgs) -> Result<Staged
     for value in &session.join.history_prefix {
         let step: JoinStep = serde_json::from_value(value.clone())
             .map_err(|error| ApiError::internal(error.to_string()))?;
+        let (authorization, commit) = step.parts()?;
         proof
-            .apply_transition(&authorization(&step)?, &step.commit)
+            .apply_transition(&authorization, &commit)
             .map_err(security(ErrorCode::InvalidInput))?;
     }
     for step in commits {
+        let (authorization, commit) = step.parts()?;
         proof
-            .apply_transition(&authorization(&step)?, &step.commit)
+            .apply_transition(&authorization, &commit)
             .map_err(security(ErrorCode::InvalidInput))?;
     }
     let workspace = pending
@@ -713,6 +713,14 @@ pub(crate) fn drive(session: &mut Session) -> Result<Value, ApiError> {
     }
     if let Some(reply) = reply {
         if reply.get("state").is_some() {
+            // Only administrators admit: a member that is not one cannot
+            // help this join, so ask the next member.
+            if reply["reason"] == admission_state::ADMINISTRATOR_REQUIRED {
+                let session = live_mut(session)?;
+                let lifecycle = session.join.lifecycle.as_mut().ok_or_else(no_lifecycle)?;
+                lifecycle.advance();
+                commit_pending_join(session)?;
+            }
             return Ok(reply);
         }
         let bad_reply = |detail: &str| ApiError::transport_failed(None, detail);

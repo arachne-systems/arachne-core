@@ -16,6 +16,16 @@ impl arachne_security::EndpointSigner for IrohEndpointSigner<'_> {
     }
 }
 
+/// A node signs with its own endpoint key. The secret never leaves the node.
+impl arachne_security::EndpointSigner for super::Node {
+    fn endpoint(&self) -> [u8; 32] {
+        self.id()
+    }
+    fn sign_endpoint(&self, message: &[u8]) -> Result<[u8; 64], &'static str> {
+        IrohEndpointSigner(self.connections.endpoint().secret_key()).sign_endpoint(message)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
