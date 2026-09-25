@@ -49,6 +49,7 @@ and a different Core pin. Core work that each plan step depends on:
 - B3a: a host that passes the checkpoint inline in `begin_join` JSON hits the 128 KiB request cap near 120 members. SDK must use the compact path (invitation link + peers).
 - B3a: only the issuer, or a member whose join history starts at that checkpoint, can answer a join (narrower failover).
 - A3: ops removed `stage_publication`, `stage_reception`, `enable_object_delivery`, `poll_recovered_publication`; added `poll_pending_object`, `stage_object_acknowledgement`, `stage_object_rejection`.
+- A4: `Context`, `ContextConfig`, `Limits`, `PowerProfile`, `Client::open_in`, `wait_for_work(Option<Duration>)`, `wake`, `next_event`, `set_deadline`/`with_deadline`, `suspend`/`resume`; C-ABI handle fns `wait_for_work_timeout`, `wake`, `next_event`; `close` idempotent; `API_VERSION` 5.
 - T1: `TransportTimeouts` gains `close_drain` (breaking for struct literals).
 - B7c: new state `direct_recovery_awaiting_application`.
 - B7b: new recovery state `recovery_awaiting_application`, field `accepted_through`; `RecoveryStage::AwaitingApplication`.
@@ -66,7 +67,9 @@ and a different Core pin. Core work that each plan step depends on:
   - [ ] A3g: check that a large workspace plus a full attachment fits the store's 1 MiB record limit.
   - [ ] A3h: drop unused `serde_json` in `arachne-delivery`; run `cargo fmt` workspace-wide once branches settle.
   Original: Decouple delivery and routing from the exact epoch and policy revision.
-- [ ] **A4** Owned `Context`, event stream, `wait_for_work(timeout)`, `close(&self)`, suspend/resume.
+- [x] **A4** (`feat/a4-context`, 7 commits; ADR steps 3–4; default limits 64 sessions / 320 overlay paths accepted)
+  - [ ] A4b: mDNS has no pause API (iroh-mdns-address-lookup 0.5); suspend does not close idle connections; Low profile only slows presence; deadlines only on typed Client and only for outbound control exchanges; end-to-end event tests for MembershipChanged, ProtectedReceived, RecoveryReady, CurrentViewReady, Presence.
+  Original: Owned `Context`, event stream, `wait_for_work(timeout)`, `close(&self)`, suspend/resume.
 - [ ] **A5** One persistence mode behind a `Storage` trait; schema versions and migrations.
 - [x] **A6** (`fix/a3-delivery-epochs`; `docs/delivery.md`)
   Original: Delivery spec; per-author quotas; bitmap dedup; remove the legacy receive stack.
