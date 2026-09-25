@@ -1482,6 +1482,28 @@ impl Node {
         self.connections.mdns_state()
     }
 
+    /// Multiply background timer intervals (gossip shuffle, bootstrap
+    /// retries) by `scale` for a low-power host; 1 is normal. Overlays
+    /// built after the call use it; running ones keep theirs until rebuilt.
+    pub fn set_timer_scale(&self, scale: u32) {
+        self.connections.set_timer_scale(scale);
+    }
+
+    pub fn timer_scale(&self) -> u32 {
+        self.connections.timer_scale()
+    }
+
+    /// (HyParView shuffle interval, first bootstrap retry delay) of each
+    /// live overlay (a test and diagnostics hook).
+    pub async fn gossip_intervals(&self) -> Vec<(Duration, Duration)> {
+        self.overlays
+            .lock()
+            .await
+            .values()
+            .map(|overlay| overlay.intervals)
+            .collect()
+    }
+
     /// Open connections of this endpoint (a test and diagnostics hook).
     pub fn open_connections(&self) -> usize {
         self.connections.live_alpns().len()

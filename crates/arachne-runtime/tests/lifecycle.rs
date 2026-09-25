@@ -295,12 +295,29 @@ fn contexts_suspend_independently() {
 }
 
 #[test]
-fn low_power_lengthens_the_presence_interval() {
+fn low_power_slows_every_background_timer() {
     let normal = context();
     let low = Context::new(ContextConfig::default().with_power(PowerProfile::Low)).unwrap();
     assert_eq!(low.power(), PowerProfile::Low);
     assert_eq!(normal.power(), PowerProfile::Normal);
     assert!(low.presence_interval() > normal.presence_interval());
+    // The gossip overlays that run use the profile's shuffle and bootstrap
+    // retry intervals.
+    let mut clients = Vec::new();
+    for (seed, context) in [(121, &normal), (122, &low)] {
+        let client = context.open(direct(Some([seed; 32]))).unwrap();
+        let info = client.create_workspace("Owner", None).unwrap();
+        client.install_workspace_policy(info.epoch + 1).unwrap();
+        clients.push(client);
+    }
+    let normal_timers = normal.gossip_intervals();
+    let low_timers = low.gossip_intervals();
+    assert_eq!((normal_timers.len(), low_timers.len()), (1, 1));
+    let (normal_shuffle, normal_retry) = normal_timers[0];
+    let (low_shuffle, low_retry) = low_timers[0];
+    assert!(low_shuffle > normal_shuffle, "{low_shuffle:?} <= {normal_shuffle:?}");
+    assert!(low_retry > normal_retry, "{low_retry:?} <= {normal_retry:?}");
+    assert!(low.interest_retry() > normal.interest_retry());
 }
 
 #[test]

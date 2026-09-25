@@ -227,6 +227,7 @@ pub(crate) fn open(
         })
         .map_err(|_| ApiError::timeout(None, "node startup timed out"))?
         .map_err(errors::node)?;
+    node.set_timer_scale(context.timer_scale());
     let signal = Arc::new(work_signal::WorkSignal::default());
     let committed = committed_view::Published::new(Some(Arc::clone(&signal)));
     node.set_inquiry_responder(committed.responder());

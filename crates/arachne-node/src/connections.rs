@@ -200,6 +200,8 @@ pub(super) struct Connections {
     outgoing: Arc<Mutex<BTreeMap<PeerProtocol, CachedConnection>>>,
     nearby: Arc<Mutex<BTreeSet<PeerId>>>,
     mdns: Option<PausableMdns>,
+    /// Background timer multiplier: 1 normally, more in low power.
+    timer_scale: Arc<std::sync::atomic::AtomicU32>,
     /// Peers whose last dial failed: retry time and consecutive failures.
     /// Dials to offline members must not hold the few control dial slots.
     unreachable: Arc<Mutex<BTreeMap<PeerId, (Instant, u32)>>>,
@@ -313,6 +315,7 @@ impl Connections {
             outgoing: Arc::new(Mutex::new(BTreeMap::new())),
             nearby,
             mdns,
+            timer_scale: Arc::new(std::sync::atomic::AtomicU32::new(1)),
             unreachable: Arc::new(Mutex::new(BTreeMap::new())),
             address_lookup: mdns_service.is_some() || plan.public_lookup || profile.uses_tor(),
             use_ip_hints,
@@ -700,6 +703,15 @@ impl Connections {
             }
         }
         closed
+    }
+
+    pub(super) fn timer_scale(&self) -> u32 {
+        self.timer_scale.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(super) fn set_timer_scale(&self, scale: u32) {
+        self.timer_scale
+            .store(scale.max(1), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Stop the mDNS service (suspend). Local lookups and announcements end.

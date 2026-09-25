@@ -7,6 +7,11 @@ use std::time::Instant;
 const MAX_INTERESTS: usize = 64;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 
+/// The retry delay at a background timer scale (1 normally).
+pub(crate) fn retry_delay(scale: u32) -> Duration {
+    RETRY_DELAY * scale.max(1)
+}
+
 #[derive(Clone)]
 pub(super) struct Update {
     pub workspace: [u8; 32],
@@ -158,7 +163,7 @@ impl Updates {
             match runtime.block_on(&mut job.task) {
                 Ok(Ok(outcome)) => {
                     if !outcome.failed.is_empty() {
-                        self.retry_at = Some(Instant::now() + RETRY_DELAY);
+                        self.retry_at = Some(Instant::now() + retry_delay(node.timer_scale()));
                     }
                     let withdrawal_observed = !job.update.subscribed && outcome.failed.is_empty();
                     value["admission"] = report_value(outcome);
@@ -175,7 +180,7 @@ impl Updates {
                     }
                 }
                 other => {
-                    self.retry_at = Some(Instant::now() + RETRY_DELAY);
+                    self.retry_at = Some(Instant::now() + retry_delay(node.timer_scale()));
                     value["state"] = json!("interest_failed");
                     value["error"] = json!(format!("{other:?}"));
                 }

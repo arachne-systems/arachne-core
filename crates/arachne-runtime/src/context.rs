@@ -49,7 +49,10 @@ impl Default for RuntimeConfig {
 pub struct ContextConfig {
     pub limits: Limits,
     pub runtime: RuntimeConfig,
-    /// `Low` lengthens background intervals for a host in the background.
+    /// `Low` multiplies background intervals by 4 for a host in the
+    /// background: presence rounds, HyParView shuffles, gossip bootstrap
+    /// retries and interest retries. The mDNS announce cadence is fixed by
+    /// its crate; `suspend` stops mDNS instead.
     pub power: PowerProfile,
 }
 
@@ -271,6 +274,34 @@ impl Context {
                     .map_or((0, 0), |session| session.node.mdns_state())
             })
             .fold((0, 0), |(a, b), (c, d)| (a + c, b + d))
+    }
+
+    /// (HyParView shuffle interval, first bootstrap retry delay) of every
+    /// live gossip overlay (a test and diagnostics hook).
+    #[doc(hidden)]
+    pub fn gossip_intervals(&self) -> Vec<(std::time::Duration, std::time::Duration)> {
+        self.sessions()
+            .into_iter()
+            .flat_map(|shared| {
+                let Ok(guard) = shared.lock() else { return Vec::new() };
+                guard.as_ref().map_or_else(Vec::new, |session| {
+                    self.handle.block_on(session.node.gossip_intervals())
+                })
+            })
+            .collect()
+    }
+
+    /// How long a failed interest announcement waits before it retries.
+    pub fn interest_retry(&self) -> std::time::Duration {
+        crate::interest::retry_delay(self.timer_scale())
+    }
+
+    /// Background timer multiplier of this context's power profile.
+    pub(crate) fn timer_scale(&self) -> u32 {
+        match self.power {
+            PowerProfile::Low => LOW_POWER_FACTOR,
+            _ => 1,
+        }
     }
 
     /// Open connections of all sessions (a test and diagnostics hook).
