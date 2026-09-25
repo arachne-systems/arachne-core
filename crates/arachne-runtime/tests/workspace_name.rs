@@ -172,10 +172,11 @@ fn rename_preserves_legacy_and_native_pending_delivery_across_interruption() {
         bytes(&call(handle, json!({"op":"poll_pending_object"})).unwrap()["payload"]),
         b"Unread incoming chat"
     );
-    // The rename kept the pending delivery state byte for byte.
+    // The rename kept the pending delivery state byte for byte (a stored
+    // value starts with a one-byte tag: 0 is the whole value).
     assert_eq!(
         provider.value(workspace, b"delivery/inbox").unwrap(),
-        original_delivery
+        [&[0u8][..], &original_delivery].concat()
     );
     close(handle).unwrap();
     handle = common::stored(&root, &provider);
