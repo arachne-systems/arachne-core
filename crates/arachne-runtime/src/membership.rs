@@ -1083,9 +1083,15 @@ fn queue_membership_offer(
         &commit,
         requires_adoption,
     )?;
-    let task = session
-        .runtime
-        .spawn(session.node.request_control(peer, &packet));
+    // The outcome wakes the host drain, as a query reply does: a staged
+    // self-update waits on it (B3c).
+    let request = session.node.request_control(peer, &packet);
+    let wake = session.node.control_signal();
+    let task = session.runtime.spawn(async move {
+        let reply = request.await;
+        wake.notify_one();
+        reply
+    });
     session.membership.offer = Some(PendingControl {
         query: after,
         peer,
