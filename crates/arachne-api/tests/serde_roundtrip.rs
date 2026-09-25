@@ -85,14 +85,20 @@ fn network_includes_tor_in_every_build() {
 
 #[test]
 fn event_round_trips() {
-    for event in [Event::AdmissionRequest, Event::Presence, Event::Closed] {
+    for event in [
+        Event::AdmissionRequest,
+        Event::Presence,
+        Event::Closed,
+        Event::Control,
+        Event::PublicationReceived,
+    ] {
         assert_eq!(round_trip(&event), event);
     }
 }
 
 #[test]
 fn capabilities_carry_the_api_version() {
-    assert_eq!(API_VERSION, 3, "bump deliberately with the change log");
+    assert_eq!(API_VERSION, 4, "bump deliberately with the change log");
     let caps = Capabilities::new(
         vec![Network::Direct, Network::Lan],
         vec![Feature::ResourceTransfer],
@@ -108,4 +114,13 @@ fn limits_round_trip_and_default_above_the_old_cap() {
     assert_eq!(limits.max_overlay_paths, limits.max_sessions * 5);
     let small = limits.with_max_sessions(2).with_max_overlay_paths(10);
     assert_eq!(round_trip(&small), small);
+}
+
+#[test]
+fn new_event_wire_names_are_stable() {
+    assert_eq!(serde_json::to_value(Event::Control).unwrap(), json!({"kind": "control"}));
+    assert_eq!(
+        serde_json::to_value(Event::PublicationReceived).unwrap(),
+        json!({"kind": "publication_received"})
+    );
 }

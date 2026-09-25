@@ -1389,6 +1389,17 @@ impl Node {
 
     /// Release the transport. Waits at most `Timeouts::close_drain` for peers
     /// to acknowledge the close, then finishes the local teardown.
+    /// Control requests wait (new arrivals, not the ones set aside).
+    /// Nothing is consumed; for `next_event`.
+    pub fn has_queued_controls(&self) -> bool {
+        !self.controls.is_empty()
+    }
+
+    /// Membership steps from gossip wait for the host. Nothing is consumed.
+    pub fn has_membership_gossip(&self) -> bool {
+        self.membership.has_pending()
+    }
+
     pub async fn close(mut self) {
         self.resources.close().await;
         self.overlays.lock().await.clear();

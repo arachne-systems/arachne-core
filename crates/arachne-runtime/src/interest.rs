@@ -35,6 +35,11 @@ pub(super) struct Updates {
 }
 
 impl Updates {
+    /// An announcement ended and `poll` has its result.
+    pub fn has_result(&self) -> bool {
+        self.pending.as_ref().is_some_and(|job| job.task.is_finished())
+    }
+
     pub fn is_idle(&self) -> bool {
         self.pending.is_none() && self.queued.is_empty() && self.repair.is_empty()
     }

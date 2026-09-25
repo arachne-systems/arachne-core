@@ -142,6 +142,10 @@ impl MembershipInbox {
         self.signal.notify_one();
     }
 
+    pub(super) fn has_pending(&self) -> bool {
+        self.queues.lock().unwrap().total != 0
+    }
+
     pub(super) fn pop(&self) -> Option<(WorkspaceId, Vec<u8>)> {
         self.queues.lock().unwrap().take(|_| true)
     }

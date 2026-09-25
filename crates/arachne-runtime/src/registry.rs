@@ -356,6 +356,17 @@ pub fn wake(handle: i64) -> Result<(), String> {
     wake_session(handle).map_err(errors::text)
 }
 
+/// The next event of this session as JSON (`{"kind": ...}`), or `None`
+/// when `timeout_ms` passed, `wake` was called, or the session closed while
+/// it waited.
+pub fn next_event(handle: i64, timeout_ms: u64) -> Result<Option<String>, String> {
+    let event = crate::events::next(handle, Some(Duration::from_millis(timeout_ms)))
+        .map_err(errors::text)?;
+    event
+        .map(|event| serde_json::to_string(&event).map_err(|error| error.to_string()))
+        .transpose()
+}
+
 pub(crate) fn wait_session_for(handle: i64, timeout: Option<Duration>) -> Result<bool, ApiError> {
     let signal = Arc::clone(&entry(handle)?.signal);
     Ok(signal.wait_for(timeout) == work_signal::Wake::Work)

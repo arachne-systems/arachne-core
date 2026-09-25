@@ -129,6 +129,8 @@ pub(crate) struct Session {
     /// Set by an op that ended the session (a removal was adopted or
     /// restored). `ops::run` then takes the session and shuts it down.
     pub(crate) ending: bool,
+    /// Ready jobs `next_event` already reported.
+    pub(crate) events: crate::events::Reported,
     /// The owning context. Last, so the node closes before a context that
     /// this session keeps alive drops its runtime.
     pub(crate) context: Arc<crate::context::Context>,
@@ -302,6 +304,7 @@ impl Session {
             presence,
             interests: interest::Updates::default(),
             ending: false,
+            events: Default::default(),
             context,
         }
     }

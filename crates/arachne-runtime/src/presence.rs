@@ -50,6 +50,16 @@ impl Presence {
         self.queued.clear();
     }
 
+    /// Requests in flight.
+    pub(crate) fn in_flight_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// A request ended and a presence round has its answer.
+    pub(crate) fn has_result(&self) -> bool {
+        self.pending.iter().any(|request| request.task.is_finished())
+    }
+
     pub(super) fn announce_next(&mut self) {
         self.announce = true;
         self.next = None;

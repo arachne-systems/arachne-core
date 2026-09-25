@@ -3,7 +3,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use arachne_api::{ApiError, ErrorCode};
+use arachne_api::{ApiError, ErrorCode, Event};
 
 use crate::ops::{self, Op, admission, candidate, invitation, join, management, publication, receive};
 use crate::persistence;
@@ -1591,6 +1591,15 @@ impl Client {
     /// for example at host shutdown.
     pub fn wake(&self) -> Result<()> {
         Ok(crate::registry::wake_session(self.handle()?)?)
+    }
+
+    /// The next event of any queue, up to `timeout` (`None`: no timeout).
+    /// `Ok(None)`: the timeout passed, `wake` was called, or the client
+    /// closed while it waited. Queue events repeat until the host drains
+    /// the queue with its poll call; a ready job reports once. After
+    /// `close`, it fails with `Closed`.
+    pub fn next_event(&self, timeout: Option<std::time::Duration>) -> Result<Option<Event>> {
+        Ok(crate::events::next(self.handle()?, timeout)?)
     }
 
     /// Give each later blocking op this deadline. At the deadline the op

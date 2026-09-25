@@ -5,8 +5,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arachne_runtime::{
-    Client, ClientConfig, Context, ContextConfig, ErrorCode, Network, TransportOptions,
-    TransportTimeouts,
+    Client, ClientConfig, Context, ContextConfig, ErrorCode, Event, Network, PeerPolicy,
+    TransportOptions, TransportTimeouts,
 };
 
 fn context() -> Arc<Context> {
@@ -112,4 +112,118 @@ fn a_per_op_deadline_fails_the_op_and_keeps_the_session() {
     let error = client.send_nearby_invitation(peer, &[7; 16]).unwrap_err();
     assert_eq!(error.code(), ErrorCode::DeadlineExceeded, "{error}");
     assert!(started.elapsed() >= Duration::from_millis(250));
+}
+
+#[test]
+fn close_from_another_thread_releases_a_parked_next_event() {
+    let context = context();
+    let client = Arc::new(context.open(direct(None)).unwrap());
+    let parked = Arc::clone(&client);
+    let waiter = thread::spawn(move || parked.next_event(Some(Duration::from_secs(30))));
+    thread::sleep(Duration::from_millis(200));
+    let closing = Instant::now();
+    client.close().unwrap();
+    assert_eq!(waiter.join().unwrap().unwrap(), None);
+    assert!(closing.elapsed() < Duration::from_secs(2));
+    let error = client.next_event(Some(Duration::ZERO)).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Closed);
+}
+
+#[test]
+fn next_event_times_out_and_wakes_with_none() {
+    let context = context();
+    let client = Arc::new(context.open(direct(None)).unwrap());
+    let started = Instant::now();
+    assert_eq!(client.next_event(Some(Duration::from_millis(100))).unwrap(), None);
+    assert!(started.elapsed() >= Duration::from_millis(100));
+    let parked = Arc::clone(&client);
+    let waiter = thread::spawn(move || parked.next_event(Some(Duration::from_secs(30))));
+    thread::sleep(Duration::from_millis(100));
+    client.wake().unwrap();
+    assert_eq!(waiter.join().unwrap().unwrap(), None);
+}
+
+#[test]
+fn next_event_reports_a_control_request() {
+    let context = context();
+    let owner = context.open(direct(Some([81; 32]))).unwrap();
+    owner.create_workspace("Event owner", Some("Events")).unwrap();
+    let peer = owner.endpoint().unwrap().endpoint_key;
+    let address: std::net::SocketAddr = local(&owner).parse().unwrap();
+    let sender = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let (node, _) = arachne_node::Node::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            node.add_address_hint(peer, address).await.unwrap();
+            node.request_control(peer, b"DFND\x01").await.unwrap()
+        })
+    });
+    assert_eq!(
+        owner.next_event(Some(Duration::from_secs(10))).unwrap(),
+        Some(Event::Control)
+    );
+    assert!(owner.poll_control().unwrap());
+    sender.join().unwrap();
+    assert_eq!(owner.next_event(Some(Duration::from_millis(100))).unwrap(), None);
+}
+
+#[test]
+fn next_event_reports_interest_and_publication() {
+    let context = context();
+    let publisher = context.open(direct(Some([71; 32]))).unwrap();
+    let subscriber = context.open(direct(Some([72; 32]))).unwrap();
+    let publisher_key = publisher.endpoint().unwrap().endpoint_key;
+    let subscriber_key = subscriber.endpoint().unwrap().endpoint_key;
+    let workspace = [73; 32];
+    let topic = "streams/events";
+    let policy = [
+        PeerPolicy {
+            peer: publisher_key,
+            publish: vec![topic.into()],
+            subscribe: Vec::new(),
+        },
+        PeerPolicy {
+            peer: subscriber_key,
+            publish: Vec::new(),
+            subscribe: vec![topic.into()],
+        },
+    ];
+    publisher
+        .add_address_hint(subscriber_key, &local(&subscriber))
+        .unwrap();
+    subscriber
+        .add_address_hint(publisher_key, &local(&publisher))
+        .unwrap();
+    publisher.install_policy(workspace, 1, &policy).unwrap();
+    subscriber.install_policy(workspace, 1, &policy).unwrap();
+    subscriber.set_interest(workspace, 1, topic, true).unwrap();
+
+    // `set_interest` starts the announcement in the background; its end is
+    // an event, and `poll_interest` reads its result.
+    assert_eq!(
+        subscriber.next_event(Some(Duration::from_secs(10))).unwrap(),
+        Some(Event::InterestChanged)
+    );
+    let observation = subscriber.poll_interest().unwrap().expect("interest result");
+    assert!(observation.admission.failed.is_empty());
+    // A ready job reports once.
+    assert_eq!(subscriber.next_event(Some(Duration::from_millis(200))).unwrap(), None);
+
+    publisher.publish(workspace, 1, topic, vec![1, 2, 3]).unwrap();
+    assert_eq!(
+        subscriber.next_event(Some(Duration::from_secs(10))).unwrap(),
+        Some(Event::PublicationReceived)
+    );
+    // A queue reports until it is drained.
+    assert_eq!(
+        subscriber.next_event(Some(Duration::ZERO)).unwrap(),
+        Some(Event::PublicationReceived)
+    );
+    assert_eq!(subscriber.poll().unwrap().unwrap().payload, vec![1, 2, 3]);
+    assert_eq!(subscriber.next_event(Some(Duration::from_millis(100))).unwrap(), None);
 }
