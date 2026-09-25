@@ -2957,13 +2957,25 @@ pub(crate) fn start_self_update(
             endpoint: member.endpoint,
             preferred: presence::contact_age(&session.presence, member.endpoint, now)
                 .is_some_and(|age| age < MEMBERSHIP_PEER_RECENT),
-            cooling: session.membership.peer_failures.contains_key(&member.endpoint),
+            cooling: session
+                .membership
+                .peer_failures
+                .get(&member.endpoint)
+                .is_some_and(|failed| {
+                    now.saturating_duration_since(*failed) < MEMBERSHIP_PEER_COOLDOWN
+                }),
         })
         .collect();
     admins.sort_unstable_by_key(|peer| peer.endpoint);
     let peer = choose_membership_peer(&admins, None);
-    if peer.is_none() && !administrator {
-        // No administrator to accept it: try again later.
+    // Every administrator failed recently (for example all are offline):
+    // defer without staging, so gossip and range steps keep landing.
+    let reachable = peer.is_some_and(|peer| {
+        admins
+            .iter()
+            .any(|admin| admin.endpoint == peer && !admin.cooling)
+    });
+    if !reachable && (peer.is_some() || !administrator) {
         session.membership.self_update.refused(now);
         return Ok(None);
     }
@@ -3017,13 +3029,13 @@ pub(crate) fn start_self_update(
         session.membership.self_update.refused(now);
         return Err(error);
     }
-    session.membership.self_update_offered = true;
+    session.membership.self_update_offered = Some(peer);
     Ok(Some(json!({"state":"self_update_offered","peer":peer})))
 }
 
 /// This member's self-update offer is still out.
 pub(crate) fn self_update_pending(session: &Session) -> bool {
-    session.membership.self_update_offered
+    session.membership.self_update_offered.is_some()
 }
 
 /// The outcome of this member's self-update offer, once it finished:
@@ -3034,16 +3046,21 @@ pub(crate) fn finish_self_update_offer(
     session: &mut Session,
     now: std::time::Instant,
 ) -> Option<bool> {
-    if !session.membership.self_update_offered {
-        return None;
-    }
+    let peer = session.membership.self_update_offered?;
     let outcome = poll_with_budget(session, Reconcile::PollOffer, MAX_PROFILE_SET_BYTES);
     if matches!(outcome, Ok(Value::Null)) {
         return None;
     }
-    session.membership.self_update_offered = false;
+    session.membership.self_update_offered = None;
     let accepted = outcome.is_ok();
     if !accepted {
+        // Unreachable (not a refusal): try another administrator next time.
+        if outcome
+            .as_ref()
+            .is_err_and(|error| error.code() != ErrorCode::NotAuthorized)
+        {
+            session.membership.peer_failures.insert(peer, now);
+        }
         if matches!(
             session.transition.staged.as_ref().map(|staged| &staged.transition),
             Some(WorkspaceTransition::SelfUpdate(_))
@@ -3500,4 +3517,25 @@ fn a_registration_and_remove_past_785_members_succeed_after_self_updates() {
         assert_eq!(receiver.epoch_fingerprint(), owner.epoch_fingerprint());
     }
     eprintln!("B3c runtime: commit sizes {sizes:?}, total {:?}", started.elapsed());
+}
+
+/// A member whose administrators all failed recently defers its
+/// self-update without staging, so steps keep landing while the
+/// administrators are offline (B3c policy).
+#[test]
+fn a_self_update_waits_while_every_administrator_is_unreachable() {
+    let (owner, members, _) = admit_members(41, "Waiting member", 1);
+    let admin = owner.endpoint();
+    let mut session = bare_test_session(members.into_iter().next().unwrap());
+    let now = std::time::Instant::now();
+    session.membership.peer_failures.insert(admin, now);
+    assert!(start_self_update(&mut session, now).unwrap().is_none());
+    assert!(session.transition.staged.is_none());
+    // Deferred, not retried at once.
+    session.membership.peer_failures.clear();
+    assert!(start_self_update(&mut session, now).unwrap().is_none());
+    // Due again after the wait: it goes on to stage (this bare session has
+    // no storage key, so staging reports that).
+    let later = now + self_update::SELF_UPDATE_RETRY;
+    assert!(start_self_update(&mut session, later).is_err());
 }
