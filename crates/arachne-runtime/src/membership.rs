@@ -4,6 +4,7 @@ use super::*;
 use crate::errors::{self, security};
 use crate::ops::management::{StagedCandidate, StagedChange, StagedRemoval};
 use arachne_api::{ApiError, ErrorCode};
+pub(crate) mod self_update;
 pub(crate) mod wire;
 pub(super) use wire::encode_reply;
 
@@ -2903,6 +2904,152 @@ pub(super) fn stage_prepared(
         snapshot,
     });
     Ok(value)
+}
+
+/// Start this member's self-update when the policy says it is due (B3c,
+/// ADR A2 section 7). Returns `None` when nothing starts.
+///
+/// The member stages its update path commit and offers it to an
+/// administrator, who must adopt it before the member does (the staged
+/// offer handshake). Until fork resolution exists (ADR A2 steps 8-13), a
+/// local self-update that raced an administrator's commit at the same epoch
+/// would strand this member on a losing branch. The only administrator
+/// stages its own and adopts it directly. Only a node that has reached the
+/// newest head it heard starts one.
+pub(crate) fn start_self_update(
+    session: &mut Session,
+    now: std::time::Instant,
+) -> Result<Option<Value>, ApiError> {
+    if crate::ops::admission_busy(session)
+        || session.membership.offer.is_some()
+        || !session.membership.steps_ahead.is_empty()
+        || session.membership.range_pull.is_some()
+    {
+        return Ok(None);
+    }
+    let Some(owner) = session.workspace.as_ref() else {
+        return Ok(None);
+    };
+    if session
+        .membership
+        .head
+        .as_ref()
+        .is_some_and(|(head, _)| *head > owner.epoch())
+        || !session
+            .membership
+            .self_update
+            .due(now, owner.needs_self_update())
+    {
+        return Ok(None);
+    }
+    let own = owner.member().map(|member| member.id());
+    let roster = owner.member_roster().map_err(security(ErrorCode::Internal))?;
+    let administrator = roster
+        .iter()
+        .any(|member| Some(member.id) == own && member.administrator);
+    let mut admins: Vec<PeerChoice> = roster
+        .iter()
+        .filter(|member| member.administrator && Some(member.id) != own)
+        .map(|member| PeerChoice {
+            endpoint: member.endpoint,
+            preferred: presence::contact_age(&session.presence, member.endpoint, now)
+                .is_some_and(|age| age < MEMBERSHIP_PEER_RECENT),
+            cooling: session.membership.peer_failures.contains_key(&member.endpoint),
+        })
+        .collect();
+    admins.sort_unstable_by_key(|peer| peer.endpoint);
+    let peer = choose_membership_peer(&admins, None);
+    if peer.is_none() && !administrator {
+        // No administrator to accept it: try again later.
+        session.membership.self_update.refused(now);
+        return Ok(None);
+    }
+    let epoch = owner.epoch();
+    let prepared = owner
+        .prepare_self_update()
+        .map_err(security(ErrorCode::Internal))?;
+    encode_step(&arachne_security::MembershipAuthorization::SelfUpdate, &prepared.commit)?;
+    let (publisher, inbox) = super::carry_delivery(session, &prepared.workspace)?;
+    let snapshot = seal_state(
+        session.records.is_some(),
+        &prepared.workspace,
+        session
+            .storage_key
+            .as_ref()
+            .ok_or_else(errors::no_root_key)?,
+        publisher.as_ref(),
+        inbox.as_ref(),
+    )?;
+    let mut value = serde_json::to_value(StagedCandidate::new(
+        prepared.workspace.id(),
+        prepared
+            .workspace
+            .workspace_name()
+            .map_err(security(ErrorCode::Internal))?,
+        snapshot.clone(),
+    ))
+    .map_err(errors::encode)?;
+    value["self_update"] = json!(true);
+    let commit = prepared.commit.clone();
+    session.transition.staged = Some(StagedWorkspace {
+        publisher,
+        inbox,
+        transition: WorkspaceTransition::SelfUpdate(prepared.commit),
+        workspace: prepared.workspace,
+        snapshot,
+    });
+    let Some(peer) = peer else {
+        // The only administrator: no one else commits at this epoch.
+        return Ok(Some(value));
+    };
+    if let Err(error) = queue_membership_offer(
+        session,
+        peer,
+        epoch,
+        arachne_security::MembershipAuthorization::SelfUpdate,
+        commit,
+        true,
+    ) {
+        session.transition.staged = None;
+        session.membership.self_update.refused(now);
+        return Err(error);
+    }
+    session.membership.self_update_offered = true;
+    Ok(Some(json!({"state":"self_update_offered","peer":peer})))
+}
+
+/// This member's self-update offer is still out.
+pub(crate) fn self_update_pending(session: &Session) -> bool {
+    session.membership.self_update_offered
+}
+
+/// The outcome of this member's self-update offer, once it finished:
+/// `Some(true)` when the administrator adopted it (the staged candidate may
+/// now be saved and adopted), `Some(false)` when it was refused or failed
+/// (the candidate is discarded). `None` while it is pending.
+pub(crate) fn finish_self_update_offer(
+    session: &mut Session,
+    now: std::time::Instant,
+) -> Option<bool> {
+    if !session.membership.self_update_offered {
+        return None;
+    }
+    let outcome = poll_with_budget(session, Reconcile::PollOffer, MAX_PROFILE_SET_BYTES);
+    if matches!(outcome, Ok(Value::Null)) {
+        return None;
+    }
+    session.membership.self_update_offered = false;
+    let accepted = outcome.is_ok();
+    if !accepted {
+        if matches!(
+            session.transition.staged.as_ref().map(|staged| &staged.transition),
+            Some(WorkspaceTransition::SelfUpdate(_))
+        ) {
+            session.transition.staged = None;
+        }
+        session.membership.self_update.refused(now);
+    }
+    Some(accepted)
 }
 
 /// `DFLV\x02 | u64 epoch | revocation order`: a signed departure that the

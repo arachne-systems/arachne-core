@@ -480,6 +480,17 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
             "workspace lifecycle requires native record storage",
         ));
     }
+    // This member's self-update offer: adopt once an administrator adopted
+    // it, or drop it when refused (B3c).
+    let now = std::time::Instant::now();
+    match membership::finish_self_update_offer(live_mut(session)?, now) {
+        Some(true) => return commit_self_update(session, now),
+        Some(false) => {
+            return Ok(json!({"state":"self_update_refused",
+                "activity":activity_value(live(session)?)}));
+        }
+        None => {}
+    }
     let mut staged = ops::nested(session, Op::PollAdmission, |session| {
         poll(session, PollAdmissionArgs { profile: false })
     })?;
@@ -502,6 +513,12 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
         if staged_state.is_some() {
             staged["activity"] = activity_value(live(session)?);
             return Ok(staged);
+        }
+        // The staged self-update waits for its administrator; membership
+        // queries wait until it is adopted or dropped.
+        if membership::self_update_pending(live(session)?) {
+            return Ok(json!({"state":"self_update_pending",
+                "activity":activity_value(live(session)?)}));
         }
         let membership = ops::nested(live_mut(session)?, Op::PollMembershipUpdate, |session| {
             ops::membership::poll_update(session)
@@ -562,6 +579,17 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
             membership["activity"] = activity_value(live(session)?);
             return Ok(membership);
         }
+        // Nothing else to do this tick: a self-update, when one is due.
+        if !membership::self_update_pending(live(session)?)
+            && let Some(started) = membership::start_self_update(live_mut(session)?, now)?
+        {
+            if started["state"] == "awaiting_save" {
+                return commit_self_update(session, now);
+            }
+            let mut started = started;
+            started["activity"] = activity_value(live(session)?);
+            return Ok(started);
+        }
         staged["activity"] = activity_value(live(session)?);
         return Ok(staged);
     }
@@ -574,6 +602,22 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
         committed["reply_queued"] = json!(reply.queued);
     }
     committed["state"] = json!("workspace_committed");
+    committed["activity"] = activity_value(live(session)?);
+    Ok(committed)
+}
+
+/// Save and adopt this member's staged self-update, then announce the head.
+fn commit_self_update(session: &mut Session, now: std::time::Instant) -> Result<Value, ApiError> {
+    let snapshot = live(session)?
+        .transition
+        .staged
+        .as_ref()
+        .map(|staged| staged.snapshot.clone())
+        .ok_or_else(|| ApiError::wrong_state("self update candidate is gone"))?;
+    persistence::commit_candidate(live_mut(session)?, &snapshot)?;
+    let mut committed = adopt_admission_value(session, snapshot)?;
+    live_mut(session)?.membership.self_update.updated(now);
+    committed["state"] = json!("self_update_committed");
     committed["activity"] = activity_value(live(session)?);
     Ok(committed)
 }

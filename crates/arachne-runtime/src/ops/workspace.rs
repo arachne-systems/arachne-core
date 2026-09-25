@@ -315,6 +315,7 @@ pub(crate) fn discard_candidate(session: &mut Session) -> Result<Discarded, ApiE
     let discarded = session.transition.staged.take().is_some();
     let offer_cancelled = session.membership.offer.take().is_some();
     session.membership.offer_requires_adoption = false;
+    session.membership.self_update_offered = false;
     session.membership.staged_step_received = false;
     Ok(Discarded {
         state: "workspace_candidate_discarded",

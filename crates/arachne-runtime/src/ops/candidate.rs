@@ -44,6 +44,7 @@ impl AdoptKind {
                 WorkspaceTransition::Admission
                     | WorkspaceTransition::Management(..)
                     | WorkspaceTransition::WorkspaceName
+                    | WorkspaceTransition::SelfUpdate(_)
                     | WorkspaceTransition::Invitation(..)
             ) | (AdoptKind::Join, WorkspaceTransition::Join)
                 | (
@@ -284,7 +285,10 @@ pub(crate) fn adopt(
     // A step this node committed goes out by gossip. A step it
     // received from a peer is already travelling; gossip relays it.
     let received = std::mem::take(&mut session.membership.staged_step_received);
-    let committed_here = matches!(staged.transition, WorkspaceTransition::Admission) && !received;
+    let committed_here = matches!(
+        staged.transition,
+        WorkspaceTransition::Admission | WorkspaceTransition::SelfUpdate(_)
+    ) && !received;
     match staged.transition {
         WorkspaceTransition::Inbox => value.state = Some("inbox_adopted"),
         WorkspaceTransition::InboxRejected => value.state = Some("inbox_rejection_adopted"),
@@ -412,6 +416,12 @@ pub(crate) fn adopt(
             value.results_pushed = Some(pushed);
         }
         WorkspaceTransition::WorkspaceName => {}
+        WorkspaceTransition::SelfUpdate(commit) => {
+            value.step = Some(membership::step_json(
+                &arachne_security::MembershipAuthorization::SelfUpdate,
+                &commit,
+            ));
+        }
         WorkspaceTransition::Join => {
             session.join.pending = None;
             session.join.lifecycle = None;

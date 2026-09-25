@@ -52,6 +52,8 @@ pub(crate) enum WorkspaceTransition {
         Vec<u8>,
     ),
     WorkspaceName,
+    /// This member's own self-update commit (ADR A2 step 5).
+    SelfUpdate(Vec<u8>),
     Invitation(
         Box<arachne_security::Invitation>,
         Vec<u8>,
@@ -226,6 +228,10 @@ pub(crate) struct MembershipState {
     /// Retained member profiles, shared with the inquiry responder.
     pub(crate) profiles: membership::Profiles,
     pub(crate) peer_profile_summaries: BTreeMap<[u8; 32], [u8; 32]>,
+    /// When this member self-updates next (B3c).
+    pub(crate) self_update: membership::self_update::SelfUpdatePolicy,
+    /// The pending staged offer is this member's own self-update.
+    pub(crate) self_update_offered: bool,
 }
 
 impl MembershipState {
@@ -245,6 +251,8 @@ impl MembershipState {
             profiles_pending: VecDeque::new(),
             profiles,
             peer_profile_summaries: BTreeMap::new(),
+            self_update: membership::self_update::SelfUpdatePolicy::new(std::time::Instant::now()),
+            self_update_offered: false,
         }
     }
 }
