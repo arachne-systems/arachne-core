@@ -867,6 +867,19 @@ impl Client {
         Ok(self.call(Op::ResetWorkspace, ops::workspace::reset)?.changed)
     }
 
+    /// Members whose leaf still comes from their KeyPackage: they never
+    /// self-updated. Each adds about 82 bytes to every management commit
+    /// (B3c), so a host can predict commit size and nudge those members.
+    pub fn members_without_self_update(&self) -> Result<usize> {
+        self.call(Op::WorkspaceState, |session| {
+            Ok(session
+                .workspace
+                .as_ref()
+                .ok_or_else(crate::errors::no_workspace)?
+                .members_without_self_update())
+        })
+    }
+
     /// Drop the staged candidate. Returns whether one was staged.
     pub fn discard_workspace_candidate(&self) -> Result<bool> {
         Ok(self

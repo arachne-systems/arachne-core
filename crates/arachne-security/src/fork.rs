@@ -4,7 +4,7 @@
 //! `ForkKey = (class, SHA-256(commit bytes))`. The lower key wins. The class
 //! decides first, so a removal always beats a step that keeps or adds access,
 //! whatever the hash. The hash only breaks ties inside one class.
-use super::{ManagementAction, MembershipAuthorization};
+use super::{ManagementAction, MembershipAuthorization, RevocationKind};
 
 /// Priority class of a membership step. A lower class wins a fork.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -18,7 +18,7 @@ pub enum ForkClass {
     Management = 2,
     /// Admission, AdmissionBatch: adds keys.
     Admission = 3,
-    /// Member self-update. No authorization variant produces it yet (ADR step 5).
+    /// Member self-update (`MembershipAuthorization::SelfUpdate`).
     SelfUpdate = 4,
 }
 
@@ -27,7 +27,7 @@ impl ForkClass {
     pub fn of_action(action: &ManagementAction) -> Self {
         // Exhaustive on purpose: a new action must pick its class.
         match action {
-            ManagementAction::Remove(_) | ManagementAction::Leave(..) => Self::Removal,
+            ManagementAction::Remove(_) => Self::Removal,
             ManagementAction::Demote(_) | ManagementAction::DisableInvitation(_) => {
                 Self::Revocation
             }
@@ -40,11 +40,21 @@ impl ForkClass {
         }
     }
 
+    /// Class of one revocation order kind.
+    pub fn of_revocation(kind: RevocationKind) -> Self {
+        match kind {
+            RevocationKind::Remove | RevocationKind::Leave => Self::Removal,
+            RevocationKind::Demote | RevocationKind::DisableInvitation => Self::Revocation,
+        }
+    }
+
     /// Class of one verified membership authorization.
     pub fn of(authorization: &MembershipAuthorization) -> Self {
-        // Exhaustive on purpose: ADR step 5 adds SelfUpdate here.
+        // Exhaustive on purpose: a new authorization must pick its class.
         match authorization {
             MembershipAuthorization::Management(action) => Self::of_action(action),
+            MembershipAuthorization::Revocation(step) => Self::of_revocation(step.order.kind),
+            MembershipAuthorization::SelfUpdate => Self::SelfUpdate,
             MembershipAuthorization::Admission(_) | MembershipAuthorization::AdmissionBatch(_) => {
                 Self::Admission
             }
@@ -169,6 +179,17 @@ mod tests {
         }
     }
 
+    fn revocation(kind: RevocationKind) -> MembershipAuthorization {
+        MembershipAuthorization::Revocation(crate::OrderStep::new(crate::RevocationOrder {
+            kind,
+            target: [4; 32],
+            issuer: [5; 32],
+            anchor_epoch: 1,
+            anchor_context: [6; 32],
+            signature: [7; 64],
+        }))
+    }
+
     const CLASSES: [ForkClass; 5] = [
         ForkClass::Removal,
         ForkClass::Revocation,
@@ -200,7 +221,6 @@ mod tests {
         let id = [1; 32];
         let cases = [
             (ManagementAction::Remove(id), ForkClass::Removal),
-            (ManagementAction::Leave(id, [2; 64]), ForkClass::Removal),
             (ManagementAction::Demote(id), ForkClass::Revocation),
             (
                 ManagementAction::DisableInvitation(id),
@@ -236,6 +256,18 @@ mod tests {
                 "{action:?}"
             );
         }
+        for (kind, class) in [
+            (RevocationKind::Remove, ForkClass::Removal),
+            (RevocationKind::Leave, ForkClass::Removal),
+            (RevocationKind::Demote, ForkClass::Revocation),
+            (RevocationKind::DisableInvitation, ForkClass::Revocation),
+        ] {
+            assert_eq!(ForkClass::of(&revocation(kind)), class, "{kind:?}");
+        }
+        assert_eq!(
+            ForkClass::of(&MembershipAuthorization::SelfUpdate),
+            ForkClass::SelfUpdate
+        );
         assert_eq!(
             ForkClass::of(&MembershipAuthorization::Admission(admission())),
             ForkClass::Admission
@@ -338,8 +370,8 @@ mod tests {
     #[test]
     fn removals_beat_adds_regardless_of_hash() {
         let mut rng = Rng(7);
-        let remove = MembershipAuthorization::Management(ManagementAction::Remove([4; 32]));
-        let leave = MembershipAuthorization::Management(ManagementAction::Leave([4; 32], [5; 64]));
+        let remove = revocation(RevocationKind::Remove);
+        let leave = revocation(RevocationKind::Leave);
         let add = MembershipAuthorization::AdmissionBatch(vec![admission()]);
         let promote = MembershipAuthorization::Management(ManagementAction::Promote([6; 32]));
         let mut lower_hash_losers = 0;

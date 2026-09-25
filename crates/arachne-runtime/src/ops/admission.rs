@@ -130,6 +130,9 @@ pub(crate) struct AdmissionArgs {
 /// Stage one admission from the host. The endpoint must be the
 /// authenticated transport identity of the requester.
 pub(crate) fn stage(session: &mut Session, args: AdmissionArgs) -> Result<StagedAdmission, ApiError> {
+    if !membership::is_administrator(session.workspace.as_deref().ok_or_else(errors::no_workspace)?) {
+        return Err(not_administrator());
+    }
     stage_admission(
         session,
         args.authenticated_endpoint,
@@ -187,7 +190,7 @@ pub(crate) fn poll(session: &mut Session, args: PollAdmissionArgs) -> Result<Val
     // waited past the puller's limit (tablets, fix16).
     if let Some(incoming) = session
         .node
-        .poll_control_first(|payload| payload.starts_with(b"DFMS"), RANGE_SCAN_DEPTH)
+        .poll_control_first(|payload| payload.starts_with(membership::wire::RANGE_QUERY), RANGE_SCAN_DEPTH)
     {
         let waited_ms = incoming.waited().as_millis() as u64;
         let reply = membership::range_reply(
@@ -311,6 +314,11 @@ pub(crate) fn poll(session: &mut Session, args: PollAdmissionArgs) -> Result<Val
         session.transition.inbound = Some(incoming);
         return Ok(value);
     }
+    if incoming.payload().starts_with(membership::OFFER_DIGEST) {
+        let value = membership::receive_offer_digest(session, incoming.peer(), incoming.payload());
+        let _ = incoming.respond(vec![if value.is_ok() { 2 } else { 0 }]);
+        return Ok(value.unwrap_or_else(|_| json!({"state":"membership_replied"})));
+    }
     if incoming.payload().starts_with(b"DFMO") {
         let offered = membership::receive_offer(session, incoming.payload());
         return match offered {
@@ -333,7 +341,7 @@ pub(crate) fn poll(session: &mut Session, args: PollAdmissionArgs) -> Result<Val
         let _ = incoming.respond(reply.unwrap_or_default());
         return Ok(json!({"state":"invitation_checkpoint_replied","accepted":accepted}));
     }
-    if incoming.payload().starts_with(b"DFMS") {
+    if incoming.payload().starts_with(membership::wire::RANGE_QUERY) {
         let reply = membership::range_reply(
             session.workspace.as_deref(),
             incoming.peer(),
@@ -472,6 +480,17 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
             "workspace lifecycle requires native record storage",
         ));
     }
+    // This member's self-update offer: adopt once an administrator adopted
+    // it, or drop it when refused (B3c).
+    let now = std::time::Instant::now();
+    match membership::finish_self_update_offer(live_mut(session)?, now) {
+        Some(true) => return commit_self_update(session, now),
+        Some(false) => {
+            return Ok(json!({"state":"self_update_refused",
+                "activity":activity_value(live(session)?)}));
+        }
+        None => {}
+    }
     let mut staged = ops::nested(session, Op::PollAdmission, |session| {
         poll(session, PollAdmissionArgs { profile: false })
     })?;
@@ -494,6 +513,12 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
         if staged_state.is_some() {
             staged["activity"] = activity_value(live(session)?);
             return Ok(staged);
+        }
+        // The staged self-update waits for its administrator; membership
+        // queries wait until it is adopted or dropped.
+        if membership::self_update_pending(live(session)?) {
+            return Ok(json!({"state":"self_update_pending",
+                "activity":activity_value(live(session)?)}));
         }
         let membership = ops::nested(live_mut(session)?, Op::PollMembershipUpdate, |session| {
             ops::membership::poll_update(session)
@@ -554,6 +579,17 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
             membership["activity"] = activity_value(live(session)?);
             return Ok(membership);
         }
+        // Nothing else to do this tick: a self-update, when one is due.
+        if !membership::self_update_pending(live(session)?)
+            && let Some(started) = membership::start_self_update(live_mut(session)?, now)?
+        {
+            if started["state"] == "awaiting_save" {
+                return commit_self_update(session, now);
+            }
+            let mut started = started;
+            started["activity"] = activity_value(live(session)?);
+            return Ok(started);
+        }
         staged["activity"] = activity_value(live(session)?);
         return Ok(staged);
     }
@@ -566,6 +602,22 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
         committed["reply_queued"] = json!(reply.queued);
     }
     committed["state"] = json!("workspace_committed");
+    committed["activity"] = activity_value(live(session)?);
+    Ok(committed)
+}
+
+/// Save and adopt this member's staged self-update, then announce the head.
+fn commit_self_update(session: &mut Session, now: std::time::Instant) -> Result<Value, ApiError> {
+    let snapshot = live(session)?
+        .transition
+        .staged
+        .as_ref()
+        .map(|staged| staged.snapshot.clone())
+        .ok_or_else(|| ApiError::wrong_state("self update candidate is gone"))?;
+    persistence::commit_candidate(live_mut(session)?, &snapshot)?;
+    let mut committed = adopt_admission_value(session, snapshot)?;
+    live_mut(session)?.membership.self_update.updated(now);
+    committed["state"] = json!("self_update_committed");
     committed["activity"] = activity_value(live(session)?);
     Ok(committed)
 }
@@ -712,31 +764,34 @@ pub(crate) fn admission_reply_page(
     checkpoint: Option<&[u8]>,
     offset: usize,
 ) -> Result<Vec<u8>, ApiError> {
-    let reply =
-        serde_json::to_value(retained_reply(workspace, peer, request)?).map_err(errors::encode)?;
-    if let Some(checkpoint) = checkpoint {
-        let mut steps = workspace
-            .membership_history(peer, request, checkpoint)
-            .map_err(security(ErrorCode::InvalidInput))?;
-        let last = steps
-            .iter()
-            .position(|(_, commit)| json!(commit) == reply["commit"])
-            .ok_or_else(|| ApiError::internal("retained admission missing from verified history"))?;
-        steps.truncate(last + 1); // Retry may follow later Adds; Welcome pins this exact step.
-        if offset >= steps.len() {
-            return Err(page_offset_out_of_bounds());
+    let reply = retained_reply(workspace, peer, request)?;
+    let steps: Vec<Vec<u8>> = match checkpoint {
+        Some(checkpoint) => {
+            let mut steps = workspace
+                .membership_history(peer, request, checkpoint)
+                .map_err(security(ErrorCode::InvalidInput))?;
+            let last = steps
+                .iter()
+                .position(|(_, commit)| *commit == reply.commit)
+                .ok_or_else(|| ApiError::internal("retained admission missing from verified history"))?;
+            steps.truncate(last + 1); // Retry may follow later Adds; Welcome pins this exact step.
+            steps
+                .iter()
+                .map(|(authorization, commit)| membership::encode_step(authorization, commit))
+                .collect::<Result<_, _>>()?
         }
-        let steps: Vec<Value> = steps
-            .iter()
-            .map(|(authorization, commit)| membership::step_json(authorization, commit))
-            .collect();
-        return admission_history_page(reply, &steps, offset, arachne_node::MAX_CONTROL_REPLY);
-    }
-    let encoded = serde_json::to_vec(&reply).map_err(errors::encode)?;
-    if encoded.len() > arachne_node::MAX_CONTROL_REPLY {
-        return Err(reply_too_large("admission reply exceeds transport bound"));
-    }
-    Ok(encoded)
+        None => {
+            let retained = workspace
+                .retained_admission(peer, request)
+                .map_err(security(ErrorCode::InvalidInput))?
+                .ok_or_else(|| ApiError::wrong_state("no retained admission"))?;
+            vec![membership::encode_step(
+                &arachne_security::MembershipAuthorization::Admission(retained.authorization),
+                &reply.commit,
+            )?]
+        }
+    };
+    admission_history_page(&reply, &steps, offset, arachne_node::MAX_CONTROL_REPLY)
 }
 
 fn page_offset_out_of_bounds() -> ApiError {
@@ -751,46 +806,162 @@ fn reply_too_large(detail: &str) -> ApiError {
     )
 }
 
+/// Binary admission reply (B3c): the history steps in the binary step codec,
+/// and on the final page the Welcome and the admission's authorization. The
+/// admission commit travels once, as the last step.
+const ADMISSION_REPLY: &[u8; 5] = b"DFAY\x01";
+
+#[derive(Serialize, Deserialize)]
+struct AdmissionReplyWire<'a> {
+    workspace: [u8; 32],
+    epoch: u64,
+    #[serde(borrow)]
+    steps: Vec<&'a [u8]>,
+    /// Final page only: the Welcome and the admission's authorization
+    /// (invitation key, grant and redemption signatures).
+    #[serde(borrow)]
+    welcome: Option<(&'a [u8], [u8; 32], &'a [u8], &'a [u8])>,
+    /// `(offset, next, complete)` when the history spans more than one page.
+    page: Option<(u32, u32, bool)>,
+}
+
+fn encode_admission_page(
+    reply: &AdmissionReply,
+    steps: &[Vec<u8>],
+    offset: usize,
+    next: usize,
+    total: usize,
+    welcome: bool,
+) -> Result<Vec<u8>, ApiError> {
+    let index = |value: usize| u32::try_from(value).map_err(|_| reply_too_large("admission history is too long"));
+    let paged = !(offset == 0 && next == total && welcome);
+    let wire = AdmissionReplyWire {
+        workspace: reply.workspace,
+        epoch: reply.epoch,
+        steps: steps[offset..next].iter().map(Vec::as_slice).collect(),
+        welcome: welcome.then(|| {
+            (
+                reply.welcome.as_slice(),
+                reply.authorization.invitation_key,
+                reply.authorization.grant_signature.as_slice(),
+                reply.authorization.redemption_signature.as_slice(),
+            )
+        }),
+        page: if paged {
+            Some((index(offset)?, index(next)?, next == total && welcome))
+        } else {
+            None
+        },
+    };
+    let mut bytes = ADMISSION_REPLY.to_vec();
+    bytes.extend(postcard::to_allocvec(&wire).map_err(|_| reply_too_large("admission reply encoding failed"))?);
+    Ok(bytes)
+}
+
 /// Fill one admission reply with as many history steps from `offset` as fit
-/// in `limit` encoded bytes.
+/// in `limit` encoded bytes and in `PAGE_STEP_BYTES` of steps (a single step
+/// may use the whole reply). The page that ends the history carries the
+/// Welcome; when the last step and the Welcome do not fit together, a final
+/// page carries only the Welcome (`offset == steps.len()`).
 ///
 /// Each candidate is encoded in its exact final form (every paging field it
 /// will carry) and the bytes returned are the bytes measured, so the reply is
 /// bounded by construction. B3d: the size used to be checked before
 /// `history_page` was added, so a page filled to within 20 bytes of the bound
-/// overshot it; random commit bytes (1-3 JSON digits each) moved the fill
-/// point, so it failed only sometimes.
+/// overshot it; varying step sizes moved the fill point, so it failed only
+/// sometimes.
 fn admission_history_page(
-    mut reply: Value,
-    steps: &[Value],
+    reply: &AdmissionReply,
+    steps: &[Vec<u8>],
     offset: usize,
     limit: usize,
 ) -> Result<Vec<u8>, ApiError> {
-    if offset >= steps.len() {
+    let total = steps.len();
+    if offset > total || total == 0 {
         return Err(page_offset_out_of_bounds());
     }
+    if offset == total {
+        let page = encode_admission_page(reply, steps, offset, total, total, true)?;
+        return (page.len() <= limit)
+            .then_some(page)
+            .ok_or_else(|| reply_too_large("admission Welcome exceeds transport bound"));
+    }
     let mut fitted = None;
-    for next in offset + 1..=steps.len() {
-        reply["commits"] = json!(steps[offset..next]);
-        if offset == 0 && next == steps.len() {
-            if let Some(object) = reply.as_object_mut() {
-                for key in ["history_offset", "history_next", "history_complete", "history_page"] {
-                    object.remove(key);
-                }
-            }
-        } else {
-            reply["history_offset"] = json!(offset);
-            reply["history_next"] = json!(next);
-            reply["history_complete"] = json!(next == steps.len());
-            reply["history_page"] = json!(true);
-        }
-        let encoded = serde_json::to_vec(&reply).map_err(errors::encode)?;
-        if encoded.len() > limit {
+    let mut step_bytes = 0;
+    for next in offset + 1..=total {
+        step_bytes += steps[next - 1].len();
+        if next > offset + 1 && step_bytes > membership::PAGE_STEP_BYTES {
             break;
         }
-        fitted = Some(encoded);
+        // The last step goes with the Welcome when both fit, else alone.
+        let candidates: &[bool] = if next == total { &[true, false] } else { &[false] };
+        let mut fits = false;
+        for welcome in candidates {
+            let encoded = encode_admission_page(reply, steps, offset, next, total, *welcome)?;
+            if encoded.len() <= limit {
+                fitted = Some(encoded);
+                fits = true;
+                break;
+            }
+        }
+        if !fits {
+            break;
+        }
     }
     fitted.ok_or_else(|| reply_too_large("admission history step exceeds transport bound"))
+}
+
+/// Read an admission reply or refusal from the wire, as the host JSON the
+/// join path uses: `commits` (host-JSON steps), paging fields, and on the
+/// final page `welcome` and `authorization`. A refusal is JSON.
+pub fn decode_admission_reply(bytes: &[u8]) -> Result<Value, String> {
+    let Some(body) = bytes.strip_prefix(ADMISSION_REPLY) else {
+        if bytes.starts_with(b"DFAY") {
+            return Err("unsupported admission reply version".into());
+        }
+        return serde_json::from_slice(bytes).map_err(|_| "invalid admission reply".into());
+    };
+    if bytes.len() > arachne_node::MAX_CONTROL_REPLY {
+        return Err("admission reply exceeds bound".into());
+    }
+    let (wire, trailing): (AdmissionReplyWire<'_>, _) =
+        postcard::take_from_bytes(body).map_err(|_| "invalid admission reply")?;
+    if !trailing.is_empty()
+        || wire.steps.len() > arachne_security::MAX_JOIN_HISTORY_STEPS
+        || (wire.steps.is_empty() && wire.welcome.is_none())
+    {
+        return Err("invalid admission reply".into());
+    }
+    let commits = wire
+        .steps
+        .iter()
+        .map(|step| {
+            if step.len() > membership::MAX_WIRE_STEP {
+                return Err("admission history step exceeds bound".to_string());
+            }
+            let (authorization, commit) = arachne_security::decode_membership_step(step)
+                .map_err(|_| "invalid admission history step")?;
+            Ok(membership::step_json(&authorization, &commit))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut value = json!({"workspace":wire.workspace, "epoch":wire.epoch, "commits":commits});
+    if let Some((welcome, invitation_key, grant, redemption)) = wire.welcome {
+        value["welcome"] = json!(welcome);
+        value["authorization"] = json!({"invitation_key":invitation_key,
+            "grant_signature":grant, "redemption_signature":redemption});
+    }
+    if let Some((offset, next, complete)) = wire.page {
+        if next < offset || complete != wire.welcome.is_some() {
+            return Err("invalid admission history page".into());
+        }
+        value["history_offset"] = json!(offset);
+        value["history_next"] = json!(next);
+        value["history_complete"] = json!(complete);
+        value["history_page"] = json!(true);
+    } else if wire.welcome.is_none() {
+        return Err("an unpaged admission reply needs its Welcome".into());
+    }
+    Ok(value)
 }
 
 pub(crate) fn send_inbound_admission_reply(session: &mut Session) -> Result<ReplySent, ApiError> {
@@ -968,9 +1139,8 @@ pub(crate) fn parse_admission_offer(packet: &[u8]) -> Result<(Vec<JoinStep>, Vec
     if length == 0 || packet.len() != 9 + length || packet.len() > 32 * 1024 {
         return Err(bad_packet("invalid admission result offer bounds"));
     }
-    let reply: Value =
-        serde_json::from_slice(&packet[9..]).map_err(|_| bad_packet("invalid admission result"))?;
-    if reply.get("history_complete").and_then(Value::as_bool) == Some(false) {
+    let reply = decode_admission_reply(&packet[9..]).map_err(|_| bad_packet("invalid admission result"))?;
+    if reply.get("history_page").is_some() {
         return Err(bad_packet("paged admission result requires the retry path"));
     }
     let commits = if let Some(commits) = reply.get("commits") {
@@ -1047,8 +1217,18 @@ pub(crate) fn queue_admission_push(
 
 /// The protocol reason a requester sees, from the security crate's exact
 /// texts (the same constants the error table uses).
+/// Security error for an Add from a non-administrator (ADR A2 step 2).
+const ONLY_ADMINISTRATORS_ADMIT: &str = "only an administrator may admit members";
+
+fn not_administrator() -> ApiError {
+    ApiError::not_authorized(
+        "Only an administrator can admit members. Ask an administrator of this workspace.",
+    )
+}
+
 fn admission_reason(error: &str) -> &'static str {
     match error {
+        ONLY_ADMINISTRATORS_ADMIT => admission_state::ADMINISTRATOR_REQUIRED,
         arachne_security::INVITATION_AUTOMATIC_APPROVAL_REQUIRED => "automatic_approval_required",
         arachne_security::INVITATION_APPROVAL_REQUIRED => "approval_required",
         arachne_security::INVITATION_DISABLED => "invitation_disabled",
@@ -1181,6 +1361,18 @@ fn queue_admission(
             }
             return Ok(json!({"state":"admission_replied", "accepted":accepted}));
         }
+    }
+    // Only administrators admit (ADR A2 section 7). Refuse before the
+    // request is queued or held for approval: a queued request would fail
+    // at staging and be retried forever. There is no forward path; the
+    // joiner asks its next member.
+    if !membership::is_administrator(session.workspace.as_deref().ok_or_else(errors::no_workspace)?) {
+        let _ = incoming.respond(feedback_bytes(&json!({
+            "state": admission_state::UNAVAILABLE,
+            "reason": admission_state::ADMINISTRATOR_REQUIRED,
+        }))?);
+        return Ok(json!({"state":admission_state::REPLIED,"accepted":false,
+            "reason":admission_state::ADMINISTRATOR_REQUIRED}));
     }
     if session.admission.queue.contains(&attempt)
         || session
@@ -1550,38 +1742,61 @@ mod tests {
     }
 
     /// B3d: every admission history page must fit the byte limit it was
-    /// filled against, whatever fill point the (random) commit bytes land on.
-    /// Sweeping the limit byte by byte forces every fill point, including one
-    /// that leaves less room than the fields added after the size check.
+    /// filled against, whatever fill point the step sizes land on. Sweeping
+    /// the limit byte by byte forces every fill point, including one that
+    /// leaves less room than the fields added after the size check, and the
+    /// case where the last step and the Welcome need separate pages.
     #[test]
     fn every_admission_history_page_fits_its_limit_at_every_fill_point() {
-        let reply = json!({"workspace":(vec![7_u8; 32]), "epoch":42_u64, "commit":(vec![200_u8; 40]),
-            "welcome":(vec![9_u8; 64]), "authorization":{"invitation_key":(vec![1_u8; 32]),
-            "grant_signature":(vec![2_u8; 64]), "redemption_signature":(vec![3_u8; 64])}});
-        let steps: Vec<Value> = (0..12_usize)
+        let reply = AdmissionReply {
+            workspace: [7; 32],
+            epoch: 42,
+            commit: vec![200; 40],
+            welcome: vec![9; 64],
+            authorization: AdmissionAuthorization {
+                invitation_key: [1; 32],
+                grant_signature: vec![2; 64],
+                redemption_signature: vec![3; 64],
+            },
+        };
+        let steps: Vec<Vec<u8>> = (0..12_usize)
             .map(|index| {
                 let commit: Vec<u8> = (0..40 + index * 23)
                     .map(|byte| ((byte * 37 + index * 11) % 256) as u8)
                     .collect();
-                json!({"commit":commit, "authorization":{"invitation_key":(vec![index as u8; 32])}})
+                membership::encode_step(
+                    &arachne_security::MembershipAuthorization::Admission(
+                        arachne_security::AdmissionAuthorization {
+                            invitation_key: [index as u8; 32],
+                            grant_signature: [2; 64],
+                            redemption_signature: [3; 64],
+                        },
+                    ),
+                    &commit,
+                )
+                .unwrap()
             })
             .collect();
-        let whole = serde_json::to_vec(&{
-            let mut whole = reply.clone();
-            whole["commits"] = json!(steps);
-            whole
-        })
-        .unwrap()
-        .len();
-        for offset in [0, 3] {
+        let whole = encode_admission_page(&reply, &steps, 0, steps.len(), steps.len(), true)
+            .unwrap()
+            .len();
+        let as_json: Vec<Value> = steps
+            .iter()
+            .map(|step| {
+                let (authorization, commit) = arachne_security::decode_membership_step(step).unwrap();
+                membership::step_json(&authorization, &commit)
+            })
+            .collect();
+        for offset in [0, 3, steps.len()] {
             for limit in 200..whole + 64 {
-                let encoded = match admission_history_page(reply.clone(), &steps, offset, limit) {
+                let encoded = match admission_history_page(&reply, &steps, offset, limit) {
                     Ok(encoded) => encoded,
                     Err(error) => {
-                        assert_eq!(
-                            error.message(),
-                            "admission history step exceeds transport bound",
-                            "offset={offset} limit={limit}"
+                        assert!(
+                            error.message() == "admission history step exceeds transport bound"
+                                || error.message() == "admission Welcome exceeds transport bound",
+                            "offset={offset} limit={limit}: {}",
+                            error.message()
                         );
                         assert_eq!(error.code(), ErrorCode::LimitReached);
                         continue;
@@ -1593,22 +1808,24 @@ mod tests {
                     encoded.len(),
                     encoded.len() - limit
                 );
-                let page: Value = serde_json::from_slice(&encoded).unwrap();
+                let page = decode_admission_reply(&encoded).unwrap();
                 let carried = page["commits"].as_array().unwrap();
-                assert_eq!(carried[..], steps[offset..offset + carried.len()]);
+                assert_eq!(carried[..], as_json[offset..offset + carried.len()]);
                 if page.get("history_page").is_some() {
                     assert_eq!(page["history_page"], json!(true));
                     assert_eq!(page["history_offset"], json!(offset));
                     let next = page["history_next"].as_u64().unwrap() as usize;
-                    assert!(next > offset, "offset={offset} limit={limit}: no progress");
                     assert_eq!(next, offset + carried.len());
-                    assert_eq!(page["history_complete"], json!(next == steps.len()));
+                    let complete = page["history_complete"].as_bool().unwrap();
+                    assert!(next > offset || complete, "offset={offset} limit={limit}: no progress");
+                    assert_eq!(complete, page.get("welcome").is_some());
+                    if complete {
+                        assert_eq!(next, steps.len());
+                    }
                 } else {
                     assert_eq!(offset, 0);
                     assert_eq!(carried.len(), steps.len());
-                    for key in ["history_offset", "history_next", "history_complete"] {
-                        assert!(page.get(key).is_none(), "unpaged reply carries {key}");
-                    }
+                    assert!(page.get("welcome").is_some());
                 }
             }
         }
@@ -1633,12 +1850,9 @@ mod tests {
         };
 
         for count in [8, MAX_RUNTIME_ADMISSION_BATCH] {
-            let endpoint = |index: usize| {
-                let mut value = [0; 32];
-                value[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
-                value
-            };
-            let mut owner = Workspace::create(endpoint(10_000), "Wire-size owner").unwrap();
+            let endpoint = |index: usize| crate::test_endpoint(index as u64);
+            let key = |index: usize| crate::test_key(index as u64);
+            let mut owner = Workspace::create(key(10_000), "Wire-size owner").unwrap();
             let (registered, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
             owner = registered.workspace;
             let mut joins = Vec::with_capacity(count);
@@ -1648,7 +1862,7 @@ mod tests {
                 let join = PendingJoin::from_invitation(
                     &invitation,
                     &checkpoint,
-                    endpoint(index + 20_000),
+                    key(index + 20_000),
                     "Wire-size member",
                 )
                 .unwrap();
@@ -1681,17 +1895,18 @@ mod tests {
                     .map(|reply| reply.authorization.clone())
                     .collect(),
             );
-            let step = membership::step_json(&authorization, &prepared.commit);
-            let mut offer = b"DFMO\x01".to_vec();
+            let step = membership::encode_step(&authorization, &prepared.commit).unwrap();
+            let mut offer = b"DFMO\x02".to_vec();
             offer.extend(prepared.workspace.id());
             offer.extend(0_u64.to_be_bytes());
-            offer.extend(serde_json::to_vec(&step).unwrap());
-            let mut reply = serde_json::to_value(
-                retained_reply(&prepared.workspace, endpoint(20_000), &requests[0]).unwrap(),
+            offer.extend(membership::wire_step(&step, None, usize::MAX).unwrap());
+            let reply = admission_history_page(
+                &retained_reply(&prepared.workspace, endpoint(20_000), &requests[0]).unwrap(),
+                &[step],
+                0,
+                arachne_node::MAX_CONTROL_REPLY,
             )
             .unwrap();
-            reply["commits"] = json!([step]);
-            let reply = serde_json::to_vec(&reply).unwrap();
             println!(
                 "admission_wire_size count={count} offer_bytes={} reply_bytes={}",
                 offer.len(),
@@ -1717,12 +1932,9 @@ mod tests {
         use arachne_security::{AdmissionAssessment, PendingJoin, Workspace};
 
         let started = std::time::Instant::now();
-        let endpoint = |index: usize| {
-            let mut value = [0; 32];
-            value[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
-            value
-        };
-        let mut owner = Workspace::create(endpoint(10_000), "500-member owner").unwrap();
+        let endpoint = |index: usize| crate::test_endpoint(index as u64);
+        let key = |index: usize| crate::test_key(index as u64);
+        let mut owner = Workspace::create(key(10_000), "500-member owner").unwrap();
         let (registered, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
         owner = registered.workspace;
         let mut joins = Vec::with_capacity(500);
@@ -1731,7 +1943,7 @@ mod tests {
         for index in 0..500 {
             let remote = endpoint(index + 20_000);
             let join =
-                PendingJoin::from_invitation(&invitation, &checkpoint, remote, "Burst member")
+                PendingJoin::from_invitation(&invitation, &checkpoint, key(index + 20_000), "Burst member")
                     .unwrap();
             let request = join.admission_request().unwrap().to_vec();
             let validated_request = match owner.assess_admission(remote, &request).unwrap() {
@@ -1786,7 +1998,7 @@ mod tests {
             page_ms.push(page_started.elapsed().as_secs_f64() * 1000.0);
             page_bytes.push(encoded.len());
             assert!(encoded.len() <= arachne_node::MAX_CONTROL_REPLY);
-            let page: Value = serde_json::from_slice(&encoded).unwrap();
+            let page = decode_admission_reply(&encoded).unwrap();
             commits.extend(page["commits"].as_array().unwrap().iter().cloned());
             pages += 1;
             if page["history_complete"].as_bool().unwrap() {
@@ -1799,9 +2011,8 @@ mod tests {
         let mut proof = target.join_proof().unwrap();
         for commit in commits {
             let step: JoinStep = serde_json::from_value(commit).unwrap();
-            proof
-                .apply_transition(&step.authorization().unwrap(), &step.commit)
-                .unwrap();
+            let (authorization, commit) = step.parts().unwrap();
+            proof.apply_transition(&authorization, &commit).unwrap();
         }
         let joined = target.prepare_workspace(&proof, &welcome).unwrap();
         assert_eq!(joined.member_count(), 501);

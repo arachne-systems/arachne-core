@@ -5,6 +5,27 @@ pub mod current;
 pub mod inbox;
 mod publisher;
 pub mod wire;
+
+/// Endpoint keys for tests, by label (ADR A2 step 6: the endpoint key signs
+/// the member binding, so a test endpoint must be a real key).
+#[cfg(test)]
+pub(crate) fn test_key(label: u64) -> &'static arachne_security::EndpointKey {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static KEYS: OnceLock<Mutex<HashMap<u64, &'static arachne_security::EndpointKey>>> =
+        OnceLock::new();
+    KEYS.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(label)
+        .or_insert_with(|| Box::leak(Box::new(arachne_security::EndpointKey::generate().unwrap())))
+}
+
+#[cfg(test)]
+pub(crate) fn test_endpoint(label: u64) -> [u8; 32] {
+    use arachne_security::EndpointSigner;
+    test_key(label).endpoint()
+}
 pub use publisher::{PUBLISHER_BUDGET, PublisherLog};
 
 use arachne_routing::{PublicationContext, Topic};
@@ -561,12 +582,12 @@ fn retention_watermarks_scope_and_snapshot_bounds() {
 #[test]
 fn restored_index_builds_offer_for_selected_real_objects() {
     use arachne_security::{PendingJoin, Workspace};
-    let admin = Workspace::create([1; 32], "Publisher").unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let admin = registered.workspace;
-    let pending = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let pending = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], pending.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
         .unwrap();
     let mut proof = pending.join_proof().unwrap();
     proof
@@ -633,7 +654,7 @@ fn restored_index_builds_offer_for_selected_real_objects() {
         Some(52)
     );
     assert_eq!(
-        wire::serve_cutoff(&log, &sender, &policy, [99; 32], &cutoff).unwrap(),
+        wire::serve_cutoff(&log, &sender, &policy, crate::test_endpoint(99), &cutoff).unwrap(),
         wire::denied_reply()
     );
     let mut unreadable = cutoff.clone();
@@ -714,7 +735,7 @@ fn restored_index_builds_offer_for_selected_real_objects() {
         wire::verify_reply(&receiver, &empty_query, b"DFRP\x01\x04").unwrap(),
         wire::RangeReply::Rejected(RetrievalError::History(RangeError::Empty))
     ));
-    let denied_empty = wire::serve_range(&log, &sender, &policy, [99; 32], &empty_query).unwrap();
+    let denied_empty = wire::serve_range(&log, &sender, &policy, crate::test_endpoint(99), &empty_query).unwrap();
     assert!(matches!(
         wire::verify_reply(&receiver, &empty_query, &denied_empty).unwrap(),
         wire::RangeReply::Rejected(RetrievalError::Denied)
@@ -792,7 +813,7 @@ fn restored_index_builds_offer_for_selected_real_objects() {
         wire::verify_reply(&receiver, &large_query, &rejected).unwrap(),
         wire::RangeReply::Rejected(RetrievalError::History(RangeError::TooLarge))
     ));
-    let denied = wire::serve_range(&log, &sender, &policy, [99; 32], &query).unwrap();
+    let denied = wire::serve_range(&log, &sender, &policy, crate::test_endpoint(99), &query).unwrap();
     assert!(matches!(
         wire::verify_reply(&receiver, &query, &denied).unwrap(),
         wire::RangeReply::Rejected(RetrievalError::Denied)

@@ -138,7 +138,7 @@ impl CommittedView {
             return Some(page.unwrap_or_else(|| UNAVAILABLE.to_vec()));
         }
         // A range pull reads committed steps only.
-        if payload.starts_with(b"DFMS") {
+        if payload.starts_with(membership::wire::RANGE_QUERY) {
             return Some(membership::range_reply(
                 Some(&self.workspace),
                 peer,
