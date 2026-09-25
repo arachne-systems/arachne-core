@@ -2,12 +2,9 @@ use arachne_runtime::{
     close, create, describe, enable_record_storage, execute, restore_record_storage, save_candidate,
 };
 use serde_json::{Value, json};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 mod common;
-
-static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn call(handle: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
@@ -49,7 +46,6 @@ fn serve_once(handle: i64) -> Value {
 
 #[test]
 fn fetches_only_the_exact_invitation_checkpoint_over_authenticated_iroh() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = create(Some(&[201; 32])).unwrap();
     let joiner = create(Some(&[202; 32])).unwrap();
     call(
@@ -162,7 +158,6 @@ fn fetches_only_the_exact_invitation_checkpoint_over_authenticated_iroh() {
 
 #[test]
 fn ordinary_member_serves_the_checkpoint_it_joined_from_after_issuer_closes() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = create(Some(&[211; 32])).unwrap();
     let mut helper = create(Some(&[212; 32])).unwrap();
     let late = create(Some(&[213; 32])).unwrap();
@@ -284,7 +279,6 @@ fn ordinary_member_serves_the_checkpoint_it_joined_from_after_issuer_closes() {
 
 #[test]
 fn existing_member_serves_a_later_invitation_after_learning_it_and_restarting() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = create(Some(&[221; 32])).unwrap();
     let mut helper = create(Some(&[222; 32])).unwrap();
     let late = create(Some(&[223; 32])).unwrap();

@@ -8,11 +8,9 @@ use arachne_runtime::{
 use arachne_security::{Invitation, PendingJoin};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
-use std::sync::{Mutex, mpsc};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-
-static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn call(handle: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
@@ -148,7 +146,6 @@ fn joiner(owner: &Owner, seed_index: u64) -> (mpsc::Sender<()>, mpsc::Receiver<V
 
 #[test]
 fn a_retained_result_is_answered_while_the_host_never_polls() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let owner = owner(61);
     let (go, replies) = joiner(&owner, 6100);
 
@@ -177,7 +174,6 @@ fn a_retained_result_is_answered_while_the_host_never_polls() {
 
 #[test]
 fn a_new_join_request_is_a_change_and_goes_to_the_host() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let owner = owner(62);
     let (go, replies) = joiner(&owner, 6200);
     go.send(()).unwrap();
@@ -200,7 +196,6 @@ fn a_new_join_request_is_a_change_and_goes_to_the_host() {
 
 #[test]
 fn an_invitation_checkpoint_is_answered_while_the_host_never_polls() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let owner = owner(63);
     let late = create(Some(&[64; 32])).unwrap();
     call(
@@ -233,7 +228,6 @@ fn an_invitation_checkpoint_is_answered_while_the_host_never_polls() {
 #[ignore]
 fn bench_inquiries_under_a_paced_host() {
     const JOINERS: u64 = 32;
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let owner = owner(65);
     let joiners: Vec<_> = (0..JOINERS).map(|index| joiner(&owner, 6500 + index)).collect();
     for (go, _) in &joiners {
@@ -311,7 +305,6 @@ fn add_member(admin: i64, joiner: i64, name: &str) {
 
 #[test]
 fn a_membership_query_is_answered_while_the_host_never_polls() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = create(Some(&[66; 32])).unwrap();
     call(admin, json!({"op":"create_workspace","display_name":"Owner"})).unwrap();
     let member = create(Some(&[67; 32])).unwrap();

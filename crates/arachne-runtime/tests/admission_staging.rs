@@ -47,12 +47,10 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
-
-static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn call(handle: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
@@ -189,7 +187,6 @@ async fn bind_joiner(seed_index: u64, invitation: &Invitation, checkpoint: &[u8]
 
 #[test]
 fn admission_batch_staging_keeps_committing_under_continuous_intake() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     const PRIORITY: usize = 64;
     // FUT-30's own field behavior: joiners retry every 0.5-5s. 500ms is the
     // fast end of that real range. The owner's poll loop below is paced to

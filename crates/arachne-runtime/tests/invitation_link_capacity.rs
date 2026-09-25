@@ -8,7 +8,7 @@ use std::{
     fs,
     net::SocketAddr,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -21,8 +21,6 @@ const INVITATION_SIZE: usize = 293;
 const COMPACT_SIZE: usize = 390;
 const BOOTSTRAP_PEERS: usize = 3;
 const CONTROL_PACKET: &[u8] = b"DFIC\x02";
-static TEST_LOCK: Mutex<()> = Mutex::new(());
-
 /// What a capacity run actually measured. `AdmissionOnly` is the legacy
 /// bug this harness had (issue #93): a joiner counted ready the instant it
 /// held a Welcome, with no `stage_join`, no adopted MLS state, no member
@@ -473,7 +471,6 @@ async fn full_onboard(
 #[test]
 #[ignore = "requires a real ATAK-issued link and an active ATAK owner"]
 fn one_atak_invitation_link_handles_500_synthetic_joiners() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let link_path = std::env::var("ARACHNE_INVITATION_LINK_FILE")
         .expect("set ARACHNE_INVITATION_LINK_FILE to a private link file");
     let receipt_path = std::env::var("ARACHNE_CAPACITY_RECEIPT").ok();
@@ -912,7 +909,6 @@ fn endpoint(value: &Value) -> [u8; 32] {
 
 #[test]
 fn local_full_onboarding_state_machine_rejects_a_corrupted_joiner() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     const GOOD_JOINERS: usize = 5;
     const OFFSET: u64 = 90_000;
     let started = Instant::now();

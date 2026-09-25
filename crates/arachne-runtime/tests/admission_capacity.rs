@@ -6,12 +6,10 @@ use arachne_security::{Invitation, PendingJoin};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
-
-static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn call(handle: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
@@ -45,7 +43,6 @@ fn admission_packet(request: &[u8], name: &str, _checkpoint: &[u8]) -> Vec<u8> {
 #[test]
 #[ignore = "explicit 500-client public runtime capacity run"]
 fn public_runtime_admission_path_handles_500_authenticated_joiners() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     const MEMBERS: usize = 500;
     const RETRIES: usize = 16;
     let started = Instant::now();

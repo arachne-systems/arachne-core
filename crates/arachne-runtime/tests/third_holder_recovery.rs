@@ -2,9 +2,6 @@ use arachne_runtime::{close, create, describe, execute};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-// Three four-node scenarios exceed the process-wide runtime budget if overlapped.
-static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 const EVENT: &str = "atak/native/v1/chat";
 const CURRENT: &str = "atak/native/v1/pli";
 
@@ -129,7 +126,6 @@ fn receive_one(handle: i64) -> Value {
 
 #[test]
 fn retained_replay_delivers_events_current_values_and_deletions() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let author = create(Some(&[121; 32])).unwrap();
     let reader = create(Some(&[122; 32])).unwrap();
     call(
@@ -212,7 +208,6 @@ fn retained_replay_delivers_events_current_values_and_deletions() {
 
 #[test]
 fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let author = create(Some(&[111; 32])).unwrap();
     let stale_holder = create(Some(&[112; 32])).unwrap();
     let fresh_holder = create(Some(&[113; 32])).unwrap();
@@ -443,7 +438,6 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
 
 #[test]
 fn intended_recipient_recovers_private_tail_from_restarted_holder() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let author = create(Some(&[101; 32])).unwrap();
     let holder = create(Some(&[102; 32])).unwrap();
     let reader = create(Some(&[103; 32])).unwrap();
@@ -636,7 +630,6 @@ fn intended_recipient_recovers_private_tail_from_restarted_holder() {
 
 #[test]
 fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let author = create(Some(&[91; 32])).unwrap();
     let holder = create(Some(&[92; 32])).unwrap();
     let reader = create(Some(&[93; 32])).unwrap();
