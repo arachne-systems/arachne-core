@@ -12,12 +12,10 @@ use arachne_node::{
     AdmissionReport, Node, Topic,
 };
 use serde_json::{Value, json};
-use tokio::{
-    runtime::Runtime,
-};
 
 mod client;
 mod committed_view;
+mod context;
 mod errors;
 mod json;
 mod ops;
@@ -29,10 +27,7 @@ pub use registry::{
 };
 #[cfg(feature = "tor")]
 pub use registry::create_tor;
-use registry::{
-    DEVICE_OVERLAY_PATHS, MAX_DEVICE_OVERLAY_PATHS, release_overlay_paths,
-    reserve_overlay_paths, session, shutdown_session,
-};
+use registry::{session, shutdown_session};
 use ops::admission::{
     ADMISSION_HISTORY_PAGE_REQUEST, admission_packet, admission_reply_page,
     parse_admission_history_page_packet, pinned_checkpoint,
@@ -83,7 +78,8 @@ pub(crate) mod presence;
 mod resources;
 mod work_signal;
 mod workspace_activity;
-pub use arachne_api::{ApiError, ErrorCode};
+pub use arachne_api::{ApiError, ErrorCode, Limits};
+pub use context::{Context, ContextConfig, RuntimeConfig};
 pub use client::{
     AdmissionApproval, AdmissionApprovalPage, AdmissionAuthorization, InvitationCheckpoint,
     InvitationControl, InvitationKind, MemberAction, NearbyAdvertisement, NearbyEndpoint,

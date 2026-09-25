@@ -41,7 +41,7 @@ impl Updates {
     pub fn set(
         &mut self,
         node: &Node,
-        runtime: &Runtime,
+        runtime: &tokio::runtime::Handle,
         update: Update,
     ) -> Result<InterestQueued, ApiError> {
         let key = (update.workspace, update.topic.clone());
@@ -123,7 +123,7 @@ impl Updates {
         }
     }
 
-    pub fn poll(&mut self, node: &Node, runtime: &Runtime) -> Value {
+    pub fn poll(&mut self, node: &Node, runtime: &tokio::runtime::Handle) -> Value {
         if self.is_idle() && self.retry_at.is_some_and(|at| Instant::now() >= at) {
             self.retry_at = None;
             self.repair();

@@ -35,8 +35,12 @@ cargo +1.98.0 test --locked --workspace -- --test-threads=1
 Published manifests declare Rust 1.91 as the MSRV. Verify that claim with
 `cargo +1.91.0 check --locked --workspace` before changing the dependency lock.
 
-Run from the repository root. Tests are serialized within each test binary
-because runtime tests share process-wide session state and capacity. The
+Run from the repository root. `arachne-runtime` tests no longer share
+process-wide session state: each session belongs to a `Context` with its own
+limits, connection budget and runtime, and the default context allows 64
+sessions. They can run in parallel. The workspace command keeps
+`--test-threads=1` for the other crates; `tests/nearby_invitation.rs` keeps its
+own lock because its scenarios share LAN discovery. The
 workspace build and tests are Rust checks; they do not build the Android plugin,
 load the library through JNI, or validate an ATAK host/device deployment.
 
@@ -48,7 +52,7 @@ cargo +1.98.0 test --locked -p arachne-routing
 cargo +1.98.0 test --locked -p arachne-delivery
 cargo +1.98.0 test --locked -p arachne-store
 cargo +1.98.0 test --locked -p arachne-node -- --test-threads=1
-cargo +1.98.0 test --locked -p arachne-runtime -- --test-threads=1
+cargo +1.98.0 test --locked -p arachne-runtime
 ```
 
 Supply-chain checks (`.github/workflows/supply-chain.yml` runs the same on each

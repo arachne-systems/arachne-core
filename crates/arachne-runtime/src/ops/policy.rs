@@ -16,8 +16,7 @@ use tokio::sync::mpsc;
 use crate::client::DeliveryReport;
 use crate::errors::{self, security};
 use crate::{
-    DEVICE_OVERLAY_PATHS, MAX_WORKSPACE_OVERLAY_PATHS, Session, interest, release_overlay_paths,
-    report, reserve_overlay_paths,
+    MAX_WORKSPACE_OVERLAY_PATHS, Session, interest, report,
 };
 
 /// A peer's topic permissions in a fixture policy.
@@ -110,7 +109,7 @@ pub(crate) struct FixtureMessage {
 
 /// These ops end at a 10 s deadline; the outcome may then be partial.
 fn with_deadline<T>(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &tokio::runtime::Handle,
     work: impl Future<Output = Result<T, ApiError>>,
 ) -> Result<T, ApiError> {
     runtime.block_on(async {
@@ -362,7 +361,7 @@ pub(crate) fn poll(session: &mut Session) -> Result<Option<FixtureMessage>, ApiE
 /// device-wide overlay path budget.
 pub(crate) async fn install_gossip_policy(
     node: &Node,
-    reserved: &mut usize,
+    reserved: &mut crate::context::OverlayPaths,
     workspace: [u8; 32],
     revision: u64,
     policy: BTreeMap<[u8; 32], Permissions>,
@@ -373,14 +372,8 @@ pub(crate) async fn install_gossip_policy(
         .filter(|peer| **peer != node.id())
         .count()
         .min(MAX_WORKSPACE_OVERLAY_PATHS);
-    let additional = desired.saturating_sub(*reserved);
-    if !reserve_overlay_paths(&DEVICE_OVERLAY_PATHS, additional) {
-        return Err(ApiError::limit_reached(
-            "device overlay paths",
-            crate::MAX_DEVICE_OVERLAY_PATHS as u64,
-            "device overlay path limit reached",
-        ));
-    }
+    let additional = desired.saturating_sub(reserved.held());
+    reserved.reserve(additional)?;
     let result = async {
         node.install_verified_policy(workspace, revision, policy)
             .await
@@ -393,12 +386,11 @@ pub(crate) async fn install_gossip_policy(
     }
     .await;
     if let Err(error) = result {
-        release_overlay_paths(&DEVICE_OVERLAY_PATHS, additional);
+        reserved.release(additional);
         return Err(error);
     }
-    if *reserved > desired {
-        release_overlay_paths(&DEVICE_OVERLAY_PATHS, *reserved - desired);
+    if reserved.held() > desired {
+        reserved.release(reserved.held() - desired);
     }
-    *reserved = desired;
     Ok(())
 }

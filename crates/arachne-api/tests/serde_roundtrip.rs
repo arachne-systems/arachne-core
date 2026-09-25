@@ -1,5 +1,5 @@
 use arachne_api::{
-    API_VERSION, ApiError, Capabilities, EndpointId, ErrorCode, Event, Feature, Network,
+    API_VERSION, ApiError, Capabilities, Limits, EndpointId, ErrorCode, Event, Feature, Network,
     PublicationId, TopicName, WorkspaceId,
 };
 use serde_json::json;
@@ -92,11 +92,20 @@ fn event_round_trips() {
 
 #[test]
 fn capabilities_carry_the_api_version() {
-    assert_eq!(API_VERSION, 2, "bump deliberately with the change log");
+    assert_eq!(API_VERSION, 3, "bump deliberately with the change log");
     let caps = Capabilities::new(
         vec![Network::Direct, Network::Lan],
         vec![Feature::ResourceTransfer],
     );
     assert_eq!(caps.api_version, API_VERSION);
     assert_eq!(round_trip(&caps), caps);
+}
+
+#[test]
+fn limits_round_trip_and_default_above_the_old_cap() {
+    let limits = Limits::default();
+    assert!(limits.max_sessions > 8);
+    assert_eq!(limits.max_overlay_paths, limits.max_sessions * 5);
+    let small = limits.with_max_sessions(2).with_max_overlay_paths(10);
+    assert_eq!(round_trip(&small), small);
 }

@@ -6,9 +6,6 @@ use std::time::{Duration, Instant};
 
 mod common;
 
-// These three scenarios share the runtime's process-wide eight-node budget.
-static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 fn call(h: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(h, &serde_json::to_vec(&request).unwrap())?)
         .map_err(|e| e.to_string())
@@ -37,7 +34,6 @@ fn begin(h: i64, invite: &Value) -> Value {
 
 #[test]
 fn overlapping_open_admissions_queue_while_membership_commit_is_pending() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = create(Some(&[121; 32])).unwrap();
     let people: Vec<_> = (122..=124)
         .map(|key| create(Some(&[key; 32])).unwrap())
@@ -204,7 +200,6 @@ fn overlapping_open_admissions_queue_while_membership_commit_is_pending() {
 
 #[test]
 fn overlapping_manual_approval_is_queued_until_the_owner_is_ready() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = create(Some(&[131; 32])).unwrap();
     let first = create(Some(&[132; 32])).unwrap();
     let requester = create(Some(&[133; 32])).unwrap();
@@ -354,7 +349,6 @@ fn overlapping_manual_approval_is_queued_until_the_owner_is_ready() {
 
 #[test]
 fn approved_personal_join_survives_restart_and_uses_peer_while_admin_is_closed() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = create(Some(&[91; 32])).unwrap();
     let helper = create(Some(&[92; 32])).unwrap();
     let mut person = create(Some(&[93; 32])).unwrap();
@@ -557,7 +551,6 @@ fn approved_personal_join_survives_restart_and_uses_peer_while_admin_is_closed()
 
 #[test]
 fn declining_a_personal_request_disables_its_invitation_without_admitting_it() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = create(Some(&[101; 32])).unwrap();
     let person = create(Some(&[102; 32])).unwrap();
     call(
@@ -603,7 +596,6 @@ fn declining_a_personal_request_disables_its_invitation_without_admitting_it() {
 
 #[test]
 fn reusable_request_access_keeps_native_commands_and_catalog_scoped() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = create(Some(&[151; 32])).unwrap();
     let people: Vec<_> = (152..=154)
         .map(|key| create(Some(&[key; 32])).unwrap())

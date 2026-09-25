@@ -14,8 +14,8 @@ use crate::ops::candidate::{MemberView, Removed};
 use crate::session::{activity_view, commit_workspace, seal_state, transition_activity};
 use crate::workspace_activity::ActivityView;
 use crate::{
-    DEVICE_OVERLAY_PATHS, MembershipState, Session, WorkspaceActivity, WorkspacePhase,
-    persistence, presence, release_overlay_paths, resources,
+    MembershipState, Session, WorkspaceActivity, WorkspacePhase, persistence, presence,
+    resources,
 };
 
 #[derive(Clone, Debug, Deserialize)]
@@ -272,8 +272,7 @@ pub(crate) fn reset(session: &mut Session) -> Result<ResetReply, ApiError> {
         persistence::reset_records(session, &resetting)?;
     }
 
-    release_overlay_paths(&DEVICE_OVERLAY_PATHS, session.overlay_paths);
-    session.overlay_paths = 0;
+    session.overlay_paths.release_all();
     session.presence = reset_presence;
     session.resources = resources::Jobs::default();
     session.interests.cancel();

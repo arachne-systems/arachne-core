@@ -759,7 +759,16 @@ pub struct Client {
 }
 
 impl Client {
+    /// Open a client in the process default context
+    /// ([`Context::default_shared`](crate::Context::default_shared)).
     pub fn open(config: ClientConfig) -> Result<Self> {
+        let context = crate::Context::default_shared()?;
+        Self::open_in(&context, config)
+    }
+
+    /// Open a client in `context`. Storage and other per-client setup
+    /// attach here, after the session is registered.
+    pub fn open_in(context: &std::sync::Arc<crate::Context>, config: ClientConfig) -> Result<Self> {
         if config.network != Network::Direct && config.secret.is_none() {
             return Err(error(
                 ErrorKind::InvalidInput,
@@ -767,7 +776,7 @@ impl Client {
             ));
         }
         let options = config.transport.node_options(config.network)?;
-        let handle = crate::registry::open(config.secret.as_ref(), options)?;
+        let handle = crate::registry::open(context, config.secret.as_ref(), options)?;
         Ok(Self {
             handle: Some(handle),
         })
