@@ -16,6 +16,8 @@ use crate::{Session, StagedWorkspace, WorkspaceTransition};
 pub(crate) struct StagedCandidate {
     pub workspace: [u8; 32],
     pub workspace_name: Option<String>,
+    /// The opaque candidate token; adopt it with the matching adopt op.
+    #[serde(rename = "candidate")]
     pub snapshot: Vec<u8>,
     pub state: &'static str,
     pub durable: bool,
@@ -48,6 +50,8 @@ impl StagedCandidate {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct StagedRemoval {
     pub workspace: [u8; 32],
+    /// The opaque candidate token; adopt it with the matching adopt op.
+    #[serde(rename = "candidate")]
     pub snapshot: Vec<u8>,
     pub state: &'static str,
     pub removed: bool,
@@ -207,16 +211,7 @@ fn stage_name(
     workspace: arachne_security::Workspace,
     missing: Option<u64>,
 ) -> Result<StagedCandidate, ApiError> {
-    let snapshot = seal_state(
-        session.records.is_some(),
-        &workspace,
-        session
-            .storage_key
-            .as_ref()
-            .ok_or_else(errors::no_root_key)?,
-        session.delivery.publisher.as_ref(),
-        session.delivery.inbox.as_ref(),
-    )?;
+    let snapshot = seal_state(session.records.is_some())?;
     let mut value = StagedCandidate::new(
         workspace.id(),
         workspace

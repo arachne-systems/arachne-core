@@ -266,3 +266,44 @@ fn freshness_anchor_has_a_fixed_byte_encoding() {
     assert!(FreshnessAnchor::from_bytes(&bytes[..39]).is_err());
     assert!(FreshnessAnchor::from_bytes(&[0; 41]).is_err());
 }
+
+fn roundtrip(provider: &dyn StorageProvider) {
+    let scope = [21; 32];
+    assert!(provider.open(scope).unwrap().is_none());
+    let mut storage = provider.create(scope).unwrap();
+    assert!(provider.create(scope).is_err(), "create never replaces a store");
+    assert_eq!(storage.revision(), 0);
+    storage
+        .commit(0, &[(b"runtime/a", Some(b"one")), (b"runtime/b", Some(b""))])
+        .unwrap();
+    let anchor = storage.freshness();
+    assert_eq!(anchor.revision, 1);
+    drop(storage);
+    let storage = provider.open(scope).unwrap().expect("store exists");
+    assert_eq!(storage.freshness(), anchor);
+    assert_eq!(storage.keys(b"runtime/"), vec![b"runtime/a".to_vec(), b"runtime/b".to_vec()]);
+    assert_eq!(storage.get(b"runtime/a").unwrap().unwrap().as_slice(), b"one");
+    assert!(storage.get(b"runtime/c").unwrap().is_none());
+    assert!(provider.open([22; 32]).unwrap().is_none());
+}
+
+#[test]
+fn sqlite_and_memory_providers_keep_one_store_per_scope() {
+    let directory = Directory::new();
+    roundtrip(&SqliteProvider::new(directory.0.path(), [7; 32]));
+    roundtrip(&MemoryProvider::default());
+}
+
+#[test]
+fn memory_provider_injects_commit_and_read_faults() {
+    let provider = MemoryProvider::default();
+    let mut storage = provider.create([1; 32]).unwrap();
+    provider.fail_next_commit();
+    assert!(storage.commit(0, &[(b"k", Some(b"v"))]).is_err());
+    assert_eq!(storage.revision(), 0);
+    storage.commit(0, &[(b"k", Some(b"v"))]).unwrap();
+    provider.corrupt_reads(true);
+    assert_ne!(storage.get(b"k").unwrap().unwrap().as_slice(), b"v");
+    provider.corrupt_reads(false);
+    assert_eq!(storage.get(b"k").unwrap().unwrap().as_slice(), b"v");
+}

@@ -1,10 +1,13 @@
-use arachne_runtime::{
-    close, create, describe, enable_record_storage, execute, restore_record_storage, save_candidate,
-};
+use arachne_runtime::{MemoryProvider, close, describe, execute};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
 mod common;
+
+/// A node with its own in-memory record storage.
+fn node(secret: u8) -> i64 {
+    common::stored(&[secret; 32], &MemoryProvider::default())
+}
 
 fn call(h: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(h, &serde_json::to_vec(&request).unwrap())?)
@@ -48,7 +51,7 @@ fn join(owner: i64, joiner: i64, invite: &Value, display_name: &str) {
     .unwrap();
     call(
         owner,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap();
     let reply = call(
@@ -63,7 +66,7 @@ fn join(owner: i64, joiner: i64, invite: &Value, display_name: &str) {
     .unwrap();
     call(
         joiner,
-        json!({"op":"adopt_join","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
     )
     .unwrap();
 }
@@ -142,22 +145,20 @@ fn issue_invitation(handle: i64) -> Value {
     .unwrap();
     call(
         handle,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap()["issued_invitation"]
         .clone()
 }
 
 fn adopt_candidate(handle: i64, staged: &Value) -> Value {
-    let snapshot = serde_json::from_value::<Vec<u8>>(staged["snapshot"].clone()).unwrap();
-    save_candidate(handle, &snapshot).unwrap();
-    call(handle, json!({"op":"adopt_admission","snapshot":staged["snapshot"]})).unwrap()
+    call(handle, json!({"op":"adopt_admission","candidate":staged["candidate"]})).unwrap()
 }
 
 #[test]
 fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave() {
-    let admin = create(Some(&[73; 32])).unwrap();
-    let successor = create(Some(&[74; 32])).unwrap();
+    let admin = node(73);
+    let successor = node(74);
     call(
         admin,
         json!({"op":"create_workspace","display_name":"Original admin"}),
@@ -165,13 +166,6 @@ fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave()
     .unwrap();
     let invite = issue_invitation(admin);
     join(admin, successor, &invite, "Successor");
-    let dir = common::directory();
-    enable_record_storage(
-        successor,
-        &dir.path().join("successor.db"),
-        &[74; 32],
-    )
-    .unwrap();
     route(admin, successor);
 
     let before_promotion = call(admin, json!({"op":"member_roster"})).unwrap();
@@ -229,7 +223,7 @@ fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave()
     );
     let promoted = call(
         admin,
-        json!({"op":"adopt_admission","snapshot":promotion["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":promotion["candidate"]}),
     )
     .unwrap();
     assert_eq!(promoted["epoch"], old_epoch + 1);
@@ -243,11 +237,9 @@ fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave()
     let staged = incoming(successor);
     assert_eq!(staged["state"], "awaiting_save");
     assert!(!leaving.is_finished(), "departure completed before the peer adopted it");
-    let snapshot = serde_json::from_value::<Vec<u8>>(staged["snapshot"].clone()).unwrap();
-    save_candidate(successor, &snapshot).unwrap();
     call(
         successor,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap();
     assert_eq!(
@@ -266,21 +258,20 @@ fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave()
     assert_eq!(
         call(
             admin,
-            json!({"op":"adopt_admission","snapshot":removed["snapshot"]}),
+            json!({"op":"adopt_admission","candidate":removed["candidate"]}),
         )
         .unwrap()["state"],
         "removed"
     );
 
     close(successor).unwrap();
-    dir.close().unwrap();
 }
 
 #[test]
 fn three_member_leave_converges_through_successive_administrator_handoffs() {
-    let admin = create(Some(&[101; 32])).unwrap();
-    let successor = create(Some(&[102; 32])).unwrap();
-    let third = create(Some(&[103; 32])).unwrap();
+    let admin = node(101);
+    let successor = node(102);
+    let third = node(103);
     call(
         admin,
         json!({"op":"create_workspace","display_name":"Alpha"}),
@@ -298,7 +289,7 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
     .unwrap();
     let adopted = call(
         admin,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap();
     let invite = adopted["issued_invitation"].clone();
@@ -309,15 +300,11 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
     .unwrap();
     call(
         successor,
-        json!({"op":"adopt_admission","snapshot":synced["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":synced["candidate"]}),
     )
     .unwrap();
     join(admin, third, &invite, "Charlie");
 
-    let dir = common::directory();
-    enable_record_storage(admin, &dir.path().join("alpha.db"), &[101; 32]).unwrap();
-    enable_record_storage(successor, &dir.path().join("bravo.db"), &[102; 32]).unwrap();
-    enable_record_storage(third, &dir.path().join("charlie.db"), &[103; 32]).unwrap();
     route(admin, successor);
     route(successor, admin);
     route(admin, third);
@@ -429,13 +416,14 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
     assert_eq!(final_roster["members"][0]["administrator"], true);
 
     close(third).unwrap();
-    dir.close().unwrap();
 }
 
 #[test]
 fn leave_over_iroh_retries_saved_outcome_then_restores_only_terminal_state() {
-    let mut admin = create(Some(&[71; 32])).unwrap();
-    let member = create(Some(&[72; 32])).unwrap();
+    let admin_storage = MemoryProvider::default();
+    let member_storage = MemoryProvider::default();
+    let mut admin = common::stored(&[71; 32], &admin_storage);
+    let member = common::stored(&[72; 32], &member_storage);
     let created = call(
         admin,
         json!({"op":"create_workspace","display_name":"Admin"}),
@@ -451,21 +439,16 @@ fn leave_over_iroh_retries_saved_outcome_then_restores_only_terminal_state() {
     let admission = call(admin, json!({"op":"stage_admission","authenticated_endpoint":join["endpoint"],"request":join["admission_request"]})).unwrap();
     call(
         admin,
-        json!({"op":"adopt_admission","snapshot":admission["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":admission["candidate"]}),
     )
     .unwrap();
     let reply = call(admin, json!({"op":"retained_admission","authenticated_endpoint":join["endpoint"],"request":join["admission_request"]})).unwrap();
     let joined = call(member, json!({"op":"stage_join","welcome":reply["welcome"],"commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]})).unwrap();
     call(
         member,
-        json!({"op":"adopt_join","snapshot":joined["snapshot"]}),
+        json!({"op":"adopt_join","candidate":joined["candidate"]}),
     )
     .unwrap();
-    let dir = common::directory();
-    let a = dir.path().join("admin.db");
-    let b = dir.path().join("member.db");
-    enable_record_storage(admin, &a, &[71; 32]).unwrap();
-    enable_record_storage(member, &b, &[72; 32]).unwrap();
     assert!(call(admin, json!({"op":"stage_solo_leave"})).is_err());
     route(member, admin);
     let peer = info(admin)["endpoint_key"].clone();
@@ -474,25 +457,18 @@ fn leave_over_iroh_retries_saved_outcome_then_restores_only_terminal_state() {
     let staged = incoming(admin);
     assert_eq!(staged["leaving"], true);
     assert!(call(admin, json!({"op":"send_admission_reply"})).is_err());
-    save_candidate(
-        admin,
-        &serde_json::from_value::<Vec<u8>>(staged["snapshot"].clone()).unwrap(),
-    )
-    .unwrap();
     let adopted = call(
         admin,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap();
     assert_eq!(adopted["members"], 1);
     close(admin).unwrap(); // Saved departure, lost reply.
     assert!(first.join().unwrap().is_err());
-    admin = create(Some(&[71; 32])).unwrap();
-    let restored = restore_record_storage(
+    admin = common::stored(&[71; 32], &admin_storage);
+    let restored = call(
         admin,
-        &a,
-        &[71; 32],
-        serde_json::from_value(created["workspace"].clone()).unwrap(),
+        json!({"op":"restore_workspace","workspace":created["workspace"]}),
     )
     .unwrap();
     assert_eq!(restored["members"], 1);
@@ -504,35 +480,21 @@ fn leave_over_iroh_retries_saved_outcome_then_restores_only_terminal_state() {
     call(admin, json!({"op":"send_admission_reply"})).unwrap();
     let departed = retry.join().unwrap().unwrap();
     assert_eq!(departed["removed"], true);
-    assert!(
-        call(
-            member,
-            json!({"op":"adopt_admission","snapshot":departed["snapshot"]})
-        )
-        .is_err()
-    );
-    save_candidate(
-        member,
-        &serde_json::from_value::<Vec<u8>>(departed["snapshot"].clone()).unwrap(),
-    )
-    .unwrap();
     assert_eq!(
         call(
             member,
-            json!({"op":"adopt_admission","snapshot":departed["snapshot"]})
+            json!({"op":"adopt_admission","candidate":departed["candidate"]})
         )
         .unwrap()["state"],
         "removed"
     );
     assert!(call(member, json!({"op":"member_roster"})).is_err());
     close(member).unwrap();
-    let member = create(Some(&[72; 32])).unwrap();
+    let member = common::stored(&[72; 32], &member_storage);
     assert_eq!(
-        restore_record_storage(
+        call(
             member,
-            &b,
-            &[72; 32],
-            serde_json::from_value(created["workspace"].clone()).unwrap()
+            json!({"op":"restore_workspace","workspace":created["workspace"]}),
         )
         .unwrap()["state"],
         "removed"
@@ -546,5 +508,4 @@ fn leave_over_iroh_retries_saved_outcome_then_restores_only_terminal_state() {
     );
     close(member).unwrap();
     close(admin).unwrap();
-    dir.close().unwrap();
 }

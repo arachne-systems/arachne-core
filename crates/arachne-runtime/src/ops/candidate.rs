@@ -14,14 +14,13 @@ use crate::ops::admission::{admission_reply_page, queue_admission_push, send_inb
 use crate::session::{activity_view, commit_workspace, transition_activity};
 use crate::workspace_activity::ActivityView;
 use crate::ops::invitation::invitation_envelope;
-use crate::{Session, WorkspacePhase, WorkspaceTransition, membership, report};
+use crate::{Session, WorkspacePhase, WorkspaceTransition, membership, persistence, report};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AdoptArgs {
-    /// The exact candidate bytes (token or sealed state) the host saved.
-    #[serde(default)]
-    pub snapshot: Vec<u8>,
+    /// The opaque token the stage op returned.
+    pub candidate: Vec<u8>,
 }
 
 /// Which adopt op runs. Each accepts only its own transitions.
@@ -64,6 +63,10 @@ impl AdoptKind {
                 )
         )
     }
+}
+
+fn kind_mismatch() -> ApiError {
+    ApiError::wrong_state("candidate kind does not match this adopt operation")
 }
 
 /// A member as a reply shows it.
@@ -170,62 +173,55 @@ impl AdoptReply {
 }
 
 pub(crate) fn adopt_admission(session: &mut Session, args: AdoptArgs) -> Result<AdoptReply, ApiError> {
-    adopt(session, AdoptKind::Admission, args.snapshot)
+    adopt(session, AdoptKind::Admission, args.candidate)
 }
 
 pub(crate) fn adopt_join(session: &mut Session, args: AdoptArgs) -> Result<AdoptReply, ApiError> {
-    adopt(session, AdoptKind::Join, args.snapshot)
+    adopt(session, AdoptKind::Join, args.candidate)
 }
 
 pub(crate) fn adopt_publication(
     session: &mut Session,
     args: AdoptArgs,
 ) -> Result<AdoptReply, ApiError> {
-    adopt(session, AdoptKind::Publication, args.snapshot)
+    adopt(session, AdoptKind::Publication, args.candidate)
 }
 
 pub(crate) fn adopt_reception(session: &mut Session, args: AdoptArgs) -> Result<AdoptReply, ApiError> {
-    adopt(session, AdoptKind::Reception, args.snapshot)
+    adopt(session, AdoptKind::Reception, args.candidate)
 }
 
 pub(crate) fn adopt_recovery(session: &mut Session, args: AdoptArgs) -> Result<AdoptReply, ApiError> {
-    adopt(session, AdoptKind::Recovery, args.snapshot)
+    adopt(session, AdoptKind::Recovery, args.candidate)
 }
 
 pub(crate) fn adopt_current_view(
     session: &mut Session,
     args: AdoptArgs,
 ) -> Result<AdoptReply, ApiError> {
-    adopt(session, AdoptKind::CurrentView, args.snapshot)
+    adopt(session, AdoptKind::CurrentView, args.candidate)
 }
 
-fn require_committed(session: &Session, snapshot: &[u8]) -> Result<(), ApiError> {
-    if let Some(store) = &session.records {
-        store.require_committed(snapshot)?;
-    }
-    Ok(())
-}
-
-/// Adopt the saved candidate of `kind`: the one place a staged candidate or
-/// a staged removal becomes committed.
+/// Adopt the staged candidate of `kind`: the one place a staged candidate or
+/// a staged removal becomes committed. Core saves it to record storage and
+/// reads it back first; only then does live state move.
 pub(crate) fn adopt(
     session: &mut Session,
     kind: AdoptKind,
     snapshot: Vec<u8>,
 ) -> Result<AdoptReply, ApiError> {
-    if let Some((removed, expected)) = &session.transition.removal {
+    if let Some((_, expected)) = &session.transition.removal {
         // The guards let only adopt_admission through while a removal waits.
         if kind != AdoptKind::Admission {
-            return Err(ApiError::wrong_state(
-                "removed membership awaits durable adoption",
-            ));
+            return Err(kind_mismatch());
         }
         if &snapshot != expected {
             return Err(ApiError::candidate_stale(
                 "removed snapshot does not match candidate",
             ));
         }
-        require_committed(session, &snapshot)?;
+        persistence::commit_candidate(session, &snapshot)?;
+        let (removed, _) = session.transition.removal.as_ref().unwrap();
         let value = Removed::of(removed);
         session.ending = true;
         return Ok(AdoptReply::Removed(value));
@@ -236,14 +232,14 @@ pub(crate) fn adopt(
         .as_ref()
         .ok_or_else(|| ApiError::wrong_state("session has no workspace candidate"))?;
     if !kind.accepts(&staged.transition) {
-        return Err(ApiError::wrong_state("wrong adoption lifecycle phase"));
+        return Err(kind_mismatch());
     }
     if snapshot != staged.snapshot {
         return Err(ApiError::candidate_stale(
             "workspace snapshot does not match candidate",
         ));
     }
-    require_committed(session, &snapshot)?;
+    persistence::commit_candidate(session, &snapshot)?;
     let staged = session.transition.staged.take().unwrap();
     let joined = matches!(&staged.transition, WorkspaceTransition::Join);
     let mut value = Adopted {
@@ -258,7 +254,7 @@ pub(crate) fn adopt(
             .workspace_name_missing_history()
             .map_err(security(ErrorCode::Internal))?,
         members: staged.workspace.member_count(),
-        durable: session.records.is_some(),
+        durable: true,
         state: None,
         publication_count: None,
         missing_count: None,
@@ -462,10 +458,12 @@ mod tests {
             inbox::{InboxStage, ObjectInbox},
         };
         use arachne_routing::PublicationContext;
-        use arachne_security::{PendingJoin, StorageKey, Workspace};
+        use arachne_security::{PendingJoin, Workspace};
 
         let root = [105; 32];
+        let provider = arachne_store::MemoryProvider::default();
         let handle = create(Some(&root)).unwrap();
+        attach_storage(handle, StorageConfig::memory(&provider)).unwrap();
         let call = |request: Value| -> Result<Value, String> {
             serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
                 .map_err(|error| error.to_string())
@@ -505,10 +503,8 @@ mod tests {
             panic!("object was not staged")
         };
         let publisher = PublisherLog::new(&admin).unwrap();
-        let key = StorageKey::derive(&root).unwrap();
-        let snapshot = inbox.seal(&admin, &key, &publisher).unwrap();
-        call(json!({"op":"restore_workspace","workspace":admin.id(),"snapshot":snapshot}))
-            .unwrap();
+        harness::seed_workspace(&provider, &admin, Some(&publisher), Some(&inbox)).unwrap();
+        call(json!({"op":"restore_workspace","workspace":admin.id()})).unwrap();
         let pending = call(json!({"op":"poll_pending_object"})).unwrap();
         assert_eq!(pending["payload"], json!(b"still pending"));
 
@@ -517,26 +513,25 @@ mod tests {
             "action":{"kind":"remove","member":sender.member().unwrap().id()}}))
         .unwrap();
         let adopted =
-            call(json!({"op":"adopt_admission","snapshot":staged["snapshot"]})).unwrap();
+            call(json!({"op":"adopt_admission","candidate":staged["candidate"]})).unwrap();
         assert_eq!(adopted["epoch"], admin.epoch() + 1);
         assert_eq!(adopted["members"], 1);
         // The pending object is carried into the new epoch and survives restart.
         assert_eq!(call(json!({"op":"poll_pending_object"})).unwrap(), pending);
         close(handle).unwrap();
         let handle = create(Some(&root)).unwrap();
+        attach_storage(handle, StorageConfig::memory(&provider)).unwrap();
         let call = |request: Value| -> Result<Value, String> {
             serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
                 .map_err(|error| error.to_string())
         };
-        call(json!({"op":"restore_workspace","workspace":admin.id(),
-            "snapshot":staged["snapshot"]}))
-        .unwrap();
+        call(json!({"op":"restore_workspace","workspace":admin.id()})).unwrap();
         assert_eq!(call(json!({"op":"poll_pending_object"})).unwrap(), pending);
         let acknowledged = call(json!({"op":"stage_object_acknowledgement",
             "member":pending["member"], "topic":pending["topic"],
             "counter":pending["counter"], "id":pending["id"]}))
         .unwrap();
-        call(json!({"op":"adopt_reception","snapshot":acknowledged["snapshot"]})).unwrap();
+        call(json!({"op":"adopt_reception","candidate":acknowledged["candidate"]})).unwrap();
         assert!(call(json!({"op":"poll_pending_object"})).unwrap().is_null());
         // The removed member's objects are no longer accepted.
         let late = PublicationContext {

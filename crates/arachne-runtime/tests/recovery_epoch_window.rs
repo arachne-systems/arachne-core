@@ -1,8 +1,10 @@
 //! A3f: the runtime recovery ops recover an author's objects from an earlier
 //! epoch that is still in the receive window, not only from the current one.
-use arachne_runtime::{close, create, describe, execute, execute_stored, execute_with_code, ErrorCode};
+use arachne_runtime::{ErrorCode, MemoryProvider, close, describe, execute, execute_with_code};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
+
+mod common;
 
 const EVENT: &str = "atak/native/v1/chat";
 
@@ -11,17 +13,9 @@ fn call(handle: i64, request: Value) -> Value {
         .unwrap()
 }
 
-/// Adopt a staged candidate. The snapshot travels as stored bytes: large
-/// publisher and inbox state does not fit a JSON request.
+/// Adopt a staged candidate: save, read back and adopt in one step.
 fn adopt(handle: i64, op: &str, staged: &Value) -> Value {
-    let snapshot: Vec<u8> = serde_json::from_value(staged["snapshot"].clone()).unwrap();
-    let [metadata, _] = execute_stored(
-        handle,
-        &serde_json::to_vec(&json!({"op":op})).unwrap(),
-        &snapshot,
-    )
-    .unwrap();
-    serde_json::from_slice(&metadata).unwrap()
+    call(handle, json!({"op":op,"candidate":staged["candidate"]}))
 }
 
 fn step(reply: &Value) -> Value {
@@ -35,7 +29,7 @@ fn issue_invitation(handle: i64) -> Value {
     );
     call(
         handle,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )["issued_invitation"]
         .clone()
 }
@@ -53,7 +47,7 @@ fn add(owner: i64, joiner: i64, invite: &Value, name: &str) {
     );
     call(
         owner,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     );
     let reply = call(
         owner,
@@ -66,7 +60,7 @@ fn add(owner: i64, joiner: i64, invite: &Value, name: &str) {
     );
     call(
         joiner,
-        json!({"op":"adopt_join","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
     );
 }
 
@@ -97,8 +91,8 @@ fn finish_range(server: i64, client: i64) -> Value {
 
 #[test]
 fn recovery_reaches_an_earlier_epoch_in_the_receive_window() {
-    let author = create(Some(&[161; 32])).unwrap();
-    let reader = create(Some(&[162; 32])).unwrap();
+    let author = common::stored(&[161; 32], &MemoryProvider::default());
+    let reader = common::stored(&[162; 32], &MemoryProvider::default());
     let created = call(
         author,
         json!({"op":"create_workspace","display_name":"Author"}),
@@ -124,13 +118,13 @@ fn recovery_reaches_an_earlier_epoch_in_the_receive_window() {
     );
     let step = call(
         author,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )["step"]
         .clone();
     let staged = call(reader, json!({"op":"stage_admission_update","step":step}));
     let adopted = call(
         reader,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     );
     assert_eq!(adopted["epoch"], 3);
     for handle in [author, reader] {

@@ -1,6 +1,8 @@
-use arachne_runtime::{close, create, describe, execute};
+use arachne_runtime::{MemoryProvider, close, describe, execute};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
+
+mod common;
 
 fn call(handle: i64, request: Value) -> Value {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap()).unwrap())
@@ -14,8 +16,9 @@ fn call(handle: i64, request: Value) -> Value {
 
 #[test]
 fn recipient_publication_survives_receiver_restart_with_object_delivery_enabled() {
-    let sender = create(Some(&[81; 32])).unwrap();
-    let receiver = create(Some(&[82; 32])).unwrap();
+    let sender = common::stored(&[81; 32], &MemoryProvider::default());
+    let receiver_provider = MemoryProvider::default();
+    let receiver = common::stored(&[82; 32], &receiver_provider);
     assert!(execute(sender, br#"{"op":"workspace_metrics"}"#).is_err());
     let workspace = call(
         sender,
@@ -24,7 +27,7 @@ fn recipient_publication_survives_receiver_restart_with_object_delivery_enabled(
     let staged = call(sender, json!({"op":"stage_invitation","personal":false,"expires_at":0}));
     let invite = call(
         sender,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )["issued_invitation"]
         .clone();
     let pending = call(
@@ -39,7 +42,7 @@ fn recipient_publication_survives_receiver_restart_with_object_delivery_enabled(
     );
     call(
         sender,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     );
     let reply = call(
         sender,
@@ -53,7 +56,7 @@ fn recipient_publication_survives_receiver_restart_with_object_delivery_enabled(
     );
     call(
         receiver,
-        json!({"op":"adopt_join","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
     );
     for handle in [sender, receiver] {
         call(
@@ -78,7 +81,7 @@ fn recipient_publication_survives_receiver_restart_with_object_delivery_enabled(
     );
     let refused = call(
         sender,
-        json!({"op":"adopt_publication","snapshot":refused["snapshot"]}),
+        json!({"op":"adopt_publication","candidate":refused["candidate"]}),
     );
     assert_eq!(
         refused["admission"]["admitted"],
@@ -109,7 +112,7 @@ fn recipient_publication_survives_receiver_restart_with_object_delivery_enabled(
     );
     let sent = call(
         sender,
-        json!({"op":"adopt_publication","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_publication","candidate":staged["candidate"]}),
     );
     assert_eq!(sent["admission"]["admitted"], json!([info["endpoint_key"]]));
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -126,9 +129,8 @@ fn recipient_publication_survives_receiver_restart_with_object_delivery_enabled(
     };
     call(
         receiver,
-        json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_reception","candidate":staged["candidate"]}),
     );
-    let saved = call(receiver, json!({"op":"seal_workspace"}));
     let metrics = call(receiver, json!({"op":"workspace_metrics"}));
     assert!(
         metrics["received_bytes"].as_u64().unwrap()
@@ -146,10 +148,10 @@ fn recipient_publication_survives_receiver_restart_with_object_delivery_enabled(
             .all(|path| path["member"] == workspace["member"]["id"])
     );
     close(receiver).unwrap();
-    let receiver = create(Some(&[82; 32])).unwrap();
+    let receiver = common::stored(&[82; 32], &receiver_provider);
     call(
         receiver,
-        json!({"op":"restore_workspace","workspace":workspace["workspace"],"snapshot":saved["snapshot"]}),
+        json!({"op":"restore_workspace","workspace":workspace["workspace"]}),
     );
     let reopened = call(receiver, json!({"op":"workspace_metrics"}));
     assert_eq!(
@@ -194,7 +196,7 @@ fn recipient_publication_survives_receiver_restart_with_object_delivery_enabled(
     let staged = call(receiver, json!({"op":"stage_direct_recovery"}));
     call(
         receiver,
-        json!({"op":"adopt_recovery","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_recovery","candidate":staged["candidate"]}),
     );
     let missed = call(receiver, json!({"op":"poll_pending_object"}));
     assert_eq!(
@@ -209,7 +211,7 @@ fn recipient_publication_survives_receiver_restart_with_object_delivery_enabled(
     );
     call(
         receiver,
-        json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_reception","candidate":staged["candidate"]}),
     );
     let item = call(receiver, json!({"op":"poll_pending_object"}));
     assert_eq!(
@@ -227,7 +229,7 @@ fn recipient_publication_survives_receiver_restart_with_object_delivery_enabled(
     );
     let published = call(
         sender,
-        json!({"op":"adopt_publication","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_publication","candidate":staged["candidate"]}),
     );
     assert_eq!(published["sequence"], 1);
     close(sender).unwrap();

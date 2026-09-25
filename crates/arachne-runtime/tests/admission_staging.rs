@@ -38,10 +38,7 @@
 //     assertion below for the measurements behind this deferral.
 
 use arachne_node::Node;
-use arachne_runtime::{
-    close, create, describe, enable_record_storage, execute, execute_stored,
-    restore_record_storage, save_candidate,
-};
+use arachne_runtime::{MemoryProvider, close, describe, execute};
 use arachne_security::{Invitation, PendingJoin};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -52,11 +49,22 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 
+mod common;
+
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn call(handle: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
         .map_err(|error| error.to_string())
+}
+
+/// Save, read back and adopt a staged admission candidate in one step.
+fn adopt(owner: i64, staged: &Value) -> Value {
+    call(
+        owner,
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+    )
+    .unwrap()
 }
 
 fn bytes(value: &Value) -> Vec<u8> {
@@ -130,9 +138,7 @@ fn timed_admission(
             }
             Some("admission_replied") => handled = Some((tick.elapsed(), value)),
             Some("awaiting_save") => {
-                let snapshot = bytes(&value["snapshot"]);
-                save_candidate(owner, &snapshot).unwrap();
-                execute_stored(owner, br#"{"op":"adopt_admission"}"#, &snapshot).unwrap();
+                adopt(owner, &value);
             }
             _ => {}
         }
@@ -144,9 +150,7 @@ fn timed_admission(
         assert!(Instant::now() < drain, "extra joiner never got a reply");
         let value = call(owner, json!({"op":"poll_admission","profile":true})).unwrap();
         if value["state"] == "awaiting_save" {
-            let snapshot = bytes(&value["snapshot"]);
-            save_candidate(owner, &snapshot).unwrap();
-            execute_stored(owner, br#"{"op":"adopt_admission"}"#, &snapshot).unwrap();
+            adopt(owner, &value);
         }
         thread::sleep(Duration::from_millis(5));
     }
@@ -217,14 +221,13 @@ fn admission_batch_staging_keeps_committing_under_continuous_intake() {
     const COMPLETION_BOUND: Duration = Duration::from_secs(180);
 
     let started = Instant::now();
-    let owner = create(Some(&[31; 32])).unwrap();
+    let provider = MemoryProvider::default();
+    let owner = common::stored(&[31; 32], &provider);
     call(
         owner,
         json!({"op":"create_workspace","display_name":"Staging owner","workspace_name":"FUT-31 staging"}),
     )
     .unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    enable_record_storage(owner, &dir.path().join("owner.db"), &[31; 32]).unwrap();
     // FUT-35: the link is created through the registered `stage_invitation`
     // path the plugin itself uses (WorkspaceController's create-link flow),
     // not the bare `issue_invitation` helper. Registration is what makes the
@@ -237,13 +240,7 @@ fn admission_batch_staging_keeps_committing_under_continuous_intake() {
         json!({"op":"stage_invitation","personal":false,"expires_at":0}),
     )
     .unwrap();
-    save_candidate(owner, &bytes(&staged["snapshot"])).unwrap();
-    let invitation = call(
-        owner,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
-    )
-    .unwrap()["issued_invitation"]
-        .clone();
+    let invitation = adopt(owner, &staged)["issued_invitation"].clone();
     let invitation_bytes = bytes(&invitation["invitation"]);
     let checkpoint = bytes(&invitation["checkpoint"]);
     let owner_info: Value = serde_json::from_str(&describe(owner).unwrap()).unwrap();
@@ -385,9 +382,7 @@ fn admission_batch_staging_keeps_committing_under_continuous_intake() {
         match value["state"].as_str() {
             Some("awaiting_save") => {
                 let count = value["admissions"].as_u64().unwrap() as usize;
-                let snapshot = bytes(&value["snapshot"]);
-                save_candidate(owner, &snapshot).unwrap();
-                execute_stored(owner, br#"{"op":"adopt_admission"}"#, &snapshot).unwrap();
+                adopt(owner, &value);
                 batch_sizes.push(count);
                 commit_events.push(Instant::now());
             }
@@ -532,9 +527,9 @@ fn admission_batch_staging_keeps_committing_under_continuous_intake() {
     // invitation checkpoint is durable, so a restarted owner keeps the cheap
     // preflight instead of paying full-history re-verification again.
     close(owner).unwrap();
-    let owner = create(Some(&[31; 32])).unwrap();
+    let owner = common::stored(&[31; 32], &provider);
     let workspace: [u8; 32] = endpoint(&invitation["workspace"]);
-    restore_record_storage(owner, &dir.path().join("owner.db"), &[31; 32], workspace).unwrap();
+    call(owner, json!({"op":"restore_workspace","workspace":workspace})).unwrap();
     let restarted_info: Value = serde_json::from_str(&describe(owner).unwrap()).unwrap();
     let restarted_peer = endpoint(&restarted_info["endpoint_key"]);
     let restarted_port = restarted_info["bound_address"]

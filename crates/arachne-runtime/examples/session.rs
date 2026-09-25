@@ -25,38 +25,39 @@ fn dispatch(handle: &mut Option<i64>, command: Value) -> Result<Value, String> {
         *handle = None;
         return Ok(json!({"closed":true}));
     }
-    if command["op"] == "enable_record_storage" || command["op"] == "restore_record_storage" {
-        let path = std::path::Path::new(
-            command["path"]
+    if command["op"] == "attach_storage" {
+        let directory = std::path::Path::new(
+            command["directory"]
                 .as_str()
-                .ok_or("missing private store path")?,
+                .ok_or("missing private store directory")?,
         );
         let root: [u8; 32] =
             serde_json::from_value(command["root"].clone()).map_err(|_| "invalid storage root")?;
-        if command["op"] == "enable_record_storage" {
-            arachne_runtime::enable_record_storage(current, path, &root)?;
-            return Ok(json!({"durable":true}));
-        }
-        let workspace = serde_json::from_value(command["workspace"].clone())
-            .map_err(|_| "invalid workspace")?;
-        return arachne_runtime::restore_record_storage(current, path, &root, workspace);
+        arachne_runtime::attach_storage(
+            current,
+            arachne_runtime::StorageConfig::sqlite(directory, root),
+        )?;
+        return Ok(json!({"attached":true}));
     }
-    if command["op"] == "save_candidate" {
-        let token: Vec<u8> = serde_json::from_value(command["token"].clone())
-            .map_err(|_| "invalid candidate token")?;
-        arachne_runtime::save_candidate(current, &token)?;
-        return Ok(json!({"durable":true}));
+    let request = command.get("request").ok_or("missing request")?;
+    // A binary Welcome (stage_join) never fits a JSON request; every other op
+    // travels as plain JSON, its candidate token an ordinary field.
+    if request["op"] == "stage_join" {
+        let welcome: Vec<u8> =
+            serde_json::from_value(request.get("welcome").cloned().unwrap_or(json!([])))
+                .map_err(|_| "invalid binary welcome")?;
+        let mut metadata = request.clone();
+        metadata
+            .as_object_mut()
+            .ok_or("request must be an object")?
+            .remove("welcome");
+        let encoded = serde_json::to_vec(&metadata).map_err(|e| e.to_string())?;
+        let response = arachne_runtime::execute_stored(current, &encoded, &welcome)?;
+        return serde_json::from_slice(&response).map_err(|e| e.to_string());
     }
-    let snapshot: Vec<u8> =
-        serde_json::from_value(command.get("snapshot").cloned().unwrap_or(json!([])))
-            .map_err(|_| "invalid binary snapshot")?;
-    let request = serde_json::to_vec(command.get("request").ok_or("missing request")?)
-        .map_err(|e| e.to_string())?;
-    let [metadata, snapshot] = arachne_runtime::execute_stored(current, &request, &snapshot)?;
-    Ok(
-        json!({"metadata":serde_json::from_slice::<Value>(&metadata).map_err(|e|e.to_string())?,
-        "snapshot":snapshot}),
-    )
+    let encoded = serde_json::to_vec(request).map_err(|e| e.to_string())?;
+    let response = arachne_runtime::execute(current, &encoded)?;
+    serde_json::from_slice(&response).map_err(|e| e.to_string())
 }
 
 fn main() -> io::Result<()> {

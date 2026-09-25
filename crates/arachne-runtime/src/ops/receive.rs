@@ -234,18 +234,8 @@ fn resolve(session: &mut Session, args: ResolveArgs, rejected: bool) -> Result<S
     }
     .map_err(delivery(ErrorCode::InvalidInput))?;
     let publisher = publisher_or_new(session, owner)?;
-    let key = session
-        .storage_key
-        .as_ref()
-        .ok_or_else(errors::no_root_key)?;
     // The inbox change is sealed with the committed workspace state.
-    let snapshot = seal_state(
-        session.records.is_some(),
-        owner,
-        key,
-        Some(&publisher),
-        Some(&inbox),
-    )?;
+    let snapshot = seal_state(session.records.is_some())?;
     let candidate = owner
         .provisional_copy()
         .map_err(security(ErrorCode::Internal))?;
@@ -276,10 +266,12 @@ mod tests {
             inbox::{InboxStage, ObjectInbox},
         };
         use arachne_routing::PublicationContext;
-        use arachne_security::{PendingJoin, StorageKey, Workspace};
+        use arachne_security::{PendingJoin, Workspace};
 
         let root = [103; 32];
+        let provider = arachne_store::MemoryProvider::default();
         let handle = create(Some(&root)).unwrap();
+        attach_storage(handle, StorageConfig::memory(&provider)).unwrap();
         let call = |request: Value| -> Result<Value, String> {
             serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
                 .map_err(|error| error.to_string())
@@ -332,11 +324,8 @@ mod tests {
         }
         let publisher =
             PublisherLog::new(&reader).unwrap();
-        let snapshot = inbox
-            .seal(&reader, &StorageKey::derive(&root).unwrap(), &publisher)
-            .unwrap();
-        call(json!({"op":"restore_workspace","workspace":reader.id(),"snapshot":snapshot}))
-            .unwrap();
+        harness::seed_workspace(&provider, &reader, Some(&publisher), Some(&inbox)).unwrap();
+        call(json!({"op":"restore_workspace","workspace":reader.id()})).unwrap();
         let pending = call(json!({"op":"poll_pending_object"})).unwrap();
         assert_eq!(pending["id"], json!(vec![2; 16]));
         assert_eq!(
@@ -398,7 +387,7 @@ mod tests {
             "topic":pending["topic"], "counter":pending["counter"], "id":pending["id"]}),
         )
         .unwrap();
-        call(json!({"op":"adopt_reception","snapshot":staged["snapshot"]})).unwrap();
+        call(json!({"op":"adopt_reception","candidate":staged["candidate"]})).unwrap();
         assert_eq!(
             call(json!({"op":"poll_pending_object"})).unwrap(),
             Value::Null

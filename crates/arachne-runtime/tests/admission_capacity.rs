@@ -1,7 +1,5 @@
 use arachne_node::Node;
-use arachne_runtime::{
-    close, create, describe, enable_record_storage, execute, execute_stored, save_candidate,
-};
+use arachne_runtime::{MemoryProvider, close, describe, execute};
 use arachne_security::{Invitation, PendingJoin};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -10,6 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
+
+mod common;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -49,23 +49,20 @@ fn public_runtime_admission_path_handles_500_authenticated_joiners() {
     const MEMBERS: usize = 500;
     const RETRIES: usize = 16;
     let started = Instant::now();
-    let owner = create(Some(&[17; 32])).unwrap();
+    let owner = common::stored(&[17; 32], &MemoryProvider::default());
     call(
         owner,
         json!({"op":"create_workspace","display_name":"Burst owner","workspace_name":"Capacity test"}),
     )
     .unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    enable_record_storage(owner, &dir.path().join("owner.db"), &[17; 32]).unwrap();
     let staged = call(
         owner,
         json!({"op":"stage_invitation","personal":false,"expires_at":0}),
     )
     .unwrap();
-    save_candidate(owner, &bytes(&staged["snapshot"])).unwrap();
     let invitation = call(
         owner,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap()["issued_invitation"]
         .clone();
@@ -205,11 +202,14 @@ fn public_runtime_admission_path_handles_500_authenticated_joiners() {
         let value = call(owner, json!({"op":"poll_admission"})).unwrap();
         if value["state"] == "awaiting_save" {
             let count = value["admissions"].as_u64().unwrap() as usize;
-            let snapshot = bytes(&value["snapshot"]);
-            save_candidate(owner, &snapshot).unwrap();
-            let adopted = execute_stored(owner, br#"{"op":"adopt_admission"}"#, &snapshot).unwrap();
+            let adopted = call(
+                owner,
+                json!({"op":"adopt_admission","candidate":value["candidate"]}),
+            )
+            .unwrap();
+            assert_eq!(adopted["durable"], true);
             assert_eq!(
-                serde_json::from_slice::<Value>(&adopted[0]).unwrap()["members"],
+                adopted["members"],
                 committed + count + 1
             );
             committed += count;
@@ -224,9 +224,11 @@ fn public_runtime_admission_path_handles_500_authenticated_joiners() {
     while !client_thread.is_finished() {
         let value = call(owner, json!({"op":"poll_admission"})).unwrap();
         if value["state"] == "awaiting_save" {
-            let snapshot = bytes(&value["snapshot"]);
-            save_candidate(owner, &snapshot).unwrap();
-            execute_stored(owner, br#"{"op":"adopt_admission"}"#, &snapshot).unwrap();
+            call(
+                owner,
+                json!({"op":"adopt_admission","candidate":value["candidate"]}),
+            )
+            .unwrap();
             batches += 1;
         } else {
             assert!(

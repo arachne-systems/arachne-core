@@ -1408,7 +1408,11 @@ pub(super) fn bare_test_session(workspace: impl Into<Arc<arachne_security::Works
         phase: super::WorkspacePhase::Active,
         reason: None,
     };
-    session.workspace = Some(workspace.into());
+    // Staging needs record storage; each bare session has its own.
+    let workspace: Arc<arachne_security::Workspace> = workspace.into();
+    session.storage = Some(super::StorageConfig::memory(&arachne_store::MemoryProvider::default()));
+    super::persistence::commit_created(&mut session, &workspace, None, None).unwrap();
+    session.workspace = Some(workspace);
     session
 }
 
@@ -1987,10 +1991,6 @@ pub(super) fn stage_update(
             prepared
         }
     };
-    let key = session
-        .storage_key
-        .as_ref()
-        .ok_or_else(errors::no_root_key)?;
     let prepared = match prepared {
         arachne_security::PreparedManagementUpdate::Active(workspace) => *workspace,
         arachne_security::PreparedManagementUpdate::Removed(removed) => {
@@ -1998,13 +1998,7 @@ pub(super) fn stage_update(
         }
     };
     let (publisher, inbox) = super::carry_delivery(session, &prepared)?;
-    let snapshot = seal_state(
-        session.records.is_some(),
-        &prepared,
-        key,
-        publisher.as_ref(),
-        inbox.as_ref(),
-    )?;
+    let snapshot = seal_state(session.records.is_some())?;
     let value = StagedCandidate::new(
         prepared.id(),
         prepared
@@ -2632,16 +2626,7 @@ pub(super) fn stage_prepared(
     prepared: arachne_security::PreparedManagement,
 ) -> Result<StagedCandidate, ApiError> {
     let (publisher, inbox) = super::carry_delivery(session, &prepared.workspace)?;
-    let snapshot = seal_state(
-        session.records.is_some(),
-        &prepared.workspace,
-        session
-            .storage_key
-            .as_ref()
-            .ok_or_else(errors::no_root_key)?,
-        publisher.as_ref(),
-        inbox.as_ref(),
-    )?;
+    let snapshot = seal_state(session.records.is_some())?;
     let value = StagedCandidate::new(
         prepared.workspace.id(),
         prepared
@@ -2764,18 +2749,7 @@ pub(super) fn stage_removal(
     removed: arachne_security::RemovedMembership,
 ) -> Result<StagedRemoval, ApiError> {
     super::transition_activity(session, super::WorkspacePhase::Leaving, None)?;
-    let snapshot = if session.records.is_some() {
-        persistence::candidate_token()?
-    } else {
-        removed
-            .seal(
-                session
-                    .storage_key
-                    .as_ref()
-                    .ok_or_else(errors::no_root_key)?,
-            )
-            .map_err(security(ErrorCode::InvalidInput))?
-    };
+    let snapshot = super::seal_state(session.records.is_some())?;
     let value = StagedRemoval {
         workspace: removed.workspace_id(),
         snapshot: snapshot.clone(),

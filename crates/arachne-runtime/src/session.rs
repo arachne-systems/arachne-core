@@ -10,7 +10,7 @@ use arachne_node::{Node, Timeouts};
 use serde_json::Value;
 use tokio::runtime::Runtime;
 
-use crate::errors::{self, delivery, security};
+use crate::errors::{self, delivery};
 use crate::ops::join::{JoinLifecycle, PendingCheckpointExchange, PendingJoinExchange};
 use crate::ops::recovery::{
     PendingCurrentView, PendingDirectRange, PendingRange, ReadyCurrentView, ReadyDirectRange,
@@ -111,6 +111,8 @@ pub(crate) struct Session {
     pub(crate) committed: committed_view::Published,
     pub(crate) activity: WorkspaceActivity,
     pub(crate) storage_key: Option<arachne_security::StorageKey>,
+    /// Where this session keeps workspace records. Required to hold one.
+    pub(crate) storage: Option<persistence::StorageConfig>,
     pub(crate) records: Option<persistence::NativeStore>,
     // Subsystems.
     pub(crate) transition: TransitionState,
@@ -283,6 +285,7 @@ impl Session {
             committed,
             activity: WorkspaceActivity::default(),
             storage_key,
+            storage: None,
             records: None,
             transition: TransitionState::default(),
             delivery: DeliveryState::default(),
@@ -346,29 +349,13 @@ pub(crate) fn activity_view(session: &Session) -> ActivityView {
     session.activity.view()
 }
 
-/// The candidate bytes the host saves: a random token with native storage,
-/// else the sealed state.
-pub(crate) fn seal_state(
-    native: bool,
-    workspace: &arachne_security::Workspace,
-    key: &arachne_security::StorageKey,
-    publisher: Option<&arachne_delivery::PublisherLog>,
-    inbox: Option<&arachne_delivery::inbox::ObjectInbox>,
-) -> Result<Vec<u8>, ApiError> {
-    if native {
-        return persistence::candidate_token();
+/// The opaque token of a new candidate. Staging needs record storage: the
+/// adopt step saves the candidate there before it becomes live.
+pub(crate) fn seal_state(native: bool) -> Result<Vec<u8>, ApiError> {
+    if !native {
+        return Err(persistence::storage_required());
     }
-    match (inbox, publisher) {
-        (Some(inbox), Some(publisher)) => inbox
-            .seal(workspace, key, publisher)
-            .map_err(delivery(ErrorCode::StorageFailed)),
-        (None, None) => workspace
-            .seal(key)
-            .map_err(security(ErrorCode::StorageFailed)),
-        _ => Err(ApiError::internal(
-            "object inbox and publisher state go together",
-        )),
-    }
+    persistence::candidate_token()
 }
 
 // Pending application objects never block a membership step: they are

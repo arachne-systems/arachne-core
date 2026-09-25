@@ -1,8 +1,8 @@
 //! One real runtime owner; admission requests/Welcome validation are local.
 //! This proves storage lifecycle, not a hundred-endpoint network topology.
 use arachne_runtime::{
-    FreshnessAnchor, close, create, enable_record_storage, execute, record_freshness,
-    restore_record_storage, restore_record_storage_with_freshness, save_candidate,
+    FreshnessAnchor, SqliteProvider, StorageConfig, attach_storage, close, create, execute,
+    record_freshness,
 };
 use arachne_security::{AdmissionAuthorization, Invitation, PendingJoin};
 use serde_json::{Value, json};
@@ -15,44 +15,48 @@ fn call(handle: i64, request: Value) -> Result<Value, String> {
 fn bytes(value: &Value) -> Vec<u8> {
     serde_json::from_value(value.clone()).unwrap()
 }
-fn save(handle: i64, staged: &Value, op: &str) -> Value {
-    let token = bytes(&staged["snapshot"]);
+/// A session with SQLite record storage in `directory`.
+fn open(root: &[u8; 32], directory: &std::path::Path) -> i64 {
+    let handle = create(Some(root)).unwrap();
+    attach_storage(handle, StorageConfig::sqlite(directory, *root)).unwrap();
+    handle
+}
+fn restore(handle: i64, workspace: [u8; 32]) -> Result<Value, String> {
+    call(handle, json!({"op":"restore_workspace","workspace":workspace}))
+}
+fn adopt(handle: i64, staged: &Value, op: &str) -> Value {
+    let token = bytes(&staged["candidate"]);
     assert_eq!(token.len(), 37);
     assert!(token.starts_with(b"DFRC\x01"));
-    assert!(
-        call(handle, json!({"op":op,"snapshot":token}))
-            .unwrap_err()
-            .contains("not been committed")
-    );
     let mut wrong = token.clone();
     wrong[36] ^= 1;
-    assert!(save_candidate(handle, &wrong).is_err());
-    save_candidate(handle, &token).unwrap();
-    save_candidate(handle, &token).unwrap();
-    call(handle, json!({"op":op,"snapshot":token})).unwrap()
+    assert!(call(handle, json!({"op":op,"candidate":wrong})).is_err());
+    call(handle, json!({"op":op,"candidate":token})).unwrap()
 }
 #[test]
 fn restore_with_freshness_anchor_rejects_a_rolled_back_database() {
     let directory = common::directory();
-    let path = directory.path().join("workspace.db");
-    let old = directory.path().join("workspace-old.db");
     let root = [93; 32];
-    let mut handle = create(Some(&root)).unwrap();
+    let mut handle = open(&root, directory.path());
+    assert!(record_freshness(handle).is_err());
     let created = call(
         handle,
         json!({"op":"create_workspace","display_name":"Owner"}),
     )
     .unwrap();
+    assert_eq!(created["durable"], true);
     let workspace: [u8; 32] = serde_json::from_value(created["workspace"].clone()).unwrap();
-    assert!(record_freshness(handle).is_err());
-    enable_record_storage(handle, &path, &root).unwrap();
+    let path = SqliteProvider::new(directory.path(), root).path(workspace);
+    let old = directory.path().join("workspace-old.db");
     let enabled = record_freshness(handle).unwrap();
     close(handle).unwrap();
     // The attacker's copy: an authentic, older database.
     std::fs::copy(&path, &old).unwrap();
 
-    handle = create(Some(&root)).unwrap();
-    restore_record_storage_with_freshness(handle, &path, &root, workspace, Some(enabled)).unwrap();
+    handle = open(&root, directory.path());
+    call(handle, json!({"op":"restore_workspace","workspace":workspace,
+        "freshness":enabled.to_bytes().to_vec()}))
+    .unwrap();
     call(handle, json!({"op":"install_workspace_policy","revision":1})).unwrap();
     let staged = call(
         handle,
@@ -60,29 +64,28 @@ fn restore_with_freshness_anchor_rejects_a_rolled_back_database() {
             "topic":"streams/opaque","id":vec![1;16],"payload":[1]}),
     )
     .unwrap();
-    let token = bytes(&staged["snapshot"]);
-    save_candidate(handle, &token).unwrap();
-    // The host saves the new anchor before the publication can leave.
+    call(handle, json!({"op":"adopt_publication","candidate":staged["candidate"]})).unwrap();
     let latest = record_freshness(handle).unwrap();
     assert!(latest.revision > enabled.revision);
     assert_eq!(FreshnessAnchor::from_bytes(&latest.to_bytes()).unwrap(), latest);
-    call(handle, json!({"op":"adopt_publication","snapshot":token})).unwrap();
     close(handle).unwrap();
 
     // Whole-database rollback: restoring would replay the sender counter.
     std::fs::copy(&old, &path).unwrap();
-    handle = create(Some(&root)).unwrap();
-    let rejected =
-        restore_record_storage_with_freshness(handle, &path, &root, workspace, Some(latest))
-            .unwrap_err();
+    handle = open(&root, directory.path());
+    let rejected = call(handle, json!({"op":"restore_workspace","workspace":workspace,
+        "freshness":latest.to_bytes().to_vec()}))
+    .unwrap_err();
     assert!(rejected.contains("freshness"), "{rejected}");
     // Rejection leaves the session empty; the matching anchor still restores.
     assert!(record_freshness(handle).is_err());
-    restore_record_storage_with_freshness(handle, &path, &root, workspace, Some(enabled)).unwrap();
+    call(handle, json!({"op":"restore_workspace","workspace":workspace,
+        "freshness":enabled.to_bytes().to_vec()}))
+    .unwrap();
     close(handle).unwrap();
-    // Callers that supply no anchor keep today's behavior.
-    handle = create(Some(&root)).unwrap();
-    restore_record_storage(handle, &path, &root, workspace).unwrap();
+    // Without a monotonic anchor store the anchor stays optional.
+    handle = open(&root, directory.path());
+    restore(handle, workspace).unwrap();
     close(handle).unwrap();
     directory.close().unwrap();
 }
@@ -105,19 +108,17 @@ fn runtime_test_directories_are_private_unique_and_cleaned_on_drop() {
 }
 
 #[test]
-fn hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots() {
+fn hundred_member_runtime_commits_and_reopens() {
     let directory = common::directory();
-    let path = directory.path().join("workspace.db");
     let root = [91; 32];
-    let mut handle = create(Some(&root)).unwrap();
+    let mut handle = open(&root, directory.path());
     let created = call(
         handle,
         json!({"op":"create_workspace","display_name":"Coordinator"}),
     )
     .unwrap();
     let workspace: [u8; 32] = serde_json::from_value(created["workspace"].clone()).unwrap();
-    let legacy = call(handle, json!({"op":"seal_workspace"})).unwrap();
-    enable_record_storage(handle, &path, &root).unwrap();
+    let path = SqliteProvider::new(directory.path(), root).path(workspace);
     let mut final_reader = None;
     // Each join also registers its link (one commit); the policy revision is epoch + 1.
     let mut revision = 0;
@@ -127,10 +128,9 @@ fn hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots() 
             json!({"op":"stage_invitation","personal":false,"expires_at":0}),
         )
         .unwrap();
-        save_candidate(handle, &bytes(&staged["snapshot"])).unwrap();
         let invite = call(
             handle,
-            json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
         )
         .unwrap()["issued_invitation"]
             .clone();
@@ -148,7 +148,7 @@ fn hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots() 
             json!({"op":"stage_admission","authenticated_endpoint":vec![member;32],"request":request}),
         )
         .unwrap();
-        save(handle, &staged, "adopt_admission");
+        adopt(handle, &staged, "adopt_admission");
         let reply = call(handle,json!({"op":"retained_admission","authenticated_endpoint":vec![member;32],"request":request})).unwrap();
         let auth = &reply["authorization"];
         let authorization = AdmissionAuthorization {
@@ -167,8 +167,8 @@ fn hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots() 
         );
         if [16, 64, 99].contains(&member) {
             close(handle).unwrap();
-            handle = create(Some(&root)).unwrap();
-            let restored = restore_record_storage(handle, &path, &root, workspace).unwrap();
+            handle = open(&root, directory.path());
+            let restored = restore(handle, workspace).unwrap();
             assert_eq!(restored["members"], u64::from(member) + 1);
             revision = restored["epoch"].as_u64().unwrap() + 1;
             println!("runtime reopened members={}", member + 1);
@@ -179,26 +179,33 @@ fn hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots() 
         json!({"op":"install_workspace_policy","revision":revision}),
     )
     .unwrap();
-    let staged=call(handle,json!({"op":"stage_network_publication","revision":revision,"topic":"streams/opaque","id":vec![1;16],"payload":[9,8,7]})).unwrap();
-    let token = bytes(&staged["snapshot"]);
-    assert!(call(handle, json!({"op":"adopt_publication","snapshot":token})).is_err());
-    save_candidate(handle, &token).unwrap();
-    // Crash after save, before adoption: counter and retained data must survive.
+    // A staged publication that is never adopted is never saved or sent.
+    let abandoned=call(handle,json!({"op":"stage_network_publication","revision":revision,"topic":"streams/opaque","id":vec![9;16],"payload":[9]})).unwrap();
     close(handle).unwrap();
-    handle = create(Some(&root)).unwrap();
-    restore_record_storage(handle, &path, &root, workspace).unwrap();
-    assert!(call(handle, json!({"op":"adopt_publication","snapshot":token})).is_err());
+    handle = open(&root, directory.path());
+    restore(handle, workspace).unwrap();
+    assert!(call(handle, json!({"op":"adopt_publication","candidate":abandoned["candidate"]})).is_err());
+    call(
+        handle,
+        json!({"op":"install_workspace_policy","revision":revision}),
+    )
+    .unwrap();
+    let staged=call(handle,json!({"op":"stage_network_publication","revision":revision,"topic":"streams/opaque","id":vec![1;16],"payload":[9,8,7]})).unwrap();
+    assert_eq!(adopt(handle, &staged, "adopt_publication")["sequence"], 1);
+    // The adopted publication's counter is in storage before it leaves.
+    close(handle).unwrap();
+    handle = open(&root, directory.path());
+    restore(handle, workspace).unwrap();
     call(
         handle,
         json!({"op":"install_workspace_policy","revision":revision}),
     )
     .unwrap();
     let staged=call(handle,json!({"op":"stage_network_publication","revision":revision,"topic":"streams/opaque","id":vec![2;16],"payload":[6]})).unwrap();
-    let adopted = save(handle, &staged, "adopt_publication");
-    assert_eq!(adopted["sequence"], 2);
+    assert_eq!(adopt(handle, &staged, "adopt_publication")["sequence"], 2);
     close(handle).unwrap();
     // The encrypted native state preserves the sender counter too.
-    let store = arachne_store::Store::open(&path, &root, workspace).unwrap();
+    let store = arachne_store::Store::open_existing(&path, &root, workspace).unwrap();
     let records = store
         .keys(b"security/")
         .map(|name| (name.to_vec(), store.get(name).unwrap().unwrap()))
@@ -221,38 +228,24 @@ fn hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots() 
         3
     );
     drop(store);
-    // A stale legacy snapshot cannot overwrite an initialized native database.
-    call(
-        handle,
-        json!({"op":"restore_workspace","workspace":workspace,"snapshot":legacy["snapshot"]}),
-    )
-    .unwrap();
-    assert!(
-        enable_record_storage(handle, &path, &root)
-            .unwrap_err()
-            .contains("already initialized")
-    );
     close(handle).unwrap();
-    handle = create(Some(&root)).unwrap();
-    assert_eq!(
-        restore_record_storage(handle, &path, &root, workspace).unwrap()["members"],
-        100
-    );
+    handle = open(&root, directory.path());
+    assert_eq!(restore(handle, workspace).unwrap()["members"], 100);
     close(handle).unwrap();
     directory.close().unwrap();
 }
 
 #[test]
-fn migration_preserves_pending_inbox_and_removal_cannot_reopen_active_state() {
+fn seeded_pending_inbox_survives_restart_and_removal_cannot_reopen_active_state() {
     use arachne_delivery::{
         PublisherLog,
         inbox::{InboxStage, ObjectInbox},
     };
-    use arachne_security::{ManagementAction, StorageKey, Workspace};
+    use arachne_security::{ManagementAction, Workspace};
     let root = [103; 32];
     let directory = common::directory();
-    let path = directory.path().join("workspace.db");
-    let mut handle = create(Some(&root)).unwrap();
+    let provider = SqliteProvider::new(directory.path(), root);
+    let mut handle = open(&root, directory.path());
     let description: Value =
         serde_json::from_str(&arachne_runtime::describe(handle).unwrap()).unwrap();
     let endpoint = serde_json::from_value(description["endpoint_key"].clone()).unwrap();
@@ -293,17 +286,12 @@ fn migration_preserves_pending_inbox_and_removal_cannot_reopen_active_state() {
         panic!("missing candidate")
     };
     let publisher = PublisherLog::new(&reader).unwrap();
-    let key = StorageKey::derive(&root).unwrap();
-    let legacy = inbox.seal(&reader, &key, &publisher).unwrap();
-    call(
-        handle,
-        json!({"op":"restore_workspace","workspace":workspace,"snapshot":legacy}),
-    )
-    .unwrap();
-    enable_record_storage(handle, &path, &root).unwrap();
+    arachne_runtime::harness::seed_workspace(&provider, &reader, Some(&publisher), Some(&inbox))
+        .unwrap();
+    restore(handle, workspace).unwrap();
     close(handle).unwrap();
-    handle = create(Some(&root)).unwrap();
-    restore_record_storage(handle, &path, &root, workspace).unwrap();
+    handle = open(&root, directory.path());
+    restore(handle, workspace).unwrap();
     let pending = call(handle, json!({"op":"poll_pending_object"})).unwrap();
     assert_eq!(bytes(&pending["payload"]), b"pending chat");
     let removed = admin
@@ -313,42 +301,29 @@ fn migration_preserves_pending_inbox_and_removal_cannot_reopen_active_state() {
     // A pending object never delays a membership step (A3); this test acks
     // first only to check acknowledgement persistence before the removal.
     let ack=call(handle,json!({"op":"stage_object_acknowledgement","member":pending["member"],"topic":pending["topic"],"counter":pending["counter"],"id":pending["id"]})).unwrap();
-    save(handle, &ack, "adopt_reception");
+    adopt(handle, &ack, "adopt_reception");
     close(handle).unwrap();
-    handle = create(Some(&root)).unwrap();
-    restore_record_storage(handle, &path, &root, workspace).unwrap();
+    handle = open(&root, directory.path());
+    restore(handle, workspace).unwrap();
     assert_eq!(
         call(handle, json!({"op":"poll_pending_object"})).unwrap(),
         Value::Null
     );
     let removal = call(handle, json!({"op":"stage_admission_update","step":step})).unwrap();
-    let token = bytes(&removal["snapshot"]);
-    assert!(
-        call(handle, json!({"op":"adopt_admission","snapshot":token}))
-            .unwrap_err()
-            .contains("not been committed")
-    );
-    save_candidate(handle, &token).unwrap();
-    // Removal must survive a crash before adoption and delete every active record.
-    close(handle).unwrap();
-    handle = create(Some(&root)).unwrap();
-    assert_eq!(
-        restore_record_storage(handle, &path, &root, workspace).unwrap()["state"],
-        "removed"
-    );
-    assert!(
-        call(
-            handle,
-            json!({"op":"restore_workspace","workspace":workspace,"snapshot":legacy})
-        )
-        .is_err()
-    );
-    close(handle).unwrap();
-    let store = arachne_store::Store::open(&path, &root, workspace).unwrap();
+    // Adoption saves the removal first and deletes every active record.
+    assert_eq!(adopt(handle, &removal, "adopt_admission")["state"], "removed");
+    assert!(call(handle, json!({"op":"workspace_state"})).is_err());
+    handle = open(&root, directory.path());
+    assert_eq!(restore(handle, workspace).unwrap()["state"], "removed");
+    handle = open(&root, directory.path());
+    // A new join may reuse the store; a new workspace cannot resurrect it.
+    let store = arachne_store::Store::open_existing(&provider.path(workspace), &root, workspace)
+        .unwrap();
     assert_eq!(store.keys(b"").count(), 2);
     assert_eq!(store.keys(b"security/").count(), 0);
     assert_eq!(store.keys(b"delivery/").count(), 0);
     drop(store);
+    close(handle).unwrap();
     directory.close().unwrap();
 }
 
@@ -357,22 +332,21 @@ fn native_pending_join_keeps_identity_until_atomic_admission_commit() {
     use arachne_security::Workspace;
     let root = [141; 32];
     let directory = common::directory();
-    let path = directory.path().join("workspace.db");
     let admin = Workspace::create([142; 32], "Administrator").unwrap();
     let workspace = admin.id();
     let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let admin = registered.workspace;
-    let mut handle = create(Some(&root)).unwrap();
+    let mut handle = open(&root, directory.path());
     let pending = call(
         handle,
         json!({"op":"begin_join","invitation":invite.export_secret_token().as_slice(),
         "checkpoint":checkpoint,"display_name":"Joining member"}),
     )
     .unwrap();
-    enable_record_storage(handle, &path, &root).unwrap();
+    assert_eq!(pending["durable"], true);
     close(handle).unwrap();
-    handle = create(Some(&root)).unwrap();
-    let restored = restore_record_storage(handle, &path, &root, workspace).unwrap();
+    handle = open(&root, directory.path());
+    let restored = restore(handle, workspace).unwrap();
     assert_eq!(restored["admission_request"], pending["admission_request"]);
     assert_eq!(restored["member"], pending["member"]);
     let endpoint = serde_json::from_value(pending["endpoint"].clone()).unwrap();
@@ -399,27 +373,30 @@ fn native_pending_join_keeps_identity_until_atomic_admission_commit() {
         )
         .is_err()
     );
-    let [response, token] = arachne_runtime::execute_stored(handle, &encoded, &welcome).unwrap();
-    let mut abandoned: Value = serde_json::from_slice(&response).unwrap();
-    abandoned["snapshot"] = json!(token);
-    assert_eq!(bytes(&abandoned["snapshot"]).len(), 37);
+    assert!(
+        arachne_runtime::execute_stored(handle, br#"{"op":"endpoint_info"}"#, &welcome).is_err()
+    );
+    let response = arachne_runtime::execute_stored(handle, &encoded, &welcome).unwrap();
+    let abandoned: Value = serde_json::from_slice(&response).unwrap();
+    assert_eq!(bytes(&abandoned["candidate"]).len(), 37);
+    // A crash before adoption: storage still holds the pending join.
     close(handle).unwrap();
-    handle = create(Some(&root)).unwrap();
+    handle = open(&root, directory.path());
     assert_eq!(
-        restore_record_storage(handle, &path, &root, workspace).unwrap()["admission_request"],
+        restore(handle, workspace).unwrap()["admission_request"],
         pending["admission_request"]
     );
     let staged = call(handle, request).unwrap();
-    let token = bytes(&staged["snapshot"]);
-    assert!(save_candidate(handle, &bytes(&abandoned["snapshot"])).is_err());
-    save_candidate(handle, &token).unwrap();
+    assert!(call(handle, json!({"op":"adopt_join","candidate":abandoned["candidate"]})).is_err());
+    adopt(handle, &staged, "adopt_join");
     close(handle).unwrap();
-    handle = create(Some(&root)).unwrap();
-    let joined = restore_record_storage(handle, &path, &root, workspace).unwrap();
+    handle = open(&root, directory.path());
+    let joined = restore(handle, workspace).unwrap();
     assert_eq!(joined["members"], 2);
     assert_eq!(joined["member"], pending["member"]);
     close(handle).unwrap();
-    let store = arachne_store::Store::open(&path, &root, workspace).unwrap();
+    let path = SqliteProvider::new(directory.path(), root).path(workspace);
+    let store = arachne_store::Store::open_existing(&path, &root, workspace).unwrap();
     assert!(store.get(b"runtime/pending").unwrap().is_none());
     assert!(store.keys(b"security/").count() > 0);
     drop(store);

@@ -60,51 +60,51 @@ conceptual steps:
 1. The joining client calls `begin_join` with invitation material and a display
    name.
 2. The workspace owner validates the request with `stage_admission`.
-3. The owner durably commits the returned snapshot, then calls
-   `adopt_admission`; it can then obtain the retained welcome/commit reply.
-4. The joining client calls `stage_join`, durably commits that candidate, then
-   calls `adopt_join`.
+3. The owner calls `adopt_admission` with the returned candidate. Core saves
+   it to record storage, reads it back, then adopts it. The owner can then
+   obtain the retained welcome/commit reply.
+4. The joining client calls `stage_join`, then `adopt_join`.
 5. Both adapters refresh routing policy from the accepted workspace state.
 
-The stage/adopt boundary is intentional. Do not emit network effects or advance
-the live state before the matching candidate is durably committed. Treat an
-uncertain storage result as a recovery case: restore the last accepted
-snapshot/state, rather than blindly replaying a cryptographic operation.
+The stage/adopt boundary is intentional. Core does not emit network effects or
+advance live state before the candidate is saved and read back. If a save fails
+or does not read back, the outcome is uncertain: the session then refuses every
+op except `reset_workspace`, `workspace_state` and close. Close it and restore
+from storage; do not replay a cryptographic operation.
 
 ### Persistence contract
 
-The host owns storage location, key custody, atomicity, and restore policy. The
-typed `stage_*` methods return candidate snapshot bytes; the host must save the
-exact bytes durably before calling the corresponding `adopt_*` method. Preserve
-the candidate bytes as opaque data and bind them to the workspace and operation
-that produced them.
+Native record storage is the only persistence mode. The host attaches a
+`StorageConfig` to the session (`ClientConfig::storage`, or `attach_storage`
+for the JSON dispatcher) before it creates, joins or restores a workspace.
+`StorageConfig::sqlite(directory, root)` keeps one encrypted SQLite file per
+workspace in a private directory. `root` is the host's storage root key.
+`StorageConfig::new` takes any `StorageProvider` implementation;
+`MemoryProvider` is for tests.
 
-`arachne-store` provides encrypted transactional records. The runtime also has
-lower-level native record-storage functions for enabling, saving, and restoring
-runtime state. Neither path removes the host's obligation to protect its root
-key and storage directory. See [Security](security.md#local-persistence).
+A stage op returns an opaque candidate token, never state bytes. The matching
+adopt op saves the candidate, reads it back, then adopts it. `create_workspace`
+and `begin_join` save their state before they return, so every reply reports
+`durable: true`. `restore_workspace(workspace)` restores what storage holds for
+that workspace: an active workspace, a pending join, or this member's removal
+(the session then ends). The host never saves or passes state bytes, and there
+is no import of old state: an import would be a rollback.
+
+The host still protects the root key and the storage directory. See
+[Security](security.md#local-persistence).
 
 Rollback detection needs a freshness anchor that the host keeps outside the
 database:
 
-- While record storage is enabled, call `record_freshness` (or
-  `Client::record_freshness`) after every call that can commit. This includes
-  `enable_record_storage`, `save_candidate`, and `execute` operations, because
-  the lifecycle driver also commits. Persist the anchor before you release that
-  call's result. For FFI, `FreshnessAnchor::to_bytes` gives 40 bytes: the
-  big-endian revision, then the digest. `FreshnessAnchor::from_bytes` reads
-  them back.
-- Restore with `restore_record_storage_with_freshness(..., Some(anchor))`. The
-  store must match the anchor exactly. An older store and a newer store are
-  both rejected before any record is read, and the session stays empty.
-- `restore_record_storage` and an anchor of `None` keep the old behavior. They
-  do not detect a rollback.
-
-`Client::create_workspace` currently creates in-session state and reports
-`durable: false`. The typed `Client` does not expose the complete native
-record-storage setup/restore lifecycle or a durable initial workspace-creation
-operation. Do not treat the typed facade alone as a production-ready persistent
-workspace integration.
+- Call `record_freshness` (or `Client::record_freshness`) after every call that
+  can commit, and persist the anchor before you release that call's result.
+  For FFI, `FreshnessAnchor::to_bytes` gives 40 bytes: the big-endian revision,
+  then the digest. `FreshnessAnchor::from_bytes` reads them back.
+- Restore with the anchor (`restore_workspace` with `freshness`, or
+  `Client::restore_workspace(workspace, Some(anchor))`). The store must match
+  the anchor exactly. An older store and a newer store are both rejected
+  before any record is read, and the session stays empty.
+- Without an anchor, restore does not detect a rollback.
 
 ## Routing and permissions
 
@@ -127,14 +127,14 @@ There are two paths that must not be conflated:
 | Path | API | Security meaning |
 | --- | --- | --- |
 | Basic transport/pub-sub example | `publish` and `poll` | Uses installed routing policy and Iroh transport. It does not encrypt the payload as an MLS group message. The example has no admitted workspace. |
-| Protected workspace publication | `stage_protected_publication`, durable save, then `adopt_protected_publication` | Stages an MLS-protected publication and delays network effects until adoption. Persist the exact candidate first. |
+| Protected workspace publication | `stage_protected_publication`, then `adopt_protected_publication` | Stages an MLS-protected publication and delays network effects until adoption. Adoption saves the candidate first. |
 
 `publish` is rejected for a workspace after admission; the runtime directs the
 caller to the protected path. Do not use the basic example as a secure group
 messaging recipe. The typed facade receives with `poll_protected` and
 `adopt_protected_reception`, then reads the inbox with `poll_pending_object`
 and resolves each object with `stage_object_acknowledgement` or
-`stage_object_rejection` (save, then `adopt_protected_reception`).
+`stage_object_rejection` (then `adopt_protected_reception`).
 
 ## Recovery and delivery expectations
 
@@ -158,11 +158,9 @@ accept these gaps:
 - The public API has not been declared stable. The crates have an initial
   crates.io release, but APIs, wire formats and saved data can still change.
 
-The typed `Client` now covers the record-storage lifecycle
-(`enable_record_storage`, `restore_record_storage`,
-`restore_record_storage_with_freshness`, `record_freshness`, `save_candidate`)
-and protected receive with durable adoption (`poll_protected`,
-`adopt_protected_reception`).
+The typed `Client` covers the record-storage lifecycle (`ClientConfig::storage`,
+`restore_workspace`, `record_freshness`) and protected receive with durable
+adoption (`poll_protected`, `adopt_protected_reception`).
 
 These are concrete implementation boundaries, not guarantees about the timing
 of future releases. Check the current API and tests before integrating.

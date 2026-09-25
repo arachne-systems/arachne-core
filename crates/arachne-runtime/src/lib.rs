@@ -76,6 +76,8 @@ pub mod harness {
             .gossip_tag_key()
             .map_err(str::to_owned)
     }
+
+    pub use crate::persistence::seed_workspace;
 }
 mod admission_waiters;
 mod persistence;
@@ -95,18 +97,15 @@ pub use client::{
     PublicationCandidate, PublicationCurrent, ProtectedReceptionCandidate,
     ReceivedProtectedPublication, RecoveryAdoption, RecoveryCandidate, RecoveryRangeReady,
     RecoveryRangeRequest, RecoveryRangeStatus, RecoveryStage, Result as ClientResult, RouteHint,
-    RouteKind, WorkspaceCandidate, WorkspaceInfo, WorkspaceMetrics, WorkspaceState,
+    RestoredJoin, RestoredWorkspace, RouteKind, WorkspaceCandidate, WorkspaceInfo, WorkspaceMetrics, WorkspaceState,
 };
 pub use client::{OperatorRelay, RelayTrust, TransportInfo, TransportOptions, TransportTimeouts};
-pub use arachne_store::FreshnessAnchor;
-pub use persistence::{
-    enable_record_storage, record_freshness, restore_record_storage,
-    restore_record_storage_with_freshness, save_candidate,
-};
+pub use arachne_store::{FreshnessAnchor, MemoryProvider, SqliteProvider, Storage, StorageProvider};
+pub use persistence::{StorageConfig, attach_storage, record_freshness};
 pub use workspace_activity::{Activity as WorkspaceActivity, Phase as WorkspacePhase};
 pub use errors::legacy_text;
 pub use json::{
-    MAX_REQUEST, MAX_STORED_SNAPSHOT, execute, execute_stored, execute_stored_with_code,
+    MAX_REQUEST, execute, execute_stored, execute_stored_with_code,
     execute_with_code, inspect_invitation,
 };
 

@@ -1,6 +1,4 @@
-use arachne_runtime::{
-    close, create, describe, enable_record_storage, execute, restore_record_storage, save_candidate,
-};
+use arachne_runtime::{MemoryProvider, close, describe, execute};
 use serde_json::{Value, json};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -12,6 +10,11 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 fn call(handle: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
         .map_err(|error| error.to_string())
+}
+
+/// A session with its own in-memory record storage.
+fn session(seed: u8) -> i64 {
+    common::stored(&[seed; 32], &MemoryProvider::default())
 }
 
 fn endpoint(handle: i64) -> Value {
@@ -26,7 +29,7 @@ fn issue_invitation(handle: i64) -> Value {
     .unwrap();
     call(
         handle,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap()["issued_invitation"]
         .clone()
@@ -50,8 +53,8 @@ fn serve_once(handle: i64) -> Value {
 #[test]
 fn fetches_only_the_exact_invitation_checkpoint_over_authenticated_iroh() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let admin = create(Some(&[201; 32])).unwrap();
-    let joiner = create(Some(&[202; 32])).unwrap();
+    let admin = session(201);
+    let joiner = session(202);
     call(
         admin,
         json!({"op":"create_workspace","display_name":"Coordinator","workspace_name":"Ridge Team"}),
@@ -99,7 +102,7 @@ fn fetches_only_the_exact_invitation_checkpoint_over_authenticated_iroh() {
     .unwrap();
     call(
         admin,
-        json!({"op":"adopt_admission","snapshot":renamed["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":renamed["candidate"]}),
     )
     .unwrap();
     let fetch_again = || {
@@ -128,14 +131,14 @@ fn fetches_only_the_exact_invitation_checkpoint_over_authenticated_iroh() {
     .unwrap();
     call(
         admin,
-        json!({"op":"adopt_admission","snapshot":disabled["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":disabled["candidate"]}),
     )
     .unwrap();
     assert!(fetch_again().is_err());
 
-    let outsider = create(Some(&[203; 32])).unwrap();
+    let outsider = session(203);
     let outsider_node = endpoint(outsider);
-    let requester = create(Some(&[204; 32])).unwrap();
+    let requester = session(204);
     call(
         requester,
         json!({"op":"add_address_hint","peer":outsider_node["endpoint_key"],
@@ -163,9 +166,10 @@ fn fetches_only_the_exact_invitation_checkpoint_over_authenticated_iroh() {
 #[test]
 fn ordinary_member_serves_the_checkpoint_it_joined_from_after_issuer_closes() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let admin = create(Some(&[211; 32])).unwrap();
-    let mut helper = create(Some(&[212; 32])).unwrap();
-    let late = create(Some(&[213; 32])).unwrap();
+    let admin = session(211);
+    let helper_storage = MemoryProvider::default();
+    let mut helper = common::stored(&[212; 32], &helper_storage);
+    let late = session(213);
     call(
         admin,
         json!({"op":"create_workspace","display_name":"Coordinator","workspace_name":"Event Team"}),
@@ -186,7 +190,7 @@ fn ordinary_member_serves_the_checkpoint_it_joined_from_after_issuer_closes() {
     .unwrap();
     call(
         admin,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap();
     let reply = call(
@@ -203,16 +207,15 @@ fn ordinary_member_serves_the_checkpoint_it_joined_from_after_issuer_closes() {
     .unwrap();
     call(
         helper,
-        json!({"op":"adopt_join","snapshot":joined["snapshot"]}),
+        json!({"op":"adopt_join","candidate":joined["candidate"]}),
     )
     .unwrap();
     close(admin).unwrap();
     close(helper).unwrap();
-    helper = create(Some(&[212; 32])).unwrap();
+    helper = common::stored(&[212; 32], &helper_storage);
     call(
         helper,
-        json!({"op":"restore_workspace","workspace":invitation["workspace"],
-            "snapshot":joined["snapshot"]}),
+        json!({"op":"restore_workspace","workspace":invitation["workspace"]}),
     )
     .unwrap();
 
@@ -251,7 +254,7 @@ fn ordinary_member_serves_the_checkpoint_it_joined_from_after_issuer_closes() {
     assert_eq!(staged["state"], "awaiting_save");
     call(
         helper,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap();
     let retry = std::thread::spawn(move || {
@@ -272,7 +275,7 @@ fn ordinary_member_serves_the_checkpoint_it_joined_from_after_issuer_closes() {
     assert_eq!(
         call(
             late,
-            json!({"op":"adopt_join","snapshot":joined["snapshot"]})
+            json!({"op":"adopt_join","candidate":joined["candidate"]})
         )
         .unwrap()["members"],
         3
@@ -285,9 +288,10 @@ fn ordinary_member_serves_the_checkpoint_it_joined_from_after_issuer_closes() {
 #[test]
 fn existing_member_serves_a_later_invitation_after_learning_it_and_restarting() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let admin = create(Some(&[221; 32])).unwrap();
-    let mut helper = create(Some(&[222; 32])).unwrap();
-    let late = create(Some(&[223; 32])).unwrap();
+    let admin = session(221);
+    let helper_storage = MemoryProvider::default();
+    let mut helper = common::stored(&[222; 32], &helper_storage);
+    let late = session(223);
     let workspace = call(
         admin,
         json!({"op":"create_workspace","display_name":"Coordinator","workspace_name":"Event Team"}),
@@ -309,7 +313,7 @@ fn existing_member_serves_a_later_invitation_after_learning_it_and_restarting() 
     .unwrap();
     call(
         admin,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap();
     let reply = call(
@@ -326,13 +330,9 @@ fn existing_member_serves_a_later_invitation_after_learning_it_and_restarting() 
     .unwrap();
     call(
         helper,
-        json!({"op":"adopt_join","snapshot":joined["snapshot"]}),
+        json!({"op":"adopt_join","candidate":joined["candidate"]}),
     )
     .unwrap();
-
-    let dir = common::directory();
-    let store = dir.path().join("helper.db");
-    enable_record_storage(helper, &store, &[222; 32]).unwrap();
 
     let staged = call(
         admin,
@@ -341,7 +341,7 @@ fn existing_member_serves_a_later_invitation_after_learning_it_and_restarting() 
     .unwrap();
     let issued = call(
         admin,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap();
     let invitation = issued["issued_invitation"].clone();
@@ -394,25 +394,18 @@ fn existing_member_serves_a_later_invitation_after_learning_it_and_restarting() 
         json!({"op":"stage_admission_update","step":update["step"]}),
     )
     .unwrap();
-    save_candidate(
-        helper,
-        &serde_json::from_value::<Vec<u8>>(learned["snapshot"].clone()).unwrap(),
-    )
-    .unwrap();
     call(
         helper,
-        json!({"op":"adopt_admission","snapshot":learned["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":learned["candidate"]}),
     )
     .unwrap();
     close(admin).unwrap();
     close(helper).unwrap();
 
-    helper = create(Some(&[222; 32])).unwrap();
-    restore_record_storage(
+    helper = common::stored(&[222; 32], &helper_storage);
+    call(
         helper,
-        &store,
-        &[222; 32],
-        serde_json::from_value(workspace).unwrap(),
+        json!({"op":"restore_workspace","workspace":workspace}),
     )
     .unwrap();
     let helper_node = endpoint(helper);
@@ -439,5 +432,4 @@ fn existing_member_serves_a_later_invitation_after_learning_it_and_restarting() 
 
     close(helper).unwrap();
     close(late).unwrap();
-    dir.close().unwrap();
 }

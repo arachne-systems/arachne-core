@@ -22,7 +22,7 @@ const RECORD_SCHEMA: &str =
     "CREATE TABLE records (name BLOB PRIMARY KEY, sealed BLOB NOT NULL) WITHOUT ROWID";
 const HEAD_SCHEMA: &str =
     "CREATE TABLE head (id INTEGER PRIMARY KEY CHECK(id=0), sealed BLOB NOT NULL)";
-type Index = BTreeMap<Vec<u8>, [u8; 32]>;
+pub(crate) type Index = BTreeMap<Vec<u8>, [u8; 32]>;
 
 /// Caller-owned proof of the accepted record head. Persist it outside the
 /// store when rollback detection must survive a whole-file restore.
@@ -64,7 +64,7 @@ pub struct Store {
     index: Index,
 }
 
-fn index_digest(index: &Index) -> [u8; 32] {
+pub(crate) fn index_digest(index: &Index) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"data-fabric/record-index/v1");
     for (name, digest) in index {
@@ -76,6 +76,25 @@ fn index_digest(index: &Index) -> [u8; 32] {
 }
 
 impl Store {
+    /// A new store at `path`. Fails when the file exists.
+    pub fn create(path: &Path, root: &[u8; 32], scope: [u8; 32]) -> Result<Self> {
+        if std::fs::symlink_metadata(path).is_ok() {
+            return Err("record store already exists".into());
+        }
+        let store = Self::open(path, root, scope)?;
+        if store.revision != 0 || !store.index.is_empty() {
+            return Err("record store already exists".into());
+        }
+        Ok(store)
+    }
+
+    /// The existing store at `path`. Never creates a file.
+    pub fn open_existing(path: &Path, root: &[u8; 32], scope: [u8; 32]) -> Result<Self> {
+        std::fs::metadata(path)?;
+        Self::open(path, root, scope)
+    }
+
+    /// Open the store at `path`, creating an empty one when it is absent.
     pub fn open(path: &Path, root: &[u8; 32], scope: [u8; 32]) -> Result<Self> {
         // Ciphertext files only; the caller owns the parent directory and lock
         // lifecycle. SQLite's exclusive mode prevents concurrent DB owners.
@@ -353,6 +372,9 @@ impl Store {
         ))
     }
 }
+
+mod provider;
+pub use provider::{MemoryProvider, SqliteProvider, Storage, StorageProvider};
 
 #[cfg(test)]
 mod tests;

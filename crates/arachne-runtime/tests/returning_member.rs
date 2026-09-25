@@ -1,6 +1,8 @@
-use arachne_runtime::{close, create, describe, execute};
+use arachne_runtime::{MemoryProvider, close, describe, execute};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
+
+mod common;
 fn call(h: i64, v: Value) -> Value {
     serde_json::from_slice(&execute(h, &serde_json::to_vec(&v).unwrap()).unwrap()).unwrap()
 }
@@ -25,7 +27,7 @@ fn issue(admin: i64) -> Value {
     );
     call(
         admin,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )["issued_invitation"]
         .clone()
 }
@@ -40,7 +42,7 @@ fn add(owner: i64, joiner: i64, invite: &Value, prior: Vec<Value>, name: &str) -
     );
     call(
         owner,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     );
     let reply = call(
         owner,
@@ -54,29 +56,29 @@ fn add(owner: i64, joiner: i64, invite: &Value, prior: Vec<Value>, name: &str) -
     );
     call(
         joiner,
-        json!({"op":"adopt_join","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
     );
     reply
 }
 #[test]
 fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
-    let admin = create(Some(&[71; 32])).unwrap();
-    let helper = create(Some(&[72; 32])).unwrap();
-    let newer = create(Some(&[73; 32])).unwrap();
+    let admin_storage = MemoryProvider::default();
+    let admin = common::stored(&[71; 32], &admin_storage);
+    let helper = common::stored(&[72; 32], &MemoryProvider::default());
+    let newer = common::stored(&[73; 32], &MemoryProvider::default());
     call(
         admin,
         json!({"op":"create_workspace","display_name":"Admin"}),
     );
     let invite = issue(admin);
     let first = add(admin, helper, &invite, vec![], "Helper");
-    let saved = call(admin, json!({"op":"seal_workspace"}));
     close(admin).unwrap();
     let second = add(helper, newer, &invite, vec![step(&first)], "New member");
     close(helper).unwrap();
-    let admin = create(Some(&[71; 32])).unwrap();
+    let admin = common::stored(&[71; 32], &admin_storage);
     call(
         admin,
-        json!({"op":"restore_workspace","workspace":invite["workspace"],"snapshot":saved["snapshot"]}),
+        json!({"op":"restore_workspace","workspace":invite["workspace"]}),
     );
     let info: Value = serde_json::from_str(&describe(admin).unwrap()).unwrap();
     let address = info["bound_address"]
@@ -179,7 +181,7 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
     assert!(call(newer, json!({"op":"poll_membership_offer"})).is_null());
     let saved = call(
         admin,
-        json!({"op":"adopt_admission","snapshot":candidate["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":candidate["candidate"]}),
     );
     assert_eq!(saved["members"], 3);
     assert_eq!(saved["epoch"], 3);
@@ -211,9 +213,10 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
 
 #[test]
 fn group_presence_announces_new_members_and_returning_peers_without_application_topics() {
-    let a = create(Some(&[101; 32])).unwrap();
-    let b = create(Some(&[102; 32])).unwrap();
-    let c = create(Some(&[103; 32])).unwrap();
+    let a = common::stored(&[101; 32], &MemoryProvider::default());
+    let b_storage = MemoryProvider::default();
+    let b = common::stored(&[102; 32], &b_storage);
+    let c = common::stored(&[103; 32], &MemoryProvider::default());
     call(a, json!({"op":"create_workspace","display_name":"Admin"}));
     let invite = issue(a);
     let first = add(a, b, &invite, vec![], "Existing member");
@@ -245,11 +248,10 @@ fn group_presence_announces_new_members_and_returning_peers_without_application_
         assert!(Instant::now() < end, "the range pull did not stage the step: {result}");
         std::thread::sleep(Duration::from_millis(5));
     };
-    call(b, json!({"op":"adopt_admission","snapshot":staged["snapshot"]}));
-    let saved = call(b, json!({"op":"seal_workspace"}));
+    call(b, json!({"op":"adopt_admission","candidate":staged["candidate"]}));
     close(b).unwrap();
-    let b = create(Some(&[102;32])).unwrap();
-    call(b, json!({"op":"restore_workspace","workspace":invite["workspace"],"snapshot":saved["snapshot"]}));
+    let b = common::stored(&[102;32], &b_storage);
+    call(b, json!({"op":"restore_workspace","workspace":invite["workspace"]}));
     let roster = call(b, json!({"op":"member_roster"}));
     assert_eq!(roster["members"].as_array().unwrap().len(), 3);
     assert!(roster["members"].as_array().unwrap().iter().filter(|m| m["self"] == false).all(|m| m["presence"] == "unknown"));

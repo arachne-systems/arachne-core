@@ -43,6 +43,8 @@ const ADMISSION_RESULT_OFFER: &[u8; 5] = b"DFAR\x01";
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct StagedAdmission {
     pub workspace: [u8; 32],
+    /// The opaque candidate token; adopt it with the matching adopt op.
+    #[serde(rename = "candidate")]
     pub snapshot: Vec<u8>,
     pub state: &'static str,
     pub durable: bool,
@@ -557,7 +559,7 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
         staged["activity"] = activity_value(live(session)?);
         return Ok(staged);
     }
-    let snapshot: Vec<u8> = serde_json::from_value(staged["snapshot"].clone())
+    let snapshot: Vec<u8> = serde_json::from_value(staged["candidate"].clone())
         .map_err(|_| ApiError::internal("workspace candidate snapshot is invalid"))?;
     persistence::commit_candidate(live_mut(session)?, &snapshot)?;
     let mut committed = adopt_admission_value(session, snapshot)?;
@@ -574,7 +576,7 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
 fn adopt_admission_value(session: &mut Session, snapshot: Vec<u8>) -> Result<Value, ApiError> {
     let session = live_mut(session)?;
     let adopted = ops::nested(session, Op::AdoptAdmission, |session| {
-        candidate::adopt_admission(session, candidate::AdoptArgs { snapshot })
+        candidate::adopt_admission(session, candidate::AdoptArgs { candidate: snapshot })
     })?;
     serde_json::to_value(adopted).map_err(errors::encode)
 }
@@ -644,18 +646,8 @@ fn stage_admission_workspace(
     workspace: arachne_security::Workspace,
     admission_count: usize,
 ) -> Result<StagedAdmission, ApiError> {
-    let key = session
-        .storage_key
-        .as_ref()
-        .ok_or_else(errors::no_root_key)?;
     let (publisher, inbox) = carry_delivery(session, &workspace)?;
-    let snapshot = seal_state(
-        session.records.is_some(),
-        &workspace,
-        key,
-        publisher.as_ref(),
-        inbox.as_ref(),
-    )?;
+    let snapshot = seal_state(session.records.is_some())?;
     let value = StagedAdmission {
         workspace: workspace.id(),
         snapshot: snapshot.clone(),

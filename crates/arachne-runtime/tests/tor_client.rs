@@ -11,6 +11,7 @@ fn typed_client_opens_tor_only_endpoint_with_the_supplied_identity() {
             network: Network::Tor,
             secret: None,
             transport: Default::default(),
+            storage: None,
         })
         .is_err()
     );
@@ -20,6 +21,7 @@ fn typed_client_opens_tor_only_endpoint_with_the_supplied_identity() {
         network: Network::Tor,
         secret: Some(secret),
         transport: Default::default(),
+        storage: None,
     })
     .unwrap();
     assert_eq!(

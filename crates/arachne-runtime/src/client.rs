@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -7,7 +5,7 @@ use arachne_api::{ApiError, ErrorCode};
 
 use crate::ops::{self, Op, admission, candidate, invitation, join, management, publication, receive};
 use crate::persistence;
-use crate::{FreshnessAnchor, Session, WorkspacePhase};
+use crate::{FreshnessAnchor, Session, StorageConfig, WorkspacePhase};
 
 /// Address discovery and transport selection for a typed runtime client.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,6 +27,8 @@ pub struct ClientConfig {
     pub secret: Option<[u8; 32]>,
     /// Relay, lookup and deadline overrides. `Default` keeps the profile's.
     pub transport: TransportOptions,
+    /// Record storage. Required to create, join or restore a workspace.
+    pub storage: Option<StorageConfig>,
 }
 
 /// Transport overrides on top of a `Network` profile. Every field left
@@ -504,10 +504,30 @@ pub struct AdmissionApprovalPage {
     pub next_after: Option<[u8; 32]>,
 }
 
+/// What `restore_workspace` found in record storage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RestoredWorkspace {
+    Active(WorkspaceInfo),
+    Joining(RestoredJoin),
+    /// This member was removed. The session has ended.
+    Removed(RemovedMembership),
+}
+
+/// A restored pending join. `admission_request` is `None` until the
+/// invitation checkpoint is known.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestoredJoin {
+    pub workspace: [u8; 32],
+    pub member: [u8; 32],
+    pub endpoint: [u8; 32],
+    pub admission_request: Option<Vec<u8>>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceCandidate {
     pub workspace: [u8; 32],
-    pub snapshot: Vec<u8>,
+    /// Opaque token; pass it to the matching adopt method.
+    pub candidate: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -619,7 +639,7 @@ pub struct DeliveryReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicationCandidate {
     pub workspace: [u8; 32],
-    pub snapshot: Vec<u8>,
+    pub candidate: Vec<u8>,
 }
 
 /// Current-value metadata for a protected publication.
@@ -638,7 +658,7 @@ pub struct PublicationCurrent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProtectedReceptionCandidate {
     pub workspace: [u8; 32],
-    pub snapshot: Vec<u8>,
+    pub candidate: Vec<u8>,
 }
 
 /// An authenticated pending object from the durable inbox.
@@ -726,7 +746,7 @@ pub enum RecoveryRangeStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryCandidate {
     pub workspace: [u8; 32],
-    pub snapshot: Vec<u8>,
+    pub candidate: Vec<u8>,
     pub publication_count: usize,
     pub durable: bool,
 }
@@ -768,9 +788,13 @@ impl Client {
         }
         let options = config.transport.node_options(config.network)?;
         let handle = crate::registry::open(config.secret.as_ref(), options)?;
-        Ok(Self {
+        let client = Self {
             handle: Some(handle),
-        })
+        };
+        if let Some(storage) = config.storage {
+            client.stored(|session| persistence::attach(session, storage))?;
+        }
+        Ok(client)
     }
 
     pub fn endpoint(&self) -> Result<EndpointInfo> {
@@ -813,34 +837,34 @@ impl Client {
         Ok(opened_info(opened))
     }
 
-    /// Seal the workspace for a host without native record storage.
-    pub fn seal_workspace(&self) -> Result<WorkspaceCandidate> {
-        let sealed = self.call(Op::SealWorkspace, ops::workspace::seal)?;
-        Ok(WorkspaceCandidate {
-            workspace: sealed.workspace,
-            snapshot: stored_output(sealed.snapshot)?,
-        })
-    }
-
-    /// Restore a sealed workspace into this empty session. A sealed removal
-    /// ends the session and gives `WrongState`.
-    pub fn restore_workspace(&self, workspace: [u8; 32], snapshot: &[u8]) -> Result<WorkspaceInfo> {
-        stored_input(snapshot)?;
+    /// Restore the workspace stored for `workspace`: an active workspace, a
+    /// pending join, or this member's removal (the session then ends). With
+    /// `expected`, the store must match that saved anchor exactly.
+    pub fn restore_workspace(
+        &self,
+        workspace: [u8; 32],
+        expected: Option<FreshnessAnchor>,
+    ) -> Result<RestoredWorkspace> {
         let restored = self.call(Op::RestoreWorkspace, |session| {
-            ops::workspace::restore(
-                session,
-                ops::workspace::RestoreArgs {
-                    workspace,
-                    snapshot: snapshot.to_vec(),
-                },
-            )
+            persistence::restore(session, workspace, expected)
         })?;
-        match restored {
-            ops::workspace::RestoreReply::Opened(opened) => Ok(opened_info(opened)),
-            ops::workspace::RestoreReply::Removed(_) => Err(Error::from(ApiError::wrong_state(
-                "this member was removed",
-            ))),
-        }
+        Ok(match restored {
+            persistence::Restored::Opened(opened) => RestoredWorkspace::Active(opened_info(opened)),
+            persistence::Restored::Pending(pending) => RestoredWorkspace::Joining(RestoredJoin {
+                workspace: pending.workspace,
+                member: pending.member.id,
+                endpoint: pending.endpoint,
+                admission_request: pending.admission_request,
+            }),
+            persistence::Restored::Removed(removed) => {
+                RestoredWorkspace::Removed(RemovedMembership {
+                    workspace: removed.removed.workspace,
+                    epoch: removed.removed.epoch,
+                    member: removed.removed.member.id,
+                    commit_digest: removed.removed.commit_digest,
+                })
+            }
+        })
     }
 
     /// Forget all workspace state. Returns whether anything changed.
@@ -924,30 +948,6 @@ impl Client {
         })
     }
 
-    /// Seal the pending join for a host without native storage.
-    pub fn seal_pending_join(&self) -> Result<WorkspaceCandidate> {
-        let sealed = self.call(Op::SealPendingJoin, join::seal_pending)?;
-        Ok(WorkspaceCandidate {
-            workspace: sealed.workspace,
-            snapshot: sealed.snapshot,
-        })
-    }
-
-    /// Restore a pending join sealed by `seal_pending_join`.
-    pub fn restore_pending_join(&self, workspace: [u8; 32], snapshot: &[u8]) -> Result<JoinRequest> {
-        stored_input(snapshot)?;
-        let pending = self.call(Op::RestorePendingJoin, |session| {
-            join::restore_pending(
-                session,
-                join::RestorePendingJoinArgs {
-                    workspace,
-                    snapshot: snapshot.to_vec(),
-                },
-            )
-        })?;
-        join_request(pending)
-    }
-
     pub fn stage_admission(
         &self,
         authenticated_endpoint: [u8; 32],
@@ -964,12 +964,12 @@ impl Client {
         })?;
         Ok(WorkspaceCandidate {
             workspace: staged.workspace,
-            snapshot: stored_output(staged.snapshot)?,
+            candidate: staged.snapshot,
         })
     }
 
-    pub fn adopt_admission(&self, snapshot: &[u8]) -> Result<WorkspaceInfo> {
-        self.adopt(Op::AdoptAdmission, candidate::adopt_admission, snapshot)
+    pub fn adopt_admission(&self, candidate: &[u8]) -> Result<WorkspaceInfo> {
+        self.adopt(Op::AdoptAdmission, candidate::adopt_admission, candidate)
             .map(workspace_info)
     }
 
@@ -1074,53 +1074,19 @@ impl Client {
         })?;
         Ok(WorkspaceCandidate {
             workspace: staged.workspace,
-            snapshot: stored_output(staged.snapshot)?,
+            candidate: staged.snapshot,
         })
     }
 
-    pub fn adopt_join(&self, snapshot: &[u8]) -> Result<WorkspaceInfo> {
-        self.adopt(Op::AdoptJoin, candidate::adopt_join, snapshot)
+    pub fn adopt_join(&self, candidate: &[u8]) -> Result<WorkspaceInfo> {
+        self.adopt(Op::AdoptJoin, candidate::adopt_join, candidate)
             .map(workspace_info)
     }
 
-    /// Enable encrypted native storage for this client's workspace.
-    pub fn enable_record_storage(&self, path: &Path, root: &[u8; 32]) -> Result<()> {
-        self.stored(|session| persistence::enable(session, path, root))
-    }
-
-    /// Restore a workspace from encrypted native storage.
-    pub fn restore_record_storage(
-        &self,
-        path: &Path,
-        root: &[u8; 32],
-        workspace: [u8; 32],
-    ) -> Result<Value> {
-        self.restore_record_storage_with_freshness(path, root, workspace, None)
-    }
-
-    /// Restore, rejecting a store that does not match the host's saved anchor.
-    pub fn restore_record_storage_with_freshness(
-        &self,
-        path: &Path,
-        root: &[u8; 32],
-        workspace: [u8; 32],
-        expected: Option<FreshnessAnchor>,
-    ) -> Result<Value> {
-        self.stored(|session| {
-            let restored = persistence::restore(session, path, root, workspace, expected)?;
-            serde_json::to_value(restored).map_err(crate::errors::encode)
-        })
-    }
-
-    /// Anchor after the latest native commit. With record storage enabled, read
-    /// it after every call and save it outside the database.
+    /// Anchor after the latest record commit. Without a monotonic anchor
+    /// store, read it after every call and save it outside the database.
     pub fn record_freshness(&self) -> Result<FreshnessAnchor> {
         self.stored(persistence::freshness)
-    }
-
-    /// Save the exact staged snapshot before adopting it.
-    pub fn save_candidate(&self, snapshot: &[u8]) -> Result<()> {
-        self.stored(|session| persistence::commit_candidate(session, snapshot))
     }
 
     /// A native storage call. These report every failure as `Storage`, as
@@ -1298,19 +1264,18 @@ impl Client {
         let staged = self.call(Op::StageSoloLeave, management::stage_solo_leave)?;
         Ok(WorkspaceCandidate {
             workspace: staged.workspace,
-            snapshot: stored_output(staged.snapshot)?,
+            candidate: staged.snapshot,
         })
     }
 
     /// Adopt a saved removal of this member. The session ends: later calls
     /// give `Closed`.
-    pub fn adopt_removal(&self, snapshot: &[u8]) -> Result<RemovedMembership> {
-        stored_input(snapshot)?;
-        let reply = self.call(Op::AdoptAdmission, |session| {
+    pub fn adopt_removal(&self, candidate: &[u8]) -> Result<RemovedMembership> {
+                let reply = self.call(Op::AdoptAdmission, |session| {
             candidate::adopt_admission(
                 session,
                 candidate::AdoptArgs {
-                    snapshot: snapshot.to_vec(),
+                    candidate: candidate.to_vec(),
                 },
             )
         })?;
@@ -1328,8 +1293,8 @@ impl Client {
     }
 
     /// Adopt a staged invitation registration and return its bearer link.
-    pub fn adopt_invitation(&self, snapshot: &[u8]) -> Result<InvitationInfo> {
-        let adopted = self.adopt(Op::AdoptAdmission, candidate::adopt_admission, snapshot)?;
+    pub fn adopt_invitation(&self, candidate: &[u8]) -> Result<InvitationInfo> {
+        let adopted = self.adopt(Op::AdoptAdmission, candidate::adopt_admission, candidate)?;
         let issued = adopted.issued_invitation.ok_or_else(|| {
             error(ErrorKind::InvalidInput, "candidate did not issue an invitation")
         })?;
@@ -1684,12 +1649,12 @@ impl Client {
         }
         Ok(PublicationCandidate {
             workspace: staged.workspace,
-            snapshot: stored_output(staged.snapshot)?,
+            candidate: staged.snapshot,
         })
     }
 
-    pub fn adopt_protected_publication(&self, snapshot: &[u8]) -> Result<DeliveryReport> {
-        let adopted = self.adopt(Op::AdoptPublication, candidate::adopt_publication, snapshot)?;
+    pub fn adopt_protected_publication(&self, candidate: &[u8]) -> Result<DeliveryReport> {
+        let adopted = self.adopt(Op::AdoptPublication, candidate::adopt_publication, candidate)?;
         let outcome = adopted
             .publication
             .ok_or_else(|| error(ErrorKind::Internal, "publication result has no admission"))?;
@@ -1702,14 +1667,14 @@ impl Client {
     }
 
     /// Stage one protected incoming publication without exposing its plaintext.
-    /// Save the exact snapshot before adoption whenever record storage is enabled.
+    /// Adopt it with `adopt_protected_reception`; core saves it first.
     pub fn poll_protected(&self) -> Result<Option<ProtectedReceptionCandidate>> {
         let staged = self.call(Op::PollProtected, receive::poll_protected)?;
         staged
             .map(|staged| {
                 Ok(ProtectedReceptionCandidate {
                     workspace: staged.workspace,
-                    snapshot: stored_output(staged.snapshot)?,
+                    candidate: staged.snapshot,
                 })
             })
             .transpose()
@@ -1718,8 +1683,8 @@ impl Client {
     /// Adopt a staged inbox candidate: a reception from `poll_protected`, or an
     /// acknowledgement or rejection. A received object then waits in the
     /// durable inbox; read it with `poll_pending_object`.
-    pub fn adopt_protected_reception(&self, snapshot: &[u8]) -> Result<()> {
-        self.adopt(Op::AdoptReception, candidate::adopt_reception, snapshot)?;
+    pub fn adopt_protected_reception(&self, candidate: &[u8]) -> Result<()> {
+        self.adopt(Op::AdoptReception, candidate::adopt_reception, candidate)?;
         Ok(())
     }
 
@@ -1746,7 +1711,7 @@ impl Client {
     }
 
     /// Stage the application's durable acceptance of a pending object. Save
-    /// the snapshot, then `adopt_protected_reception`.
+    /// then adopt it with `adopt_protected_reception`.
     pub fn stage_object_acknowledgement(
         &self,
         object: &ReceivedProtectedPublication,
@@ -1782,7 +1747,7 @@ impl Client {
         })?;
         Ok(ProtectedReceptionCandidate {
             workspace: staged.workspace,
-            snapshot: stored_output(staged.snapshot)?,
+            candidate: staged.snapshot,
         })
     }
 
@@ -1929,7 +1894,7 @@ impl Client {
             ops::recovery::RecoveryStaged::Candidate(candidate) => {
                 Ok(RecoveryStage::Candidate(RecoveryCandidate {
                     workspace: candidate.workspace,
-                    snapshot: stored_output(candidate.snapshot)?,
+                    candidate: candidate.snapshot,
                     publication_count: candidate.publication_count.unwrap_or(0),
                     durable: candidate.durable,
                 }))
@@ -1946,8 +1911,8 @@ impl Client {
         }
     }
 
-    pub fn adopt_recovery(&self, snapshot: &[u8]) -> Result<RecoveryAdoption> {
-        let adopted = self.adopt(Op::AdoptRecovery, candidate::adopt_recovery, snapshot)?;
+    pub fn adopt_recovery(&self, candidate: &[u8]) -> Result<RecoveryAdoption> {
+        let adopted = self.adopt(Op::AdoptRecovery, candidate::adopt_recovery, candidate)?;
         let (recovered_publications, missing_publications) = match adopted.state {
             Some("recovery_adopted") => (
                 adopted.publication_count.unwrap_or(0),
@@ -1994,14 +1959,13 @@ impl Client {
         &self,
         op: Op,
         adopt: fn(&mut Session, candidate::AdoptArgs) -> std::result::Result<candidate::AdoptReply, ApiError>,
-        snapshot: &[u8],
+        candidate: &[u8],
     ) -> Result<candidate::Adopted> {
-        stored_input(snapshot)?;
-        let reply = self.call(op, |session| {
+                let reply = self.call(op, |session| {
             adopt(
                 session,
                 candidate::AdoptArgs {
-                    snapshot: snapshot.to_vec(),
+                    candidate: candidate.to_vec(),
                 },
             )
         })?;
@@ -2023,33 +1987,10 @@ impl Drop for Client {
     }
 }
 
-/// The bound `execute_stored` puts on a snapshot the host passes in.
-fn stored_input(snapshot: &[u8]) -> Result<()> {
-    if snapshot.len() > crate::MAX_STORED_SNAPSHOT {
-        return Err(Error::from(ApiError::invalid_input(
-            "request",
-            "stored request exceeds limit",
-        )));
-    }
-    Ok(())
-}
-
-/// The bound `execute_stored` puts on a snapshot the runtime returns.
-fn stored_output(snapshot: Vec<u8>) -> Result<Vec<u8>> {
-    if snapshot.len() > crate::MAX_STORED_SNAPSHOT {
-        return Err(Error::from(ApiError::limit_reached(
-            "stored snapshot",
-            crate::MAX_STORED_SNAPSHOT as u64,
-            "stored response exceeds limit; close and restore",
-        )));
-    }
-    Ok(snapshot)
-}
-
 fn candidate_of(staged: management::StagedCandidate) -> Result<WorkspaceCandidate> {
     Ok(WorkspaceCandidate {
         workspace: staged.workspace,
-        snapshot: stored_output(staged.snapshot)?,
+        candidate: staged.snapshot,
     })
 }
 
@@ -2058,7 +1999,7 @@ fn change_candidate(staged: management::StagedChange) -> Result<WorkspaceCandida
         management::StagedChange::Candidate(candidate) => candidate_of(candidate),
         management::StagedChange::Removal(removal) => Ok(WorkspaceCandidate {
             workspace: removal.workspace,
-            snapshot: stored_output(removal.snapshot)?,
+            candidate: removal.snapshot,
         }),
     }
 }

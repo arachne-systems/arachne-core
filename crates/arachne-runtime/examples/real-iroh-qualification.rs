@@ -17,8 +17,8 @@ use arachne_node::{
 };
 use arachne_runtime::harness::{self, Query, StateBasis};
 use arachne_runtime::{
-    create, create_relay, create_relay_with_options, create_wan, describe, enable_record_storage,
-    execute, restore_record_storage, save_candidate, wait_for_work,
+    StorageConfig, attach_storage, create, create_relay, create_relay_with_options, create_wan,
+    describe, execute, wait_for_work,
 };
 use arachne_security::{AdmissionAuthorization, Invitation, MembershipAuthorization, PendingJoin};
 use serde_json::{Value, json};
@@ -1041,20 +1041,19 @@ fn create_owner(
     let handle = create_endpoint_for_profile(profile, &secret, relay)?;
     let records = tempfile::tempdir().map_err(|e| e.to_string())?;
     let result = (|| {
+        attach_storage(handle, StorageConfig::sqlite(records.path(), secret))?;
         let created = call(
             handle,
             json!({"op":"create_workspace","display_name":"Qualification owner","workspace_name":"Rust qualification"}),
         )?;
         let workspace = array32(&created["workspace"])?;
-        enable_record_storage(handle, &records.path().join("owner.db"), &secret)?;
         let staged = call(
             handle,
             json!({"op":"stage_invitation","personal":false,"expires_at":0}),
         )?;
-        save_candidate(handle, &bytes(&staged["snapshot"])?)?;
         let invitation = call(
             handle,
-            json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
         )?["issued_invitation"]
             .clone();
         let info: Value = serde_json::from_str(&describe(handle)?).map_err(|e| e.to_string())?;
@@ -1097,7 +1096,6 @@ fn restore_owner(
         _records: records,
         ..
     } = owner;
-    let path = records.path().join("owner.db");
     // The partition phase closes the first endpoint before restoring its
     // records; a repeated close is expected here.
     let _ = arachne_runtime::close(handle);
@@ -1105,7 +1103,8 @@ fn restore_owner(
     secret[..8].copy_from_slice(&seed.to_be_bytes());
     let handle = create_endpoint_for_profile(profile, &secret, relay)?;
     let result = (|| {
-        restore_record_storage(handle, &path, &secret, workspace)?;
+        attach_storage(handle, StorageConfig::sqlite(records.path(), secret))?;
+        call(handle, json!({"op":"restore_workspace","workspace":workspace}))?;
         let info: Value = serde_json::from_str(&describe(handle)?).map_err(|e| e.to_string())?;
         let peer = array32(&info["endpoint_key"])?;
         let port = info["bound_address"]

@@ -1,6 +1,8 @@
-use arachne_runtime::{close, create, describe, execute};
+use arachne_runtime::{MemoryProvider, close, describe, execute};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
+
+mod common;
 
 fn call(handle: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
@@ -14,16 +16,17 @@ fn issue_invitation(handle: i64) -> Value {
     .unwrap();
     call(
         handle,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap()
 }
 
 #[test]
 fn old_invitation_redeems_through_an_ordinary_member_with_issuer_closed() {
-    let admin = create(Some(&[81; 32])).unwrap();
-    let mut helper = create(Some(&[82; 32])).unwrap();
-    let late = create(Some(&[83; 32])).unwrap();
+    let admin = common::stored(&[81; 32], &MemoryProvider::default());
+    let helper_storage = MemoryProvider::default();
+    let mut helper = common::stored(&[82; 32], &helper_storage);
+    let late = common::stored(&[83; 32], &MemoryProvider::default());
     call(
         admin,
         json!({"op":"create_workspace","display_name":"Coordinator"}),
@@ -47,7 +50,7 @@ fn old_invitation_redeems_through_an_ordinary_member_with_issuer_closed() {
     .unwrap();
     call(
         admin,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap();
     let reply = call(
@@ -64,12 +67,12 @@ fn old_invitation_redeems_through_an_ordinary_member_with_issuer_closed() {
     .unwrap();
     call(
         helper,
-        json!({"op":"adopt_join","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
     )
     .unwrap();
     close(helper).unwrap();
-    helper = create(Some(&[82; 32])).unwrap();
-    call(helper, json!({"op":"restore_workspace","workspace":invite["workspace"],"snapshot":staged["snapshot"]})).unwrap();
+    helper = common::stored(&[82; 32], &helper_storage);
+    call(helper, json!({"op":"restore_workspace","workspace":invite["workspace"]})).unwrap();
     assert!(call(helper, json!({"op":"stage_invitation","personal":false,"expires_at":0})).is_err());
     let node: Value = serde_json::from_str(&describe(helper).unwrap()).unwrap();
     let helper_address = node["bound_address"]
@@ -97,7 +100,7 @@ fn old_invitation_redeems_through_an_ordinary_member_with_issuer_closed() {
     .unwrap();
     call(
         helper,
-        json!({"op":"adopt_admission","snapshot":s["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":s["candidate"]}),
     )
     .unwrap();
     let routed = adopted["issued_invitation"].clone();
@@ -149,7 +152,7 @@ fn old_invitation_redeems_through_an_ordinary_member_with_issuer_closed() {
         if staged["state"] == "awaiting_save" {
             call(
                 helper,
-                json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+                json!({"op":"adopt_admission","candidate":staged["candidate"]}),
             )
             .unwrap();
             break;
@@ -193,7 +196,8 @@ fn old_invitation_redeems_through_an_ordinary_member_with_issuer_closed() {
         )
         .is_err()
     );
-    assert!(call(late, json!({"op":"seal_pending_join"})).is_ok());
+    // The rejected history left the pending join in place: the true history
+    // below still stages from it.
     let staged = call(
         late,
         json!({"op":"stage_join","welcome":reply["welcome"],"commits":steps}),
@@ -201,7 +205,7 @@ fn old_invitation_redeems_through_an_ordinary_member_with_issuer_closed() {
     .expect("reachable member must provide the missing authorized history from the old invitation");
     let joined = call(
         late,
-        json!({"op":"adopt_join","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
     )
     .unwrap();
     assert_eq!(joined["members"], 3);

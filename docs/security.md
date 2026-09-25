@@ -135,8 +135,10 @@ reach an offline peer.
 
 ## Local persistence
 
-`arachne-store` encrypts values with AES-256-GCM using a derived key based on a
-root key supplied by the host and a caller-selected scope. It authenticates the
+Native record storage is the only persistence mode. Core saves each staged
+candidate, reads it back, and only then adopts it; the host never handles
+state bytes. `arachne-store` encrypts values with AES-256-GCM using a derived
+key based on a root key supplied by the host and the workspace scope. It authenticates the
 record index when opening the database and authenticates record ciphertext
 when each record is read. The host remains responsible for protecting the root
 key, filesystem access, backups, and concurrent-open lifecycle.
@@ -148,7 +150,7 @@ can roll both back together. Key loss also means stored state cannot be
 recovered by Core.
 
 The runtime exposes the anchor through `record_freshness` and checks it in
-`restore_record_storage_with_freshness`. The check is exact equality, not
+`restore_workspace` when the host passes the saved anchor. The check is exact equality, not
 "at least this revision". Two stores for the same workspace and root share one
 key, so an old file from an earlier lineage can have a higher revision and
 still authenticate. A rollback that is accepted replays MLS state and reuses
@@ -157,16 +159,17 @@ sender counters, which reuses AES-GCM nonces. Exact equality has a cost:
 - If the process stops after a commit but before the host saves the new
   anchor, the current database no longer matches. Restore fails closed, and
   the host must decide how to recover.
-- Some `execute` operations commit and send in one call. The host cannot save
-  the anchor between that commit and the send. A crash in that window,
-  followed by a rollback to the saved anchor, is not detected.
+- Adopt operations commit and send in one call. The host cannot save the
+  anchor between that commit and the send. A crash in that window, followed
+  by a rollback to the saved anchor, is not detected.
 - A restore without an anchor does not detect rollback.
 
-For staged workspace, membership, publication, and recovery operations, persist
-the exact candidate before adoption. If a write result is uncertain, close and
-restore from the last committed state before retrying. This prevents the host
-from advancing live cryptographic state after losing the matching durable
-snapshot.
+For staged workspace, membership, publication, and recovery operations, core
+saves and reads back the exact candidate before adoption. If a save fails or
+does not read back, the session refuses further operations until it is closed
+and restored from the last committed state. This prevents live cryptographic
+state from advancing past the durable state. A candidate that is already in
+storage cannot be discarded.
 
 ## Host responsibilities
 
@@ -175,7 +178,8 @@ An integrating application must, at minimum:
 - generate, protect, rotate, back up, and restore endpoint and store secrets;
 - authenticate application users/devices before binding them to workspace
   credentials;
-- persist accepted and staged state using the documented commit/adopt order;
+- attach record storage to every session that holds a workspace, and keep the
+  storage directory private;
 - derive routing policy from current accepted membership state;
 - avoid logging invitation material, secrets, plaintext, or sensitive endpoint
   metadata;
