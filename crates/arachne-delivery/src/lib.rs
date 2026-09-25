@@ -181,6 +181,13 @@ impl EpochLog {
         self.epoch
     }
 
+    /// Every retained publication, in sequence order (all topics).
+    pub fn publications(&self) -> Vec<&RetainedPublication> {
+        let mut records: Vec<_> = self.topics.values().flat_map(|h| &h.records).collect();
+        records.sort_by_key(|record| record.sequence);
+        records
+    }
+
     /// New publications only. Retransmit existing ciphertext without appending.
     /// Duplicate-ID detection covers retained records, not all historical IDs.
     pub fn append(

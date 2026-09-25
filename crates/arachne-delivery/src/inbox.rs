@@ -804,6 +804,52 @@ impl ObjectInbox {
         Ok(advanced)
     }
 
+    /// Move to a winning branch (ADR A2 step 8). `current` is the owner on
+    /// the losing branch, `fork_epoch` the fork epoch F, `next` the owner
+    /// after the winning steps. The epoch numbers above F exist on both
+    /// branches with different keys, so every per-epoch record above F is
+    /// dropped: a replay window from the losing epoch F+1 would otherwise
+    /// refuse the winning epoch F+1's objects. Pending objects are
+    /// authenticated plaintext and stay. Save the result with `next`.
+    pub fn rebase(
+        &self,
+        current: &arachne_security::Workspace,
+        fork_epoch: u64,
+        next: &arachne_security::Workspace,
+    ) -> Result<Self, &'static str> {
+        self.validate_owner(current)?;
+        if next.id() != self.workspace || fork_epoch >= current.epoch() || next.epoch() <= fork_epoch
+        {
+            return Err("inbox cannot rebase to this owner");
+        }
+        let oldest = next.oldest_receive_epoch();
+        let kept = |epoch: u64| epoch >= oldest && epoch <= fork_epoch;
+        let member = |id: &[u8; 32]| next.endpoints_for_members(&[*id]).is_ok();
+        let mut moved = self.clone();
+        moved.epoch = next.epoch();
+        moved.replay.retain(|replay| kept(replay.epoch));
+        moved.progress.retain(|progress| kept(progress.epoch));
+        moved.retained_ranges.retain(|range| {
+            RangeQuery::from_wire(&range.query)
+                .is_ok_and(|query| kept(query.epoch) && member(&query.author))
+        });
+        moved.current = None;
+        moved.retained_current_views.clear();
+        moved.current_progress.clear();
+        for stream in &mut moved.direct {
+            stream.records.retain(|record| {
+                arachne_security::object_epoch(&record.object).is_some_and(kept)
+            });
+        }
+        moved.direct.retain(|stream| {
+            (!stream.records.is_empty() || stream.known_head != 0)
+                && member(&stream.author)
+                && stream.recipients.iter().all(member)
+        });
+        moved.snapshot()?;
+        Ok(moved)
+    }
+
     /// Direct sequences given up as missed since this inbox was created or
     /// restored: a record window overflow moved a scope floor past a gap
     /// (B7e). The difference between a staged candidate and the current state
