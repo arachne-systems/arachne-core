@@ -8,7 +8,7 @@ use std::sync::Arc;
 use arachne_api::{ApiError, ErrorCode};
 use arachne_node::{Node, Timeouts};
 use serde_json::Value;
-use tokio::runtime::Runtime;
+use tokio::runtime::Handle;
 
 use crate::errors::{self, delivery};
 use crate::ops::join::{JoinLifecycle, PendingCheckpointExchange, PendingJoinExchange};
@@ -101,8 +101,11 @@ pub(crate) struct Session {
     // Transport and runtime.
     pub(crate) node: Node,
     pub(crate) receiver: arachne_node::MessageReceiver,
-    pub(crate) runtime: Runtime,
-    pub(crate) overlay_paths: usize,
+    /// The context's shared runtime.
+    pub(crate) runtime: Handle,
+    pub(crate) overlay_paths: crate::context::OverlayPaths,
+    /// Session-owned background tasks, aborted at shutdown.
+    pub(crate) tasks: Vec<tokio::task::AbortHandle>,
     // Committed workspace and durable state.
     /// The committed workspace. Shared and never edited in place: a transition
     /// works on a provisional copy, and `commit_workspace` replaces this.
@@ -127,6 +130,13 @@ pub(crate) struct Session {
     /// Set by an op that ended the session (a removal was adopted or
     /// restored). `ops::run` then takes the session and shuts it down.
     pub(crate) ending: bool,
+    /// When the op in flight must end (`ops::run` sets it).
+    pub(crate) op_deadline: Option<std::time::Instant>,
+    /// Ready jobs `next_event` already reported.
+    pub(crate) events: crate::events::Reported,
+    /// The owning context. Last, so the node closes before a context that
+    /// this session keeps alive drops its runtime.
+    pub(crate) context: Arc<crate::context::Context>,
 }
 
 /// The one staged transition and the one inbound exchange that waits for it.
@@ -269,7 +279,7 @@ impl Session {
     pub(crate) fn new(
         node: Node,
         receiver: arachne_node::MessageReceiver,
-        runtime: Runtime,
+        context: Arc<crate::context::Context>,
         committed: committed_view::Published,
         presence: presence::Presence,
     ) -> Self {
@@ -277,8 +287,9 @@ impl Session {
         Self {
             node,
             receiver,
-            runtime,
-            overlay_paths: 0,
+            runtime: context.handle().clone(),
+            overlay_paths: context.overlay_paths(),
+            tasks: Vec::new(),
             workspace: None,
             committed,
             activity: WorkspaceActivity::default(),
@@ -295,6 +306,9 @@ impl Session {
             presence,
             interests: interest::Updates::default(),
             ending: false,
+            op_deadline: None,
+            events: Default::default(),
+            context,
         }
     }
 }

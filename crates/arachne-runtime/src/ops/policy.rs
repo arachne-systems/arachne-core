@@ -16,8 +16,7 @@ use tokio::sync::mpsc;
 use crate::client::DeliveryReport;
 use crate::errors::{self, security};
 use crate::{
-    DEVICE_OVERLAY_PATHS, MAX_WORKSPACE_OVERLAY_PATHS, Session, interest, release_overlay_paths,
-    report, reserve_overlay_paths,
+    MAX_WORKSPACE_OVERLAY_PATHS, Session, interest, report,
 };
 
 /// A peer's topic permissions in a fixture policy.
@@ -108,13 +107,16 @@ pub(crate) struct FixtureMessage {
     pub payload: Vec<u8>,
 }
 
-/// These ops end at a 10 s deadline; the outcome may then be partial.
+/// These ops end at a 10 s deadline, or at the op deadline when it comes
+/// first (policy install and its gossip join); the outcome may then be
+/// partial.
 fn with_deadline<T>(
-    runtime: &tokio::runtime::Runtime,
+    op_deadline: Option<std::time::Instant>,
+    runtime: &tokio::runtime::Handle,
     work: impl Future<Output = Result<T, ApiError>>,
 ) -> Result<T, ApiError> {
     runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(10), work)
+        tokio::time::timeout(crate::deadline::cap(op_deadline, Duration::from_secs(10)), work)
             .await
             .map_err(|_| ApiError::DeadlineExceeded)?
     })
@@ -129,7 +131,7 @@ fn topics(names: Vec<String>) -> Result<BTreeSet<Topic>, ApiError> {
 }
 
 pub(crate) fn add_address_hint(session: &mut Session, args: AddressHintArgs) -> Result<(), ApiError> {
-    with_deadline(&session.runtime, async {
+    with_deadline(session.op_deadline, &session.runtime, async {
         session
             .node
             .add_address_hint(
@@ -151,7 +153,7 @@ pub(crate) fn install_workspace_policy(
     args: WorkspacePolicyArgs,
 ) -> Result<PolicyInstalled, ApiError> {
     let revision = args.revision;
-    with_deadline(&session.runtime, async {
+    with_deadline(session.op_deadline, &session.runtime, async {
         let owner = session
             .workspace
             .as_ref()
@@ -191,7 +193,7 @@ pub(crate) fn install_member_policy(
     args: MemberPolicyArgs,
 ) -> Result<PolicyInstalled, ApiError> {
     let MemberPolicyArgs { revision, topics: names } = args;
-    with_deadline(&session.runtime, async {
+    with_deadline(session.op_deadline, &session.runtime, async {
         let workspace = session
             .workspace
             .as_ref()
@@ -247,7 +249,7 @@ pub(crate) fn install_verified_policy(
     session: &mut Session,
     args: VerifiedPolicyArgs,
 ) -> Result<(), ApiError> {
-    with_deadline(&session.runtime, async {
+    with_deadline(session.op_deadline, &session.runtime, async {
         let mut policy = BTreeMap::new();
         for endpoint in args.endpoints {
             let access = Permissions::Selected {
@@ -300,7 +302,7 @@ fn interest_idle(session: &Session) -> Result<(), ApiError> {
 
 pub(crate) fn subscribe(session: &mut Session, args: TopicArgs) -> Result<DeliveryReport, ApiError> {
     interest_idle(session)?;
-    with_deadline(&session.runtime, async {
+    with_deadline(session.op_deadline, &session.runtime, async {
         let topic = Topic::new(args.topic).map_err(errors::routing)?;
         Ok(report(
             session
@@ -314,7 +316,7 @@ pub(crate) fn subscribe(session: &mut Session, args: TopicArgs) -> Result<Delive
 
 pub(crate) fn unsubscribe(session: &mut Session, args: TopicArgs) -> Result<DeliveryReport, ApiError> {
     interest_idle(session)?;
-    with_deadline(&session.runtime, async {
+    with_deadline(session.op_deadline, &session.runtime, async {
         let topic = Topic::new(args.topic).map_err(errors::routing)?;
         Ok(report(
             session
@@ -329,7 +331,7 @@ pub(crate) fn unsubscribe(session: &mut Session, args: TopicArgs) -> Result<Deli
 /// Fixture: an unprotected publication, rejected once the session owns a
 /// workspace.
 pub(crate) fn publish(session: &mut Session, args: PublishArgs) -> Result<DeliveryReport, ApiError> {
-    with_deadline(&session.runtime, async {
+    with_deadline(session.op_deadline, &session.runtime, async {
         let topic = Topic::new(args.topic).map_err(errors::routing)?;
         Ok(report(
             session
@@ -362,7 +364,7 @@ pub(crate) fn poll(session: &mut Session) -> Result<Option<FixtureMessage>, ApiE
 /// device-wide overlay path budget.
 pub(crate) async fn install_gossip_policy(
     node: &Node,
-    reserved: &mut usize,
+    reserved: &mut crate::context::OverlayPaths,
     workspace: [u8; 32],
     revision: u64,
     policy: BTreeMap<[u8; 32], Permissions>,
@@ -373,14 +375,8 @@ pub(crate) async fn install_gossip_policy(
         .filter(|peer| **peer != node.id())
         .count()
         .min(MAX_WORKSPACE_OVERLAY_PATHS);
-    let additional = desired.saturating_sub(*reserved);
-    if !reserve_overlay_paths(&DEVICE_OVERLAY_PATHS, additional) {
-        return Err(ApiError::limit_reached(
-            "device overlay paths",
-            crate::MAX_DEVICE_OVERLAY_PATHS as u64,
-            "device overlay path limit reached",
-        ));
-    }
+    let additional = desired.saturating_sub(reserved.held());
+    reserved.reserve(additional)?;
     let result = async {
         node.install_verified_policy(workspace, revision, policy)
             .await
@@ -393,12 +389,11 @@ pub(crate) async fn install_gossip_policy(
     }
     .await;
     if let Err(error) = result {
-        release_overlay_paths(&DEVICE_OVERLAY_PATHS, additional);
+        reserved.release(additional);
         return Err(error);
     }
-    if *reserved > desired {
-        release_overlay_paths(&DEVICE_OVERLAY_PATHS, *reserved - desired);
+    if reserved.held() > desired {
+        reserved.release(reserved.held() - desired);
     }
-    *reserved = desired;
     Ok(())
 }

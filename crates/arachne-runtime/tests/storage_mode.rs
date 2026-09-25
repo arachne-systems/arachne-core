@@ -25,13 +25,13 @@ fn publish(client: &Client, workspace: [u8; 32], id: u8) -> arachne_runtime::Cli
 #[test]
 fn adopt_saves_and_reads_back_without_a_host_save() {
     let provider = MemoryProvider::default();
-    let mut client = open(41, Some(&provider));
+    let client = open(41, Some(&provider));
     let created = client.create_workspace("Owner", None).unwrap();
     assert!(created.durable);
     publish(&client, created.workspace, 1).unwrap();
     client.close().unwrap();
 
-    let mut client = open(41, Some(&provider));
+    let client = open(41, Some(&provider));
     let RestoredWorkspace::Active(info) = client.restore_workspace(created.workspace, None).unwrap()
     else {
         panic!("expected an active workspace")
@@ -50,7 +50,7 @@ fn adopt_saves_and_reads_back_without_a_host_save() {
 #[test]
 fn a_read_back_mismatch_stops_the_session_until_restore() {
     let provider = MemoryProvider::default();
-    let mut client = open(42, Some(&provider));
+    let client = open(42, Some(&provider));
     let created = client.create_workspace("Owner", None).unwrap();
     client.install_workspace_policy(1).unwrap();
     let staged = client
@@ -68,7 +68,7 @@ fn a_read_back_mismatch_stops_the_session_until_restore() {
         ErrorCode::StorageFailed
     );
     client.close().unwrap();
-    let mut client = open(42, Some(&provider));
+    let client = open(42, Some(&provider));
     assert!(matches!(
         client.restore_workspace(created.workspace, None).unwrap(),
         RestoredWorkspace::Active(_)
@@ -79,7 +79,7 @@ fn a_read_back_mismatch_stops_the_session_until_restore() {
 #[test]
 fn a_failed_commit_stops_the_session_until_restore() {
     let provider = MemoryProvider::default();
-    let mut client = open(43, Some(&provider));
+    let client = open(43, Some(&provider));
     let created = client.create_workspace("Owner", None).unwrap();
     client.install_workspace_policy(1).unwrap();
     let staged = client
@@ -93,7 +93,7 @@ fn a_failed_commit_stops_the_session_until_restore() {
         ErrorCode::StorageFailed
     );
     client.close().unwrap();
-    let mut client = open(43, Some(&provider));
+    let client = open(43, Some(&provider));
     client.restore_workspace(created.workspace, None).unwrap();
     publish(&client, created.workspace, 3).unwrap();
     client.close().unwrap();
@@ -150,7 +150,7 @@ fn host_snapshot_paths_are_gone() {
 
 #[test]
 fn without_storage_a_session_cannot_hold_a_workspace() {
-    let mut client = open(46, None);
+    let client = open(46, None);
     let error = client.create_workspace("Owner", None).unwrap_err();
     assert_eq!(error.code(), ErrorCode::WrongState, "{error:?}");
     assert!(error.message().contains("storage"));
@@ -160,12 +160,12 @@ fn without_storage_a_session_cannot_hold_a_workspace() {
 #[test]
 fn create_workspace_is_durable_before_any_adoption() {
     let provider = MemoryProvider::default();
-    let mut client = open(47, Some(&provider));
+    let client = open(47, Some(&provider));
     let created = client.create_workspace("Owner", Some("Team")).unwrap();
     assert!(created.durable);
     assert!(client.workspace_state().unwrap().durable);
     client.close().unwrap();
-    let mut client = open(47, Some(&provider));
+    let client = open(47, Some(&provider));
     let RestoredWorkspace::Active(info) = client.restore_workspace(created.workspace, None).unwrap()
     else {
         panic!("expected an active workspace")

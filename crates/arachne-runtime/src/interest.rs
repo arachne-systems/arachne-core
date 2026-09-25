@@ -7,6 +7,11 @@ use std::time::Instant;
 const MAX_INTERESTS: usize = 64;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 
+/// The retry delay at a background timer scale (1 normally).
+pub(crate) fn retry_delay(scale: u32) -> Duration {
+    RETRY_DELAY * scale.max(1)
+}
+
 #[derive(Clone)]
 pub(super) struct Update {
     pub workspace: [u8; 32],
@@ -35,13 +40,32 @@ pub(super) struct Updates {
 }
 
 impl Updates {
+    /// An announcement ended and `poll` has its result.
+    pub fn has_result(&self) -> bool {
+        self.pending.as_ref().is_some_and(|job| job.task.is_finished())
+    }
+
+    /// Work waits for `poll` to start it: a queued change, a repair after a
+    /// network change or resume, or a retry that is due.
+    pub fn has_work_to_start(&self) -> bool {
+        self.pending.is_none()
+            && (!self.queued.is_empty()
+                || !self.repair.is_empty()
+                || self.retry_at.is_some_and(|at| Instant::now() >= at))
+    }
+
+    /// An announcement runs, or a retry is scheduled.
+    pub fn is_running(&self) -> bool {
+        self.pending.is_some() || self.retry_at.is_some()
+    }
+
     pub fn is_idle(&self) -> bool {
         self.pending.is_none() && self.queued.is_empty() && self.repair.is_empty()
     }
     pub fn set(
         &mut self,
         node: &Node,
-        runtime: &Runtime,
+        runtime: &tokio::runtime::Handle,
         update: Update,
     ) -> Result<InterestQueued, ApiError> {
         let key = (update.workspace, update.topic.clone());
@@ -123,7 +147,7 @@ impl Updates {
         }
     }
 
-    pub fn poll(&mut self, node: &Node, runtime: &Runtime) -> Value {
+    pub fn poll(&mut self, node: &Node, runtime: &tokio::runtime::Handle) -> Value {
         if self.is_idle() && self.retry_at.is_some_and(|at| Instant::now() >= at) {
             self.retry_at = None;
             self.repair();
@@ -139,7 +163,7 @@ impl Updates {
             match runtime.block_on(&mut job.task) {
                 Ok(Ok(outcome)) => {
                     if !outcome.failed.is_empty() {
-                        self.retry_at = Some(Instant::now() + RETRY_DELAY);
+                        self.retry_at = Some(Instant::now() + retry_delay(node.timer_scale()));
                     }
                     let withdrawal_observed = !job.update.subscribed && outcome.failed.is_empty();
                     value["admission"] = report_value(outcome);
@@ -156,7 +180,7 @@ impl Updates {
                     }
                 }
                 other => {
-                    self.retry_at = Some(Instant::now() + RETRY_DELAY);
+                    self.retry_at = Some(Instant::now() + retry_delay(node.timer_scale()));
                     value["state"] = json!("interest_failed");
                     value["error"] = json!(format!("{other:?}"));
                 }

@@ -1,6 +1,5 @@
 use arachne_runtime::{MemoryProvider, close, describe, execute};
 use serde_json::{Value, json};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 mod common;
@@ -9,8 +8,6 @@ mod common;
 fn node(secret: u8) -> i64 {
     common::stored(&[secret; 32], &MemoryProvider::default())
 }
-
-static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn call(handle: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
@@ -32,7 +29,6 @@ fn issue_invitation(handle: i64) -> Value {
 
 #[test]
 fn creator_name_is_authenticated_in_invitation_without_creating_join_state() {
-    let _nodes = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = node(171);
     let invitee = node(172);
     let created = call(
@@ -80,7 +76,6 @@ fn bytes(value: &Value) -> Vec<u8> {
 
 #[test]
 fn rename_preserves_legacy_and_native_pending_delivery_across_interruption() {
-    let _nodes = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     use arachne_delivery::{
         PublisherLog,
         inbox::{InboxStage, ObjectInbox},
@@ -231,7 +226,6 @@ fn poll_reply(responder: i64, receiver: i64) -> Value {
 
 #[test]
 fn existing_control_poll_pages_names_and_discards_reply_for_old_name_head() {
-    let _nodes = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = node(175);
     let member_storage = MemoryProvider::default();
     let mut member = common::stored(&[176; 32], &member_storage);
@@ -333,7 +327,6 @@ fn existing_control_poll_pages_names_and_discards_reply_for_old_name_head() {
 
 #[test]
 fn rust_workspace_driver_converges_same_epoch_name_from_presence() {
-    let _nodes = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = node(179);
     let member = node(180);
     call(
@@ -410,7 +403,6 @@ fn rust_workspace_driver_converges_same_epoch_name_from_presence() {
 
 #[test]
 fn rust_workspace_driver_reports_a_stale_name_peer_without_overwriting_local() {
-    let _nodes = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = node(181);
     let member = node(182);
     call(
@@ -458,7 +450,6 @@ fn rust_workspace_driver_reports_a_stale_name_peer_without_overwriting_local() {
 
 #[test]
 fn rust_workspace_driver_reports_equal_revision_name_conflict_without_overwriting_local() {
-    let _nodes = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = node(183);
     let member = node(184);
     call(
@@ -534,7 +525,6 @@ fn rust_workspace_driver_reports_equal_revision_name_conflict_without_overwritin
 
 #[test]
 fn iroh_name_checkpoint_recovers_after_renaming_admin_is_demoted() {
-    let _nodes = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = node(177);
     // The member uses SQLite so the test can put an older, authentic copy of
     // its database back: the stale restore below.

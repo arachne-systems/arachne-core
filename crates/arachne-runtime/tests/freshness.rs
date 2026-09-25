@@ -32,14 +32,14 @@ fn a_rolled_back_store_is_refused_without_host_bookkeeping() {
     let root = [92; 32];
     let anchors = Arc::new(MemoryAnchors::default());
     let storage = || StorageConfig::sqlite(directory.path(), root).with_anchors(anchors.clone());
-    let mut client = open(storage());
+    let client = open(storage());
     let created = client.create_workspace("Owner", None).unwrap();
     let path = SqliteProvider::new(directory.path(), root).path(created.workspace);
     let old = directory.path().join("old-copy");
     client.close().unwrap();
     std::fs::copy(&path, &old).unwrap();
 
-    let mut client = open(storage());
+    let client = open(storage());
     client.restore_workspace(created.workspace, None).unwrap();
     publish(&client, created.workspace, 1).unwrap();
     client.close().unwrap();
@@ -48,14 +48,14 @@ fn a_rolled_back_store_is_refused_without_host_bookkeeping() {
 
     // Whole-file rollback: the anchor in monotonic storage refuses it.
     std::fs::copy(&old, &path).unwrap();
-    let mut client = open(storage());
+    let client = open(storage());
     let error = client.restore_workspace(created.workspace, None).unwrap_err();
     assert_eq!(error.code(), ErrorCode::CandidateStale, "{error:?}");
     assert!(error.message().contains("freshness"), "{error:?}");
     client.close().unwrap();
 
     std::fs::copy(&latest, &path).unwrap();
-    let mut client = open(storage());
+    let client = open(storage());
     assert!(matches!(
         client.restore_workspace(created.workspace, None).unwrap(),
         RestoredWorkspace::Active(_)
@@ -68,13 +68,13 @@ fn a_rolled_back_store_is_refused_without_host_bookkeeping() {
 fn a_missing_anchor_fails_closed() {
     let directory = common::directory();
     let root = [93; 32];
-    let mut client = open(
+    let client = open(
         StorageConfig::sqlite(directory.path(), root).with_anchors(Arc::new(MemoryAnchors::default())),
     );
     let created = client.create_workspace("Owner", None).unwrap();
     client.close().unwrap();
     // Another device's anchor storage, or a wiped one.
-    let mut client = open(
+    let client = open(
         StorageConfig::sqlite(directory.path(), root).with_anchors(Arc::new(MemoryAnchors::default())),
     );
     let error = client.restore_workspace(created.workspace, None).unwrap_err();
@@ -89,7 +89,7 @@ fn a_crash_after_commit_before_the_anchor_is_confirmed_still_restores() {
     let root = [94; 32];
     let anchors = Arc::new(MemoryAnchors::default());
     let storage = || StorageConfig::sqlite(directory.path(), root).with_anchors(anchors.clone());
-    let mut client = open(storage());
+    let client = open(storage());
     let created = client.create_workspace("Owner", None).unwrap();
     // The commit lands; confirming its anchor fails, as a crash would.
     anchors.fail_confirmations(true);
@@ -98,7 +98,7 @@ fn a_crash_after_commit_before_the_anchor_is_confirmed_still_restores() {
     client.close().unwrap();
     anchors.fail_confirmations(false);
     // The pre-commit anchor slot names the landed commit: restore accepts it.
-    let mut client = open(storage());
+    let client = open(storage());
     client.restore_workspace(created.workspace, None).unwrap();
     publish(&client, created.workspace, 2).unwrap();
     client.close().unwrap();

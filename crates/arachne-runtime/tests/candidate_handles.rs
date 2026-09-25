@@ -18,8 +18,8 @@ fn open(secret: u8, provider: &MemoryProvider) -> Client {
 #[test]
 fn a_candidate_adopts_once_and_only_on_its_client() {
     let provider = MemoryProvider::default();
-    let mut owner = open(61, &provider);
-    let mut other = open(62, &provider);
+    let owner = open(61, &provider);
+    let other = open(62, &provider);
     owner.create_workspace("Owner", None).unwrap();
     other.create_workspace("Other", None).unwrap();
     let renamed = owner.stage_workspace_name("Renamed").unwrap();
@@ -44,7 +44,7 @@ fn a_candidate_adopts_once_and_only_on_its_client() {
 #[test]
 fn discard_and_drop_release_the_session() {
     let provider = MemoryProvider::default();
-    let mut owner = open(63, &provider);
+    let owner = open(63, &provider);
     let created = owner.create_workspace("Owner", None).unwrap();
     let first = owner.stage_workspace_name("First").unwrap();
     assert_eq!(first.workspace(), created.workspace);

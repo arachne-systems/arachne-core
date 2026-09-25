@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use arachne_api::{ApiError, ErrorCode};
+use arachne_api::{ApiError, ErrorCode, Event};
 
 use crate::ops::candidate::CandidateKind;
 use crate::ops::{self, Op, admission, candidate, invitation, join, management, publication, receive};
+use crate::persistence;
+use crate::{FreshnessAnchor, Session, StorageConfig, WorkspacePhase};
 
 /// The kinds `adopt_admission` accepts.
 const WORKSPACE_KINDS: &[CandidateKind] = &[
@@ -12,8 +14,6 @@ const WORKSPACE_KINDS: &[CandidateKind] = &[
     CandidateKind::Management,
     CandidateKind::WorkspaceName,
 ];
-use crate::persistence;
-use crate::{FreshnessAnchor, Session, StorageConfig, WorkspacePhase};
 
 /// Address discovery and transport selection for a typed runtime client.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,6 +50,10 @@ pub struct TransportOptions {
     pub public_lookup: Option<bool>,
     /// Deadlines for a slow or constrained link.
     pub timeouts: Option<TransportTimeouts>,
+    /// Per-op deadline for this client's blocking ops, and for its bind.
+    /// At the deadline an op fails with `DeadlineExceeded` and the session
+    /// stays usable. `Client::set_deadline` changes it later.
+    pub deadline: Option<std::time::Duration>,
 }
 
 /// Relays run by the deployment operator.
@@ -888,12 +892,25 @@ pub struct RecoveryAdoption {
 
 /// Typed adopter seam over the portable runtime. The JSON dispatcher remains
 /// private to adapters; consumers use typed lifecycle operations here.
+///
+/// A `Client` is `Send + Sync`. `close`, `wake`, `wait_for_work` and
+/// `next_event` may run on any thread while another thread waits.
 pub struct Client {
-    handle: Option<i64>,
+    handle: i64,
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl Client {
+    /// Open a client in the process default context
+    /// ([`Context::default_shared`](crate::Context::default_shared)).
     pub fn open(config: ClientConfig) -> Result<Self> {
+        let context = crate::Context::default_shared()?;
+        Self::open_in(&context, config)
+    }
+
+    /// Open a client in `context`. Storage and other per-client setup
+    /// attach here, after the session is registered.
+    pub fn open_in(context: &std::sync::Arc<crate::Context>, config: ClientConfig) -> Result<Self> {
         if config.network != Network::Direct && config.secret.is_none() {
             return Err(error(
                 ErrorKind::InvalidInput,
@@ -901,9 +918,11 @@ impl Client {
             ));
         }
         let options = config.transport.node_options(config.network)?;
-        let handle = crate::registry::open(config.secret.as_ref(), options)?;
+        let handle =
+            crate::registry::open(context, config.secret.as_ref(), options, config.transport.deadline)?;
         let client = Self {
-            handle: Some(handle),
+            handle,
+            closed: std::sync::atomic::AtomicBool::new(false),
         };
         if let Some(storage) = config.storage {
             client.stored(|session| persistence::attach(session, storage))?;
@@ -1647,12 +1666,50 @@ impl Client {
         Ok(())
     }
 
+    /// Interrupt the blocking op in flight (its outbound control
+    /// exchanges). Not sticky: the latch clears when that op ends, so the
+    /// next op runs normally.
     pub fn cancel(&self) -> Result<()> {
         Ok(crate::registry::cancel_session(self.handle()?)?)
     }
 
-    pub fn wait_for_work(&self) -> Result<bool> {
-        Ok(crate::registry::wait_session(self.handle()?)?)
+    /// Park until the session may have work, up to `timeout` (`None`: no
+    /// timeout). Holds no client or session lock. `Ok(true)`: drain the
+    /// queues (or call `next_event`), then call again. `Ok(false)`: the
+    /// timeout passed, `wake` was called, or the client closed.
+    pub fn wait_for_work(&self, timeout: Option<std::time::Duration>) -> Result<bool> {
+        Ok(crate::registry::wait_session_for(self.handle()?, timeout)?)
+    }
+
+    /// Release one waiter (`wait_for_work` or `next_event`) without work,
+    /// for example at host shutdown.
+    pub fn wake(&self) -> Result<()> {
+        Ok(crate::registry::wake_session(self.handle()?)?)
+    }
+
+    /// The next event of any queue, up to `timeout` (`None`: no timeout).
+    /// `Ok(None)`: the timeout passed, `wake` was called, or the client
+    /// closed while it waited. Queue events repeat until the host drains
+    /// the queue with its poll call; a ready job reports once. After
+    /// `close`, it fails with `Closed`.
+    pub fn next_event(&self, timeout: Option<std::time::Duration>) -> Result<Option<Event>> {
+        Ok(crate::events::next(self.handle()?, timeout)?)
+    }
+
+    /// Give each later blocking op this deadline. At the deadline the op
+    /// fails with `DeadlineExceeded` and the session stays usable.
+    pub fn set_deadline(&self, deadline: Option<std::time::Duration>) {
+        if let Ok(handle) = self.handle()
+            && let Ok(entry) = crate::registry::entry(handle)
+        {
+            entry.set_deadline(deadline);
+        }
+    }
+
+    /// `set_deadline`, as a builder.
+    pub fn with_deadline(self, deadline: std::time::Duration) -> Self {
+        self.set_deadline(Some(deadline));
+        self
     }
 
     /// Service one queued peer-control exchange and report whether one was served.
@@ -2076,12 +2133,14 @@ impl Client {
         })
     }
 
-    pub fn close(&mut self) -> Result<()> {
-        let handle = self
-            .handle
-            .take()
-            .ok_or_else(|| error(ErrorKind::Closed, "client is closed"))?;
-        Ok(crate::registry::close_session(handle)?)
+    /// Close the session. Idempotent, and callable from any thread: it
+    /// interrupts the op in flight, releases every waiter, and later calls
+    /// fail with `Closed`. Bounded by the close drain deadline.
+    pub fn close(&self) -> Result<()> {
+        if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return Ok(());
+        }
+        Ok(crate::registry::close_session(self.handle)?)
     }
 
     /// Run one typed op on this client's session (guards and wake-ups
@@ -2121,16 +2180,18 @@ impl Client {
     }
 
     fn handle(&self) -> Result<i64> {
-        self.handle
-            .ok_or_else(|| error(ErrorKind::Closed, "client is closed"))
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(error(ErrorKind::Closed, "client is closed"));
+        }
+        Ok(self.handle)
     }
 
 }
 
 impl Drop for Client {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            let _ = crate::registry::close_session(handle);
+        if !self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            let _ = crate::registry::close_session(self.handle);
         }
     }
 }

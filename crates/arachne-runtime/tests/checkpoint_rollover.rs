@@ -23,12 +23,9 @@
 use arachne_node::MAX_CONTROL_REPLY;
 use arachne_runtime::{MemoryProvider, close, describe, execute};
 use serde_json::{Value, json};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 mod common;
-
-static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// 55 promote/demote cycles on top of the helper's own admission puts the
 /// workspace far past the 64-step ceiling without a network round trip each.
@@ -290,7 +287,6 @@ fn redeem(ramp: &Ramp, responder: i64, responder_peer: Value) -> Value {
 
 #[test]
 fn epoch_zero_invitation_redeems_through_the_issuer_after_a_hundred_epochs() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let ramp = ramp(171);
     let peer = ramp.invite["peer"].clone();
     let reply = redeem(&ramp, ramp.admin, peer);
@@ -313,7 +309,6 @@ fn epoch_zero_invitation_redeems_through_the_issuer_after_a_hundred_epochs() {
 
 #[test]
 fn epoch_zero_invitation_redeems_through_an_ordinary_member_with_the_issuer_offline() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let ramp = ramp(181);
     let helper_peer = node(ramp.helper)["endpoint_key"].clone();
     close(ramp.admin).unwrap();

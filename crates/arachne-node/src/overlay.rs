@@ -142,6 +142,10 @@ impl MembershipInbox {
         self.signal.notify_one();
     }
 
+    pub(super) fn has_pending(&self) -> bool {
+        self.queues.lock().unwrap().total != 0
+    }
+
     pub(super) fn pop(&self) -> Option<(WorkspaceId, Vec<u8>)> {
         self.queues.lock().unwrap().take(|_| true)
     }
@@ -221,6 +225,8 @@ pub(super) struct Overlay {
     join_timeout: Duration,
     receiver: JoinHandle<()>,
     bootstrap_retry: Option<JoinHandle<()>>,
+    /// HyParView shuffle interval and first bootstrap retry delay in use.
+    pub(super) intervals: (Duration, Duration),
 }
 
 impl Overlay {
@@ -281,7 +287,13 @@ impl Overlay {
         let local_index = peers.binary_search(&local).map_err(|_| Error::Rejected)?;
         let peers_set: BTreeSet<PeerId> = peers.iter().copied().collect();
         let digest = digest(workspace);
-        let config = HyparviewConfig::default();
+        let scale = connections.timer_scale();
+        let config = HyparviewConfig {
+            shuffle_interval: HyparviewConfig::default().shuffle_interval * scale,
+            ..HyparviewConfig::default()
+        };
+        let retry_delays = BOOTSTRAP_RETRY_DELAYS.map(|delay| delay * scale);
+        let intervals = (config.shuffle_interval, retry_delays[0]);
         let gossip = Gossip::builder()
             .alpn(ALPN)
             .connect_preamble(tag.to_vec())
@@ -406,7 +418,7 @@ impl Overlay {
             tokio::spawn(async move {
                 let mut failures = 0u32;
                 loop {
-                    let delay = BOOTSTRAP_RETRY_DELAYS[failures.min(2) as usize];
+                    let delay = retry_delays[failures.min(2) as usize];
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {
                             if !retry_neighbors.lock().unwrap().is_empty() {
@@ -448,6 +460,7 @@ impl Overlay {
             join_timeout: connections.timeouts().gossip_join,
             receiver,
             bootstrap_retry,
+            intervals,
         })
     }
 

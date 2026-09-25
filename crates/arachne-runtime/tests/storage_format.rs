@@ -20,7 +20,7 @@ fn open(storage: StorageConfig) -> Client {
 #[test]
 fn runtime_records_carry_their_format_and_refuse_others() {
     let provider = MemoryProvider::default();
-    let mut client = open(StorageConfig::memory(&provider));
+    let client = open(StorageConfig::memory(&provider));
     let created = client.create_workspace("Owner", None).unwrap();
     client.close().unwrap();
     let workspace = created.workspace;
@@ -34,14 +34,14 @@ fn runtime_records_carry_their_format_and_refuse_others() {
     ] {
         let original = provider.value(workspace, b"runtime/format");
         provider.tamper(workspace, b"runtime/format", format.as_deref());
-        let mut client = open(StorageConfig::memory(&provider));
+        let client = open(StorageConfig::memory(&provider));
         let error = client.restore_workspace(workspace, None).unwrap_err();
         assert_eq!(error.code(), ErrorCode::FormatNotSupported, "{error:?}");
         assert!(error.message().contains(what), "{error:?}");
         client.close().unwrap();
         provider.tamper(workspace, b"runtime/format", original.as_deref());
     }
-    let mut client = open(StorageConfig::memory(&provider));
+    let client = open(StorageConfig::memory(&provider));
     assert!(matches!(
         client.restore_workspace(workspace, None).unwrap(),
         RestoredWorkspace::Active(_)
@@ -53,7 +53,7 @@ fn runtime_records_carry_their_format_and_refuse_others() {
 fn a_newer_store_file_format_is_refused_with_its_code() {
     let directory = common::directory();
     let root = [82; 32];
-    let mut client = open(StorageConfig::sqlite(directory.path(), root));
+    let client = open(StorageConfig::sqlite(directory.path(), root));
     let created = client.create_workspace("Owner", None).unwrap();
     client.close().unwrap();
     let path = SqliteProvider::new(directory.path(), root).path(created.workspace);
@@ -61,7 +61,7 @@ fn a_newer_store_file_format_is_refused_with_its_code() {
     let connection = rusqlite::Connection::open(&path).unwrap();
     connection.execute_batch("PRAGMA user_version=99;").unwrap();
     drop(connection);
-    let mut client = open(StorageConfig::sqlite(directory.path(), root));
+    let client = open(StorageConfig::sqlite(directory.path(), root));
     let error = client.restore_workspace(created.workspace, None).unwrap_err();
     assert_eq!(error.code(), ErrorCode::FormatNotSupported, "{error:?}");
     assert!(error.message().contains("99"), "{error:?}");

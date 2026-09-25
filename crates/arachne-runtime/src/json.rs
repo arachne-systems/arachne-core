@@ -431,8 +431,16 @@ mod tests {
     fn real_node_lifecycle_rejects_stale_handles_and_releases_capacity() {
         assert!(describe(0).is_err());
         assert!(close(-1).is_err());
-        let handles: Vec<_> = (0..8).map(|_| create(None).unwrap()).collect();
-        assert!(create(None).is_err());
+        // The cap is the context's: this test's own context allows eight.
+        let context = crate::Context::new(crate::ContextConfig::default().with_limits(
+            arachne_api::Limits::default().with_max_sessions(8),
+        ))
+        .unwrap();
+        let direct = || arachne_node::NodeOptions::new(arachne_node::NetworkProfile::Direct);
+        let handles: Vec<_> = (0..8)
+            .map(|_| context.create_with_options(None, direct()).unwrap())
+            .collect();
+        assert!(context.create_with_options(None, direct()).is_err());
         for handle in &handles {
             let info: serde_json::Value =
                 serde_json::from_str(&describe(*handle).unwrap()).unwrap();
@@ -442,7 +450,7 @@ mod tests {
             assert!(describe(*handle).is_err());
             assert!(close(*handle).is_err());
         }
-        let next = create(None).unwrap();
+        let next = context.create_with_options(None, direct()).unwrap();
         assert!(next > *handles.last().unwrap());
         close(next).unwrap();
 

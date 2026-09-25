@@ -185,6 +185,15 @@ impl ConnectionBudget {
         }
     }
 
+    /// An exchange runs on this connection now.
+    pub(crate) fn is_busy(&self, id: usize) -> bool {
+        self.tracked
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|entry| entry.busy != 0)
+    }
+
     pub(crate) fn exchange(&self, id: usize) -> ExchangeGuard {
         if let Some(entry) = self.tracked.lock().unwrap().get_mut(&id) {
             entry.busy += 1;

@@ -423,8 +423,10 @@ pub(crate) fn adopt(
         }
         WorkspaceTransition::RoutedPublication(context, delivery, packet, endpoints, recipients) => {
             // Adoption is final even if network admission fails or times out.
+            // The send (and its gossip join) also ends at the op deadline.
+            let send_limit = crate::deadline::cap(session.op_deadline, Duration::from_secs(10));
             let sent = session.runtime.block_on(async {
-                tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::time::timeout(send_limit, async {
                     if recipients.is_empty() {
                         session
                             .node

@@ -62,9 +62,10 @@ cargo +1.98.0 check --locked --workspace
 cargo +1.98.0 test --locked --workspace -- --test-threads=1
 ```
 
-Tests run serially because some runtime tests share a process-wide session-
-capacity limit. These commands build the portable Rust workspace; they do not
-require Android, ATAK, or a device.
+The workspace command runs tests serially for the lower crates. Runtime tests
+own their sessions through a `Context`, so they share no process-wide session
+cap (`cargo +1.98.0 test --locked -p arachne-runtime`). These commands build
+the portable Rust workspace; they do not require Android, ATAK, or a device.
 
 ## Documentation
 
