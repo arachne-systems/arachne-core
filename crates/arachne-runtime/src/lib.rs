@@ -24,6 +24,7 @@ mod session;
 pub use registry::{
     cancel, close, create, create_lan, create_nearby, create_relay, create_relay_with_options,
     create_wan, create_wan_only, create_with_options, describe, wait_for_work,
+    wait_for_work_timeout, wake,
 };
 #[cfg(feature = "tor")]
 pub use registry::create_tor;

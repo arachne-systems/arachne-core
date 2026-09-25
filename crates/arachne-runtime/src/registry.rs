@@ -282,6 +282,28 @@ pub(crate) fn cancel_session(handle: i64) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Park up to `timeout_ms` for work (the SDK form of `wait_for_work`, ADR
+/// step 4), without holding the session lock. `Ok(true)`: work may be ready.
+/// `Ok(false)`: the timeout passed, `wake` was called, or the session closed.
+pub fn wait_for_work_timeout(handle: i64, timeout_ms: u64) -> Result<bool, String> {
+    wait_session_for(handle, Some(Duration::from_millis(timeout_ms))).map_err(errors::text)
+}
+
+/// Release one waiter of this session without work (host shutdown or UI).
+pub fn wake(handle: i64) -> Result<(), String> {
+    wake_session(handle).map_err(errors::text)
+}
+
+pub(crate) fn wait_session_for(handle: i64, timeout: Option<Duration>) -> Result<bool, ApiError> {
+    let signal = Arc::clone(&entry(handle)?.signal);
+    Ok(signal.wait_for(timeout) == work_signal::Wake::Work)
+}
+
+pub(crate) fn wake_session(handle: i64) -> Result<(), ApiError> {
+    entry(handle)?.signal.wake();
+    Ok(())
+}
+
 /// Park the calling thread until this session may have work, without holding the
 /// session lock. `Ok(true)`: drain with `poll_admission` until it returns null,
 /// then call again. `Ok(false)`: the session closed. Spurious `true` is allowed.
