@@ -480,28 +480,51 @@ pub(crate) fn request_admission(
     // encoding uses. The host still carries at most one chunk into its
     // StageJoin call; the rest stays here and is replayed -- never trusted
     // -- when the join is staged.
-    let total = reply["commits"].as_array().map_or(0, Vec::len);
-    if total > arachne_security::HISTORY_CHUNK_STEPS {
-        let trailing = match total % arachne_security::HISTORY_CHUNK_STEPS {
-            0 => arachne_security::HISTORY_CHUNK_STEPS,
-            remainder => remainder,
-        };
-        let split = total - trailing;
-        let commits = reply["commits"].as_array().unwrap();
-        let prefix = commits[..split].to_vec();
-        let carried = Value::Array(commits[split..].to_vec());
-        reply["commits"] = carried;
-        reply["history_verified_prefix"] = json!(split);
-        session.join.history_prefix = prefix;
-    } else {
-        session.join.history_prefix.clear();
-    }
+    session.join.history_prefix = roll_over(&mut reply);
     if reply.get("commits").is_some() {
         // Only a reply that actually served history reports page sizes; a
         // queued or refused attempt keeps its exact previous shape.
         reply["history_page_bytes"] = json!(page_bytes);
     }
     Ok(reply)
+}
+
+/// JSON bytes of history steps a host carries into one StageJoin request.
+/// The request is at most 128 KiB, and binary steps become JSON numbers
+/// there; the Welcome may ride along.
+const HOST_CARRY_BYTES: usize = 64 * 1024;
+
+/// Roll a fetched history over: the host carries at most one chunk of
+/// steps, within `HOST_CARRY_BYTES`, into its StageJoin call. The rest is
+/// returned and stays in the session, replayed -- never trusted -- when the
+/// join is staged. The split is at the chunk boundary the inline encoding
+/// uses when the chunk fits, else later.
+fn roll_over(reply: &mut Value) -> Vec<Value> {
+    let Some(commits) = reply["commits"].as_array() else {
+        return Vec::new();
+    };
+    let total = commits.len();
+    let chunk = arachne_security::HISTORY_CHUNK_STEPS;
+    let mut split = if total > chunk {
+        total - match total % chunk {
+            0 => chunk,
+            remainder => remainder,
+        }
+    } else {
+        0
+    };
+    let size = |steps: &[Value]| serde_json::to_vec(steps).map_or(usize::MAX, |bytes| bytes.len());
+    while split + 1 < total && size(&commits[split..]) > HOST_CARRY_BYTES {
+        split += 1;
+    }
+    if split == 0 {
+        return Vec::new();
+    }
+    let prefix = commits[..split].to_vec();
+    let carried = Value::Array(commits[split..].to_vec());
+    reply["commits"] = carried;
+    reply["history_verified_prefix"] = json!(split);
+    prefix
 }
 
 fn no_lifecycle() -> ApiError {
@@ -1099,19 +1122,7 @@ async fn request_join_exchange(
         reply["history_complete"] = Value::Bool(true);
     }
 
-    let mut history_prefix = Vec::new();
-    let total = reply["commits"].as_array().map_or(0, Vec::len);
-    if total > arachne_security::HISTORY_CHUNK_STEPS {
-        let trailing = match total % arachne_security::HISTORY_CHUNK_STEPS {
-            0 => arachne_security::HISTORY_CHUNK_STEPS,
-            remainder => remainder,
-        };
-        let split = total - trailing;
-        let commits = reply["commits"].as_array().unwrap();
-        history_prefix = commits[..split].to_vec();
-        reply["commits"] = Value::Array(commits[split..].to_vec());
-        reply["history_verified_prefix"] = json!(split);
-    }
+    let history_prefix = roll_over(&mut reply);
     if reply.get("commits").is_some() {
         reply["history_page_bytes"] = json!(page_bytes);
     }
