@@ -67,7 +67,7 @@ and a different Core pin. Core work that each plan step depends on:
   - [ ] A3g: check that a large workspace plus a full attachment fits the store's 1 MiB record limit.
   - [ ] A3h: drop unused `serde_json` in `arachne-delivery`; run `cargo fmt` workspace-wide once branches settle.
   Original: Decouple delivery and routing from the exact epoch and policy revision.
-- [x] **A4** (`feat/a4-context`, 7 commits; ADR steps 3–4; default limits 64 sessions / 320 overlay paths accepted)
+- [x] **A4** (`feat/a4-context` merged at `2205887`; full suite before merge 526 pass / 0 fail; ADR steps 3–4; default limits 64 sessions / 320 overlay paths accepted)
   - [ ] A4b: mDNS has no pause API (iroh-mdns-address-lookup 0.5); suspend does not close idle connections; Low profile only slows presence; deadlines only on typed Client and only for outbound control exchanges; end-to-end event tests for MembershipChanged, ProtectedReceived, RecoveryReady, CurrentViewReady, Presence.
   Original: Owned `Context`, event stream, `wait_for_work(timeout)`, `close(&self)`, suspend/resume.
 - [ ] **A5** One persistence mode behind a `Storage` trait; schema versions and migrations.
