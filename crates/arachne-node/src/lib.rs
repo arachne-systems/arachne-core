@@ -17,6 +17,7 @@ use std::{
 
 mod budget;
 mod connections;
+mod mdns;
 mod control;
 mod endpoint;
 pub use endpoint::IrohEndpointSigner;
@@ -441,6 +442,9 @@ pub struct Node {
     resources: resources::ResourceTransfers,
     events: DeliveryQueue,
     overlays: Arc<Mutex<BTreeMap<WorkspaceId, Arc<overlay::Overlay>>>>,
+    /// Overlays parked by `suspend`: workspace to (tag, revision). `Some`
+    /// while suspended; `resume` rebuilds them.
+    parked: Arc<StdMutex<Option<BTreeMap<WorkspaceId, ([u8; overlay::TAG], u64)>>>>,
     membership: overlay::MembershipInbox,
     listener: JoinHandle<()>,
 }
@@ -828,6 +832,7 @@ impl Node {
                 resources,
                 events,
                 overlays,
+                parked: Arc::new(StdMutex::new(None)),
                 membership: overlay::MembershipInbox::new(control_signal_for_membership),
                 listener,
             },
@@ -1056,6 +1061,11 @@ impl Node {
             .authorized_endpoints(workspace, revision)?;
         let tag = overlay::tag(tag_key, workspace);
         self.connections.authorize_gossip(tag, peers.clone());
+        if let Some(parked) = self.parked.lock().unwrap().as_mut() {
+            // Suspended: no gossip timers run. `resume` builds this overlay.
+            parked.insert(workspace, (tag, revision));
+            return Ok(());
+        }
         let candidate = overlay::Overlay::prepare(
             &self.connections,
             workspace,
@@ -1391,6 +1401,126 @@ impl Node {
 
     /// Release the transport. Waits at most `Timeouts::close_drain` for peers
     /// to acknowledge the close, then finishes the local teardown.
+    /// Control requests wait (new arrivals, not the ones set aside).
+    /// Nothing is consumed; for `next_event`.
+    pub fn has_queued_controls(&self) -> bool {
+        !self.controls.is_empty()
+    }
+
+    /// Membership steps from gossip wait for the host. Nothing is consumed.
+    pub fn has_membership_gossip(&self) -> bool {
+        self.membership.has_pending()
+    }
+
+    /// Stop background work for a host in the background: each workspace
+    /// overlay (its HyParView shuffle timers and bootstrap retries) is
+    /// dropped and parked, every idle connection closes, and the mDNS
+    /// service stops (see `mdns.rs`). The endpoint,
+    /// routing policy and queues stay; an exchange in progress keeps its
+    /// connection. Later dials reconnect. Idempotent.
+    pub async fn suspend(&self) {
+        let overlays = std::mem::take(&mut *self.overlays.lock().await);
+        let mut parked = self.parked.lock().unwrap();
+        let parked = parked.get_or_insert_with(BTreeMap::new);
+        for (workspace, overlay) in overlays {
+            parked.insert(workspace, (overlay.tag, overlay.revision()));
+        }
+        let overlays = parked.len();
+        drop(parked);
+        // Idle links would keep QUIC keep-alives running.
+        let closed = self.connections.close_idle().await;
+        // No local announcements or lookups while in the background.
+        self.connections.pause_mdns().await;
+        tracing::info!(target: "data_fabric_transport", overlays, closed, "NODE_SUSPENDED");
+    }
+
+    /// Rebuild the parked overlays at their current policy, then rebind
+    /// sockets (`network_change`). A no-op when not suspended.
+    pub async fn resume(&self) {
+        let Some(parked) = self.parked.lock().unwrap().take() else {
+            return;
+        };
+        for (workspace, (tag, revision)) in parked {
+            let peers = match self
+                .routing
+                .lock()
+                .await
+                .authorized_endpoints(workspace, revision)
+            {
+                Ok(peers) if peers.contains(&self.id()) => peers,
+                _ => continue,
+            };
+            match overlay::Overlay::prepare(
+                &self.connections,
+                workspace,
+                tag,
+                revision,
+                peers,
+                self.routing.clone(),
+                self.events.clone(),
+                self.membership.clone(),
+            )
+            .await
+            {
+                Ok(overlay) => {
+                    self.overlays
+                        .lock()
+                        .await
+                        .insert(workspace, Arc::new(overlay));
+                }
+                Err(error) => {
+                    tracing::warn!(target: "data_fabric_transport", %error, "NODE_RESUME_OVERLAY_FAILED");
+                }
+            }
+        }
+        self.connections.resume_mdns();
+        self.connections.network_change().await;
+        tracing::info!(target: "data_fabric_transport", "NODE_RESUMED");
+    }
+
+    /// (running mDNS services, address sets announced to mDNS): a test and
+    /// diagnostics hook for `suspend`.
+    pub fn mdns_state(&self) -> (usize, u64) {
+        self.connections.mdns_state()
+    }
+
+    /// Multiply background timer intervals (gossip shuffle, bootstrap
+    /// retries) by `scale` for a low-power host; 1 is normal. Overlays
+    /// built after the call use it; running ones keep theirs until rebuilt.
+    pub fn set_timer_scale(&self, scale: u32) {
+        self.connections.set_timer_scale(scale);
+    }
+
+    pub fn timer_scale(&self) -> u32 {
+        self.connections.timer_scale()
+    }
+
+    /// (HyParView shuffle interval, first bootstrap retry delay) of each
+    /// live overlay (a test and diagnostics hook).
+    pub async fn gossip_intervals(&self) -> Vec<(Duration, Duration)> {
+        self.overlays
+            .lock()
+            .await
+            .values()
+            .map(|overlay| overlay.intervals)
+            .collect()
+    }
+
+    /// Open connections of this endpoint (a test and diagnostics hook).
+    pub fn open_connections(&self) -> usize {
+        self.connections.live_alpns().len()
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        self.parked.lock().unwrap().is_some()
+    }
+
+    /// Live gossip overlays, each with its own timers (a test and
+    /// diagnostics hook for `suspend`).
+    pub async fn active_overlays(&self) -> usize {
+        self.overlays.lock().await.len()
+    }
+
     pub async fn close(mut self) {
         self.resources.close().await;
         self.overlays.lock().await.clear();

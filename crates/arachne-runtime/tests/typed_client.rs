@@ -27,7 +27,9 @@ fn typed_client_reports_endpoint_and_workspace_state_then_closes() {
 
     client.cancel().unwrap();
     client.close().unwrap();
-    let error = client.close().unwrap_err();
+    // Close is idempotent (ADR step 4); other calls report Closed.
+    client.close().unwrap();
+    let error = client.endpoint().unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Closed);
 }
 

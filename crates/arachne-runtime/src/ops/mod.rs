@@ -227,6 +227,13 @@ pub(crate) fn admission_busy(session: &Session) -> bool {
     session.transition.staged.is_some() || session.transition.inbound.is_some()
 }
 
+/// Clear the control cancel latch without a change notice when it is
+/// already clear: every notice, even to `false`, stops the control
+/// exchanges in flight (presence, recovery and interest tasks).
+pub(crate) fn clear_cancel(latch: &tokio::sync::watch::Sender<bool>) {
+    latch.send_if_modified(|cancelled| std::mem::replace(cancelled, false));
+}
+
 /// Run one op on a live session: lock, guard, run, then the wake-ups and a
 /// shutdown if the op ended the session. The typed `Client` and the JSON
 /// dispatcher both come through here.
@@ -235,13 +242,46 @@ pub(crate) fn run<T>(
     op: Op,
     body: impl FnOnce(&mut Session) -> Result<T, ApiError>,
 ) -> Result<T, ApiError> {
-    let shared = crate::session(handle)?;
+    let entry = crate::registry::entry(handle)?;
+    // The deadline counts from the call, so a wait for the lock counts too.
+    let Some(limit) = entry.deadline() else {
+        return run_locked(handle, &entry.shared, op, None, body);
+    };
+    let deadline = std::time::Instant::now() + limit;
+    let timer = std::sync::Arc::clone(&entry).arm_deadline(limit);
+    let result = run_locked(handle, &entry.shared, op, Some(deadline), body);
+    let fired = timer.finish();
+    match result {
+        Err(_) if fired || crate::deadline::expired(Some(deadline)) => {
+            Err(ApiError::DeadlineExceeded)
+        }
+        result => result,
+    }
+}
+
+fn run_locked<T>(
+    handle: i64,
+    shared: &crate::registry::SharedSession,
+    op: Op,
+    deadline: Option<std::time::Instant>,
+    body: impl FnOnce(&mut Session) -> Result<T, ApiError>,
+) -> Result<T, ApiError> {
     let mut guard = shared
         .lock()
         .map_err(errors::poisoned("node session unavailable"))?;
     let session = guard.as_mut().ok_or_else(errors::closed)?;
     let busy_before = admission_busy(session);
+    session.op_deadline = deadline;
     let result = admit(session, op).and_then(|()| body(session));
+    session.op_deadline = None;
+    // Cancel and deadlines act on the op in flight only (ADR step 4). Close
+    // removes the handle first; its cancel stays set, so an op queued on
+    // this lock cannot delay the close.
+    session.events.rearm_queues();
+    let closing = crate::registry::entry(handle).map_or(true, |entry| entry.signal.is_closed());
+    if !closing {
+        clear_cancel(&session.node.control_cancellation());
+    }
     // Control requests set aside while a commit was pending raised their
     // signal on arrival, and the host already found nothing it could serve.
     // Wake it again now that they can be served.

@@ -6,7 +6,6 @@ use std::time::Instant;
 
 const PREFIX: &[u8; 5] = b"DFPR\x01";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const FRESH: Duration = Duration::from_secs(70);
 const MAX_HEADS: usize = 8;
 
@@ -48,6 +47,16 @@ impl Presence {
     pub fn cancel(&mut self) {
         self.pending.clear();
         self.queued.clear();
+    }
+
+    /// Requests in flight.
+    pub(crate) fn in_flight_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// A request ended and a presence round has its answer.
+    pub(crate) fn has_result(&self) -> bool {
+        self.pending.iter().any(|request| request.task.is_finished())
     }
 
     pub(super) fn announce_next(&mut self) {
@@ -362,16 +371,19 @@ pub(super) fn poll(session: &mut Session, announce: bool) -> Result<PresenceRepl
             }
         }
     }
-    if session.presence.pending.is_empty()
+    // Suspended (host in the background): no new rounds and no requests.
+    let suspended = session.context.is_suspended();
+    if !suspended
+        && session.presence.pending.is_empty()
         && session.presence.queued.is_empty()
         && session.presence.next.is_none_or(|next| now >= next)
     {
         session.presence.queued.extend(peers);
-        session.presence.next = Some(now + REFRESH_INTERVAL);
+        session.presence.next = Some(now + session.context.presence_interval());
     }
     // ponytail: bounded direct-peer fanout; a measured gossip overlay replaces
     // all-peer refresh rounds before claiming large-workspace convergence.
-    while session.presence.pending.len() < 16 {
+    while !suspended && session.presence.pending.len() < 16 {
         let Some(peer) = session.presence.queued.pop_front() else {
             break;
         };
@@ -458,5 +470,23 @@ mod tests {
         receive(&mut session, peer, &packet).unwrap();
 
         assert!(session.membership.update.is_some());
+    }
+}
+
+#[cfg(test)]
+mod suspend_tests {
+    use super::*;
+
+    #[test]
+    fn a_suspended_context_starts_no_presence_requests() {
+        let (owner, _, _) = crate::membership::admit_members(31, "Presence member", 3);
+        let mut session = crate::membership::bare_test_session(owner);
+        let context = Arc::clone(&session.context);
+        context.suspend().unwrap();
+        poll(&mut session, true).unwrap();
+        assert_eq!(session.presence.in_flight_count(), 0);
+        context.resume().unwrap();
+        poll(&mut session, true).unwrap();
+        assert!(session.presence.in_flight_count() > 0);
     }
 }

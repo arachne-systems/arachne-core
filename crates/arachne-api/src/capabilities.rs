@@ -13,8 +13,9 @@ pub enum Feature {
 /// What this build and client support (returned by `Client::capabilities`,
 /// ADR step 6).
 ///
-/// The ADR also lists `limits`. That field is added with `Context` and
-/// `Limits` (step 3), because `Limits` is defined there.
+/// The ADR also lists `limits`. [`crate::Limits`] exists since step 3; the
+/// field is added with `Client::capabilities` in step 6, from the client's
+/// `Context`.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {

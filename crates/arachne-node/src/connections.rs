@@ -5,13 +5,12 @@ use std::{
     time::Instant,
 };
 
-use futures_util::StreamExt;
 use iroh::{
     Endpoint, EndpointAddr, PublicKey,
     address_lookup::memory::MemoryLookup,
     endpoint::{AfterHandshakeOutcome, BeforeConnectOutcome, EndpointHooks, presets},
 };
-use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
+use super::mdns::PausableMdns;
 use tokio::sync::{Mutex, OnceCell};
 
 use super::{
@@ -200,7 +199,9 @@ pub(super) struct Connections {
     observer: ConnectionObserver,
     outgoing: Arc<Mutex<BTreeMap<PeerProtocol, CachedConnection>>>,
     nearby: Arc<Mutex<BTreeSet<PeerId>>>,
-    nearby_listener: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    mdns: Option<PausableMdns>,
+    /// Background timer multiplier: 1 normally, more in low power.
+    timer_scale: Arc<std::sync::atomic::AtomicU32>,
     /// Peers whose last dial failed: retry time and consecutive failures.
     /// Dials to offline members must not hold the few control dial slots.
     unreachable: Arc<Mutex<BTreeMap<PeerId, (Instant, u32)>>>,
@@ -289,45 +290,18 @@ impl Connections {
                 .ca_tls_config(relay.tls);
         }
         let endpoint = builder.bind().await.map_err(transport)?;
+        let nearby = Arc::new(Mutex::new(BTreeSet::new()));
         let mdns = if let Some(service_name) = mdns_service {
-            let lookup = MdnsAddressLookup::builder()
-                .service_name(service_name)
-                .build(endpoint.id())
+            let mdns = PausableMdns::start_new(service_name.into(), endpoint.id(), nearby.clone())
                 .map_err(transport)?;
             endpoint
                 .address_lookup()
                 .map_err(transport)?
-                .add(lookup.clone());
-            Some(lookup)
+                .add(mdns.clone());
+            Some(mdns)
         } else {
             None
         };
-        let nearby = Arc::new(Mutex::new(BTreeSet::new()));
-        let nearby_listener = mdns.as_ref().map(|lookup| {
-            let lookup = lookup.clone();
-            let nearby = nearby.clone();
-            let own = endpoint.id();
-            tokio::spawn(async move {
-                let mut events = lookup.subscribe().await;
-                while let Some(event) = events.next().await {
-                    match event {
-                        DiscoveryEvent::Discovered { endpoint_info, .. } => {
-                            let endpoint = endpoint_info.endpoint_id;
-                            if endpoint != own {
-                                let mut discovered = nearby.lock().await;
-                                if discovered.len() < 16 {
-                                    discovered.insert(*endpoint.as_bytes());
-                                }
-                            }
-                        }
-                        DiscoveryEvent::Expired { endpoint_id } => {
-                            nearby.lock().await.remove(endpoint_id.as_bytes());
-                        }
-                        _ => {}
-                    }
-                }
-            })
-        });
         let bound_address = endpoint.bound_sockets().first().copied().unwrap_or(address);
         Ok(Self {
             endpoint,
@@ -340,7 +314,8 @@ impl Connections {
             observer,
             outgoing: Arc::new(Mutex::new(BTreeMap::new())),
             nearby,
-            nearby_listener: Arc::new(Mutex::new(nearby_listener)),
+            mdns,
+            timer_scale: Arc::new(std::sync::atomic::AtomicU32::new(1)),
             unreachable: Arc::new(Mutex::new(BTreeMap::new())),
             address_lookup: mdns_service.is_some() || plan.public_lookup || profile.uses_tor(),
             use_ip_hints,
@@ -372,7 +347,6 @@ impl Connections {
     }
 
     /// Protocols of the open connections this endpoint observed.
-    #[cfg(test)]
     pub(super) fn live_alpns(&self) -> Vec<Vec<u8>> {
         self.observer
             .0
@@ -706,14 +680,68 @@ impl Connections {
         }
     }
 
+    /// Close every connection with no exchange in progress (suspend). The
+    /// endpoint stays bound; later dials open new connections. Returns the
+    /// number closed.
+    pub(super) async fn close_idle(&self) -> usize {
+        self.outgoing.lock().await.clear();
+        let live: Vec<_> = self
+            .observer
+            .0
+            .read()
+            .unwrap()
+            .live
+            .iter()
+            .filter_map(|weak| weak.upgrade())
+            .filter(|connection| connection.close_reason().is_none())
+            .collect();
+        let mut closed = 0;
+        for connection in live {
+            if !self.budget.is_busy(connection.stable_id()) {
+                connection.close(0u32.into(), b"suspended");
+                closed += 1;
+            }
+        }
+        closed
+    }
+
+    pub(super) fn timer_scale(&self) -> u32 {
+        self.timer_scale.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(super) fn set_timer_scale(&self, scale: u32) {
+        self.timer_scale
+            .store(scale.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Stop the mDNS service (suspend). Local lookups and announcements end.
+    pub(super) async fn pause_mdns(&self) {
+        if let Some(mdns) = &self.mdns {
+            mdns.pause().await;
+        }
+    }
+
+    /// Start the mDNS service again with the current addresses.
+    pub(super) fn resume_mdns(&self) {
+        if let Some(mdns) = &self.mdns
+            && let Err(error) = mdns.start()
+        {
+            tracing::warn!(target: "data_fabric_transport", %error, "MDNS_RESUME_FAILED");
+        }
+    }
+
+    /// (running mDNS services, address sets announced): a test hook.
+    pub(super) fn mdns_state(&self) -> (usize, u64) {
+        self.mdns.as_ref().map_or((0, 0), PausableMdns::state)
+    }
+
     pub(super) async fn nearby_peers(&self, _first_result: bool) -> Vec<PeerId> {
         self.nearby.lock().await.iter().copied().take(16).collect()
     }
 
     pub(super) async fn close(&self) {
-        if let Some(listener) = self.nearby_listener.lock().await.take() {
-            listener.abort();
-            let _ = listener.await;
+        if let Some(mdns) = &self.mdns {
+            mdns.pause().await;
         }
         // The drain waits for peers to acknowledge the close, up to three
         // probe timeouts of the slowest open connection. A probe timeout grows

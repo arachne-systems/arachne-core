@@ -1,6 +1,6 @@
 //! The session registry and session lifecycle: create (bind) an endpoint,
-//! look up a live session, describe, cancel, park, and close it. The
-//! device-wide overlay path budget lives here too.
+//! look up a live session, describe, cancel, park, and close it. Each
+//! session belongs to a [`Context`], which owns the limits and the runtime.
 //!
 //! The typed functions return [`ApiError`]; the public `String` functions keep
 //! the old text through [`errors::text`].
@@ -9,89 +9,127 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
     },
     time::Duration,
 };
 
 use arachne_api::{ApiError, ErrorCode};
-use arachne_node::{ConnectionBudget, NetworkProfile, Node, NodeOptions, RelayOptions};
+use arachne_node::{NetworkProfile, Node, NodeOptions, RelayOptions};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
+use crate::context::Context;
 use crate::errors;
 use crate::session::activity_value;
 use crate::{Session, TransportSummary, committed_view, presence, resources, work_signal};
 
-pub(crate) struct Registry {
-    pub(crate) next: i64,
-    // Slots held by startups binding outside the lock; they count toward the cap.
-    pub(crate) reserved: usize,
-    pub(crate) sessions: BTreeMap<i64, SharedSession>,
-    // Kept outside the session mutex: a parked host never blocks `execute`.
-    pub(crate) signals: BTreeMap<i64, Arc<work_signal::WorkSignal>>,
-    pub(crate) cancellations: BTreeMap<i64, watch::Sender<bool>>,
-    pub(crate) transports: BTreeMap<i64, TransportSummary>,
-    pub(crate) connection_budget: ConnectionBudget,
-}
-
 pub(crate) type SharedSession = Arc<Mutex<Option<Session>>>;
 
-// ponytail: Startup reserves a slot under the registry lock and binds outside it; sessions
-// are capped at eight; replace the registry
-// with owned sessions when the secured capacity harness requires more. Data operations take only
-// their session lock; a slow peer cannot hold the global registry during fanout.
-pub(crate) static REGISTRY: std::sync::LazyLock<Mutex<Registry>> = std::sync::LazyLock::new(|| {
-    Mutex::new(Registry {
-        next: 1,
-        reserved: 0,
-        sessions: BTreeMap::new(),
-        signals: BTreeMap::new(),
-        cancellations: BTreeMap::new(),
-        transports: BTreeMap::new(),
-        connection_budget: ConnectionBudget::default(),
-    })
-});
-pub(crate) const MAX_SESSIONS: usize = 8;
-
-impl Registry {
-    /// Claim a handle and a session slot for a startup that binds outside the lock.
-    pub(crate) fn reserve(&mut self) -> Result<i64, ApiError> {
-        if self.sessions.len() + self.reserved >= MAX_SESSIONS || self.next == i64::MAX {
-            return Err(ApiError::limit_reached(
-                "sessions",
-                MAX_SESSIONS as u64,
-                "node limit reached",
-            ));
-        }
-        let handle = self.next;
-        self.next += 1;
-        self.reserved += 1;
-        Ok(handle)
-    }
-
-    pub(crate) fn release(&mut self) {
-        self.reserved -= 1;
-    }
+/// One live session and the handles that stay outside its mutex, so a
+/// parked host never blocks `execute`.
+pub(crate) struct Entry {
+    pub(crate) context: Arc<Context>,
+    pub(crate) shared: SharedSession,
+    pub(crate) signal: Arc<work_signal::WorkSignal>,
+    pub(crate) cancellation: watch::Sender<bool>,
+    pub(crate) transport: TransportSummary,
+    /// Counts deadline timers, so a late timer never cancels a later op.
+    pub(crate) generation: Arc<Mutex<u64>>,
+    /// Per-op deadline of this session (`None`: only each wait's own limit).
+    pub(crate) deadline: Mutex<Option<Duration>>,
 }
 
-/// Returns an unused startup slot to the registry if startup fails.
-pub(crate) struct Reservation {
-    pub(crate) armed: bool,
-}
+impl Entry {
+    pub(crate) fn deadline(&self) -> Option<Duration> {
+        *self.deadline.lock().unwrap_or_else(|error| error.into_inner())
+    }
 
-impl Drop for Reservation {
-    fn drop(&mut self) {
-        if self.armed {
-            if let Ok(mut registry) = REGISTRY.lock() {
-                registry.release();
+    pub(crate) fn set_deadline(&self, deadline: Option<Duration>) {
+        *self.deadline.lock().unwrap_or_else(|error| error.into_inner()) = deadline;
+    }
+
+    /// Start a deadline for one op: at `deadline` it interrupts the op's
+    /// outbound control exchanges. `DeadlineTimer::finish` ends it.
+    pub(crate) fn arm_deadline(self: Arc<Self>, deadline: Duration) -> DeadlineTimer {
+        let token = {
+            let mut generation = self
+                .generation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            *generation += 1;
+            *generation
+        };
+        let fired = Arc::new(AtomicBool::new(false));
+        let generation = Arc::clone(&self.generation);
+        let cancellation = self.cancellation.clone();
+        let fire = Arc::clone(&fired);
+        let task = self.context.handle().spawn(async move {
+            tokio::time::sleep(deadline).await;
+            let current = generation.lock().unwrap_or_else(|error| error.into_inner());
+            if *current == token {
+                fire.store(true, Ordering::Release);
+                cancellation.send_replace(true);
             }
+        });
+        DeadlineTimer {
+            entry: self,
+            fired,
+            task,
         }
     }
 }
 
-pub(crate) const MAX_DEVICE_OVERLAY_PATHS: usize = 24;
-pub(crate) static DEVICE_OVERLAY_PATHS: AtomicUsize = AtomicUsize::new(0);
+/// One op's deadline. Its task ends at `finish` or at the deadline.
+pub(crate) struct DeadlineTimer {
+    entry: Arc<Entry>,
+    fired: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl DeadlineTimer {
+    /// End the deadline. `true`: it fired while the op ran. The cancel it
+    /// sent is cleared unless the session is closing.
+    pub(crate) fn finish(self) -> bool {
+        // Under the generation lock, so a timer cannot fire after this.
+        *self
+            .entry
+            .generation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) += 1;
+        self.task.abort();
+        let fired = self.fired.load(Ordering::Acquire);
+        if fired && !self.entry.signal.is_closed() {
+            crate::ops::clear_cancel(&self.entry.cancellation);
+        }
+        fired
+    }
+}
+
+/// Handle index over all contexts. It has no cap and no budget; each
+/// context owns its own limits. Data operations take only their session
+/// lock, and a bind never holds this lock.
+static DIRECTORY: std::sync::LazyLock<Mutex<BTreeMap<i64, Arc<Entry>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(BTreeMap::new()));
+/// Handles are unique in the process and never reused.
+static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1);
+
+fn directory() -> Result<std::sync::MutexGuard<'static, BTreeMap<i64, Arc<Entry>>>, ApiError> {
+    DIRECTORY
+        .lock()
+        .map_err(errors::poisoned("node registry unavailable"))
+}
+
+pub(crate) fn entry(handle: i64) -> Result<Arc<Entry>, ApiError> {
+    directory()?
+        .get(&handle)
+        .cloned()
+        .ok_or_else(errors::unknown_handle)
+}
+
+fn default_context() -> Result<Arc<Context>, ApiError> {
+    Context::default_shared()
+}
 
 /// Create an endpoint session. Credentials must be unique to this workspace-facing endpoint.
 /// Blocking: invoke outside an async runtime. Call `close` to release its resources.
@@ -156,36 +194,39 @@ pub fn create_with_options(
 }
 
 pub(crate) fn create_endpoint(secret: Option<&[u8; 32]>, options: NodeOptions) -> Result<i64, String> {
-    open(secret, options).map_err(errors::text)
+    default_context()
+        .and_then(|context| open(&context, secret, options, None))
+        .map_err(errors::text)
 }
 
-/// Bind an endpoint and register its session. Returns the new handle.
-pub(crate) fn open(secret: Option<&[u8; 32]>, options: NodeOptions) -> Result<i64, ApiError> {
+/// Bind an endpoint in `context` and register its session. Returns the new handle.
+pub(crate) fn open(
+    context: &Arc<Context>,
+    secret: Option<&[u8; 32]>,
+    options: NodeOptions,
+    deadline: Option<Duration>,
+) -> Result<i64, ApiError> {
+    let bind_deadline = deadline.map(|deadline| std::time::Instant::now() + deadline);
     let profile = options.profile;
     let transport = TransportSummary {
         public_lookup: options.public_lookup,
         operator_relay: options.relay.is_some(),
         timeouts: options.timeouts,
     };
-    // Hold the registry only to reserve; a bind can take seconds and every
-    // other session's lookup needs this lock.
-    let (handle, connection_budget) = {
-        let mut registry = REGISTRY
-            .lock()
-            .map_err(errors::poisoned("node registry unavailable"))?;
-        (registry.reserve()?, registry.connection_budget.clone())
-    };
-    let mut reservation = Reservation { armed: true };
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    // Hold the table only to reserve; a bind can take seconds.
+    let reservation = context.reserve()?;
+    let handle = NEXT_HANDLE
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+            (next < i64::MAX).then_some(next + 1)
+        })
+        .map_err(|_| ApiError::limit_reached("sessions", i64::MAX as u64, "node limit reached"))?;
+    let runtime = context.handle().clone();
+    let connection_budget = context.budget();
     #[cfg(test)]
     tests::pause_bind(secret);
     let (node, receiver) = runtime
         .block_on(async {
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(crate::deadline::cap(bind_deadline, BIND_WAIT), async {
                 let address = ([0, 0, 0, 0], 0).into();
                 let bound =
                     Node::bind_with_options(address, secret, options, connection_budget).await?;
@@ -196,15 +237,23 @@ pub(crate) fn open(secret: Option<&[u8; 32]>, options: NodeOptions) -> Result<i6
             })
             .await
         })
-        .map_err(|_| ApiError::timeout(None, "node startup timed out"))?
+        .map_err(|_| {
+            if crate::deadline::expired(bind_deadline) {
+                ApiError::DeadlineExceeded
+            } else {
+                ApiError::timeout(None, "node startup timed out")
+            }
+        })?
         .map_err(errors::node)?;
+    node.set_timer_scale(context.timer_scale());
     let signal = Arc::new(work_signal::WorkSignal::default());
     let committed = committed_view::Published::new(Some(Arc::clone(&signal)));
     node.set_inquiry_responder(committed.responder());
     let arrivals = node.control_signal();
     let forward = Arc::clone(&signal);
-    // Ends with the runtime at close. It only forwards; it holds no session state.
-    runtime.spawn(async move {
+    // It only forwards and holds no session state. The runtime is shared,
+    // so the session aborts it at shutdown.
+    let forwarder = runtime.spawn(async move {
         loop {
             arrivals.notified().await;
             forward.raise();
@@ -216,34 +265,39 @@ pub(crate) fn open(secret: Option<&[u8; 32]>, options: NodeOptions) -> Result<i6
         .map(arachne_security::StorageKey::derive)
         .transpose()
         .map_err(errors::security(ErrorCode::InvalidInput))?;
-    let shared = Arc::new(Mutex::new(Some(Session::new(
+    let mut session = Session::new(
         node,
         receiver,
-        runtime,
+        Arc::clone(context),
         committed,
         storage_key,
         presence,
-    ))));
-    let mut registry = REGISTRY
-        .lock()
-        .map_err(errors::poisoned("node registry unavailable"))?;
-    registry.signals.insert(handle, signal);
-    registry.cancellations.insert(handle, cancellation);
-    registry.transports.insert(handle, transport);
-    registry.sessions.insert(handle, shared);
-    registry.release();
-    reservation.armed = false;
+    );
+    session.tasks.push(forwarder.abort_handle());
+    let entry = Arc::new(Entry {
+        context: Arc::clone(context),
+        shared: Arc::new(Mutex::new(Some(session))),
+        signal,
+        cancellation,
+        transport,
+        generation: Arc::default(),
+        deadline: Mutex::new(deadline),
+    });
+    directory()?.insert(handle, Arc::clone(&entry));
+    reservation.commit(handle);
+    // After the commit: either `Context::suspend` sees this session or this
+    // check sees the flag, so a session opened during a suspend is covered.
+    if context.is_suspended()
+        && let Ok(mut guard) = entry.shared.lock()
+        && let Some(session) = guard.as_mut()
+    {
+        runtime.block_on(session.node.suspend());
+    }
     Ok(handle)
 }
 
 pub(crate) fn session(handle: i64) -> Result<SharedSession, ApiError> {
-    REGISTRY
-        .lock()
-        .map_err(errors::poisoned("node registry unavailable"))?
-        .sessions
-        .get(&handle)
-        .cloned()
-        .ok_or_else(errors::unknown_handle)
+    Ok(Arc::clone(&entry(handle)?.shared))
 }
 
 /// Return endpoint metadata for a live session.
@@ -255,15 +309,10 @@ pub fn describe(handle: i64) -> Result<String, String> {
 
 /// Endpoint metadata for a live session, as `EndpointInfo` JSON.
 pub(crate) fn endpoint_value(handle: i64) -> Result<Value, ApiError> {
-    let transport = REGISTRY
-        .lock()
-        .map_err(errors::poisoned("node registry unavailable"))?
-        .transports
-        .get(&handle)
-        .copied()
-        .ok_or_else(errors::unknown_handle)?;
-    let shared = session(handle)?;
-    let guard = shared
+    let entry = entry(handle)?;
+    let transport = entry.transport;
+    let guard = entry
+        .shared
         .lock()
         .map_err(errors::poisoned("node session unavailable"))?;
     let session = guard.as_ref().ok_or_else(errors::closed)?;
@@ -293,29 +342,15 @@ pub fn close(handle: i64) -> Result<(), String> {
 
 /// `close`, typed.
 pub(crate) fn close_session(handle: i64) -> Result<(), ApiError> {
-    let (shared, signal, cancellation, _) = {
-        let mut registry = REGISTRY
-            .lock()
-            .map_err(errors::poisoned("node registry unavailable"))?;
-        let shared = registry
-            .sessions
-            .remove(&handle)
-            .ok_or_else(errors::unknown_handle)?;
-        (
-            shared,
-            registry.signals.remove(&handle),
-            registry.cancellations.remove(&handle),
-            registry.transports.remove(&handle),
-        )
-    };
-    if let Some(cancellation) = cancellation {
-        cancellation.send_replace(true);
-    }
-    if let Some(signal) = signal {
-        signal.close();
-    }
+    let entry = directory()?
+        .remove(&handle)
+        .ok_or_else(errors::unknown_handle)?;
+    entry.context.remove(handle);
+    entry.cancellation.send_replace(true);
+    entry.signal.close();
     // A lookup racing with close sees either the prior admitted operation or None.
-    let session = shared
+    let session = entry
+        .shared
         .lock()
         .map_err(errors::poisoned("node session unavailable"))?
         .take();
@@ -324,22 +359,89 @@ pub(crate) fn close_session(handle: i64) -> Result<(), ApiError> {
     session.map(shutdown_session).unwrap_or(Ok(()))
 }
 
-/// Interrupt outbound control exchanges. The owner still calls `close` to
-/// release the endpoint once its serial JNI request returns.
+/// Interrupt the outbound control exchanges of the op in flight. Not
+/// sticky (ADR step 4): the latch clears when that op ends. The owner still
+/// calls `close` to release the endpoint.
 pub fn cancel(handle: i64) -> Result<(), String> {
     cancel_session(handle).map_err(errors::text)
 }
 
 /// `cancel`, typed.
 pub(crate) fn cancel_session(handle: i64) -> Result<(), ApiError> {
-    let cancellation = REGISTRY
-        .lock()
-        .map_err(errors::poisoned("node registry unavailable"))?
-        .cancellations
-        .get(&handle)
-        .cloned()
-        .ok_or_else(errors::unknown_handle)?;
-    cancellation.send_replace(true);
+    entry(handle)?.cancellation.send_replace(true);
+    Ok(())
+}
+
+/// Park up to `timeout_ms` for work (the SDK form of `wait_for_work`, ADR
+/// step 4), without holding the session lock. `Ok(true)`: work may be ready.
+/// `Ok(false)`: the timeout passed, `wake` was called, or the session closed.
+pub fn wait_for_work_timeout(handle: i64, timeout_ms: u64) -> Result<bool, String> {
+    wait_session_for(handle, Some(Duration::from_millis(timeout_ms))).map_err(errors::text)
+}
+
+/// Release one waiter of this session without work (host shutdown or UI).
+pub fn wake(handle: i64) -> Result<(), String> {
+    wake_session(handle).map_err(errors::text)
+}
+
+/// The next event of this session as JSON (`{"kind": ...}`), or `None`
+/// when `timeout_ms` passed, `wake` was called, or the session closed while
+/// it waited.
+pub fn next_event(handle: i64, timeout_ms: u64) -> Result<Option<String>, String> {
+    let event = crate::events::next(handle, Some(Duration::from_millis(timeout_ms)))
+        .map_err(errors::text)?;
+    event
+        .map(|event| serde_json::to_string(&event).map_err(|error| error.to_string()))
+        .transpose()
+}
+
+/// Create an endpoint session in the default context whose blocking ops
+/// (and this bind) end at `deadline_ms` with `DeadlineExceeded` (the SDK
+/// form of `TransportOptions::deadline`). 0: no deadline.
+pub fn create_with_deadline(
+    secret: Option<&[u8; 32]>,
+    options: NodeOptions,
+    deadline_ms: u64,
+) -> Result<i64, String> {
+    let deadline = (deadline_ms != 0).then(|| Duration::from_millis(deadline_ms));
+    default_context()
+        .and_then(|context| open(&context, secret, options, deadline))
+        .map_err(errors::text)
+}
+
+/// Give each later blocking op of this session a deadline of
+/// `deadline_ms` (0: none). At the deadline the op fails with
+/// `DeadlineExceeded` (code 3) and the session stays usable.
+pub fn set_deadline(handle: i64, deadline_ms: u64) -> Result<(), String> {
+    entry(handle)
+        .map(|entry| {
+            entry.set_deadline((deadline_ms != 0).then(|| Duration::from_millis(deadline_ms)))
+        })
+        .map_err(errors::text)
+}
+
+/// Suspend the background work of every session of the default context
+/// (Android host in the background). See `Context::suspend`.
+pub fn suspend() -> Result<(), String> {
+    default_context()
+        .and_then(|context| context.suspend())
+        .map_err(errors::text)
+}
+
+/// Restart what `suspend` stopped. See `Context::resume`.
+pub fn resume() -> Result<(), String> {
+    default_context()
+        .and_then(|context| context.resume())
+        .map_err(errors::text)
+}
+
+pub(crate) fn wait_session_for(handle: i64, timeout: Option<Duration>) -> Result<bool, ApiError> {
+    let signal = Arc::clone(&entry(handle)?.signal);
+    Ok(signal.wait_for(timeout) == work_signal::Wake::Work)
+}
+
+pub(crate) fn wake_session(handle: i64) -> Result<(), ApiError> {
+    entry(handle)?.signal.wake();
     Ok(())
 }
 
@@ -352,22 +454,21 @@ pub fn wait_for_work(handle: i64) -> Result<bool, String> {
 
 /// `wait_for_work`, typed.
 pub(crate) fn wait_session(handle: i64) -> Result<bool, ApiError> {
-    let signal = REGISTRY
-        .lock()
-        .map_err(errors::poisoned("node registry unavailable"))?
-        .signals
-        .get(&handle)
-        .cloned()
-        .ok_or_else(errors::unknown_handle)?;
+    let signal = Arc::clone(&entry(handle)?.signal);
     Ok(signal.wait())
 }
+
+/// The longest an endpoint bind waits (a relay-only bind waits for its relay).
+const BIND_WAIT: Duration = Duration::from_secs(10);
 
 /// Time `shutdown_session` allows for local teardown after the peer drain.
 const LOCAL_TEARDOWN: Duration = Duration::from_secs(2);
 
 pub(crate) fn shutdown_session(mut session: Session) -> Result<(), ApiError> {
-    release_overlay_paths(&DEVICE_OVERLAY_PATHS, session.overlay_paths);
-    session.overlay_paths = 0;
+    session.overlay_paths.release_all();
+    for task in session.tasks.drain(..) {
+        task.abort();
+    }
     session.presence.cancel();
     session.interests.cancel();
     drop(session.join.exchange.take());
@@ -381,28 +482,12 @@ pub(crate) fn shutdown_session(mut session: Session) -> Result<(), ApiError> {
     // default, host-overridable). This guard only catches a stuck local
     // teardown, so it allows the drain plus a small margin for the local work.
     let deadline = session.node.timeouts().close_drain + LOCAL_TEARDOWN;
-    let result = session
-        .runtime
-        .block_on(async { tokio::time::timeout(deadline, session.node.close()).await });
-    session.runtime.shutdown_timeout(Duration::from_secs(2));
+    // The runtime is shared by the context; the session's tasks end with
+    // the node and with the aborts above, not with a runtime shutdown.
+    let runtime = session.runtime.clone();
+    let result =
+        runtime.block_on(async { tokio::time::timeout(deadline, session.node.close()).await });
     result.map_err(|_| ApiError::timeout(None, "node shutdown timed out"))
-}
-
-pub(crate) fn reserve_overlay_paths(total: &AtomicUsize, additional: usize) -> bool {
-    total
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            current
-                .checked_add(additional)
-                .filter(|next| *next <= MAX_DEVICE_OVERLAY_PATHS)
-        })
-        .is_ok()
-}
-
-pub(crate) fn release_overlay_paths(total: &AtomicUsize, count: usize) {
-    if count != 0 {
-        let previous = total.fetch_sub(count, Ordering::AcqRel);
-        debug_assert!(previous >= count);
-    }
 }
 
 #[cfg(test)]
@@ -433,29 +518,6 @@ mod tests {
     }
 
     #[test]
-    fn startup_reservations_count_toward_the_session_cap() {
-        let mut registry = Registry {
-            next: 1,
-            reserved: 0,
-            sessions: BTreeMap::new(),
-            signals: BTreeMap::new(),
-            cancellations: BTreeMap::new(),
-            transports: BTreeMap::new(),
-            connection_budget: ConnectionBudget::default(),
-        };
-        let handles: Vec<_> = (0..MAX_SESSIONS)
-            .map(|_| registry.reserve().unwrap())
-            .collect();
-        assert_eq!(handles, (1..=MAX_SESSIONS as i64).collect::<Vec<_>>());
-        let limit = registry.reserve().unwrap_err();
-        assert_eq!(limit.code(), ErrorCode::LimitReached);
-        assert_eq!(errors::text(limit), "node limit reached");
-        // A failed startup returns its slot; handles are never reused.
-        registry.release();
-        assert_eq!(registry.reserve().unwrap(), MAX_SESSIONS as i64 + 1);
-    }
-
-    #[test]
     fn slow_endpoint_bind_does_not_block_other_sessions() {
         let other = create(Some(&[91; 32])).unwrap();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -479,16 +541,5 @@ mod tests {
         probed.unwrap();
         close(created.unwrap()).unwrap();
         close(other).unwrap();
-    }
-
-    #[test]
-    fn overlay_path_budget_fails_closed_and_releases() {
-        let total = AtomicUsize::new(0);
-        assert!(reserve_overlay_paths(&total, MAX_DEVICE_OVERLAY_PATHS));
-        assert!(!reserve_overlay_paths(&total, 1));
-        release_overlay_paths(&total, MAX_DEVICE_OVERLAY_PATHS);
-        assert_eq!(total.load(Ordering::Acquire), 0);
-        assert!(reserve_overlay_paths(&total, 5));
-        assert_eq!(total.load(Ordering::Acquire), 5);
     }
 }

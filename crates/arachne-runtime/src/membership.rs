@@ -1486,12 +1486,9 @@ pub(super) fn admit_members(
 /// at the end of the test).
 #[cfg(test)]
 pub(super) fn bare_test_session(workspace: impl Into<Arc<arachne_security::Workspace>>) -> Session {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let (node, receiver) = runtime
+    let context = crate::context::Context::for_tests();
+    let (node, receiver) = context
+        .handle()
         .block_on(Node::bind_with_profile(
             ([0, 0, 0, 0], 0).into(),
             None,
@@ -1503,7 +1500,7 @@ pub(super) fn bare_test_session(workspace: impl Into<Arc<arachne_security::Works
     let mut session = Session::new(
         node,
         receiver,
-        runtime,
+        context,
         committed,
         None,
         presence::Presence::new().unwrap(),
