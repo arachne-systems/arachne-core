@@ -206,9 +206,15 @@ fn hundred_member_runtime_commits_and_reopens() {
     close(handle).unwrap();
     // The encrypted native state preserves the sender counter too.
     let store = arachne_store::Store::open_existing(&path, &root, workspace).unwrap();
+    // Each stored value starts with a one-byte tag; 0 is the whole value
+    // (this roster has no value long enough to be saved in parts).
     let records = store
         .keys(b"security/")
-        .map(|name| (name.to_vec(), store.get(name).unwrap().unwrap()))
+        .map(|name| {
+            let stored = store.get(name).unwrap().unwrap();
+            assert_eq!(stored[0], 0);
+            (name.to_vec(), zeroize::Zeroizing::new(stored[1..].to_vec()))
+        })
         .collect();
     handle = create(Some(&root)).unwrap();
     let description: Value =
