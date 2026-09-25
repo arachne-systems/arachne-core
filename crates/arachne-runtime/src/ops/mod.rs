@@ -227,6 +227,13 @@ pub(crate) fn admission_busy(session: &Session) -> bool {
     session.transition.staged.is_some() || session.transition.inbound.is_some()
 }
 
+/// Clear the control cancel latch without a change notice when it is
+/// already clear: every notice, even to `false`, stops the control
+/// exchanges in flight (presence, recovery and interest tasks).
+pub(crate) fn clear_cancel(latch: &tokio::sync::watch::Sender<bool>) {
+    latch.send_if_modified(|cancelled| std::mem::replace(cancelled, false));
+}
+
 /// Run one op on a live session: lock, guard, run, then the wake-ups and a
 /// shutdown if the op ended the session. The typed `Client` and the JSON
 /// dispatcher both come through here.
@@ -247,7 +254,7 @@ pub(crate) fn run<T>(
     // this lock cannot delay the close.
     let closing = crate::registry::entry(handle).map_or(true, |entry| entry.signal.is_closed());
     if !closing {
-        session.node.control_cancellation().send_replace(false);
+        clear_cancel(&session.node.control_cancellation());
     }
     // Control requests set aside while a commit was pending raised their
     // signal on arrival, and the host already found nothing it could serve.

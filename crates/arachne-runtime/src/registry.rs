@@ -90,7 +90,7 @@ impl DeadlineTimer {
         self.task.abort();
         let fired = self.fired.load(Ordering::Acquire);
         if fired && !self.entry.signal.is_closed() {
-            self.entry.cancellation.send_replace(false);
+            crate::ops::clear_cancel(&self.entry.cancellation);
         }
         fired
     }
