@@ -44,6 +44,14 @@ and a different Core pin. Core work that each plan step depends on:
 | 4. Distinct ID types, error categories through the C ABI | A1: core must emit real error codes first; today `ErrorKind` is a substring guess |
 | 5. End-to-end flow through the AAR, then ATAK host | B9 (freshness anchor), A4 (suspend/resume, `wait_for_work(timeout)`) |
 
+## SDK work
+
+- [x] SDK B10/B11 (`fix/b10-b11-locks-pin`).
+- [x] UniFFI pipeline (`feat/uniffi-sdk`, 9 commits): generated Kotlin/Swift/Python/Go, committed `generated/` + drift check in CI, patched Go generator, smoke tests pass in all four; Rust examples/tests ported to new core; hand-binding CI steps disabled (to be deleted).
+- [ ] Extend generated surface to stable Client groups (in progress); storage/candidates after A5; management/revocation after A2.
+- [ ] Core step 6 blockers from the SDK: `#[non_exhaustive]` blocks remote derives (add `uniffi` derives behind a feature in arachne-api); `Event` needs `ALL`; `[u8;32]` IDs, `usize`, `serde_json::Value` returns (`drive_join`, `request_admission`, `drive_workspace`, `poll_membership_update`), `&[&str]`, `&Path`; `with_deadline(self)`; two `Network` enums (Tor feature-gated); plain struct error; `open_in(&Arc<Context>)`; close-race code 101 vs `Closed`.
+- [ ] Delete `ffi.rs` + hand bindings; reconcile Kotlin PR #1 (other agent's) with generated Kotlin.
+
 ## SDK-facing notes from core changes
 
 - B3a: a host that passes the checkpoint inline in `begin_join` JSON hits the 128 KiB request cap near 120 members. SDK must use the compact path (invitation link + peers).
