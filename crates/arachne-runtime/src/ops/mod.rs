@@ -252,6 +252,7 @@ pub(crate) fn run<T>(
     // Cancel and deadlines act on the op in flight only (ADR step 4). Close
     // removes the handle first; its cancel stays set, so an op queued on
     // this lock cannot delay the close.
+    session.events.rearm_queues();
     let closing = crate::registry::entry(handle).map_or(true, |entry| entry.signal.is_closed());
     if !closing {
         clear_cancel(&session.node.control_cancellation());

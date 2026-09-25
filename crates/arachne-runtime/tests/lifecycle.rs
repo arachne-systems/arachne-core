@@ -226,6 +226,21 @@ fn next_event_reports_interest_and_publication() {
     );
     assert_eq!(subscriber.poll().unwrap().unwrap().payload, vec![1, 2, 3]);
     assert_eq!(subscriber.next_event(Some(Duration::from_millis(100))).unwrap(), None);
+
+    // A network change queues an interest repair. A host that only waits on
+    // next_event must hear of it, so the repair starts at its poll.
+    subscriber.network_change().unwrap();
+    assert_eq!(
+        subscriber.next_event(Some(Duration::from_secs(2))).unwrap(),
+        Some(Event::InterestChanged)
+    );
+    // The poll starts the repair; its end is the next event.
+    let _ = subscriber.poll_interest().unwrap();
+    assert_eq!(
+        subscriber.next_event(Some(Duration::from_secs(10))).unwrap(),
+        Some(Event::InterestChanged)
+    );
+    assert!(subscriber.poll_interest().unwrap().is_some());
 }
 
 #[test]
@@ -279,4 +294,47 @@ fn low_power_lengthens_the_presence_interval() {
     assert_eq!(low.power(), PowerProfile::Low);
     assert_eq!(normal.power(), PowerProfile::Normal);
     assert!(low.presence_interval() > normal.presence_interval());
+}
+
+#[test]
+fn close_while_another_thread_is_inside_an_op_is_bounded() {
+    let context = context();
+    let gone = context.open(direct(None)).unwrap();
+    let peer = gone.endpoint().unwrap().endpoint_key;
+    let address = local(&gone);
+    gone.close().unwrap();
+    let client = Arc::new(
+        context
+            .open(ClientConfig {
+                network: Network::Direct,
+                secret: Some([62; 32]),
+                transport: TransportOptions {
+                    timeouts: Some(TransportTimeouts {
+                        operation: Duration::from_secs(30),
+                        dial: Duration::from_secs(30),
+                        gossip_join: Duration::from_secs(30),
+                        close_drain: Duration::from_secs(1),
+                    }),
+                    ..Default::default()
+                },
+            })
+            .unwrap(),
+    );
+    client.add_address_hint(peer, &address).unwrap();
+    let busy = Arc::clone(&client);
+    // No deadline: only close can end this 30 s dial early.
+    let op = thread::spawn(move || {
+        let started = Instant::now();
+        let result = busy.send_nearby_invitation(peer, &[7; 16]);
+        (result, started.elapsed())
+    });
+    thread::sleep(Duration::from_millis(300));
+    let closing = Instant::now();
+    client.close().unwrap();
+    let closed_in = closing.elapsed();
+    let (result, op_time) = op.join().unwrap();
+    assert!(result.is_err());
+    // Close drain (1 s) plus the local teardown (2 s) bound it.
+    assert!(closed_in < Duration::from_millis(3500), "close took {closed_in:?}");
+    assert!(op_time < Duration::from_secs(4), "op ran {op_time:?}");
 }

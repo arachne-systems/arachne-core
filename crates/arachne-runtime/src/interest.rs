@@ -40,6 +40,20 @@ impl Updates {
         self.pending.as_ref().is_some_and(|job| job.task.is_finished())
     }
 
+    /// Work waits for `poll` to start it: a queued change, a repair after a
+    /// network change or resume, or a retry that is due.
+    pub fn has_work_to_start(&self) -> bool {
+        self.pending.is_none()
+            && (!self.queued.is_empty()
+                || !self.repair.is_empty()
+                || self.retry_at.is_some_and(|at| Instant::now() >= at))
+    }
+
+    /// An announcement runs, or a retry is scheduled.
+    pub fn is_running(&self) -> bool {
+        self.pending.is_some() || self.retry_at.is_some()
+    }
+
     pub fn is_idle(&self) -> bool {
         self.pending.is_none() && self.queued.is_empty() && self.repair.is_empty()
     }

@@ -38,7 +38,8 @@ Published manifests declare Rust 1.91 as the MSRV. Verify that claim with
 Run from the repository root. `arachne-runtime` tests no longer share
 process-wide session state: each session belongs to a `Context` with its own
 limits, connection budget and runtime, and the default context allows 64
-sessions. They can run in parallel. The workspace command keeps
+sessions. So they need no `--test-threads=1` for a shared session cap; a
+full parallel run of the crate is still to be confirmed. The workspace command keeps
 `--test-threads=1` for the other crates; `tests/nearby_invitation.rs` keeps its
 own lock because its scenarios share LAN discovery. The
 workspace build and tests are Rust checks; they do not build the Android plugin,
