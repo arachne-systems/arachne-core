@@ -1774,7 +1774,7 @@ fn missing_names_come_back_from_one_peer_in_pages() {
         .map(|member| member.sign_member_profile().unwrap())
         .collect();
     let owner = Arc::new(owner);
-    let answerer_endpoint = [16; 32]; // admit_members creates the owner at [seed; 32]
+    let answerer_endpoint = owner.endpoint();
     let mut answerer = bare_test_session(owner.clone());
     for chunk in profiles.chunks(MAX_REQUEST_PROFILES) {
         roster_value(&mut answerer, chunk).unwrap();
@@ -2943,7 +2943,7 @@ pub(crate) fn start_self_update(
         return Ok(None);
     }
     let own = owner.member().map(|member| member.id());
-    let roster = owner.member_roster().map_err(security(ErrorCode::Internal))?;
+    let roster = owner.member_roster().map_err(security(ErrorCode::WrongState))?;
     let administrator = roster
         .iter()
         .any(|member| Some(member.id) == own && member.administrator);
@@ -2967,7 +2967,7 @@ pub(crate) fn start_self_update(
     let epoch = owner.epoch();
     let prepared = owner
         .prepare_self_update()
-        .map_err(security(ErrorCode::Internal))?;
+        .map_err(security(ErrorCode::WrongState))?;
     encode_step(&arachne_security::MembershipAuthorization::SelfUpdate, &prepared.commit)?;
     let (publisher, inbox) = super::carry_delivery(session, &prepared.workspace)?;
     let snapshot = seal_state(
@@ -2985,7 +2985,7 @@ pub(crate) fn start_self_update(
         prepared
             .workspace
             .workspace_name()
-            .map_err(security(ErrorCode::Internal))?,
+            .map_err(security(ErrorCode::WrongState))?,
         snapshot.clone(),
     ))
     .map_err(errors::encode)?;
@@ -3322,4 +3322,185 @@ fn a_step_with_an_anchor_proof_past_the_transport_bound_is_refused() {
     assert_eq!(wire_step(&large, None, usize::MAX).unwrap_err().code(), ErrorCode::LimitReached);
     let (authorization, commit) = arachne_security::decode_membership_step(&large).unwrap();
     assert_eq!(encode_step(&authorization, &commit).unwrap_err().code(), ErrorCode::LimitReached);
+}
+
+/// Save and adopt the staged candidate of a test session with records.
+#[cfg(test)]
+fn adopt_staged(session: &mut Session) {
+    let snapshot = session.transition.staged.as_ref().unwrap().snapshot.clone();
+    persistence::commit_candidate(session, &snapshot).unwrap();
+    crate::ops::candidate::adopt_admission(
+        session,
+        crate::ops::candidate::AdoptArgs { snapshot },
+    )
+    .unwrap();
+}
+
+/// A test session with native record storage for `workspace`.
+#[cfg(test)]
+fn stored_test_session(
+    workspace: arachne_security::Workspace,
+    directory: &std::path::Path,
+    root: [u8; 32],
+) -> Session {
+    let mut session = bare_test_session(workspace);
+    session.storage_key = Some(arachne_security::StorageKey::derive(&root).unwrap());
+    persistence::enable(&mut session, &directory.join(format!("{}.db", root[0])), &root).unwrap();
+    session
+}
+
+/// B3c end to end, runtime level (no network): past 785 members a link
+/// registration and a Remove succeed once members self-updated. The owner
+/// commits both through the runtime (stage_invitation, stage_management);
+/// a member receives each as a binary range page (range_reply, decode,
+/// JoinStep) and stages it with stage_update.
+///
+/// Growth: batches of 128 through the security API, one fresh link per
+/// batch. After each batch, its first and last joiners self-update (the
+/// policy's "right after the Welcome"); the owner applies each. The
+/// populated interior nodes collapse the owner's copath, so every commit
+/// stays under the old 64 KiB bound even though most members never
+/// self-updated. Without self-updates a registration at 897 members was
+/// over 64 KiB (ADR A2, B3c measurements).
+#[test]
+#[ignore = "B3c capacity run: ~900 members; slow in debug"]
+fn a_registration_and_remove_past_785_members_succeed_after_self_updates() {
+    use arachne_security::{
+        AdmissionAssessment, EndpointKey, EndpointSigner, MAX_ADMISSION_BATCH,
+        MembershipAuthorization, PendingJoin, PreparedManagementUpdate,
+    };
+    const MEMBERS: usize = 900;
+    let started = std::time::Instant::now();
+    let active = |update: PreparedManagementUpdate| match update {
+        PreparedManagementUpdate::Active(workspace) => *workspace,
+        PreparedManagementUpdate::Removed(_) => panic!("unexpected removal"),
+    };
+    let owner_key = EndpointKey::generate().unwrap();
+    let mut owner = arachne_security::Workspace::create(&owner_key, "Owner").unwrap();
+    let mut receiver: Option<(arachne_security::Workspace, [u8; 32])> = None;
+    let mut self_updates = 0;
+    while owner.member_count() < MEMBERS {
+        let (registration, invitation, checkpoint) =
+            owner.prepare_invitation(0, false, false).unwrap();
+        owner = registration.workspace;
+        let count = (MEMBERS - owner.member_count()).min(MAX_ADMISSION_BATCH);
+        let keys: Vec<_> = (0..count).map(|_| EndpointKey::generate().unwrap()).collect();
+        let joins: Vec<_> = keys
+            .iter()
+            .map(|key| PendingJoin::from_invitation(&invitation, &checkpoint, key, "Member").unwrap())
+            .collect();
+        let requests: Vec<_> = joins
+            .iter()
+            .map(|join| join.admission_request().unwrap().to_vec())
+            .collect();
+        let validated: Vec<_> = keys
+            .iter()
+            .zip(&requests)
+            .map(|(key, request)| match owner.assess_admission(key.endpoint(), request).unwrap() {
+                AdmissionAssessment::Ready(validated) => validated,
+                _ => panic!("open invitation needs no approval"),
+            })
+            .collect();
+        let entries: Vec<_> = keys
+            .iter()
+            .zip(requests.iter().zip(&validated))
+            .map(|(key, (request, validated))| (key.endpoint(), request.as_slice(), validated))
+            .collect();
+        let prepared = owner.prepare_validated_admission_batch(&entries).unwrap();
+        let authorization = if count == 1 {
+            MembershipAuthorization::Admission(prepared.replies[0].authorization.clone())
+        } else {
+            MembershipAuthorization::AdmissionBatch(
+                prepared.replies.iter().map(|reply| reply.authorization.clone()).collect(),
+            )
+        };
+        owner = prepared.workspace;
+        let join = |index: usize| {
+            let mut proof = joins[index].join_proof().unwrap();
+            proof.apply_transition(&authorization, &prepared.commit).unwrap();
+            joins[index].prepare_workspace(&proof, &prepared.welcome).unwrap()
+        };
+        // The batch's first and last joiners self-update, in turn.
+        let mut last = join(count - 1);
+        if count > 1 {
+            let first = join(0).prepare_self_update().unwrap();
+            owner = active(owner.prepare_self_update_update(&first.commit).unwrap());
+            last = active(last.prepare_self_update_update(&first.commit).unwrap());
+            self_updates += 1;
+        }
+        let update = last.prepare_self_update().unwrap();
+        owner = active(owner.prepare_self_update_update(&update.commit).unwrap());
+        self_updates += 1;
+        receiver = Some((update.workspace, keys[count - 1].endpoint()));
+    }
+    let (receiver, receiver_endpoint) = receiver.unwrap();
+    assert!(owner.member_count() > 785);
+    eprintln!(
+        "B3c runtime: {} members, {self_updates} self-updates, {} without, grown in {:?}",
+        owner.member_count(),
+        owner.members_without_self_update(),
+        started.elapsed()
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut owner_session = stored_test_session(owner, directory.path(), [61; 32]);
+    let mut member_session = stored_test_session(receiver, directory.path(), [62; 32]);
+    let mut sizes = Vec::new();
+    for change in ["registration", "remove"] {
+        let after = owner_session.workspace.as_ref().unwrap().epoch();
+        match change {
+            "registration" => {
+                crate::ops::invitation::stage(
+                    &mut owner_session,
+                    serde_json::from_value(json!({"personal":false,"expires_at":0})).unwrap(),
+                )
+                .unwrap();
+            }
+            _ => {
+                let target = owner_session
+                    .workspace
+                    .as_ref()
+                    .unwrap()
+                    .member_roster()
+                    .unwrap()
+                    .into_iter()
+                    .find(|member| !member.administrator && member.endpoint != receiver_endpoint)
+                    .unwrap()
+                    .id;
+                stage_management(
+                    &mut owner_session,
+                    arachne_security::ManagementAction::Remove(target),
+                )
+                .unwrap();
+            }
+        }
+        adopt_staged(&mut owner_session);
+        let owner = owner_session.workspace.as_ref().unwrap();
+        let (authorization, commit) =
+            owner.membership_update_for(receiver_endpoint, after).unwrap().unwrap();
+        sizes.push((change, commit.len()));
+        // The old 64 KiB bound: the self-updates did the work, not the raise.
+        assert!(commit.len() < 64 * 1024, "{change}: {} bytes", commit.len());
+        assert_eq!(step_kind(&authorization), if change == "remove" { "remove" } else { "create_invitation" });
+        // The member pulls it as one binary range page and stages it.
+        let query = wire::encode_range_query(&wire::RangeQuery {
+            workspace: owner.id(),
+            after,
+            until: owner.epoch(),
+        })
+        .unwrap();
+        let page = range_reply(Some(owner), receiver_endpoint, &query);
+        assert!(page.len() <= arachne_node::MAX_CONTROL_REPLY);
+        let reply = wire::decode_range_reply(&page).unwrap();
+        assert_eq!((reply.after, reply.steps.len()), (after, 1));
+        let step = join_step_from_wire(reply.steps[0]).unwrap();
+        let staged = stage_update(&mut member_session, step).unwrap();
+        assert!(matches!(staged, StagedChange::Candidate(_)));
+        adopt_staged(&mut member_session);
+        assert_eq!(
+            member_session.workspace.as_ref().unwrap().epoch_fingerprint(),
+            owner_session.workspace.as_ref().unwrap().epoch_fingerprint()
+        );
+    }
+    eprintln!("B3c runtime: commit sizes {sizes:?}, total {:?}", started.elapsed());
 }

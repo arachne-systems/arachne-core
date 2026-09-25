@@ -1918,7 +1918,11 @@ mod tests {
         assert_eq!(pending_count(), 32);
         let fetched = fetch();
         assert_eq!(fetched["state"], "membership_update_available");
-        assert_eq!(fetched["step"], step);
+        // The binary step carries exactly the retained admission.
+        assert_eq!(fetched["step"]["kind"], "admission");
+        let binary: Vec<u8> = serde_json::from_value(fetched["step"]["step"].clone()).unwrap();
+        let (_, commit) = arachne_security::decode_membership_step(&binary).unwrap();
+        assert_eq!(json!(commit), step["commit"]);
         assert!(fetched.get("welcome").is_none());
         let update = json!({"op":"stage_admission_update", "step":fetched["step"]});
         assert_eq!(pending_count(), 32);

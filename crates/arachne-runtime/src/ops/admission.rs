@@ -780,26 +780,16 @@ pub(crate) fn admission_reply_page(
                 .map(|(authorization, commit)| membership::encode_step(authorization, commit))
                 .collect::<Result<_, _>>()?
         }
-        None => vec![membership::encode_step(
-            &arachne_security::MembershipAuthorization::Admission(
-                arachne_security::AdmissionAuthorization {
-                    invitation_key: reply.authorization.invitation_key,
-                    grant_signature: reply
-                        .authorization
-                        .grant_signature
-                        .clone()
-                        .try_into()
-                        .map_err(|_| ApiError::internal("invalid retained grant signature"))?,
-                    redemption_signature: reply
-                        .authorization
-                        .redemption_signature
-                        .clone()
-                        .try_into()
-                        .map_err(|_| ApiError::internal("invalid retained redemption signature"))?,
-                },
-            ),
-            &reply.commit,
-        )?],
+        None => {
+            let retained = workspace
+                .retained_admission(peer, request)
+                .map_err(security(ErrorCode::InvalidInput))?
+                .ok_or_else(|| ApiError::wrong_state("no retained admission"))?;
+            vec![membership::encode_step(
+                &arachne_security::MembershipAuthorization::Admission(retained.authorization),
+                &reply.commit,
+            )?]
+        }
     };
     admission_history_page(&reply, &steps, offset, arachne_node::MAX_CONTROL_REPLY)
 }
@@ -864,7 +854,7 @@ fn encode_admission_page(
         },
     };
     let mut bytes = ADMISSION_REPLY.to_vec();
-    bytes.extend(postcard::to_allocvec(&wire).map_err(|_| ApiError::internal("admission reply encoding failed"))?);
+    bytes.extend(postcard::to_allocvec(&wire).map_err(|_| reply_too_large("admission reply encoding failed"))?);
     Ok(bytes)
 }
 
