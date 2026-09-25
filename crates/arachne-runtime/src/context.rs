@@ -210,9 +210,9 @@ impl Context {
     /// suspended start suspended. Blocking: call it outside async code.
     /// Each session is suspended after its op in flight ends.
     ///
-    /// Not stopped: the mDNS responder and browser of a LAN or nearby
-    /// endpoint (`iroh-mdns-address-lookup` 0.5 has no pause), and the
-    /// transport's own keep-alives on open connections.
+    /// Idle connections close (the endpoint stays bound; later dials
+    /// reconnect) and the mDNS service of a LAN or nearby endpoint stops;
+    /// `resume` starts it again with the current addresses.
     pub fn suspend(&self) -> Result<(), ApiError> {
         self.suspended.store(true, Ordering::Release);
         for shared in self.sessions() {
@@ -256,6 +256,21 @@ impl Context {
                 })
             })
             .sum()
+    }
+
+    /// (running mDNS services, address sets announced to mDNS) over all
+    /// sessions (a test and diagnostics hook).
+    #[doc(hidden)]
+    pub fn mdns(&self) -> (usize, u64) {
+        self.sessions()
+            .into_iter()
+            .map(|shared| {
+                let Ok(guard) = shared.lock() else { return (0, 0) };
+                guard
+                    .as_ref()
+                    .map_or((0, 0), |session| session.node.mdns_state())
+            })
+            .fold((0, 0), |(a, b), (c, d)| (a + c, b + d))
     }
 
     /// Open connections of all sessions (a test and diagnostics hook).

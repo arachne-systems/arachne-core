@@ -380,3 +380,35 @@ fn suspend_closes_idle_connections_and_resume_reconnects() {
     assert_eq!(subscriber.poll().unwrap().unwrap().payload, vec![2]);
     assert!(context.open_connections() > 0);
 }
+
+#[test]
+fn suspend_stops_mdns_announcements_and_resume_restarts_them() {
+    let context = context();
+    let client = context
+        .open(ClientConfig {
+            network: Network::Lan,
+            secret: Some([111; 32]),
+            transport: Default::default(),
+        })
+        .unwrap();
+    // The mDNS service runs and has the endpoint's addresses to announce.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while context.mdns().1 == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let (running, announced) = context.mdns();
+    assert_eq!(running, 1);
+    assert!(announced > 0, "the endpoint published its addresses to mDNS");
+
+    context.suspend().unwrap();
+    assert_eq!(context.mdns(), (0, announced), "the mDNS service stopped");
+    // A network change republishes addresses; none reach mDNS while suspended.
+    client.network_change().unwrap();
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(context.mdns(), (0, announced));
+
+    context.resume().unwrap();
+    let (running, after) = context.mdns();
+    assert_eq!(running, 1);
+    assert!(after > announced, "resume announces the current addresses");
+}

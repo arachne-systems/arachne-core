@@ -17,6 +17,7 @@ use std::{
 
 mod budget;
 mod connections;
+mod mdns;
 mod control;
 mod overlay;
 pub mod resources;
@@ -1411,7 +1412,8 @@ impl Node {
 
     /// Stop background work for a host in the background: each workspace
     /// overlay (its HyParView shuffle timers and bootstrap retries) is
-    /// dropped and parked, and every idle connection closes. The endpoint,
+    /// dropped and parked, every idle connection closes, and the mDNS
+    /// service stops (see `mdns.rs`). The endpoint,
     /// routing policy and queues stay; an exchange in progress keeps its
     /// connection. Later dials reconnect. Idempotent.
     pub async fn suspend(&self) {
@@ -1425,6 +1427,8 @@ impl Node {
         drop(parked);
         // Idle links would keep QUIC keep-alives running.
         let closed = self.connections.close_idle().await;
+        // No local announcements or lookups while in the background.
+        self.connections.pause_mdns().await;
         tracing::info!(target: "data_fabric_transport", overlays, closed, "NODE_SUSPENDED");
     }
 
@@ -1467,8 +1471,15 @@ impl Node {
                 }
             }
         }
+        self.connections.resume_mdns();
         self.connections.network_change().await;
         tracing::info!(target: "data_fabric_transport", "NODE_RESUMED");
+    }
+
+    /// (running mDNS services, address sets announced to mDNS): a test and
+    /// diagnostics hook for `suspend`.
+    pub fn mdns_state(&self) -> (usize, u64) {
+        self.connections.mdns_state()
     }
 
     /// Open connections of this endpoint (a test and diagnostics hook).
