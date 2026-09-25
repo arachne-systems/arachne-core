@@ -12,11 +12,11 @@ use std::{
     collections::BTreeSet,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
-use arachne_api::{ApiError, Limits};
+use arachne_api::{ApiError, Limits, PowerProfile};
 use arachne_node::{ConnectionBudget, NodeOptions};
 use tokio::runtime::{Handle, Runtime, RuntimeFlavor};
 
@@ -49,6 +49,8 @@ impl Default for RuntimeConfig {
 pub struct ContextConfig {
     pub limits: Limits,
     pub runtime: RuntimeConfig,
+    /// `Low` lengthens background intervals for a host in the background.
+    pub power: PowerProfile,
 }
 
 impl ContextConfig {
@@ -61,7 +63,17 @@ impl ContextConfig {
         self.runtime = runtime;
         self
     }
+
+    pub fn with_power(mut self, power: PowerProfile) -> Self {
+        self.power = power;
+        self
+    }
 }
+
+/// Presence refresh interval of the normal profile.
+const PRESENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// The low-power profile runs presence rounds this many times less often.
+const LOW_POWER_FACTOR: u32 = 4;
 
 /// Owns the sessions of one host and everything they share.
 pub struct Context {
@@ -72,6 +84,8 @@ pub struct Context {
     budget: ConnectionBudget,
     overlay: Arc<OverlayBudget>,
     table: Mutex<Table>,
+    power: PowerProfile,
+    suspended: AtomicBool,
 }
 
 #[derive(Default)]
@@ -131,6 +145,8 @@ impl Context {
                 max: config.limits.max_overlay_paths as usize,
             }),
             table: Mutex::new(Table::default()),
+            power: config.power,
+            suspended: AtomicBool::new(false),
         }))
     }
 
@@ -169,6 +185,90 @@ impl Context {
     #[doc(hidden)]
     pub fn alive_tasks(&self) -> usize {
         self.handle.metrics().num_alive_tasks()
+    }
+
+    pub fn power(&self) -> PowerProfile {
+        self.power
+    }
+
+    /// How often a session starts a presence round (longer in `Low`).
+    pub fn presence_interval(&self) -> std::time::Duration {
+        match self.power {
+            PowerProfile::Low => PRESENCE_INTERVAL * LOW_POWER_FACTOR,
+            _ => PRESENCE_INTERVAL,
+        }
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        self.suspended.load(Ordering::Acquire)
+    }
+
+    /// Stop background work of every session for a host in the background
+    /// (Android): gossip overlays (HyParView shuffles, bootstrap retries)
+    /// are parked and presence rounds stop. Sessions, workspaces, routing
+    /// policy and queues stay; ops still run. Sessions opened while
+    /// suspended start suspended. Blocking: call it outside async code.
+    /// Each session is suspended after its op in flight ends.
+    ///
+    /// Not stopped: the mDNS responder and browser of a LAN or nearby
+    /// endpoint (`iroh-mdns-address-lookup` 0.5 has no pause), and the
+    /// transport's own keep-alives on open connections.
+    pub fn suspend(&self) -> Result<(), ApiError> {
+        self.suspended.store(true, Ordering::Release);
+        for shared in self.sessions() {
+            let mut guard = shared
+                .lock()
+                .map_err(errors::poisoned("node session unavailable"))?;
+            if let Some(session) = guard.as_mut() {
+                self.handle.block_on(session.node.suspend());
+                session.presence.cancel();
+            }
+        }
+        Ok(())
+    }
+
+    /// Restart what `suspend` stopped and rebind sockets (`network_change`).
+    pub fn resume(&self) -> Result<(), ApiError> {
+        self.suspended.store(false, Ordering::Release);
+        for shared in self.sessions() {
+            let mut guard = shared
+                .lock()
+                .map_err(errors::poisoned("node session unavailable"))?;
+            if let Some(session) = guard.as_mut() {
+                self.handle.block_on(session.node.resume());
+                session.interests.repair();
+            }
+        }
+        Ok(())
+    }
+
+    /// Background timer sources of all sessions: live gossip overlays and
+    /// presence requests in flight (a test and diagnostics hook).
+    #[doc(hidden)]
+    pub fn background_timers(&self) -> usize {
+        self.sessions()
+            .into_iter()
+            .map(|shared| {
+                let Ok(guard) = shared.lock() else { return 0 };
+                guard.as_ref().map_or(0, |session| {
+                    self.handle.block_on(session.node.active_overlays())
+                        + session.presence.in_flight_count()
+                })
+            })
+            .sum()
+    }
+
+    fn sessions(&self) -> Vec<registry::SharedSession> {
+        let handles: Vec<i64> = self
+            .table
+            .lock()
+            .map(|table| table.live.iter().copied().collect())
+            .unwrap_or_default();
+        handles
+            .into_iter()
+            .filter_map(|handle| registry::entry(handle).ok())
+            .map(|entry| Arc::clone(&entry.shared))
+            .collect()
     }
 
     pub(crate) fn handle(&self) -> &Handle {
@@ -330,6 +430,7 @@ mod tests {
                 .with_max_sessions(max_sessions)
                 .with_max_overlay_paths(max_overlay_paths),
             runtime: RuntimeConfig::Owned { workers: 1 },
+            power: PowerProfile::Normal,
         })
         .unwrap()
     }

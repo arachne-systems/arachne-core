@@ -39,3 +39,14 @@ impl Default for Limits {
         }
     }
 }
+
+/// How often background work runs (ADR step 4). `Low` is for an Android
+/// host in the background: longer presence and interest intervals.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerProfile {
+    #[default]
+    Normal,
+    Low,
+}

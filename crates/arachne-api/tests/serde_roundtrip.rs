@@ -98,7 +98,7 @@ fn event_round_trips() {
 
 #[test]
 fn capabilities_carry_the_api_version() {
-    assert_eq!(API_VERSION, 4, "bump deliberately with the change log");
+    assert_eq!(API_VERSION, 5, "bump deliberately with the change log");
     let caps = Capabilities::new(
         vec![Network::Direct, Network::Lan],
         vec![Feature::ResourceTransfer],
@@ -123,4 +123,12 @@ fn new_event_wire_names_are_stable() {
         serde_json::to_value(Event::PublicationReceived).unwrap(),
         json!({"kind": "publication_received"})
     );
+}
+
+#[test]
+fn power_profile_wire_names_are_stable() {
+    use arachne_api::PowerProfile;
+    assert_eq!(serde_json::to_value(PowerProfile::Low).unwrap(), json!("low"));
+    assert_eq!(serde_json::to_value(PowerProfile::Normal).unwrap(), json!("normal"));
+    assert_eq!(PowerProfile::default(), PowerProfile::Normal);
 }

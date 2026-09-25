@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use arachne_runtime::{
     Client, ClientConfig, Context, ContextConfig, ErrorCode, Event, Network, PeerPolicy,
-    TransportOptions, TransportTimeouts,
+    PowerProfile, TransportOptions, TransportTimeouts,
 };
 
 fn context() -> Arc<Context> {
@@ -226,4 +226,57 @@ fn next_event_reports_interest_and_publication() {
     );
     assert_eq!(subscriber.poll().unwrap().unwrap().payload, vec![1, 2, 3]);
     assert_eq!(subscriber.next_event(Some(Duration::from_millis(100))).unwrap(), None);
+}
+
+#[test]
+fn suspend_stops_background_timers_and_resume_restores_them() {
+    let context = context();
+    let owner = context.open(direct(Some([91; 32]))).unwrap();
+    let info = owner.create_workspace("Suspend owner", Some("Suspend")).unwrap();
+    owner.install_workspace_policy(info.epoch + 1).unwrap();
+    assert_eq!(context.background_timers(), 1, "one gossip overlay");
+
+    context.suspend().unwrap();
+    assert!(context.is_suspended());
+    assert_eq!(context.background_timers(), 0);
+    // State stays and ops still run.
+    assert!(owner.workspace_state().unwrap().workspace_ready);
+    // A session opened while suspended starts suspended; its policy
+    // install parks its overlay.
+    let late = context.open(direct(Some([92; 32]))).unwrap();
+    let late_info = late.create_workspace("Late owner", None).unwrap();
+    late.install_workspace_policy(late_info.epoch + 1).unwrap();
+    assert_eq!(context.background_timers(), 0);
+    context.suspend().unwrap();
+
+    context.resume().unwrap();
+    assert!(!context.is_suspended());
+    assert_eq!(context.background_timers(), 2);
+    context.resume().unwrap();
+    assert_eq!(context.background_timers(), 2);
+}
+
+#[test]
+fn contexts_suspend_independently() {
+    let first = context();
+    let second = context();
+    let a = first.open(direct(Some([93; 32]))).unwrap();
+    let b = second.open(direct(Some([94; 32]))).unwrap();
+    for client in [&a, &b] {
+        let info = client.create_workspace("Owner", None).unwrap();
+        client.install_workspace_policy(info.epoch + 1).unwrap();
+    }
+    first.suspend().unwrap();
+    assert_eq!(first.background_timers(), 0);
+    assert_eq!(second.background_timers(), 1);
+    assert!(!second.is_suspended());
+}
+
+#[test]
+fn low_power_lengthens_the_presence_interval() {
+    let normal = context();
+    let low = Context::new(ContextConfig::default().with_power(PowerProfile::Low)).unwrap();
+    assert_eq!(low.power(), PowerProfile::Low);
+    assert_eq!(normal.power(), PowerProfile::Normal);
+    assert!(low.presence_interval() > normal.presence_interval());
 }

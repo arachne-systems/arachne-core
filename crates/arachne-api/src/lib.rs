@@ -29,7 +29,7 @@ pub use event::Event;
 pub use ids::{
     AttemptId, EndpointId, MAX_TOPIC_LEN, MemberId, PublicationId, RecordId, TopicName, WorkspaceId,
 };
-pub use limits::Limits;
+pub use limits::{Limits, PowerProfile};
 pub use network::Network;
 
 /// The version of the public contract. It increments for every change to a
@@ -39,5 +39,5 @@ pub use network::Network;
 /// History: 1 = first contract (ADR step 1). 2 = `ApiError::LimitReached`
 /// and a `detail` field on `ApiError::CapacityExceeded` (ADR step 2).
 /// 3 = `Limits` (ADR step 3). 4 = `Event::Control` and
-/// `Event::PublicationReceived` (ADR step 4).
-pub const API_VERSION: u32 = 4;
+/// `Event::PublicationReceived` (ADR step 4). 5 = `PowerProfile` (ADR step 4).
+pub const API_VERSION: u32 = 5;

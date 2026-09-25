@@ -25,7 +25,7 @@ mod session;
 pub use registry::{
     cancel, close, create, create_lan, create_nearby, create_relay, create_relay_with_options,
     create_wan, create_wan_only, create_with_options, describe, wait_for_work,
-    next_event, wait_for_work_timeout, wake,
+    next_event, resume, suspend, wait_for_work_timeout, wake,
 };
 #[cfg(feature = "tor")]
 pub use registry::create_tor;
@@ -80,7 +80,7 @@ pub(crate) mod presence;
 mod resources;
 mod work_signal;
 mod workspace_activity;
-pub use arachne_api::{ApiError, ErrorCode, Event, Limits};
+pub use arachne_api::{ApiError, ErrorCode, Event, Limits, PowerProfile};
 pub use context::{Context, ContextConfig, RuntimeConfig};
 pub use client::{
     AdmissionApproval, AdmissionApprovalPage, AdmissionAuthorization, InvitationCheckpoint,

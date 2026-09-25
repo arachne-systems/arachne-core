@@ -263,8 +263,16 @@ pub(crate) fn open(
         transport,
         generation: Arc::default(),
     });
-    directory()?.insert(handle, entry);
+    directory()?.insert(handle, Arc::clone(&entry));
     reservation.commit(handle);
+    // After the commit: either `Context::suspend` sees this session or this
+    // check sees the flag, so a session opened during a suspend is covered.
+    if context.is_suspended()
+        && let Ok(mut guard) = entry.shared.lock()
+        && let Some(session) = guard.as_mut()
+    {
+        runtime.block_on(session.node.suspend());
+    }
     Ok(handle)
 }
 
@@ -365,6 +373,21 @@ pub fn next_event(handle: i64, timeout_ms: u64) -> Result<Option<String>, String
     event
         .map(|event| serde_json::to_string(&event).map_err(|error| error.to_string()))
         .transpose()
+}
+
+/// Suspend the background work of every session of the default context
+/// (Android host in the background). See `Context::suspend`.
+pub fn suspend() -> Result<(), String> {
+    default_context()
+        .and_then(|context| context.suspend())
+        .map_err(errors::text)
+}
+
+/// Restart what `suspend` stopped. See `Context::resume`.
+pub fn resume() -> Result<(), String> {
+    default_context()
+        .and_then(|context| context.resume())
+        .map_err(errors::text)
 }
 
 pub(crate) fn wait_session_for(handle: i64, timeout: Option<Duration>) -> Result<bool, ApiError> {

@@ -439,6 +439,9 @@ pub struct Node {
     resources: resources::ResourceTransfers,
     events: DeliveryQueue,
     overlays: Arc<Mutex<BTreeMap<WorkspaceId, Arc<overlay::Overlay>>>>,
+    /// Overlays parked by `suspend`: workspace to (tag, revision). `Some`
+    /// while suspended; `resume` rebuilds them.
+    parked: Arc<StdMutex<Option<BTreeMap<WorkspaceId, ([u8; overlay::TAG], u64)>>>>,
     membership: overlay::MembershipInbox,
     listener: JoinHandle<()>,
 }
@@ -826,6 +829,7 @@ impl Node {
                 resources,
                 events,
                 overlays,
+                parked: Arc::new(StdMutex::new(None)),
                 membership: overlay::MembershipInbox::new(control_signal_for_membership),
                 listener,
             },
@@ -1054,6 +1058,11 @@ impl Node {
             .authorized_endpoints(workspace, revision)?;
         let tag = overlay::tag(tag_key, workspace);
         self.connections.authorize_gossip(tag, peers.clone());
+        if let Some(parked) = self.parked.lock().unwrap().as_mut() {
+            // Suspended: no gossip timers run. `resume` builds this overlay.
+            parked.insert(workspace, (tag, revision));
+            return Ok(());
+        }
         let candidate = overlay::Overlay::prepare(
             &self.connections,
             workspace,
@@ -1398,6 +1407,73 @@ impl Node {
     /// Membership steps from gossip wait for the host. Nothing is consumed.
     pub fn has_membership_gossip(&self) -> bool {
         self.membership.has_pending()
+    }
+
+    /// Stop background gossip work for a host in the background: each
+    /// workspace overlay (its HyParView shuffle timers and bootstrap retries)
+    /// is dropped and parked. Routing policy, connections and queues stay.
+    /// Idempotent.
+    pub async fn suspend(&self) {
+        let overlays = std::mem::take(&mut *self.overlays.lock().await);
+        let mut parked = self.parked.lock().unwrap();
+        let parked = parked.get_or_insert_with(BTreeMap::new);
+        for (workspace, overlay) in overlays {
+            parked.insert(workspace, (overlay.tag, overlay.revision()));
+        }
+        tracing::info!(target: "data_fabric_transport", overlays = parked.len(), "NODE_SUSPENDED");
+    }
+
+    /// Rebuild the parked overlays at their current policy, then rebind
+    /// sockets (`network_change`). A no-op when not suspended.
+    pub async fn resume(&self) {
+        let Some(parked) = self.parked.lock().unwrap().take() else {
+            return;
+        };
+        for (workspace, (tag, revision)) in parked {
+            let peers = match self
+                .routing
+                .lock()
+                .await
+                .authorized_endpoints(workspace, revision)
+            {
+                Ok(peers) if peers.contains(&self.id()) => peers,
+                _ => continue,
+            };
+            match overlay::Overlay::prepare(
+                &self.connections,
+                workspace,
+                tag,
+                revision,
+                peers,
+                self.routing.clone(),
+                self.events.clone(),
+                self.membership.clone(),
+            )
+            .await
+            {
+                Ok(overlay) => {
+                    self.overlays
+                        .lock()
+                        .await
+                        .insert(workspace, Arc::new(overlay));
+                }
+                Err(error) => {
+                    tracing::warn!(target: "data_fabric_transport", %error, "NODE_RESUME_OVERLAY_FAILED");
+                }
+            }
+        }
+        self.connections.network_change().await;
+        tracing::info!(target: "data_fabric_transport", "NODE_RESUMED");
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        self.parked.lock().unwrap().is_some()
+    }
+
+    /// Live gossip overlays, each with its own timers (a test and
+    /// diagnostics hook for `suspend`).
+    pub async fn active_overlays(&self) -> usize {
+        self.overlays.lock().await.len()
     }
 
     pub async fn close(mut self) {
