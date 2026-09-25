@@ -356,20 +356,30 @@ pub(crate) fn adopt(
             "workspace snapshot does not match candidate",
         ));
     }
+    // Everything that can fail runs before the save: once storage holds the
+    // candidate, live state must take it too, or the next save forks.
+    let workspace_name = staged
+        .workspace
+        .workspace_name()
+        .map_err(security(ErrorCode::Internal))?;
+    let workspace_name_missing_history = staged
+        .workspace
+        .workspace_name_missing_history()
+        .map_err(security(ErrorCode::Internal))?;
+    let joined = matches!(&staged.transition, WorkspaceTransition::Join);
+    if joined {
+        session
+            .activity
+            .clone()
+            .transition(WorkspacePhase::Synchronizing, None)?;
+    }
     persistence::commit_candidate(session, &snapshot)?;
     let staged = session.transition.staged.take().unwrap();
-    let joined = matches!(&staged.transition, WorkspaceTransition::Join);
     let mut value = Adopted {
         workspace: staged.workspace.id(),
-        workspace_name: staged
-            .workspace
-            .workspace_name()
-            .map_err(security(ErrorCode::Internal))?,
+        workspace_name,
         epoch: staged.workspace.epoch(),
-        workspace_name_missing_history: staged
-            .workspace
-            .workspace_name_missing_history()
-            .map_err(security(ErrorCode::Internal))?,
+        workspace_name_missing_history,
         members: staged.workspace.member_count(),
         durable: true,
         state: None,
@@ -389,8 +399,11 @@ pub(crate) fn adopt(
     let missed = crate::ops::publication::missed_since_commit(session, staged.inbox.as_ref());
     session.delivery.publisher = staged.publisher;
     session.delivery.inbox = staged.inbox;
-    if matches!(&staged.transition, WorkspaceTransition::Join) {
-        transition_activity(session, WorkspacePhase::Synchronizing, None)?;
+    if joined
+        && let Err(error) = transition_activity(session, WorkspacePhase::Synchronizing, None)
+    {
+        persistence::mark_uncertain(session);
+        return Err(error);
     }
     commit_workspace(session, staged.workspace);
     let staged_approval_id = session.admission.staged_approval_id;
@@ -569,6 +582,31 @@ pub(crate) fn adopt(
 #[cfg(test)]
 mod tests {
     use crate::*;
+
+    /// A step that would fail after the save must fail before it: storage
+    /// must never hold a state that live state did not take.
+    #[test]
+    fn an_adoption_that_cannot_complete_saves_nothing() {
+        let owner = arachne_security::Workspace::create([109; 32], "Owner").unwrap();
+        let mut session = crate::membership::bare_test_session(owner);
+        let token = crate::persistence::candidate_token().unwrap();
+        session.transition.staged = Some(StagedWorkspace {
+            publisher: None,
+            inbox: None,
+            transition: WorkspaceTransition::Join,
+            workspace: arachne_security::Workspace::create([110; 32], "Joined").unwrap(),
+            snapshot: token.clone(),
+        });
+        // Leaving -> Synchronizing is not a legal activity step.
+        session.activity = WorkspaceActivity {
+            phase: WorkspacePhase::Leaving,
+            reason: None,
+        };
+        let error = super::adopt(&mut session, super::AdoptKind::Join, token.clone()).unwrap_err();
+        assert_eq!(error.code(), arachne_api::ErrorCode::WrongState, "{error:?}");
+        assert!(!crate::persistence::candidate_saved(&session, &token));
+        assert!(session.transition.staged.is_some());
+    }
 
     #[test]
     fn discard_returns_a_staged_admission_batch_to_intake() {

@@ -500,7 +500,9 @@ fn open_new(session: &Session, workspace: [u8; 32]) -> Result<NativeStore, ApiEr
     let config = session.storage.as_ref().ok_or_else(storage_required)?;
     if let Some(store) = provider.open(workspace).map_err(errors::store)? {
         let store = NativeStore::new(store, workspace, config, endpoint, Vec::new());
-        if !store.terminal()? {
+        // An empty store is one whose first save failed: nothing to keep.
+        let empty = store.store.keys(b"").is_empty();
+        if !empty && !store.terminal()? {
             return Err(ApiError::wrong_state(
                 "record store already initialized; restore it",
             ));
@@ -594,6 +596,14 @@ pub(crate) fn commit_candidate(session: &mut Session, token: &[u8]) -> Result<()
         .as_mut()
         .ok_or_else(storage_required)?
         .commit(records, token)
+}
+
+/// Storage may hold a state that live state did not take: stop the session
+/// until it is closed and restored.
+pub(crate) fn mark_uncertain(session: &mut Session) {
+    if let Some(store) = session.records.as_mut() {
+        store.uncertain = true;
+    }
 }
 
 /// Whether the staged candidate `token` is already in storage. A candidate

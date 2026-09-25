@@ -174,3 +174,29 @@ fn create_workspace_is_durable_before_any_adoption() {
     assert_eq!(info.member_count, 1);
     client.close().unwrap();
 }
+
+#[test]
+fn a_failed_first_save_does_not_block_a_retry() {
+    use arachne_security::Workspace;
+    let provider = MemoryProvider::default();
+    let admin = Workspace::create([48; 32], "Administrator").unwrap();
+    let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    drop(registered);
+    let handle = arachne_runtime::create(Some(&[49; 32])).unwrap();
+    arachne_runtime::attach_storage(handle, StorageConfig::memory(&provider)).unwrap();
+    let begin = || {
+        arachne_runtime::execute(
+            handle,
+            &serde_json::to_vec(&json!({"op":"begin_join",
+                "invitation":invite.export_secret_token().as_slice(),
+                "checkpoint":checkpoint,"display_name":"Joiner"}))
+            .unwrap(),
+        )
+    };
+    // The store is created, then its first commit fails.
+    provider.fail_next_commit();
+    assert!(begin().is_err());
+    // The workspace ID comes from the invitation: the retry must work.
+    begin().unwrap();
+    arachne_runtime::close(handle).unwrap();
+}
