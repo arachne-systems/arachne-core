@@ -118,7 +118,13 @@ fn routing_with_detail(error: arachne_routing::Error, detail: String) -> ApiErro
 }
 
 /// A native record store failure.
-pub(crate) fn store(error: impl std::fmt::Display) -> ApiError {
+pub(crate) fn store(error: Box<dyn std::error::Error + Send + Sync>) -> ApiError {
+    if error
+        .downcast_ref::<arachne_store::FormatNotSupported>()
+        .is_some()
+    {
+        return ApiError::format_not_supported(error.to_string());
+    }
     ApiError::storage_failed(error.to_string())
 }
 

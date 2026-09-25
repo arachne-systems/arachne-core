@@ -145,6 +145,15 @@ record index when opening the database and authenticates record ciphertext
 when each record is read. The host remains responsible for protecting the root
 key, filesystem access, backups, and concurrent-open lifecycle.
 
+Stored data is versioned. A store file carries its format (format 1) in the
+SQLite header and in the authenticated head, and the runtime records carry
+their own format record (format 1). There are no legacy readers: an unknown,
+older-than-first or newer format fails with `FormatNotSupported` (code 303)
+before any state is used. A later format change adds a migration step that
+runs on restore and saves the upgraded records in one commit. A new store is
+built in a temporary file and linked into place only when complete, so a crash
+during creation never leaves an empty file that cannot open.
+
 The store's `FreshnessAnchor` detects rollback only when the host saves the
 anchor somewhere independent of the database and verifies it during restore.
 An attacker who can replace the entire database and its only freshness value

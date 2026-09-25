@@ -25,6 +25,16 @@ const INBOX: &[u8] = b"delivery/inbox";
 /// The endpoint key the stored state belongs to. Checked before any state
 /// record is read, so a new endpoint identity gets a clear error.
 const ENDPOINT: &[u8] = b"runtime/endpoint";
+/// The runtime record format (big-endian u32), written with every commit.
+const FORMAT: &[u8] = b"runtime/format";
+/// The runtime record format this build reads and writes.
+pub(crate) const RUNTIME_FORMAT: u32 = 1;
+/// Upgrades one format to the next: `MIGRATIONS[n]` turns format `n + 1`
+/// records into format `n + 2`. Empty: format 1 is the first, and there are
+/// no legacy readers.
+type Migration = fn(&mut SecurityRecords) -> Result<(), ApiError>;
+const MIGRATIONS: &[Migration] = &[];
+const _: () = assert!(MIGRATIONS.len() + 1 == RUNTIME_FORMAT as usize);
 
 // A pending join, with its checkpoint, is one record.
 const _: () = assert!(arachne_security::MAX_SEALED_PENDING_JOIN <= arachne_store::MAX_RECORD_BYTES);
@@ -108,6 +118,10 @@ impl NativeStore {
         }
         records.insert(TOKEN.to_vec(), Zeroizing::new(token.to_vec()));
         records.insert(ENDPOINT.to_vec(), Zeroizing::new(self.endpoint.to_vec()));
+        records.insert(
+            FORMAT.to_vec(),
+            Zeroizing::new(RUNTIME_FORMAT.to_be_bytes().to_vec()),
+        );
         let deleted: Vec<Vec<u8>> = self
             .store
             .keys(b"")
@@ -152,6 +166,41 @@ impl NativeStore {
         Ok(self.store.get(RESET).map_err(errors::store)?.is_some()
             || self.store.get(REMOVED).map_err(errors::store)?.is_some())
     }
+}
+
+/// The format of stored runtime records. Unknown, newer and pre-format
+/// stores fail with `FormatNotSupported`; there is no legacy reader.
+fn stored_format(bytes: Option<&[u8]>) -> Result<u32, ApiError> {
+    let bytes = bytes.ok_or_else(|| {
+        ApiError::format_not_supported(
+            "record store has no runtime format record; it predates format 1 and has no reader",
+        )
+    })?;
+    let found = u32::from_be_bytes(bytes.try_into().map_err(|_| {
+        ApiError::format_not_supported("record store has an invalid runtime format record")
+    })?);
+    if found == 0 || found > RUNTIME_FORMAT {
+        return Err(ApiError::format_not_supported(format!(
+            "runtime record format {found} is newer than supported format {RUNTIME_FORMAT}"
+        )));
+    }
+    Ok(found)
+}
+
+/// Upgrade `records` from format `from` with `migrations` (the migration
+/// hook). Records at the current format are unchanged.
+fn migrate(
+    records: &mut SecurityRecords,
+    from: u32,
+    migrations: &[Migration],
+) -> Result<bool, ApiError> {
+    let pending = migrations
+        .get(from as usize - 1..)
+        .ok_or_else(|| ApiError::format_not_supported(format!("no migration from format {from}")))?;
+    for migration in pending {
+        migration(records)?;
+    }
+    Ok(!pending.is_empty())
 }
 
 fn uncertain() -> ApiError {
@@ -495,16 +544,38 @@ pub(crate) fn restore(
     if get(RESET)?.is_some() {
         return Err(ApiError::wrong_state("native record store was reset"));
     }
+    let format = stored_format(get(FORMAT)?.as_deref().map(|bytes| bytes.as_slice()))?;
     let endpoint = session.node.id();
     if get(ENDPOINT)?.as_deref().map(|bytes| bytes.as_slice()) != Some(endpoint.as_slice()) {
         return Err(ApiError::wrong_state(
             "the stored workspace belongs to a different endpoint key; restore it with that endpoint identity",
         ));
     }
+    let mut store = NativeStore::new(store, endpoint, committed);
+    if format != RUNTIME_FORMAT {
+        // The migration hook: upgrade every record, then save them as one
+        // commit before any is used.
+        let mut records: SecurityRecords = store
+            .store
+            .keys(b"")
+            .into_iter()
+            .map(|name| {
+                let value = store.store.get(&name).map_err(errors::store)?;
+                Ok((name, value.ok_or_else(|| corrupt("missing record"))?))
+            })
+            .collect::<Result<_, ApiError>>()?;
+        if migrate(&mut records, format, MIGRATIONS)? {
+            let token = store.committed.clone();
+            store.commit(records, &token)?;
+        }
+    }
+    let (store, committed) = (store.store, store.committed);
+    let get = |name: &[u8]| store.get(name).map_err(errors::store);
     let keys = store.keys(b"");
     if let Some(bytes) = get(PENDING)? {
         if keys.iter().any(|name| {
-            ![PENDING, TOKEN, ENDPOINT, JOIN_LIFECYCLE, ACTIVITY].contains(&name.as_slice())
+            ![PENDING, TOKEN, ENDPOINT, FORMAT, JOIN_LIFECYCLE, ACTIVITY]
+                .contains(&name.as_slice())
         }) {
             return Err(corrupt("pending store contains other lifecycle state"));
         }
@@ -540,7 +611,7 @@ pub(crate) fn restore(
         return Ok(Restored::Pending(value));
     }
     if let Some(bytes) = get(REMOVED)? {
-        if keys.len() != 3 {
+        if keys.len() != 4 {
             return Err(corrupt("removed store contains active state"));
         }
         let removed = arachne_security::RemovedMembership::restore(
@@ -560,7 +631,7 @@ pub(crate) fn restore(
     }
     for name in &keys {
         if !name.starts_with(b"security/")
-            && ![TOKEN, ENDPOINT, INBOX, ACTIVITY].contains(&name.as_slice())
+            && ![TOKEN, ENDPOINT, FORMAT, INBOX, ACTIVITY].contains(&name.as_slice())
         {
             return Err(corrupt("unknown native runtime record"));
         }
@@ -642,6 +713,10 @@ pub fn seed_workspace(
     let mut store_records = records;
     store_records.insert(TOKEN.to_vec(), Zeroizing::new(candidate_token().map_err(errors::text)?));
     store_records.insert(ENDPOINT.to_vec(), Zeroizing::new(owner.endpoint().to_vec()));
+    store_records.insert(
+        FORMAT.to_vec(),
+        Zeroizing::new(RUNTIME_FORMAT.to_be_bytes().to_vec()),
+    );
     let stale: Vec<Vec<u8>> = store
         .keys(b"")
         .into_iter()
@@ -655,4 +730,31 @@ pub fn seed_workspace(
     let revision = store.revision();
     store.commit(revision, &changes).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn to_format_two(records: &mut SecurityRecords) -> Result<(), ApiError> {
+        records.insert(b"runtime/added".to_vec(), Zeroizing::new(vec![2]));
+        Ok(())
+    }
+
+    #[test]
+    fn the_migration_hook_runs_each_step_from_the_stored_format() {
+        let mut records = SecurityRecords::new();
+        // Current format: nothing to do.
+        assert!(!migrate(&mut records, 1, MIGRATIONS).unwrap());
+        // A later build with one step (format 1 to 2) upgrades format 1 records.
+        assert!(migrate(&mut records, 1, &[to_format_two]).unwrap());
+        assert_eq!(records[b"runtime/added".as_slice()].as_slice(), [2]);
+        assert!(!migrate(&mut records, 2, &[to_format_two]).unwrap());
+        assert_eq!(stored_format(None).unwrap_err().code(), ErrorCode::FormatNotSupported);
+        assert_eq!(
+            stored_format(Some(&2u32.to_be_bytes())).unwrap_err().code(),
+            ErrorCode::FormatNotSupported
+        );
+        assert_eq!(stored_format(Some(&1u32.to_be_bytes())).unwrap(), 1);
+    }
 }

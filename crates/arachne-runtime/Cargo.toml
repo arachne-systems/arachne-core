@@ -37,4 +37,6 @@ zeroize = "1.9.0"
 base64 = "0.22.1"
 # Exact pin: must match arachne-node's iroh pin (unstable custom-transport API).
 iroh = { version = "=1.2.0", default-features = false, features = ["tls-ring", "metrics", "test-utils"] }
+# Test only: edits a store file header as a later build would.
+rusqlite = "0.40.2"
 tempfile = "3.27.0"
