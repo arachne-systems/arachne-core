@@ -18,7 +18,8 @@ pub const FORMAT_NOT_SUPPORTED: &str = "workspace format not supported; create t
 /// Standalone transport form of one step.
 const TRANSPORT: &[u8; 5] = b"DFMS\x03";
 
-/// Largest commit a step may carry. Management commits are capped at 64 KiB
+/// Largest commit a step may carry. Membership commits are capped at
+/// `MAX_MEMBERSHIP_COMMIT`
 /// by the verifier; this bound only keeps a decoder from trusting a length.
 const MAX_STEP_COMMIT: usize = 1024 * 1024;
 

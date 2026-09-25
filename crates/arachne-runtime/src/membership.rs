@@ -216,7 +216,24 @@ impl JoinStep {
 /// store: a history record holds up to 1 MiB, and a step must fit one
 /// control reply. It bounds anchor proofs far below the security crate's
 /// 2 MiB decoder bound.
-pub(crate) const MAX_WIRE_STEP: usize = 96 * 1024;
+pub(crate) const MAX_WIRE_STEP: usize =
+    arachne_security::MAX_MEMBERSHIP_COMMIT + MAX_STEP_AUTHORIZATION;
+
+/// The largest authorization a step carries besides its commit: a full
+/// admission batch (key and two signatures per admission) and the codec
+/// header. Anchor proofs must fit in this too.
+const MAX_STEP_AUTHORIZATION: usize = 20 * 1024 + 1024;
+
+/// The transport cap and the verifier bound move together (B3c): one step
+/// of the largest verifiable size, plus the reply envelope, fits one
+/// control reply, so every step a node accepts it can also serve.
+const _: () = assert!(
+    arachne_security::MAX_MEMBERSHIP_COMMIT
+        + arachne_security::MAX_ADMISSION_BATCH * (32 + 64 + 64)
+        + 16
+        <= MAX_WIRE_STEP
+);
+const _: () = assert!(MAX_WIRE_STEP + 1024 <= arachne_node::MAX_CONTROL_REPLY);
 
 /// A short, informational name for a step's kind.
 pub(crate) fn step_kind(auth: &arachne_security::MembershipAuthorization) -> &'static str {

@@ -479,3 +479,30 @@ fn a_step_near_the_commit_bound_fits_one_binary_range_reply() {
     let json = serde_json::to_vec(&serde_json::json!({"commit": commit})).unwrap();
     assert!(json.len() > arachne_node::MAX_CONTROL_REPLY, "{}", json.len());
 }
+
+/// B3c: the transport cap moves with the verifier bound. A step of the
+/// largest verifiable size (a full admission batch around a commit at
+/// `MAX_MEMBERSHIP_COMMIT`) is accepted, wrapped and served in one reply.
+#[test]
+fn a_step_at_the_verifier_bound_is_accepted_and_served_in_one_reply() {
+    let auth = |n: u8| arachne_security::AdmissionAuthorization {
+        invitation_key: [n; 32],
+        grant_signature: [n; 64],
+        redemption_signature: [n; 64],
+    };
+    let authorization = arachne_security::MembershipAuthorization::AdmissionBatch(
+        (0..arachne_security::MAX_ADMISSION_BATCH as u8).map(auth).collect(),
+    );
+    let commit = vec![3; arachne_security::MAX_MEMBERSHIP_COMMIT];
+    let step = super::encode_step(&authorization, &commit).unwrap();
+    assert!(super::JoinStep::binary(step.clone(), None).parts().is_ok());
+    let wire = super::wire_step(&step, None, usize::MAX).unwrap();
+    let reply = encode_range_reply(&RangeReply {
+        workspace: [1; 32],
+        after: 0,
+        steps: vec![&wire],
+    })
+    .unwrap();
+    assert!(reply.len() <= arachne_node::MAX_CONTROL_REPLY, "{}", reply.len());
+    assert!(arachne_security::MAX_MEMBERSHIP_COMMIT > 64 * 1024);
+}

@@ -11,7 +11,12 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::{OpenMlsProvider, crypto::OpenMlsCrypto};
 use sha2::{Digest, Sha256};
 
-const MAX_BYTES: usize = 64 * 1024;
+/// Largest membership commit a verifier accepts. Raised from 64 KiB with the
+/// runtime transport (B3c): steps now travel binary in 128 KiB pages, and a
+/// commit grows about 82 bytes per member that never self-updated, so 96 KiB
+/// holds about 1,170 such members.
+pub const MAX_MEMBERSHIP_COMMIT: usize = 96 * 1024;
+const MAX_BYTES: usize = MAX_MEMBERSHIP_COMMIT;
 /// Bound for this device's own group state re-read for verification. It never
 /// crosses the network, so the 64 KiB wire bound does not apply: GroupInfo
 /// with the ratchet tree passes 64 KiB near 250 members (measured ~255 B per

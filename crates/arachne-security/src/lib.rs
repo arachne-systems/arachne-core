@@ -64,7 +64,7 @@ mod storage;
 pub use bootstrap::{
     AdmissionAuthorization, HISTORY_CHUNK_STEPS, JoinProof, MAX_CHECKPOINT, MAX_CHECKPOINT_PIN,
     MAX_CHECKPOINT_TREE, MAX_JOIN_HISTORY_BYTES, MAX_JOIN_HISTORY_STEPS, MembershipAuthorization,
-    MembershipVerifier, admission_asserted_time, checkpoint_digest,
+    MAX_MEMBERSHIP_COMMIT, MembershipVerifier, admission_asserted_time, checkpoint_digest,
 };
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
