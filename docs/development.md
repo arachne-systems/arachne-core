@@ -29,19 +29,24 @@ Use the Rust 1.98.0 toolchain recorded in the root README:
 
 ```sh
 cargo +1.98.0 check --locked --workspace
-cargo +1.98.0 test --locked --workspace -- --test-threads=1
+cargo +1.98.0 test --locked --workspace --exclude arachne-runtime -- --test-threads=1
+cargo +1.98.0 test --locked -p arachne-runtime
 ```
 
 Published manifests declare Rust 1.91 as the MSRV. Verify that claim with
 `cargo +1.91.0 check --locked --workspace` before changing the dependency lock.
 
-Run from the repository root. `arachne-runtime` tests no longer share
-process-wide session state: each session belongs to a `Context` with its own
-limits, connection budget and runtime, and the default context allows 64
-sessions. So they need no `--test-threads=1` for a shared session cap; a
-full parallel run of the crate is still to be confirmed. The workspace command keeps
-`--test-threads=1` for the other crates; `tests/nearby_invitation.rs` keeps its
-own lock because its scenarios share LAN discovery. The
+Run from the repository root. `arachne-runtime` tests run with the default
+thread count: each session belongs to a `Context` with its own limits,
+connection budget and runtime (the default context allows 64 sessions), and
+no runtime test holds a process-wide lock except `tests/nearby_invitation.rs`,
+whose scenarios share LAN discovery. The other crates still run serially.
+Some runtime tests are slow in a debug build and CPU-bound, not serialized
+(measured on a 4-CPU slice): the lib test
+`membership::gossiped_names_from_a_join_wave_survive_until_their_steps_land`
+(about 12 minutes), `tests/record_storage.rs` (about 12 minutes), and
+`hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots`
+in `tests/native_persistence.rs` (about 26 minutes alone). The
 workspace build and tests are Rust checks; they do not build the Android plugin,
 load the library through JNI, or validate an ATAK host/device deployment.
 
