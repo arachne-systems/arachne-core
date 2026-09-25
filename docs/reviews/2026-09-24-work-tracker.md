@@ -3,16 +3,11 @@
 Source: [architecture review](2026-09-24-architecture-review.md). Tick each box only after its
 test is red → green and the crate tests pass.
 
-## PAUSED 2026-09-24 ~21:50 (weekly usage limit) — resume notes
+## PAUSED 2026-09-24 — see the handoff package
 
-- Integration branch: `integrate/wave1` at `bc2a2d1` (worktree `arachne-core-integrate`). Last full suite before A2-runtime merge: 526 pass / 0 fail. Post-merge full suite was stopped at 26 pass / 0 fail — rerun first.
-- In flight (agents stopped; work on disk, not lost):
-  - `feat/a2-forks` (A2 steps 8–13): 16 commits ahead + 7 uncommitted files. Was starting the delivery re-publish step.
-  - `feat/a5-storage` (A5 + A3g + 1 MiB record ceiling + A2 branch-record needs): 10 commits ahead, **merge of integrate/wave1 in progress** with 76 uncommitted files. Finish or `git merge --abort` first.
-  - `feat/a4-context` test-speed task (dep opt-level): 1 uncommitted file (Cargo.toml profile experiment), nothing committed.
-- SDK: `feat/uniffi-sdk` (arachne-sdk worktree `arachne-sdk-uniffi`): pipeline + stable surface + Android AAR done; waits on A5 (storage) and A2 (management). Core submodule pinned to local-only `2205887`.
-- Rules: build under `flock <worktrees>/.cargo-build.lock ... --no-run`, run tests outside the lock pinned (`taskset`), nice 19, 4 jobs; clean finished `target/` dirs (disk fills fast).
-- Needs owner OK: push branches, crates.io publish (A9e), upstream Go generator patch.
+All open work is described in [`handoff/README.md`](handoff/README.md) (briefs H1–H8).
+In-flight work is committed as WIP: `feat/a2-forks` `df5dcec`, `feat/a5-storage` `0119662`
+(merge, not built), `feat/a4-context` `f84acfe`. Integration head: `integrate/wave1` `bc2a2d1`.
 
 ## Fix-now bugs (core)
 
