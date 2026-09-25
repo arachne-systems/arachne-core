@@ -160,8 +160,25 @@ An attacker who can replace the entire database and its only freshness value
 can roll both back together. Key loss also means stored state cannot be
 recovered by Core.
 
-The runtime exposes the anchor through `record_freshness` and checks it in
-`restore_workspace` when the host passes the saved anchor. The check is exact equality, not
+Where the platform supplies monotonic storage (a hardware-backed keystore,
+a counter, or storage an attacker who replaces the database files cannot roll
+back), the host passes it as an `AnchorStore` with
+`StorageConfig::with_anchors`. Core then keeps the anchor itself and restore
+requires it (B9):
+
+- Before each commit, core saves two slots: `current` (the last confirmed
+  anchor) and `next` (the anchor the commit will produce). After the commit
+  and its read-back, it saves `next` as the new `current`.
+- Restore accepts the store only if it matches `current` or `next`. A
+  rolled-back database matches neither and is refused with `CandidateStale`.
+  A crash between a commit and its confirmation matches `next`, so it
+  restores, and core confirms that anchor.
+- A missing anchor fails closed. If the anchor save fails, the session stops
+  (uncertain outcome) until it is closed and restored.
+
+Without monotonic storage the anchor stays optional. The runtime exposes it
+through `record_freshness`, and `restore_workspace` checks it when the host
+passes the saved anchor. The check is exact equality, not
 "at least this revision". Two stores for the same workspace and root share one
 key, so an old file from an earlier lineage can have a higher revision and
 still authenticate. A rollback that is accepted replays MLS state and reuses

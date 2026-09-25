@@ -100,7 +100,10 @@ pub use client::{
     RestoredJoin, RestoredWorkspace, InvitationCandidate, JoinCandidate, RemovalCandidate, RouteKind, WorkspaceCandidate, WorkspaceInfo, WorkspaceMetrics, WorkspaceState,
 };
 pub use client::{OperatorRelay, RelayTrust, TransportInfo, TransportOptions, TransportTimeouts};
-pub use arachne_store::{FreshnessAnchor, MemoryProvider, SqliteProvider, Storage, StorageProvider};
+pub use arachne_store::{
+    AnchorSlots, AnchorStore, FreshnessAnchor, MemoryAnchors, MemoryProvider, SqliteProvider,
+    Storage, StorageProvider,
+};
 pub use persistence::{StorageConfig, attach_storage, record_freshness};
 pub use workspace_activity::{Activity as WorkspaceActivity, Phase as WorkspacePhase};
 pub use errors::legacy_text;

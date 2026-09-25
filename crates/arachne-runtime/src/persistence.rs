@@ -11,7 +11,10 @@ use crate::ops::join::PendingJoinInfo;
 use crate::ops::workspace::WorkspaceOpened;
 use arachne_api::{ApiError, ErrorCode};
 use arachne_security::{SecurityRecords, Workspace};
-use arachne_store::{FreshnessAnchor, MemoryProvider, SqliteProvider, Storage, StorageProvider};
+use arachne_store::{
+    AnchorSlots, AnchorStore, FreshnessAnchor, MemoryProvider, SqliteProvider, Storage,
+    StorageProvider,
+};
 use std::path::Path;
 use zeroize::Zeroizing;
 
@@ -44,10 +47,16 @@ const _: () = assert!(arachne_security::MAX_SEALED_PENDING_JOIN <= arachne_store
 /// `root` is the host's storage root key. It is not the endpoint secret:
 /// a session without an endpoint secret can persist, and a new endpoint
 /// identity does not change how the store is read.
+///
+/// With [`StorageConfig::with_anchors`] (monotonic host storage), core saves
+/// the freshness anchor with every commit and restore requires a match: a
+/// rolled-back database is refused. Without it the anchor is optional: the
+/// host may save `record_freshness` itself and pass it to restore.
 #[derive(Clone)]
 pub struct StorageConfig {
     provider: Arc<dyn StorageProvider>,
     root: Arc<Zeroizing<[u8; 32]>>,
+    anchors: Option<Arc<dyn AnchorStore>>,
 }
 
 impl StorageConfig {
@@ -55,7 +64,15 @@ impl StorageConfig {
         Self {
             provider,
             root: Arc::new(Zeroizing::new(root)),
+            anchors: None,
         }
+    }
+
+    /// Keep freshness anchors in the platform's monotonic storage. Restore
+    /// then requires the saved anchor.
+    pub fn with_anchors(mut self, anchors: Arc<dyn AnchorStore>) -> Self {
+        self.anchors = Some(anchors);
+        self
     }
 
     /// Encrypted SQLite files in a private directory, all under `root`.
@@ -90,6 +107,8 @@ impl Eq for StorageConfig {}
 
 pub(crate) struct NativeStore {
     store: Box<dyn Storage>,
+    scope: [u8; 32],
+    anchors: Option<Arc<dyn AnchorStore>>,
     endpoint: [u8; 32],
     committed: Vec<u8>,
     /// A commit failed or did not read back. The durable outcome is unknown,
@@ -98,9 +117,17 @@ pub(crate) struct NativeStore {
 }
 
 impl NativeStore {
-    fn new(store: Box<dyn Storage>, endpoint: [u8; 32], committed: Vec<u8>) -> Self {
+    fn new(
+        store: Box<dyn Storage>,
+        scope: [u8; 32],
+        config: &StorageConfig,
+        endpoint: [u8; 32],
+        committed: Vec<u8>,
+    ) -> Self {
         Self {
             store,
+            scope,
+            anchors: config.anchors.clone(),
             endpoint,
             committed,
             uncertain: false,
@@ -136,13 +163,41 @@ impl NativeStore {
         }
         changes.extend(deleted.iter().map(|name| (name.as_slice(), None)));
         let revision = self.store.revision();
-        if let Err(error) = self.store.commit(revision, &changes) {
+        let current = self.store.freshness();
+        let (scope, anchors) = (self.scope, self.anchors.clone());
+        let committed = match &anchors {
+            // Name the coming state first, so a crash after the commit and
+            // before its confirmation still restores.
+            Some(anchors) => self.store.commit_anchored(revision, &changes, &mut |next| {
+                anchors.save(
+                    scope,
+                    AnchorSlots {
+                        current,
+                        next: Some(next),
+                    },
+                )
+            }),
+            None => self.store.commit(revision, &changes),
+        };
+        if let Err(error) = committed {
             self.uncertain = true;
             return Err(errors::store(error));
         }
         if let Err(error) = self.read_back(&records) {
             self.uncertain = true;
             return Err(error);
+        }
+        if let Some(anchors) = &anchors {
+            let confirmed = AnchorSlots {
+                current: self.store.freshness(),
+                next: None,
+            };
+            if let Err(error) = anchors.save(scope, confirmed) {
+                self.uncertain = true;
+                return Err(ApiError::storage_failed(format!(
+                    "freshness anchor was not confirmed: {error}"
+                )));
+            }
         }
         self.committed = token.to_vec();
         Ok(())
@@ -348,8 +403,9 @@ fn open_new(session: &Session, workspace: [u8; 32]) -> Result<NativeStore, ApiEr
     }
     let provider = &session.storage.as_ref().ok_or_else(storage_required)?.provider;
     let endpoint = session.node.id();
+    let config = session.storage.as_ref().ok_or_else(storage_required)?;
     if let Some(store) = provider.open(workspace).map_err(errors::store)? {
-        let store = NativeStore::new(store, endpoint, Vec::new());
+        let store = NativeStore::new(store, workspace, config, endpoint, Vec::new());
         if !store.terminal()? {
             return Err(ApiError::wrong_state(
                 "record store already initialized; restore it",
@@ -359,6 +415,8 @@ fn open_new(session: &Session, workspace: [u8; 32]) -> Result<NativeStore, ApiEr
     }
     Ok(NativeStore::new(
         provider.create(workspace).map_err(errors::store)?,
+        workspace,
+        config,
         endpoint,
         Vec::new(),
     ))
@@ -518,7 +576,8 @@ pub(crate) fn restore(
     if session.workspace.is_some() || session.join.pending.is_some() || session.records.is_some() {
         return Err(ApiError::wrong_state("session already owns a workspace"));
     }
-    let provider = &session.storage.as_ref().ok_or_else(storage_required)?.provider;
+    let config = session.storage.as_ref().ok_or_else(storage_required)?.clone();
+    let provider = &config.provider;
     // An absent store must never become a new empty one.
     let store = provider
         .open(workspace)
@@ -532,6 +591,35 @@ pub(crate) fn restore(
         return Err(ApiError::candidate_stale(
             "record store freshness anchor mismatch",
         ));
+    }
+    // With monotonic anchor storage the anchor is required.
+    if let Some(anchors) = &config.anchors {
+        let slots = anchors
+            .load(workspace)
+            .map_err(errors::store)?
+            .ok_or_else(|| {
+                ApiError::candidate_stale(
+                    "no saved freshness anchor for this workspace; restore refused",
+                )
+            })?;
+        let found = store.freshness();
+        if !slots.accepts(found) {
+            return Err(ApiError::candidate_stale(
+                "record store freshness anchor mismatch",
+            ));
+        }
+        if slots.current != found {
+            // The last commit landed; confirm its anchor now.
+            anchors
+                .save(
+                    workspace,
+                    AnchorSlots {
+                        current: found,
+                        next: None,
+                    },
+                )
+                .map_err(errors::store)?;
+        }
     }
     let get = |name: &[u8]| store.get(name).map_err(errors::store);
     let corrupt = |detail: &str| ApiError::storage_corrupt(detail);
@@ -551,7 +639,7 @@ pub(crate) fn restore(
             "the stored workspace belongs to a different endpoint key; restore it with that endpoint identity",
         ));
     }
-    let mut store = NativeStore::new(store, endpoint, committed);
+    let mut store = NativeStore::new(store, workspace, &config, endpoint, committed);
     if format != RUNTIME_FORMAT {
         // The migration hook: upgrade every record, then save them as one
         // commit before any is used.
@@ -607,7 +695,7 @@ pub(crate) fn restore(
         session.activity = activity;
         session.join.lifecycle = lifecycle;
         session.join.pending = Some(pending);
-        session.records = Some(NativeStore::new(store, endpoint, committed));
+        session.records = Some(NativeStore::new(store, workspace, &config, endpoint, committed));
         return Ok(Restored::Pending(value));
     }
     if let Some(bytes) = get(REMOVED)? {
@@ -674,7 +762,7 @@ pub(crate) fn restore(
     session.delivery.inbox = inbox;
     commit_workspace(session, owner);
     value.activity = session.activity.view();
-    session.records = Some(NativeStore::new(store, endpoint, committed));
+    session.records = Some(NativeStore::new(store, workspace, &config, endpoint, committed));
     Ok(Restored::Opened(value))
 }
 

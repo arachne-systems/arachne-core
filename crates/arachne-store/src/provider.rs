@@ -21,7 +21,77 @@ pub trait Storage: Send {
     /// Keys from the accepted index with `prefix`, in byte order.
     fn keys(&self, prefix: &[u8]) -> Vec<Vec<u8>>;
     fn get(&self, name: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>>;
-    fn commit(&mut self, expected_revision: u64, changes: &[Change<'_>]) -> Result<u64>;
+    /// Commit `changes`, first giving `before` the anchor the commit will
+    /// produce. If `before` fails, nothing is committed.
+    fn commit_anchored(
+        &mut self,
+        expected_revision: u64,
+        changes: &[Change<'_>],
+        before: &mut dyn FnMut(FreshnessAnchor) -> Result<()>,
+    ) -> Result<u64>;
+    fn commit(&mut self, expected_revision: u64, changes: &[Change<'_>]) -> Result<u64> {
+        self.commit_anchored(expected_revision, changes, &mut |_| Ok(()))
+    }
+}
+
+/// The freshness anchors of one scope in the host's monotonic storage (for
+/// example a hardware-backed keystore or counter). `current` is the anchor of
+/// the last confirmed commit; `next` is set just before a commit and names
+/// the state that commit produces, so a crash between the commit and its
+/// confirmation still restores.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnchorSlots {
+    pub current: FreshnessAnchor,
+    pub next: Option<FreshnessAnchor>,
+}
+
+impl AnchorSlots {
+    /// Whether a store with `anchor` is the latest one these slots allow.
+    pub fn accepts(&self, anchor: FreshnessAnchor) -> bool {
+        anchor == self.current || self.next == Some(anchor)
+    }
+}
+
+/// Host storage that an attacker who replaces the database files cannot roll
+/// back. With it, restore requires a matching anchor.
+pub trait AnchorStore: Send + Sync {
+    fn load(&self, scope: [u8; 32]) -> Result<Option<AnchorSlots>>;
+    fn save(&self, scope: [u8; 32], slots: AnchorSlots) -> Result<()>;
+}
+
+/// Anchors in process memory (tests), with a fault switch.
+#[derive(Default)]
+pub struct MemoryAnchors {
+    slots: Mutex<BTreeMap<[u8; 32], AnchorSlots>>,
+    fail_confirmations: AtomicBool,
+}
+
+impl MemoryAnchors {
+    /// Saves that confirm a commit (no `next` slot) fail while on.
+    pub fn fail_confirmations(&self, on: bool) {
+        self.fail_confirmations.store(on, Ordering::SeqCst);
+    }
+}
+
+impl AnchorStore for MemoryAnchors {
+    fn load(&self, scope: [u8; 32]) -> Result<Option<AnchorSlots>> {
+        Ok(self
+            .slots
+            .lock()
+            .map_err(|_| "anchor storage poisoned")?
+            .get(&scope)
+            .copied())
+    }
+    fn save(&self, scope: [u8; 32], slots: AnchorSlots) -> Result<()> {
+        if slots.next.is_none() && self.fail_confirmations.load(Ordering::SeqCst) {
+            return Err("injected anchor confirmation failure".into());
+        }
+        self.slots
+            .lock()
+            .map_err(|_| "anchor storage poisoned")?
+            .insert(scope, slots);
+        Ok(())
+    }
 }
 
 impl Storage for Store {
@@ -37,8 +107,13 @@ impl Storage for Store {
     fn get(&self, name: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>> {
         Store::get(self, name)
     }
-    fn commit(&mut self, expected_revision: u64, changes: &[Change<'_>]) -> Result<u64> {
-        Store::commit(self, expected_revision, changes)
+    fn commit_anchored(
+        &mut self,
+        expected_revision: u64,
+        changes: &[Change<'_>],
+        before: &mut dyn FnMut(FreshnessAnchor) -> Result<()>,
+    ) -> Result<u64> {
+        Store::commit_anchored(self, expected_revision, changes, before)
     }
 }
 
@@ -149,6 +224,18 @@ impl MemoryProvider {
     }
 }
 
+fn anchor_of(records: &Records) -> FreshnessAnchor {
+    let index: Index = records
+        .values
+        .iter()
+        .map(|(name, value)| (name.clone(), Sha256::digest(value.as_slice()).into()))
+        .collect();
+    FreshnessAnchor {
+        revision: records.revision,
+        digest: index_digest(&index),
+    }
+}
+
 struct MemoryStorage {
     shared: Arc<Shared>,
     records: Arc<Mutex<Records>>,
@@ -165,16 +252,7 @@ impl Storage for MemoryStorage {
         self.records().revision
     }
     fn freshness(&self) -> FreshnessAnchor {
-        let records = self.records();
-        let index: Index = records
-            .values
-            .iter()
-            .map(|(name, value)| (name.clone(), Sha256::digest(value.as_slice()).into()))
-            .collect();
-        FreshnessAnchor {
-            revision: records.revision,
-            digest: index_digest(&index),
-        }
+        anchor_of(&self.records())
     }
     fn keys(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
         self.records()
@@ -193,7 +271,12 @@ impl Storage for MemoryStorage {
         }
         Ok(value)
     }
-    fn commit(&mut self, expected_revision: u64, changes: &[Change<'_>]) -> Result<u64> {
+    fn commit_anchored(
+        &mut self,
+        expected_revision: u64,
+        changes: &[Change<'_>],
+        before: &mut dyn FnMut(FreshnessAnchor) -> Result<()>,
+    ) -> Result<u64> {
         let mut records = self.records();
         if expected_revision != records.revision {
             return Err("stale record revision".into());
@@ -224,6 +307,7 @@ impl Storage for MemoryStorage {
             .revision
             .checked_add(1)
             .ok_or("record revision exhausted")?;
+        before(anchor_of(&next))?;
         *records = next;
         Ok(records.revision)
     }

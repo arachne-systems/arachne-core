@@ -108,8 +108,11 @@ is no import of old state: an import would be a rollback.
 The host still protects the root key and the storage directory. See
 [Security](security.md#local-persistence).
 
-Rollback detection needs a freshness anchor that the host keeps outside the
-database:
+Rollback detection needs a freshness anchor kept outside the database. If
+the platform has monotonic storage, give it to core with
+`StorageConfig::with_anchors(anchor_store)`: core saves the anchor with every
+commit and restore requires it (see [Security](security.md#local-persistence)).
+Otherwise the host keeps the anchor:
 
 - Call `record_freshness` (or `Client::record_freshness`) after every call that
   can commit, and persist the anchor before you release that call's result.

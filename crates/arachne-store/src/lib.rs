@@ -340,6 +340,18 @@ impl Store {
     /// packets. A failed commit leaves this owner at the prior revision; if I/O
     /// makes the outcome uncertain, close/reopen before attempting another write.
     pub fn commit(&mut self, expected_revision: u64, changes: &[Change<'_>]) -> Result<u64> {
+        self.commit_anchored(expected_revision, changes, &mut |_| Ok(()))
+    }
+
+    /// `commit`, but first give the anchor this commit will produce to
+    /// `before` (to save it in monotonic storage). If `before` fails,
+    /// nothing is committed.
+    pub fn commit_anchored(
+        &mut self,
+        expected_revision: u64,
+        changes: &[Change<'_>],
+        before: &mut dyn FnMut(FreshnessAnchor) -> Result<()>,
+    ) -> Result<u64> {
         if expected_revision != self.revision {
             return Err("stale record revision".into());
         }
@@ -385,6 +397,10 @@ impl Store {
             sealed.push((*name, value));
         }
         let head = self.seal_head(revision, &index)?;
+        before(FreshnessAnchor {
+            revision,
+            digest: index_digest(&index),
+        })?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -469,7 +485,10 @@ impl Store {
 }
 
 mod provider;
-pub use provider::{MemoryProvider, SqliteProvider, Storage, StorageProvider};
+pub use provider::{
+    AnchorSlots, AnchorStore, MemoryAnchors, MemoryProvider, SqliteProvider, Storage,
+    StorageProvider,
+};
 
 #[cfg(test)]
 mod tests;
