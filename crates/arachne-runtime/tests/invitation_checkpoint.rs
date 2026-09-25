@@ -241,42 +241,18 @@ fn ordinary_member_serves_the_checkpoint_it_joined_from_after_issuer_closes() {
             "checkpoint":fetched["checkpoint"]}),
     )
     .unwrap();
+    // Only administrators admit (ADR A2): the ordinary member serves the
+    // checkpoint, but refuses the admission itself so the joiner asks an
+    // administrator.
     let peer = helper_node["endpoint_key"].clone();
-    let retry_peer = peer.clone();
     let admission = std::thread::spawn(move || {
         call(late, json!({"op":"request_admission","peer":peer})).unwrap()
     });
-    assert_eq!(serve_once(helper), json!({"state":"admission_queued"}));
-    let staged = serve_once(helper);
-    assert_eq!(staged["state"], "awaiting_save");
-    call(
-        helper,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
-    )
-    .unwrap();
-    let retry = std::thread::spawn(move || {
-        call(late, json!({"op":"request_admission","peer":retry_peer})).unwrap()
-    });
-    // The result is retained, so this retry is an inquiry: the
-    // committed view answers it and the host sees no event.
-    // The owner holds the request's exchange and writes the committed
-    // result onto it after save and adopt (event-driven admission).
-    assert!(admission.join().unwrap()["commits"].is_array());
-    let reply = retry.join().unwrap();
-    assert_eq!(reply["commits"].as_array().unwrap().len(), 2);
-    let joined = call(
-        late,
-        json!({"op":"stage_join","welcome":reply["welcome"],"commits":reply["commits"]}),
-    )
-    .unwrap();
-    assert_eq!(
-        call(
-            late,
-            json!({"op":"adopt_join","snapshot":joined["snapshot"]})
-        )
-        .unwrap()["members"],
-        3
-    );
+    let served = serve_once(helper);
+    assert_eq!(served["reason"], "administrator_required", "{served}");
+    let refused = admission.join().unwrap();
+    assert_eq!(refused["state"], "admission_unavailable", "{refused}");
+    assert_eq!(refused["reason"], "administrator_required", "{refused}");
     for handle in [helper, late] {
         close(handle).unwrap();
     }

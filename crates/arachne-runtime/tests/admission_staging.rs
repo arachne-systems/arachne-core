@@ -311,7 +311,7 @@ fn admission_batch_staging_keeps_committing_under_continuous_intake() {
                         // retained -- that is also success, just observed
                         // late, not a failure.
                         assert!(
-                            value["state"] == "admission_queued" || value["commit"].is_array(),
+                            value["state"] == "admission_queued" || value["commits"].is_array(),
                             "unexpected initial admission reply: {value}"
                         );
                         return;

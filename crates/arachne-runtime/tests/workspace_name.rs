@@ -425,6 +425,18 @@ fn rust_workspace_driver_converges_same_epoch_name_from_presence() {
         json!({"op":"add_address_hint","peer":admin_info["endpoint_key"],"address":loopback(&admin_info)}),
     )
     .unwrap();
+    // The new member's Rust driver self-updates through the administrator
+    // first (B3c policy); the rename below then lands at the same epoch.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        call(admin, json!({"op":"drive_workspace"})).unwrap();
+        let value = call(member, json!({"op":"drive_workspace"})).unwrap();
+        if value["state"] == "self_update_committed" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no self-update: {value}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     // Consume the initial announcement so the rename below must trigger its
     // own native presence packet.
     call(
@@ -455,7 +467,10 @@ fn rust_workspace_driver_converges_same_epoch_name_from_presence() {
     let committed = loop {
         call(member, json!({"op":"poll_admission"})).unwrap();
         call(admin, json!({"op":"poll_workspace_presence"})).unwrap();
-        call(admin, json!({"op":"poll_admission"})).unwrap();
+        // The admin's Rust driver, like a host: it saves and adopts what it
+        // stages (for example the member's own self-update, B3c).
+        let tick = call(admin, json!({"op":"drive_workspace"})).unwrap();
+        let _ = tick;
         let value = call(member, json!({"op":"drive_workspace"})).unwrap();
         if value["state"] == "workspace_name_committed" {
             break value;

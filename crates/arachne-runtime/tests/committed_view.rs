@@ -160,7 +160,7 @@ fn a_retained_result_is_answered_while_the_host_never_polls() {
         admitted.is_some()
     }));
     let admitted: Value = admitted.unwrap();
-    assert!(admitted["commit"].is_array(), "{admitted}");
+    assert!(admitted["commits"].is_array(), "{admitted}");
     let before = inquiries(owner.handle);
 
     // Second ask: the result is retained, so this is an inquiry. From here on
@@ -169,7 +169,7 @@ fn a_retained_result_is_answered_while_the_host_never_polls() {
     let again = replies
         .recv_timeout(Duration::from_secs(5))
         .expect("no answer without a host poll");
-    assert_eq!(again["commit"], admitted["commit"]);
+    assert_eq!(again["commits"], admitted["commits"]);
     assert_eq!(again["welcome"], admitted["welcome"]);
     assert_eq!(inquiries(owner.handle), before + 1);
     close(owner.handle).unwrap();
@@ -193,7 +193,7 @@ fn a_new_join_request_is_a_change_and_goes_to_the_host() {
         reply.is_some()
     }));
     assert!(intake, "the host never saw the join request");
-    assert!(reply.unwrap()["commit"].is_array());
+    assert!(reply.unwrap()["commits"].is_array());
     assert_eq!(inquiries(owner.handle), 0, "a membership change was answered as an inquiry");
     close(owner.handle).unwrap();
 }

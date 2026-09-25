@@ -431,6 +431,15 @@ fn approved_personal_join_survives_restart_and_uses_peer_while_admin_is_closed()
         )
         .is_err()
     );
+    // Only administrators admit (ADR A2): the helper is promoted before it
+    // accepts requests while the issuer is closed.
+    let promotion = call(
+        admin,
+        json!({"op":"stage_management","action":{"kind":"promote","member":early["member"]["id"]}}),
+    )
+    .unwrap();
+    let promoted = adopt(admin, &promotion, true);
+    apply(helper, &promoted["step"]);
     // A premature retry gets useful feedback without disrupting the member
     // accepting requests. It cannot become membership or consume the request.
     let node: Value = serde_json::from_str(&describe(helper).unwrap()).unwrap();

@@ -20,7 +20,7 @@ fn issue_invitation(handle: i64) -> Value {
 }
 
 #[test]
-fn old_invitation_redeems_through_an_ordinary_member_with_issuer_closed() {
+fn old_invitation_redeems_through_another_administrator_with_issuer_closed() {
     let admin = create(Some(&[81; 32])).unwrap();
     let mut helper = create(Some(&[82; 32])).unwrap();
     let late = create(Some(&[83; 32])).unwrap();
@@ -113,6 +113,24 @@ fn old_invitation_redeems_through_an_ordinary_member_with_issuer_closed() {
             .unwrap()
             .contains(&node["endpoint_key"])
     );
+    // Only administrators admit (ADR A2): the issuer promotes the helper,
+    // which then redeems the old invitation while the issuer is closed.
+    let promotion = call(
+        admin,
+        json!({"op":"stage_management","action":{"kind":"promote","member":early["member"]["id"]}}),
+    )
+    .unwrap();
+    let promoted = call(
+        admin,
+        json!({"op":"adopt_admission","snapshot":promotion["snapshot"]}),
+    )
+    .unwrap();
+    let s = call(
+        helper,
+        json!({"op":"stage_admission_update","step":promoted["step"]}),
+    )
+    .unwrap();
+    call(helper, json!({"op":"adopt_admission","snapshot":s["snapshot"]})).unwrap();
     close(admin).unwrap();
     assert!(describe(admin).is_err());
     begin(late, "Late arrival");
@@ -174,11 +192,10 @@ fn old_invitation_redeems_through_an_ordinary_member_with_issuer_closed() {
     // committed view answers it and the host sees no event.
     let reply = retry.join().unwrap();
     let steps = reply.get("commits").expect("complete authorized history");
-    // 2 -> 3: registering both invitations now costs an epoch each, and the
-    // invite1 checkpoint is captured after its own registration, so the
-    // extra step here is only the "routed" invitation's registration commit
-    // that helper had to apply.
-    assert_eq!(steps.as_array().unwrap().len(), 3);
+    // The helper's admission, the "routed" invitation's registration, the
+    // helper's promotion and this admission: the invite1 checkpoint is
+    // captured after its own registration.
+    assert_eq!(steps.as_array().unwrap().len(), 4);
     let mut altered = steps.clone();
     // Byte 39 of a binary step lies in its authorization fields (after
     // `DFMS\x03`, tag, class and a 32-byte key or id).
@@ -202,9 +219,8 @@ fn old_invitation_redeems_through_an_ordinary_member_with_issuer_closed() {
     )
     .unwrap();
     assert_eq!(joined["members"], 3);
-    // 2 -> 4: +2 epochs from registering both invitations (invite1 before
-    // helper joined, "routed" after).
-    assert_eq!(joined["epoch"], 4);
+    // Two link registrations, two admissions and the helper's promotion.
+    assert_eq!(joined["epoch"], 5);
     close(late).unwrap();
     close(helper).unwrap();
 }
