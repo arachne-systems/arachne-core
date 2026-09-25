@@ -172,14 +172,14 @@ fn next_event_reports_a_control_request() {
     assert_eq!(owner.next_event(Some(Duration::from_millis(100))).unwrap(), None);
 }
 
-#[test]
-fn next_event_reports_interest_and_publication() {
-    let context = context();
-    let publisher = context.open(direct(Some([71; 32]))).unwrap();
-    let subscriber = context.open(direct(Some([72; 32]))).unwrap();
+/// A fixture publisher and subscriber with routes both ways and the
+/// subscriber's interest announced (not yet observed).
+fn pubsub(context: &Arc<Context>, seed: u8) -> (Client, Client, [u8; 32], &'static str) {
+    let publisher = context.open(direct(Some([seed; 32]))).unwrap();
+    let subscriber = context.open(direct(Some([seed + 1; 32]))).unwrap();
     let publisher_key = publisher.endpoint().unwrap().endpoint_key;
     let subscriber_key = subscriber.endpoint().unwrap().endpoint_key;
-    let workspace = [73; 32];
+    let workspace = [seed + 2; 32];
     let topic = "streams/events";
     let policy = [
         PeerPolicy {
@@ -202,6 +202,13 @@ fn next_event_reports_interest_and_publication() {
     publisher.install_policy(workspace, 1, &policy).unwrap();
     subscriber.install_policy(workspace, 1, &policy).unwrap();
     subscriber.set_interest(workspace, 1, topic, true).unwrap();
+    (publisher, subscriber, workspace, topic)
+}
+
+#[test]
+fn next_event_reports_interest_and_publication() {
+    let context = context();
+    let (publisher, subscriber, workspace, topic) = pubsub(&context, 71);
 
     // `set_interest` starts the announcement in the background; its end is
     // an event, and `poll_interest` reads its result.
@@ -337,4 +344,39 @@ fn close_while_another_thread_is_inside_an_op_is_bounded() {
     // Close drain (1 s) plus the local teardown (2 s) bound it.
     assert!(closed_in < Duration::from_millis(3500), "close took {closed_in:?}");
     assert!(op_time < Duration::from_secs(4), "op ran {op_time:?}");
+}
+
+#[test]
+fn suspend_closes_idle_connections_and_resume_reconnects() {
+    let context = context();
+    let (publisher, subscriber, workspace, topic) = pubsub(&context, 101);
+    assert_eq!(
+        subscriber.next_event(Some(Duration::from_secs(10))).unwrap(),
+        Some(Event::InterestChanged)
+    );
+    assert!(subscriber.poll_interest().unwrap().unwrap().admission.failed.is_empty());
+    publisher.publish(workspace, 1, topic, vec![1]).unwrap();
+    assert!(context.open_connections() > 0, "the publication opened a link");
+    let address = publisher.endpoint().unwrap().bound_address;
+
+    context.suspend().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while context.open_connections() > 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(context.open_connections(), 0, "idle links stay open while suspended");
+    // The endpoint stays bound.
+    assert_eq!(publisher.endpoint().unwrap().bound_address, address);
+    // Queued data stays too.
+    assert_eq!(subscriber.poll().unwrap().unwrap().payload, vec![1]);
+
+    context.resume().unwrap();
+    let report = publisher.publish(workspace, 1, topic, vec![2]).unwrap();
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert_eq!(
+        subscriber.next_event(Some(Duration::from_secs(10))).unwrap(),
+        Some(Event::PublicationReceived)
+    );
+    assert_eq!(subscriber.poll().unwrap().unwrap().payload, vec![2]);
+    assert!(context.open_connections() > 0);
 }

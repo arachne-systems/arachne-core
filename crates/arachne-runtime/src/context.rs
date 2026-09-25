@@ -258,6 +258,20 @@ impl Context {
             .sum()
     }
 
+    /// Open connections of all sessions (a test and diagnostics hook).
+    #[doc(hidden)]
+    pub fn open_connections(&self) -> usize {
+        self.sessions()
+            .into_iter()
+            .map(|shared| {
+                let Ok(guard) = shared.lock() else { return 0 };
+                guard
+                    .as_ref()
+                    .map_or(0, |session| session.node.open_connections())
+            })
+            .sum()
+    }
+
     fn sessions(&self) -> Vec<registry::SharedSession> {
         let handles: Vec<i64> = self
             .table

@@ -372,7 +372,6 @@ impl Connections {
     }
 
     /// Protocols of the open connections this endpoint observed.
-    #[cfg(test)]
     pub(super) fn live_alpns(&self) -> Vec<Vec<u8>> {
         self.observer
             .0
@@ -704,6 +703,31 @@ impl Connections {
         if let Some(connection) = cached.and_then(|cached| cached.connection.get().cloned()) {
             connection.close(0u8.into(), b"stalled");
         }
+    }
+
+    /// Close every connection with no exchange in progress (suspend). The
+    /// endpoint stays bound; later dials open new connections. Returns the
+    /// number closed.
+    pub(super) async fn close_idle(&self) -> usize {
+        self.outgoing.lock().await.clear();
+        let live: Vec<_> = self
+            .observer
+            .0
+            .read()
+            .unwrap()
+            .live
+            .iter()
+            .filter_map(|weak| weak.upgrade())
+            .filter(|connection| connection.close_reason().is_none())
+            .collect();
+        let mut closed = 0;
+        for connection in live {
+            if !self.budget.is_busy(connection.stable_id()) {
+                connection.close(0u32.into(), b"suspended");
+                closed += 1;
+            }
+        }
+        closed
     }
 
     pub(super) async fn nearby_peers(&self, _first_result: bool) -> Vec<PeerId> {

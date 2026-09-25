@@ -1409,10 +1409,11 @@ impl Node {
         self.membership.has_pending()
     }
 
-    /// Stop background gossip work for a host in the background: each
-    /// workspace overlay (its HyParView shuffle timers and bootstrap retries)
-    /// is dropped and parked. Routing policy, connections and queues stay.
-    /// Idempotent.
+    /// Stop background work for a host in the background: each workspace
+    /// overlay (its HyParView shuffle timers and bootstrap retries) is
+    /// dropped and parked, and every idle connection closes. The endpoint,
+    /// routing policy and queues stay; an exchange in progress keeps its
+    /// connection. Later dials reconnect. Idempotent.
     pub async fn suspend(&self) {
         let overlays = std::mem::take(&mut *self.overlays.lock().await);
         let mut parked = self.parked.lock().unwrap();
@@ -1420,7 +1421,11 @@ impl Node {
         for (workspace, overlay) in overlays {
             parked.insert(workspace, (overlay.tag, overlay.revision()));
         }
-        tracing::info!(target: "data_fabric_transport", overlays = parked.len(), "NODE_SUSPENDED");
+        let overlays = parked.len();
+        drop(parked);
+        // Idle links would keep QUIC keep-alives running.
+        let closed = self.connections.close_idle().await;
+        tracing::info!(target: "data_fabric_transport", overlays, closed, "NODE_SUSPENDED");
     }
 
     /// Rebuild the parked overlays at their current policy, then rebind
@@ -1464,6 +1469,11 @@ impl Node {
         }
         self.connections.network_change().await;
         tracing::info!(target: "data_fabric_transport", "NODE_RESUMED");
+    }
+
+    /// Open connections of this endpoint (a test and diagnostics hook).
+    pub fn open_connections(&self) -> usize {
+        self.connections.live_alpns().len()
     }
 
     pub fn is_suspended(&self) -> bool {
