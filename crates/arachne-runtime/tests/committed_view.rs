@@ -139,7 +139,7 @@ fn joiner(owner: &Owner, seed_index: u64) -> (mpsc::Sender<()>, mpsc::Receiver<V
             node.add_address_hint(peer, address).await.unwrap();
             while asked.recv().is_ok() {
                 let reply = node.request_control(peer, &packet).await.unwrap();
-                replied.send(serde_json::from_slice(&reply).unwrap()).unwrap();
+                replied.send(arachne_runtime::harness::decode_admission_reply(&reply).unwrap()).unwrap();
             }
         })
     });

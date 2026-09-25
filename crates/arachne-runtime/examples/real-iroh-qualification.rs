@@ -639,7 +639,7 @@ async fn request_until_welcome(
 ) -> Result<Value, String> {
     loop {
         let reply = request_control(node, peer, payload, deadline).await?;
-        let value: Value = serde_json::from_slice(&reply).map_err(|e| {
+        let value: Value = arachne_runtime::harness::decode_admission_reply(&reply).map_err(|e| {
             format!(
                 "control reply JSON decode failed ({} bytes): {e}",
                 reply.len()
@@ -711,7 +711,7 @@ async fn full_join_with_pending(
         )
         .await
         .map_err(|error| format!("history: {error}"))?;
-        page = serde_json::from_slice(&reply).map_err(|e| {
+        page = arachne_runtime::harness::decode_admission_reply(&reply).map_err(|e| {
             format!(
                 "history reply JSON decode failed ({} bytes): {e}",
                 reply.len()

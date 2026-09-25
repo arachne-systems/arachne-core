@@ -145,7 +145,7 @@ fn public_runtime_admission_path_handles_500_authenticated_joiners() {
             let mut initial_queued = 0;
             while let Some(result) = first.join_next().await {
                 let reply = result.unwrap().unwrap();
-                let value: Value = serde_json::from_slice(&reply).unwrap();
+                let value: Value = arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
                 assert_eq!(
                     value["state"], "admission_queued",
                     "unexpected admission reply: {value}"
@@ -163,7 +163,7 @@ fn public_runtime_admission_path_handles_500_authenticated_joiners() {
                 retry.spawn(async move {
                     for _ in 0..200 {
                         let reply = node.request_control(owner_peer, &packet).await?;
-                        let state: Value = serde_json::from_slice(&reply).unwrap();
+                        let state: Value = arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
                         if state["state"] != "admission_queued" {
                             return Ok(reply);
                         }
@@ -175,7 +175,7 @@ fn public_runtime_admission_path_handles_500_authenticated_joiners() {
             let mut retained = 0;
             while let Some(result) = retry.join_next().await {
                 let reply = result.unwrap().unwrap();
-                let value: Value = serde_json::from_slice(&reply).unwrap();
+                let value: Value = arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
                 assert!(
                     value["commit"].is_array(),
                     "unexpected retained reply: {value}"

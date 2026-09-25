@@ -237,7 +237,7 @@ fn rust_driver_commits_and_replies_without_host_candidate_steps() {
     };
     assert_eq!(committed["state"], "workspace_committed");
     assert_eq!(committed["members"], 2);
-    let reply: Value = serde_json::from_slice(&reply_rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap()).unwrap();
+    let reply: Value = arachne_runtime::harness::decode_admission_reply(&reply_rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap()).unwrap();
     assert!(reply.get("welcome").is_some());
     requester.join().unwrap();
 
@@ -523,7 +523,7 @@ fn one_request_is_enough_the_result_arrives_on_the_same_exchange() {
             let (node, packet) = joiner(5200, &shadow).await;
             // Exactly one request. No retry loop.
             let reply = node.request_control(peer, &packet).await.unwrap();
-            serde_json::from_slice::<Value>(&reply).unwrap()
+            arachne_runtime::harness::decode_admission_reply(&reply).unwrap()
         })
     });
 
@@ -532,7 +532,7 @@ fn one_request_is_enough_the_result_arrives_on_the_same_exchange() {
     drive(owner.handle, Instant::now() + Duration::from_secs(20), |_| client.is_finished());
     let metrics = call(owner.handle, json!({"op":"workspace_metrics"})).unwrap();
     let reply = client.join().unwrap();
-    delivered += usize::from(reply["commit"].is_array());
+    delivered += usize::from(reply["commits"].is_array());
     close(owner.handle).unwrap();
 
     assert_eq!(delivered, 1, "the single request got {reply} instead of its result");
@@ -619,9 +619,9 @@ fn expired_admission_exchange_receives_a_pushed_result_without_retry() {
     assert_eq!(serde_json::from_slice::<Value>(&committed[0]).unwrap()["members"], 2);
     commit_tx.send(()).unwrap();
     let pushed = client.join().unwrap();
-    let reply: Value = serde_json::from_slice(&pushed[9..]).unwrap();
+    let reply: Value = arachne_runtime::harness::decode_admission_reply(&pushed[9..]).unwrap();
     assert!(reply["welcome"].is_array());
-    assert!(reply["commit"].is_array() || reply["commits"].is_array());
+    assert!(reply["commits"].is_array());
     close(owner.handle).unwrap();
 }
 

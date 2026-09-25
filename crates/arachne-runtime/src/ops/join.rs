@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::errors::{self, security};
 use crate::membership::JoinStep;
 use crate::ops::admission::{
-    admission_history_page_packet, admission_offer_candidate, admission_request_packet, live,
+    admission_history_page_packet, decode_admission_reply, admission_offer_candidate, admission_request_packet, live,
     live_mut, parse_admission_offer,
 };
 use crate::ops::candidate::{self, AdoptArgs, MemberView};
@@ -404,7 +404,7 @@ pub(crate) fn request_admission(
     // history over many pages.
     let mut page_bytes = vec![reply.len()];
     let mut reply: Value =
-        serde_json::from_slice(&reply).map_err(|_| from_peer("invalid admission reply"))?;
+        decode_admission_reply(&reply).map_err(|_| from_peer("invalid admission reply"))?;
     if reply
         .get("history_complete")
         .is_some_and(|complete| !complete.as_bool().unwrap_or(false))
@@ -441,7 +441,7 @@ pub(crate) fn request_admission(
                 return Err(too_much("admission history exceeds transport bounds"));
             }
             page_bytes.push(page.len());
-            let page: Value = serde_json::from_slice(&page)
+            let page: Value = decode_admission_reply(&page)
                 .map_err(|_| from_peer("invalid admission history page"))?;
             // A served page carries the retained reply plus its paging
             // markers; only a refusal carries a `state`. Requiring both was
@@ -460,7 +460,10 @@ pub(crate) fn request_admission(
                 .as_u64()
                 .ok_or_else(|| from_peer("admission history page missing next offset"))?
                 as usize;
-            if page_commits.is_empty() || next <= offset {
+            // A page carries steps, except the final page that carries only
+            // the Welcome.
+            let complete = page["history_complete"].as_bool() == Some(true);
+            if (page_commits.is_empty() && !complete) || next < offset || (next == offset && !complete) {
                 return Err(from_peer("admission history page made no progress"));
             }
             if commits.len() + page_commits.len() > arachne_security::MAX_JOIN_HISTORY_STEPS {
@@ -1001,7 +1004,7 @@ async fn request_join_exchange(
         Err(error) => return join_attempt_error(error, true),
     };
     let mut page_bytes = vec![first.len()];
-    let mut reply: Value = match serde_json::from_slice(&first) {
+    let mut reply: Value = match decode_admission_reply(&first) {
         Ok(value) => value,
         Err(_) => return JoinAttemptOutcome::Failed("invalid admission reply".into()),
     };
@@ -1047,7 +1050,7 @@ async fn request_join_exchange(
                 );
             }
             page_bytes.push(page.len());
-            let page: Value = match serde_json::from_slice(&page) {
+            let page: Value = match decode_admission_reply(&page) {
                 Ok(value) => value,
                 Err(_) => {
                     return JoinAttemptOutcome::Failed("invalid admission history page".into());
@@ -1077,7 +1080,10 @@ async fn request_join_exchange(
                     );
                 }
             };
-            if page_commits.is_empty() || next <= offset {
+            // A page carries steps, except the final page that carries only
+            // the Welcome.
+            let complete = page["history_complete"].as_bool() == Some(true);
+            if (page_commits.is_empty() && !complete) || next < offset || (next == offset && !complete) {
                 return JoinAttemptOutcome::Failed(
                     "admission history page made no progress".into(),
                 );

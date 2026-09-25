@@ -304,7 +304,7 @@ fn admission_batch_staging_keeps_committing_under_continuous_intake() {
                         let Ok(reply) = node.request_control(owner_peer, &packet).await else {
                             continue;
                         };
-                        let value: Value = serde_json::from_slice(&reply).unwrap();
+                        let value: Value = arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
                         // A retry here (after a lost/timed-out reply to a
                         // send that the owner actually processed) can land
                         // after the request was already staged and
@@ -341,7 +341,7 @@ fn admission_batch_staging_keeps_committing_under_continuous_intake() {
                         else {
                             continue;
                         };
-                        let value: Value = serde_json::from_slice(&reply).unwrap();
+                        let value: Value = arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
                         if value["state"] != "admission_queued" {
                             // Retained: nothing further to do for this joiner.
                             return;

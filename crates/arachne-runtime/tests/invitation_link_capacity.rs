@@ -279,7 +279,7 @@ async fn collect_join_steps(
             .await
             .map_err(|error| error.to_string())?;
         let page: Value =
-            serde_json::from_slice(&page_bytes).map_err(|error| error.to_string())?;
+            arachne_runtime::harness::decode_admission_reply(&page_bytes).map_err(|error| error.to_string())?;
         if page["state"] != "admission_replied" || page.get("history_page").is_none() {
             return Err("admission history page was not accepted".into());
         }
@@ -587,7 +587,7 @@ fn one_atak_invitation_link_handles_500_synthetic_joiners() {
                     match result {
                         Ok(reply) => {
                             let value: Value =
-                                serde_json::from_slice(&reply).map_err(|e| e.to_string())?;
+                                arachne_runtime::harness::decode_admission_reply(&reply).map_err(|e| e.to_string())?;
                             if let Some(welcome) = value.get("welcome") {
                                 ready_elapsed_ms.push(started.elapsed().as_millis());
                                 welcomed.insert(
@@ -644,7 +644,7 @@ fn one_atak_invitation_link_handles_500_synthetic_joiners() {
                         match result {
                             Ok(reply) => {
                                 let value: Value =
-                                    serde_json::from_slice(&reply).map_err(|e| e.to_string())?;
+                                    arachne_runtime::harness::decode_admission_reply(&reply).map_err(|e| e.to_string())?;
                                 if let Some(welcome) = value.get("welcome") {
                                     ready_elapsed_ms.push(started.elapsed().as_millis());
                                     welcomed.insert(
@@ -989,7 +989,7 @@ fn local_full_onboarding_state_machine_rejects_a_corrupted_joiner() {
                 let deadline = Instant::now() + Duration::from_secs(20);
                 let mut reply = loop {
                     let reply = node.request_control(owner_peer, &packet).await.unwrap();
-                    let value: Value = serde_json::from_slice(&reply).unwrap();
+                    let value: Value = arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
                     if value.get("welcome").is_some() {
                         break value;
                     }

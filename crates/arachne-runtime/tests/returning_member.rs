@@ -18,6 +18,22 @@ fn poll(h: i64, op: &str) -> Value {
 fn step(reply: &Value) -> Value {
     json!({"commit":reply["commit"],"authorization":reply["authorization"]})
 }
+/// An admission reply's step in the binary step codec.
+fn binary_step(reply: &Value) -> Vec<u8> {
+    let bytes = |value: &Value| serde_json::from_value::<Vec<u8>>(value.clone()).unwrap();
+    let auth = &reply["authorization"];
+    arachne_security::encode_membership_step(
+        &arachne_security::MembershipAuthorization::Admission(
+            arachne_security::AdmissionAuthorization {
+                invitation_key: bytes(&auth["invitation_key"]).try_into().unwrap(),
+                grant_signature: bytes(&auth["grant_signature"]).try_into().unwrap(),
+                redemption_signature: bytes(&auth["redemption_signature"]).try_into().unwrap(),
+            },
+        ),
+        &bytes(&reply["commit"]),
+    )
+    .unwrap()
+}
 fn issue(admin: i64) -> Value {
     let staged = call(
         admin,
@@ -132,14 +148,10 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
         "membership_denied"
     );
     // A transport-authenticated outsider's corrupted offer must not mutate membership.
-    let mut altered = step(&second);
-    altered["authorization"]["grant_signature"][0] = json!(
-        altered["authorization"]["grant_signature"][0]
-            .as_u64()
-            .unwrap()
-            ^ 1
-    );
-    let mut packet = b"DFMO\x01".to_vec();
+    let mut altered = binary_step(&second);
+    // Byte 39 is the first grant signature byte of a binary admission step.
+    altered[39] ^= 1;
+    let mut packet = b"DFMO\x02".to_vec();
     packet.extend(
         invite["workspace"]
             .as_array()
@@ -150,7 +162,7 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
     // Epoch 3: the link registration, the helper's admission and its
     // promotion come first.
     packet.extend(3u64.to_be_bytes());
-    packet.extend(serde_json::to_vec(&altered).unwrap());
+    packet.extend(arachne_runtime::harness::wire_step(&altered));
     let peer: [u8; 32] = info["endpoint_key"]
         .as_array()
         .unwrap()
@@ -160,13 +172,13 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
         .try_into()
         .unwrap();
     let mut valid = packet[..45].to_vec();
-    valid.extend(serde_json::to_vec(&step(&second)).unwrap());
+    valid.extend(arachne_runtime::harness::wire_step(&binary_step(&second)));
     let mut wrong_workspace = valid.clone();
     wrong_workspace[5] ^= 1;
     let mut wrong_epoch = valid.clone();
     wrong_epoch[44] = 9;
     let mut wrong_version = valid.clone();
-    wrong_version[4] = 2;
+    wrong_version[4] = 1;
     let packets = vec![
         packet,
         wrong_workspace,

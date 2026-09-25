@@ -61,6 +61,14 @@ pub mod harness {
     pub use crate::membership::StateBasis;
     pub use crate::membership::wire::{Query, decode_reply, encode_query};
     pub use crate::presence::harness_presence_packet;
+    /// Read an admission reply from the wire as host JSON (binary since B3c).
+    pub use crate::ops::admission::decode_admission_reply;
+
+    /// One binary step (`DFMS\x03`) in the peer wire envelope a membership
+    /// offer carries, without an invitation checkpoint.
+    pub fn wire_step(step: &[u8]) -> Vec<u8> {
+        crate::membership::wire_step(step, None, usize::MAX).unwrap_or_default()
+    }
 
     /// The session workspace's gossip tag key, so a qualification harness can
     /// join raw nodes to the same overlay. The host already holds this state.

@@ -277,6 +277,104 @@ pub(crate) fn is_administrator(owner: &arachne_security::Workspace) -> bool {
         .is_ok_and(|roster| roster.iter().any(|m| m.id == own && m.administrator))
 }
 
+/// Step bytes one history page carries: a control reply is 128 KiB, and the
+/// rest holds the envelope and optional records (B3c). A single step larger
+/// than this still travels alone when it fits the reply.
+pub(crate) const PAGE_STEP_BYTES: usize = 96 * 1024;
+
+/// Encode one step for the peer wire. The invitation checkpoint rides along
+/// only while the whole step stays within `room`; it is optional.
+pub(crate) fn wire_step(
+    step: &[u8],
+    invitation_checkpoint: Option<(&[u8], &[u8])>,
+    room: usize,
+) -> Result<Vec<u8>, ApiError> {
+    if step.len() > MAX_WIRE_STEP {
+        return Err(ApiError::limit_reached(
+            "membership step",
+            MAX_WIRE_STEP as u64,
+            "membership step exceeds transport bound",
+        ));
+    }
+    if invitation_checkpoint.is_some()
+        && let Ok(bytes) = wire::encode_wire_step(&wire::WireStep {
+            step,
+            invitation_checkpoint,
+        })
+        && bytes.len() <= room
+    {
+        return Ok(bytes);
+    }
+    wire::encode_wire_step(&wire::WireStep {
+        step,
+        invitation_checkpoint: None,
+    })
+    .map_err(ApiError::internal)
+}
+
+/// The wire form of one host-JSON step (`step` and an optional
+/// `invitation_checkpoint`).
+pub(crate) fn wire_step_from_json(value: &Value, room: usize) -> Result<Vec<u8>, ApiError> {
+    let invalid = || ApiError::invalid_input("step", "invalid membership step");
+    let step: Vec<u8> = serde_json::from_value(value["step"].clone()).map_err(|_| invalid())?;
+    let checkpoint = value
+        .get("invitation_checkpoint")
+        .map(|checkpoint| {
+            let part = |name: &str| {
+                serde_json::from_value::<Vec<u8>>(checkpoint[name].clone()).map_err(|_| invalid())
+            };
+            Ok::<_, ApiError>((part("grant")?, part("checkpoint")?))
+        })
+        .transpose()?;
+    wire_step(
+        &step,
+        checkpoint
+            .as_ref()
+            .map(|(grant, checkpoint)| (grant.as_slice(), checkpoint.as_slice())),
+        room,
+    )
+}
+
+/// The host JSON of one wire step.
+pub(crate) fn wire_step_json(bytes: &[u8]) -> Result<Value, String> {
+    let step = wire::decode_wire_step(bytes)?;
+    let (authorization, _) = arachne_security::decode_membership_step(step.step)
+        .map_err(|_| "invalid membership step")?;
+    let mut value = json!({"step": step.step, "kind": step_kind(&authorization)});
+    if let Some((grant, checkpoint)) = step.invitation_checkpoint {
+        value["invitation_checkpoint"] = json!({"grant":grant,"checkpoint":checkpoint});
+    }
+    Ok(value)
+}
+
+/// The step a peer sent, for staging.
+pub(crate) fn join_step_from_wire(bytes: &[u8]) -> Result<JoinStep, ApiError> {
+    let step = wire::decode_wire_step(bytes)
+        .map_err(|reason| ApiError::invalid_input("step", reason))?;
+    Ok(JoinStep::binary(
+        step.step.to_vec(),
+        step.invitation_checkpoint
+            .map(|(grant, checkpoint)| (grant.to_vec(), checkpoint.to_vec())),
+    ))
+}
+
+/// This owner's wire step, with the invitation checkpoint it retained.
+fn owner_wire_step(
+    owner: &arachne_security::Workspace,
+    auth: &arachne_security::MembershipAuthorization,
+    commit: &[u8],
+    room: usize,
+) -> Result<Vec<u8>, ApiError> {
+    let step = encode_step(auth, commit)?;
+    let checkpoint = match auth {
+        arachne_security::MembershipAuthorization::Management(action) => {
+            owner.retained_invitation_checkpoint(action)
+        }
+        _ => None,
+    };
+    wire_step(&step, checkpoint, room)
+}
+
 fn step_with_retained_checkpoint(
     owner: &arachne_security::Workspace,
     auth: &arachne_security::MembershipAuthorization,
@@ -959,19 +1057,17 @@ fn queue_membership_offer(
             .workspace
             .as_ref()
             .ok_or_else(errors::no_workspace)?;
-        let mut packet = b"DFMO\x01".to_vec();
+        let mut packet = OFFER.to_vec();
         packet.extend(owner.id());
         packet.extend(after.to_be_bytes());
-        packet.extend(
-            serde_json::to_vec(&step_with_retained_checkpoint(
-                owner,
-                &authorization,
-                &commit,
-            ))
-            .map_err(errors::encode)?,
-        );
-        if packet.len() > 32 * 1024 {
-            return Err(ApiError::limit_reached("control request", 32 * 1024, "membership offer exceeds control bound"));
+        packet.extend(owner_wire_step(
+            owner,
+            &authorization,
+            &commit,
+            MAX_OFFER - OFFER_HEADER,
+        )?);
+        if packet.len() > MAX_OFFER {
+            return Err(ApiError::limit_reached("control request", MAX_OFFER as u64, "membership offer exceeds control bound"));
         }
         packet
     };
@@ -1795,15 +1891,14 @@ fn a_range_serves_consecutive_steps_to_members_only() {
     assert_eq!(range.len() as u64, owner.epoch() - 1);
     for (next, step) in (1..).zip(&range) {
         let (authorization, commit) = owner.membership_update_for(member, next).unwrap().unwrap();
+        // Binary on the wire (B3c): the step codec, not JSON numbers.
+        let wire = wire::decode_wire_step(step).unwrap();
+        assert!(wire.step.starts_with(b"DFMS\x03"));
         assert_eq!(
-            *step,
-            serde_json::to_vec(&step_with_retained_checkpoint(
-                &owner,
-                &authorization,
-                &commit
-            ))
-            .unwrap()
+            wire.step,
+            arachne_security::encode_membership_step(&authorization, &commit).unwrap()
         );
+        assert!(join_step_from_wire(step).unwrap().parts().is_ok());
     }
     // Never past the requested end or the local head.
     assert_eq!(
@@ -2310,7 +2405,7 @@ pub(super) fn stage_gossiped_step(session: &mut Session) -> Result<Option<Value>
     let Some(bytes) = session.membership.steps_ahead.remove(&epoch) else {
         return Ok(None);
     };
-    let Ok(step) = serde_json::from_slice::<JoinStep>(&bytes) else {
+    let Ok(step) = join_step_from_wire(&bytes) else {
         return Ok(None);
     };
     match stage_update(session, step).and_then(|change| serde_json::to_value(change).map_err(errors::encode)) {
@@ -2594,29 +2689,7 @@ pub(super) fn range_reply(
         (Some(owner), Ok(query))
             if query.workspace == owner.id() && owner.member_id_for_endpoint(peer).is_ok() =>
         {
-            let mut steps = Vec::new();
-            let mut size = 256;
-            let mut next = query.after;
-            while next < query.until.min(owner.epoch()) && steps.len() < wire::MAX_RANGE_STEPS {
-                let Ok(Some((authorization, commit))) = owner.membership_update_for(peer, next)
-                else {
-                    break;
-                };
-                let Ok(step) = serde_json::to_vec(&step_with_retained_checkpoint(
-                    owner,
-                    &authorization,
-                    &commit,
-                )) else {
-                    break;
-                };
-                size += step.len() + 8;
-                if size > arachne_node::MAX_CONTROL_REPLY {
-                    break;
-                }
-                steps.push(step);
-                next += 1;
-            }
-            (owner.id(), query.after, steps)
+            (owner.id(), query.after, range_page(owner, peer, query.after, query.until))
         }
         _ => ([0; 32], 0, Vec::new()),
     };
@@ -2630,18 +2703,65 @@ pub(super) fn range_reply(
     .unwrap_or_default()
 }
 
+/// One page of consecutive steps from `after` toward `until`: at most
+/// `PAGE_STEP_BYTES` of steps, but always the first step when it alone fits
+/// the reply. The requester asks again from where the page ended (the
+/// cursor is `after` plus the steps it got), so it applies page by page.
+fn range_page(
+    owner: &arachne_security::Workspace,
+    peer: [u8; 32],
+    after: u64,
+    until: u64,
+) -> Vec<Vec<u8>> {
+    let mut steps: Vec<Vec<u8>> = Vec::new();
+    let mut size = 0;
+    let mut next = after;
+    while next < until.min(owner.epoch()) && steps.len() < wire::MAX_RANGE_STEPS {
+        let Ok(Some((authorization, commit))) = owner.membership_update_for(peer, next) else {
+            break;
+        };
+        let room = PAGE_STEP_BYTES.saturating_sub(size);
+        let Ok(step) = owner_wire_step(owner, &authorization, &commit, room) else {
+            break;
+        };
+        let budget = if steps.is_empty() {
+            RANGE_REPLY_STEP_ROOM
+        } else {
+            PAGE_STEP_BYTES
+        };
+        if size + step.len() > budget {
+            break;
+        }
+        size += step.len();
+        steps.push(step);
+        next += 1;
+    }
+    steps
+}
+
+/// Room for the steps of a range reply: the reply bound less its envelope
+/// (prefix, workspace, cursor and per-step lengths).
+const RANGE_REPLY_STEP_ROOM: usize = arachne_node::MAX_CONTROL_REPLY - 1024;
+const _: () = assert!(MAX_WIRE_STEP + 64 <= RANGE_REPLY_STEP_ROOM);
+
 /// Accept a carrier's signed next transition, not the carrier as membership authority.
 /// Responses reveal no roster, fingerprint, current epoch, Welcome or invitation.
+/// `DFMO\x02 | workspace | u64 after | wire step`: a member offers the step
+/// that extends `after`. A control request is at most 32 KiB.
+const OFFER: &[u8; 5] = b"DFMO\x02";
+const OFFER_HEADER: usize = 5 + 32 + 8;
+const MAX_OFFER: usize = 32 * 1024;
+
 pub(super) fn receive_offer(session: &mut Session, packet: &[u8]) -> Result<Value, ApiError> {
-    if packet.len() <= 45 || packet.len() > 32 * 1024 || !packet.starts_with(b"DFMO\x01") {
+    if packet.len() <= OFFER_HEADER || packet.len() > MAX_OFFER || !packet.starts_with(OFFER) {
         return Err(ApiError::invalid_input("offer", "invalid membership offer"));
     }
     let owner = session.workspace.as_ref().ok_or_else(|| ApiError::wrong_state("no workspace"))?;
     if packet[5..37] != owner.id() || packet[37..45] != owner.epoch().to_be_bytes() {
         return Err(ApiError::epoch_mismatch("membership offer does not extend current epoch"));
     }
-    let step: JoinStep =
-        serde_json::from_slice(&packet[45..]).map_err(|_| ApiError::invalid_input("offer", "invalid offered transition"))?;
+    let step = join_step_from_wire(&packet[OFFER_HEADER..])
+        .map_err(|_| ApiError::invalid_input("offer", "invalid offered transition"))?;
     serde_json::to_value(stage_update(session, step)?).map_err(errors::encode)
 }
 
