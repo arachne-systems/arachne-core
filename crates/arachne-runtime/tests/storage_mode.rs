@@ -19,7 +19,7 @@ fn publish(client: &Client, workspace: [u8; 32], id: u8) -> arachne_runtime::Cli
     client.install_workspace_policy(1)?;
     let staged =
         client.stage_protected_publication(workspace, 1, "streams/opaque", [id; 16], vec![id])?;
-    client.adopt_protected_publication(&staged.candidate).map(|_| ())
+    client.adopt_protected_publication(&staged).map(|_| ())
 }
 
 #[test]
@@ -43,7 +43,7 @@ fn adopt_saves_and_reads_back_without_a_host_save() {
     let staged = client
         .stage_protected_publication(created.workspace, 1, "streams/opaque", [2; 16], vec![2])
         .unwrap();
-    client.adopt_protected_publication(&staged.candidate).unwrap();
+    client.adopt_protected_publication(&staged).unwrap();
     client.close().unwrap();
 }
 
@@ -57,11 +57,11 @@ fn a_read_back_mismatch_stops_the_session_until_restore() {
         .stage_protected_publication(created.workspace, 1, "streams/opaque", [1; 16], vec![1])
         .unwrap();
     provider.corrupt_reads(true);
-    let error = client.adopt_protected_publication(&staged.candidate).unwrap_err();
+    let error = client.adopt_protected_publication(&staged).unwrap_err();
     assert_eq!(error.code(), ErrorCode::StorageFailed, "{error:?}");
     provider.corrupt_reads(false);
     // Live state did not move, and it cannot move now: the outcome is unknown.
-    let error = client.adopt_protected_publication(&staged.candidate).unwrap_err();
+    let error = client.adopt_protected_publication(&staged).unwrap_err();
     assert_eq!(error.code(), ErrorCode::StorageFailed);
     assert_eq!(
         client.discard_workspace_candidate().unwrap_err().code(),
@@ -86,7 +86,7 @@ fn a_failed_commit_stops_the_session_until_restore() {
         .stage_protected_publication(created.workspace, 1, "streams/opaque", [1; 16], vec![1])
         .unwrap();
     provider.fail_next_commit();
-    let error = client.adopt_protected_publication(&staged.candidate).unwrap_err();
+    let error = client.adopt_protected_publication(&staged).unwrap_err();
     assert_eq!(error.code(), ErrorCode::StorageFailed);
     assert_eq!(
         client.install_workspace_policy(1).unwrap_err().code(),

@@ -34,6 +34,7 @@ pub(crate) enum Op {
     WorkspaceState,
     ResetWorkspace,
     DiscardWorkspaceCandidate,
+    DiscardCandidate,
     NetworkChange,
     NearbyEndpoints,
     SetNearbyIdentity,
@@ -123,6 +124,7 @@ impl Op {
             self,
             Op::ResetWorkspace
                 | Op::DiscardWorkspaceCandidate
+                | Op::DiscardCandidate
                 | Op::DriveWorkspace
                 | Op::DriveJoin
                 | Op::WorkspaceState

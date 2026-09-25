@@ -131,7 +131,7 @@ fn typed_clients_recover_an_opaque_publication() {
         .create_workspace("Owner", Some("Recovery proof"))
         .unwrap();
     let candidate = owner.stage_invitation(0).unwrap();
-    let invitation = owner.adopt_invitation(&candidate.candidate).unwrap();
+    let invitation = owner.adopt_invitation(&candidate).unwrap();
     let owner_address = invitation.address.replace("0.0.0.0:", "127.0.0.1:");
     reader
         .add_address_hint(invitation.peer, &owner_address)
@@ -143,7 +143,7 @@ fn typed_clients_recover_an_opaque_publication() {
     let staged = owner
         .stage_admission(join.endpoint, &join.admission_request)
         .unwrap();
-    let joined_owner = owner.adopt_admission(&staged.candidate).unwrap();
+    let joined_owner = owner.adopt_admission(&staged).unwrap();
     let reply = owner
         .retained_admission(join.endpoint, &join.admission_request)
         .unwrap();
@@ -156,7 +156,7 @@ fn typed_clients_recover_an_opaque_publication() {
             }],
         )
         .unwrap();
-    let joined_reader = reader.adopt_join(&staged.candidate).unwrap();
+    let joined_reader = reader.adopt_join(&staged).unwrap();
     assert_eq!(joined_owner.epoch, joined_reader.epoch);
     let revision = joined_owner.epoch + 1;
     owner.install_workspace_policy(revision).unwrap();
@@ -172,7 +172,7 @@ fn typed_clients_recover_an_opaque_publication() {
             payload.clone(),
         )
         .unwrap();
-    owner.adopt_protected_publication(&staged.candidate).unwrap();
+    owner.adopt_protected_publication(&staged).unwrap();
 
     let owner_endpoint = owner.endpoint().unwrap();
     let owner_member = owner
@@ -216,8 +216,8 @@ fn typed_clients_recover_an_opaque_publication() {
         arachne_runtime::RecoveryStage::Candidate(candidate) => candidate,
         other => panic!("unexpected recovery stage: {other:?}"),
     };
-    assert_eq!(staged.publication_count, 1);
-    let adoption = reader.adopt_recovery(&staged.candidate).unwrap();
+    assert_eq!(staged.publication_count(), 1);
+    let adoption = reader.adopt_recovery(&staged).unwrap();
     assert_eq!(adoption.recovered_publications, 1);
 
     // Recovered objects wait in the durable inbox until acknowledged.
@@ -228,7 +228,7 @@ fn typed_clients_recover_an_opaque_publication() {
     assert_eq!(reader.poll_pending_object().unwrap(), Some(recovered.clone()));
     let acknowledged = reader.stage_object_acknowledgement(&recovered).unwrap();
     reader
-        .adopt_protected_reception(&acknowledged.candidate)
+        .adopt_protected_reception(&acknowledged)
         .unwrap();
     assert_eq!(reader.poll_pending_object().unwrap(), None);
 
@@ -268,8 +268,8 @@ fn typed_client_rejects_wrong_publication_workspace_before_staging() {
             vec![2],
         )
         .unwrap();
-    assert_eq!(staged.workspace, workspace.workspace);
-    client.adopt_protected_publication(&staged.candidate).unwrap();
+    assert_eq!(staged.workspace(), workspace.workspace);
+    client.adopt_protected_publication(&staged).unwrap();
     client.close().unwrap();
 }
 
@@ -346,7 +346,7 @@ fn typed_client_issues_an_invitation_with_bounded_route_hints() {
         .unwrap();
 
     let candidate = client.stage_invitation(0).unwrap();
-    let invitation = client.adopt_invitation(&candidate.candidate).unwrap();
+    let invitation = client.adopt_invitation(&candidate).unwrap();
     assert_eq!(invitation.workspace, workspace.workspace);
     assert_eq!(invitation.workspace_name.as_deref(), Some("Field Team"));
     assert!(!invitation.invitation.is_empty());
@@ -506,20 +506,13 @@ fn typed_admission_ops_report_codes_and_pages() {
         owner.send_admission_reply().unwrap_err().code(),
         ErrorCode::WrongState
     );
-    // A candidate that is not the staged one is stale.
+    // A candidate is an opaque object: the wrong adopt method does not
+    // compile, and a used candidate is stale.
     let staged = owner.stage_invitation(0).unwrap();
-    let mut other = staged.candidate.clone();
-    *other.last_mut().unwrap() ^= 1;
-    let error = owner.adopt_invitation(&other).unwrap_err();
-    assert_eq!(error.code(), ErrorCode::CandidateStale, "{error}");
-    assert_eq!(error.message(), "workspace snapshot does not match candidate");
-    // The wrong adopt op for this kind of candidate.
-    assert_eq!(
-        owner.adopt_join(&staged.candidate).unwrap_err().code(),
-        ErrorCode::WrongState
-    );
-    let invitation = owner.adopt_invitation(&staged.candidate).unwrap();
+    let invitation = owner.adopt_invitation(&staged).unwrap();
     assert!(!invitation.invitation.is_empty());
+    let error = owner.adopt_invitation(&staged).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::CandidateStale, "{error}");
     assert!(!owner.poll_control().unwrap());
     owner.close().unwrap();
 }
@@ -539,14 +532,14 @@ fn typed_management_invitation_and_name_ops() {
     let workspace = owner.create_workspace("Owner", Some("Team")).unwrap();
 
     let renamed = owner.stage_workspace_name("Field Team").unwrap();
-    assert_eq!(renamed.workspace, workspace.workspace);
-    let adopted = owner.adopt_admission(&renamed.candidate).unwrap();
+    assert_eq!(renamed.workspace(), workspace.workspace);
+    let adopted = owner.adopt_admission(&renamed).unwrap();
     assert_eq!(adopted.workspace_name.as_deref(), Some("Field Team"));
 
     let personal = owner
         .stage_invitation_of(0, InvitationKind::Personal)
         .unwrap();
-    let link = owner.adopt_invitation(&personal.candidate).unwrap();
+    let link = owner.adopt_invitation(&personal).unwrap();
     let controls = owner.invitation_controls().unwrap();
     assert_eq!(controls.len(), 1);
     assert!(controls[0].personal);
@@ -559,7 +552,7 @@ fn typed_management_invitation_and_name_ops() {
     let disabled = owner
         .stage_management(MemberAction::DisableInvitation(link.invitation_key))
         .unwrap();
-    owner.adopt_admission(&disabled.candidate).unwrap();
+    owner.adopt_admission(&disabled).unwrap();
     assert!(!owner.invitation_controls().unwrap()[0].enabled);
 
     // A management action on a stranger is refused with a code.
@@ -568,7 +561,7 @@ fn typed_management_invitation_and_name_ops() {
 
     // The last member leaves alone; adopting the removal ends the session.
     let leave = owner.stage_solo_leave().unwrap();
-    let removed = owner.adopt_removal(&leave.candidate).unwrap();
+    let removed = owner.adopt_removal(&leave).unwrap();
     assert_eq!(removed.workspace, workspace.workspace);
     assert_eq!(owner.member_roster().unwrap_err().code(), ErrorCode::Closed);
     let _ = owner.close();

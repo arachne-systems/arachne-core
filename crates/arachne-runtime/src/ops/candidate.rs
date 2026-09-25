@@ -65,8 +65,125 @@ impl AdoptKind {
     }
 }
 
+/// The exact kind of a staged candidate. A typed candidate carries the kinds
+/// its adopt method accepts, so a candidate of one kind never adopts as
+/// another (for example an admission as an invitation or a removal).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CandidateKind {
+    Admission,
+    Management,
+    WorkspaceName,
+    Invitation,
+    Removal,
+    Join,
+    Publication,
+    Reception,
+    Recovery,
+    CurrentView,
+}
+
+impl CandidateKind {
+    fn of(transition: &WorkspaceTransition) -> Self {
+        match transition {
+            WorkspaceTransition::Admission => CandidateKind::Admission,
+            WorkspaceTransition::Management(..) => CandidateKind::Management,
+            WorkspaceTransition::WorkspaceName => CandidateKind::WorkspaceName,
+            WorkspaceTransition::Invitation(..) => CandidateKind::Invitation,
+            WorkspaceTransition::Join => CandidateKind::Join,
+            WorkspaceTransition::RoutedPublication(..) => CandidateKind::Publication,
+            WorkspaceTransition::Inbox | WorkspaceTransition::InboxRejected => {
+                CandidateKind::Reception
+            }
+            WorkspaceTransition::InboxRecovery { .. } | WorkspaceTransition::DirectMiss { .. } => {
+                CandidateKind::Recovery
+            }
+            WorkspaceTransition::CurrentView { .. } => CandidateKind::CurrentView,
+        }
+    }
+
+    /// The adopt op family of this kind.
+    fn family(self) -> AdoptKind {
+        match self {
+            CandidateKind::Admission
+            | CandidateKind::Management
+            | CandidateKind::WorkspaceName
+            | CandidateKind::Invitation
+            | CandidateKind::Removal => AdoptKind::Admission,
+            CandidateKind::Join => AdoptKind::Join,
+            CandidateKind::Publication => AdoptKind::Publication,
+            CandidateKind::Reception => AdoptKind::Reception,
+            CandidateKind::Recovery => AdoptKind::Recovery,
+            CandidateKind::CurrentView => AdoptKind::CurrentView,
+        }
+    }
+}
+
+/// The staged candidate: its exact kind and token.
+pub(crate) fn staged(session: &Session) -> Option<(CandidateKind, &[u8])> {
+    if let Some((_, token)) = &session.transition.removal {
+        return Some((CandidateKind::Removal, token));
+    }
+    session
+        .transition
+        .staged
+        .as_ref()
+        .map(|staged| (CandidateKind::of(&staged.transition), staged.snapshot.as_slice()))
+}
+
 fn kind_mismatch() -> ApiError {
     ApiError::wrong_state("candidate kind does not match this adopt operation")
+}
+
+/// Adopt `token` only if the staged candidate is exactly one of `kinds`.
+/// Every check runs before anything changes.
+pub(crate) fn adopt_exact(
+    session: &mut Session,
+    kinds: &[CandidateKind],
+    token: Vec<u8>,
+) -> Result<AdoptReply, ApiError> {
+    let (kind, staged_token) = staged(session)
+        .ok_or_else(|| ApiError::candidate_stale("candidate is no longer staged"))?;
+    if staged_token != token.as_slice() {
+        return Err(ApiError::candidate_stale("candidate is no longer staged"));
+    }
+    if !kinds.contains(&kind) {
+        return Err(kind_mismatch());
+    }
+    adopt(session, kind.family(), token)
+}
+
+/// Drop the staged candidate `token`. `false` when it is no longer staged.
+/// A candidate already in storage, or a removal, cannot be discarded.
+pub(crate) fn discard(session: &mut Session, token: &[u8]) -> Result<bool, ApiError> {
+    match staged(session) {
+        Some((CandidateKind::Removal, staged)) if staged == token => Err(ApiError::wrong_state(
+            "removed membership awaits durable adoption",
+        )),
+        Some((_, staged)) if staged == token => {
+            Ok(crate::ops::workspace::discard_candidate(session)?.discarded)
+        }
+        _ => Ok(false),
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DiscardArgs {
+    pub candidate: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub(crate) struct DiscardReply {
+    pub discarded: bool,
+}
+
+pub(crate) fn discard_candidate(
+    session: &mut Session,
+    args: DiscardArgs,
+) -> Result<DiscardReply, ApiError> {
+    Ok(DiscardReply {
+        discarded: discard(session, &args.candidate)?,
+    })
 }
 
 /// A member as a reply shows it.
@@ -450,6 +567,28 @@ pub(crate) fn adopt(
 #[cfg(test)]
 mod tests {
     use crate::*;
+
+    #[test]
+    fn discard_returns_a_staged_admission_batch_to_intake() {
+        let owner = arachne_security::Workspace::create([107; 32], "Owner").unwrap();
+        let mut session = crate::membership::bare_test_session(owner);
+        let staged = crate::ops::management::stage_workspace_name(
+            &mut session,
+            crate::ops::management::WorkspaceNameArgs {
+                workspace_name: "Named".into(),
+            },
+        )
+        .unwrap();
+        // As if the staged step also carried an admission batch and approval.
+        session.admission.in_flight =
+            vec![arachne_security::AdmissionAttempt::new([1; 32], vec![1]).unwrap()];
+        session.admission.staged_approval_id = Some([2; 32]);
+        assert!(!super::discard(&mut session, &[0; 37]).unwrap());
+        assert!(super::discard(&mut session, &staged.snapshot).unwrap());
+        // A retried request is assessed again instead of waiting for ever.
+        assert!(session.admission.in_flight.is_empty());
+        assert!(session.admission.staged_approval_id.is_none());
+    }
 
     #[test]
     fn removal_is_not_delayed_by_pending_objects_and_delivery_state_carries() {

@@ -75,7 +75,7 @@ fn errors_from_secret_inputs_do_not_show_the_secret() {
     let created = owner.create_workspace("Owner", None).unwrap();
     let anchor = owner.record_freshness().unwrap();
     let candidate = owner.stage_invitation(0).unwrap();
-    let invitation = owner.adopt_invitation(&candidate.candidate).unwrap();
+    let invitation = owner.adopt_invitation(&candidate).unwrap();
 
     let other_provider = MemoryProvider::default();
     let mut other = open([0x3C; 32], &other_provider);
@@ -101,24 +101,18 @@ fn errors_from_secret_inputs_do_not_show_the_secret() {
             .inspect_invitation(&invitation.invitation, &tampered(&invitation.checkpoint))
             .err(),
     );
-    // A candidate that is no longer staged, and a damaged one.
-    errors.extend(owner.adopt_invitation(&candidate.candidate).err());
-    errors.extend(
-        owner
-            .adopt_invitation(&tampered(&candidate.candidate))
-            .err(),
-    );
+    // A candidate that was already used.
+    errors.extend(owner.adopt_invitation(&candidate).err());
     assert!(
         errors.len() >= 4,
         "expected most secret inputs to fail, got {} errors",
         errors.len()
     );
 
-    let secrets: [(&str, &[u8]); 4] = [
+    let secrets: [(&str, &[u8]); 3] = [
         ("endpoint secret", &SECRET),
         ("invitation", &invitation.invitation),
         ("invitation key", &invitation.invitation_key),
-        ("invitation candidate", &candidate.candidate),
     ];
     for error in &errors {
         assert_no_secret(error, &secrets);

@@ -3,7 +3,15 @@ use serde_json::Value;
 
 use arachne_api::{ApiError, ErrorCode};
 
+use crate::ops::candidate::CandidateKind;
 use crate::ops::{self, Op, admission, candidate, invitation, join, management, publication, receive};
+
+/// The kinds `adopt_admission` accepts.
+const WORKSPACE_KINDS: &[CandidateKind] = &[
+    CandidateKind::Admission,
+    CandidateKind::Management,
+    CandidateKind::WorkspaceName,
+];
 use crate::persistence;
 use crate::{FreshnessAnchor, Session, StorageConfig, WorkspacePhase};
 
@@ -523,12 +531,105 @@ pub struct RestoredJoin {
     pub admission_request: Option<Vec<u8>>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorkspaceCandidate {
-    pub workspace: [u8; 32],
-    /// Opaque token; pass it to the matching adopt method.
-    pub candidate: Vec<u8>,
+/// The staged candidate inside every typed candidate: the client it
+/// belongs to and its token, which is taken when it is adopted or discarded.
+#[derive(Debug)]
+struct Staged {
+    client: i64,
+    token: std::sync::Mutex<Option<Vec<u8>>>,
 }
+
+impl Staged {
+    fn new(client: i64, token: Vec<u8>) -> Self {
+        Self {
+            client,
+            token: std::sync::Mutex::new(Some(token)),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Vec<u8>>> {
+        self.token
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Drop it in core. `false`: it was already used or is no longer staged.
+    fn discard(&self) -> Result<bool> {
+        let mut token = self.lock();
+        let Some(staged) = token.as_ref() else {
+            return Ok(false);
+        };
+        let discarded = ops::run(self.client, Op::DiscardCandidate, |session| {
+            candidate::discard(session, staged)
+        })?;
+        *token = None;
+        Ok(discarded)
+    }
+}
+
+impl Drop for Staged {
+    /// A candidate dropped without adoption is discarded in core.
+    fn drop(&mut self) {
+        if let Some(token) = self.lock().take() {
+            let _ = ops::run(self.client, Op::DiscardCandidate, |session| {
+                candidate::discard(session, &token)
+            });
+        }
+    }
+}
+
+macro_rules! candidate_type {
+    ($(#[$doc:meta])* $name:ident) => {
+        $(#[$doc])*
+        ///
+        /// Opaque, bound to the client that staged it, and usable one time:
+        /// adopt it with its own adopt method, or `discard` it. Dropping it
+        /// without adoption discards it.
+        #[derive(Debug)]
+        pub struct $name {
+            workspace: [u8; 32],
+            staged: Staged,
+        }
+
+        impl $name {
+            fn new(client: i64, workspace: [u8; 32], token: Vec<u8>) -> Self {
+                Self {
+                    workspace,
+                    staged: Staged::new(client, token),
+                }
+            }
+
+            pub fn workspace(&self) -> [u8; 32] {
+                self.workspace
+            }
+
+            /// Drop the staged change. `false`: it was already used or is no
+            /// longer staged. A candidate already in storage cannot be
+            /// discarded (`WrongState`).
+            pub fn discard(&self) -> Result<bool> {
+                self.staged.discard()
+            }
+        }
+    };
+}
+
+candidate_type!(
+    /// An admission, administrator action or workspace name change. Adopt it
+    /// with `adopt_admission`.
+    WorkspaceCandidate
+);
+candidate_type!(
+    /// An invitation registration. Adopt it with `adopt_invitation`.
+    InvitationCandidate
+);
+candidate_type!(
+    /// This member's removal. Adopt it with `adopt_removal`; that ends the session.
+    RemovalCandidate
+);
+candidate_type!(
+    /// A join. Adopt it with `adopt_join`.
+    JoinCandidate
+);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RouteKind {
@@ -636,11 +737,10 @@ pub struct DeliveryReport {
     pub failed: Vec<DeliveryFailure>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PublicationCandidate {
-    pub workspace: [u8; 32],
-    pub candidate: Vec<u8>,
-}
+candidate_type!(
+    /// A protected publication. Adopt it with `adopt_protected_publication`.
+    PublicationCandidate
+);
 
 /// Current-value metadata for a protected publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -653,13 +753,12 @@ pub struct PublicationCurrent {
     pub tombstone: bool,
 }
 
-/// A protected incoming publication staged for caller-owned save/adopt.
-/// The authenticated plaintext is withheld until `adopt_protected_reception`.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProtectedReceptionCandidate {
-    pub workspace: [u8; 32],
-    pub candidate: Vec<u8>,
-}
+candidate_type!(
+    /// A protected incoming publication, or an acknowledgement or rejection
+    /// of a pending object. The authenticated plaintext is withheld until
+    /// `adopt_protected_reception`.
+    ProtectedReceptionCandidate
+);
 
 /// An authenticated pending object from the durable inbox.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -743,15 +842,30 @@ pub enum RecoveryRangeStatus {
     Cancelled,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// A recovery range. Adopt it with `adopt_recovery`.
+#[derive(Debug)]
 pub struct RecoveryCandidate {
-    pub workspace: [u8; 32],
-    pub candidate: Vec<u8>,
-    pub publication_count: usize,
-    pub durable: bool,
+    candidate: ProtectedReceptionCandidate,
+    publication_count: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl RecoveryCandidate {
+    pub fn workspace(&self) -> [u8; 32] {
+        self.candidate.workspace()
+    }
+
+    /// Objects the range brings into the durable inbox.
+    pub fn publication_count(&self) -> usize {
+        self.publication_count
+    }
+
+    /// See [`WorkspaceCandidate::discard`].
+    pub fn discard(&self) -> Result<bool> {
+        self.candidate.discard()
+    }
+}
+
+#[derive(Debug)]
 pub enum RecoveryStage {
     Candidate(RecoveryCandidate),
     AlreadyCovered,
@@ -962,15 +1076,23 @@ impl Client {
                 },
             )
         })?;
-        Ok(WorkspaceCandidate {
-            workspace: staged.workspace,
-            candidate: staged.snapshot,
-        })
+        Ok(WorkspaceCandidate::new(self.handle()?, staged.workspace, staged.snapshot))
     }
 
-    pub fn adopt_admission(&self, candidate: &[u8]) -> Result<WorkspaceInfo> {
-        self.adopt(Op::AdoptAdmission, candidate::adopt_admission, candidate)
+    /// Adopt an admission, administrator action or name change. Core saves
+    /// it, reads it back, then adopts it.
+    ///
+    /// Only its own kind compiles:
+    /// ```compile_fail
+    /// # fn wrong(client: &arachne_runtime::Client, c: &arachne_runtime::InvitationCandidate) {
+    /// client.adopt_admission(c);
+    /// # }
+    /// ```
+    pub fn adopt_admission(&self, candidate: &WorkspaceCandidate) -> Result<WorkspaceInfo> {
+        self.adopt(Op::AdoptAdmission, &candidate.staged, WORKSPACE_KINDS)?
+            .adopted()
             .map(workspace_info)
+            .map_err(Error::from)
     }
 
     pub fn retained_admission(
@@ -1045,7 +1167,7 @@ impl Client {
         &self,
         welcome: &[u8],
         commits: &[JoinAdmissionStep],
-    ) -> Result<WorkspaceCandidate> {
+    ) -> Result<JoinCandidate> {
         if welcome.len() > arachne_security::MAX_WELCOME {
             return Err(Error::from(ApiError::invalid_input(
                 "request",
@@ -1072,15 +1194,14 @@ impl Client {
                 },
             )
         })?;
-        Ok(WorkspaceCandidate {
-            workspace: staged.workspace,
-            candidate: staged.snapshot,
-        })
+        Ok(JoinCandidate::new(self.handle()?, staged.workspace, staged.snapshot))
     }
 
-    pub fn adopt_join(&self, candidate: &[u8]) -> Result<WorkspaceInfo> {
-        self.adopt(Op::AdoptJoin, candidate::adopt_join, candidate)
+    pub fn adopt_join(&self, candidate: &JoinCandidate) -> Result<WorkspaceInfo> {
+        self.adopt(Op::AdoptJoin, &candidate.staged, &[CandidateKind::Join])?
+            .adopted()
             .map(workspace_info)
+            .map_err(Error::from)
     }
 
     /// Anchor after the latest record commit. Without a monotonic anchor
@@ -1134,7 +1255,7 @@ impl Client {
 
     /// Register a reusable invitation link in shared policy. The link is
     /// released only by `adopt_invitation`, after the candidate is saved.
-    pub fn stage_invitation(&self, expires_at: u64) -> Result<WorkspaceCandidate> {
+    pub fn stage_invitation(&self, expires_at: u64) -> Result<InvitationCandidate> {
         self.stage_invitation_of(expires_at, InvitationKind::Reusable)
     }
 
@@ -1144,7 +1265,7 @@ impl Client {
         &self,
         expires_at: u64,
         kind: InvitationKind,
-    ) -> Result<WorkspaceCandidate> {
+    ) -> Result<InvitationCandidate> {
         let (personal, automatic, request_access) = match kind {
             InvitationKind::Reusable => (false, false, false),
             InvitationKind::Personal => (true, false, false),
@@ -1162,7 +1283,7 @@ impl Client {
                 },
             )
         })?;
-        candidate_of(staged)
+        Ok(InvitationCandidate::new(self.handle()?, staged.workspace, staged.snapshot))
     }
 
     /// Approve (bind) a personal invitation for one join request. Adopt the
@@ -1181,7 +1302,7 @@ impl Client {
                 },
             )
         })?;
-        candidate_of(staged)
+        self.candidate_of(staged)
     }
 
     /// Decline a personal invitation request. Adopt the candidate with
@@ -1200,7 +1321,7 @@ impl Client {
                 },
             )
         })?;
-        candidate_of(staged)
+        self.candidate_of(staged)
     }
 
     /// The registered invitation links, numbered for people.
@@ -1234,7 +1355,7 @@ impl Client {
         let staged = self.call(Op::StageManagement, |session| {
             management::stage(session, management::ManagementArgs { action })
         })?;
-        candidate_of(staged)
+        self.candidate_of(staged)
     }
 
     /// Rename the workspace. Adopt the candidate with `adopt_admission`.
@@ -1247,38 +1368,42 @@ impl Client {
                 },
             )
         })?;
-        candidate_of(staged)
+        self.candidate_of(staged)
     }
 
     /// Leave through another member, who commits the departure. Adopt the
     /// staged removal with `adopt_removal`; that ends the session.
-    pub fn leave_via_peer(&self, peer: [u8; 32]) -> Result<WorkspaceCandidate> {
+    pub fn leave_via_peer(&self, peer: [u8; 32]) -> Result<RemovalCandidate> {
         let staged = self.call(Op::LeaveViaPeer, |session| {
             management::leave_via_peer(session, management::PeerArgs { peer })
         })?;
-        change_candidate(staged)
+        match staged {
+            management::StagedChange::Removal(removal) => Ok(RemovalCandidate::new(
+                self.handle()?,
+                removal.workspace,
+                removal.snapshot,
+            )),
+            // The peer answered with a step that does not remove this
+            // member: drop it, it is not what the caller asked for.
+            management::StagedChange::Candidate(candidate) => {
+                drop(self.candidate_of(candidate)?);
+                Err(Error::from(ApiError::wrong_state(
+                    "the peer's step does not remove this member",
+                )))
+            }
+        }
     }
 
     /// The last member leaves alone. Adopt with `adopt_removal`.
-    pub fn stage_solo_leave(&self) -> Result<WorkspaceCandidate> {
+    pub fn stage_solo_leave(&self) -> Result<RemovalCandidate> {
         let staged = self.call(Op::StageSoloLeave, management::stage_solo_leave)?;
-        Ok(WorkspaceCandidate {
-            workspace: staged.workspace,
-            candidate: staged.snapshot,
-        })
+        Ok(RemovalCandidate::new(self.handle()?, staged.workspace, staged.snapshot))
     }
 
     /// Adopt a saved removal of this member. The session ends: later calls
     /// give `Closed`.
-    pub fn adopt_removal(&self, candidate: &[u8]) -> Result<RemovedMembership> {
-                let reply = self.call(Op::AdoptAdmission, |session| {
-            candidate::adopt_admission(
-                session,
-                candidate::AdoptArgs {
-                    candidate: candidate.to_vec(),
-                },
-            )
-        })?;
+    pub fn adopt_removal(&self, candidate: &RemovalCandidate) -> Result<RemovedMembership> {
+        let reply = self.adopt(Op::AdoptAdmission, &candidate.staged, &[CandidateKind::Removal])?;
         match reply {
             candidate::AdoptReply::Removed(removed) => Ok(RemovedMembership {
                 workspace: removed.workspace,
@@ -1293,8 +1418,10 @@ impl Client {
     }
 
     /// Adopt a staged invitation registration and return its bearer link.
-    pub fn adopt_invitation(&self, candidate: &[u8]) -> Result<InvitationInfo> {
-        let adopted = self.adopt(Op::AdoptAdmission, candidate::adopt_admission, candidate)?;
+    pub fn adopt_invitation(&self, candidate: &InvitationCandidate) -> Result<InvitationInfo> {
+        let adopted = self
+            .adopt(Op::AdoptAdmission, &candidate.staged, &[CandidateKind::Invitation])?
+            .adopted()?;
         let issued = adopted.issued_invitation.ok_or_else(|| {
             error(ErrorKind::InvalidInput, "candidate did not issue an invitation")
         })?;
@@ -1647,14 +1774,16 @@ impl Client {
                 "publication candidate workspace mismatch",
             ));
         }
-        Ok(PublicationCandidate {
-            workspace: staged.workspace,
-            candidate: staged.snapshot,
-        })
+        Ok(PublicationCandidate::new(self.handle()?, staged.workspace, staged.snapshot))
     }
 
-    pub fn adopt_protected_publication(&self, candidate: &[u8]) -> Result<DeliveryReport> {
-        let adopted = self.adopt(Op::AdoptPublication, candidate::adopt_publication, candidate)?;
+    pub fn adopt_protected_publication(
+        &self,
+        candidate: &PublicationCandidate,
+    ) -> Result<DeliveryReport> {
+        let adopted = self
+            .adopt(Op::AdoptPublication, &candidate.staged, &[CandidateKind::Publication])?
+            .adopted()?;
         let outcome = adopted
             .publication
             .ok_or_else(|| error(ErrorKind::Internal, "publication result has no admission"))?;
@@ -1672,10 +1801,11 @@ impl Client {
         let staged = self.call(Op::PollProtected, receive::poll_protected)?;
         staged
             .map(|staged| {
-                Ok(ProtectedReceptionCandidate {
-                    workspace: staged.workspace,
-                    candidate: staged.snapshot,
-                })
+                Ok(ProtectedReceptionCandidate::new(
+                    self.handle()?,
+                    staged.workspace,
+                    staged.snapshot,
+                ))
             })
             .transpose()
     }
@@ -1683,8 +1813,9 @@ impl Client {
     /// Adopt a staged inbox candidate: a reception from `poll_protected`, or an
     /// acknowledgement or rejection. A received object then waits in the
     /// durable inbox; read it with `poll_pending_object`.
-    pub fn adopt_protected_reception(&self, candidate: &[u8]) -> Result<()> {
-        self.adopt(Op::AdoptReception, candidate::adopt_reception, candidate)?;
+    pub fn adopt_protected_reception(&self, candidate: &ProtectedReceptionCandidate) -> Result<()> {
+        self.adopt(Op::AdoptReception, &candidate.staged, &[CandidateKind::Reception])?
+            .adopted()?;
         Ok(())
     }
 
@@ -1745,10 +1876,11 @@ impl Client {
                 },
             )
         })?;
-        Ok(ProtectedReceptionCandidate {
-            workspace: staged.workspace,
-            candidate: staged.snapshot,
-        })
+        Ok(ProtectedReceptionCandidate::new(
+            self.handle()?,
+            staged.workspace,
+            staged.snapshot,
+        ))
     }
 
     pub fn set_interest(
@@ -1893,10 +2025,12 @@ impl Client {
         match staged {
             ops::recovery::RecoveryStaged::Candidate(candidate) => {
                 Ok(RecoveryStage::Candidate(RecoveryCandidate {
-                    workspace: candidate.workspace,
-                    candidate: candidate.snapshot,
+                    candidate: ProtectedReceptionCandidate::new(
+                        self.handle()?,
+                        candidate.workspace,
+                        candidate.snapshot,
+                    ),
                     publication_count: candidate.publication_count.unwrap_or(0),
-                    durable: candidate.durable,
                 }))
             }
             ops::recovery::RecoveryStaged::Nothing(nothing) => match nothing.state {
@@ -1911,8 +2045,14 @@ impl Client {
         }
     }
 
-    pub fn adopt_recovery(&self, candidate: &[u8]) -> Result<RecoveryAdoption> {
-        let adopted = self.adopt(Op::AdoptRecovery, candidate::adopt_recovery, candidate)?;
+    pub fn adopt_recovery(&self, candidate: &RecoveryCandidate) -> Result<RecoveryAdoption> {
+        let adopted = self
+            .adopt(
+                Op::AdoptRecovery,
+                &candidate.candidate.staged,
+                &[CandidateKind::Recovery],
+            )?
+            .adopted()?;
         let (recovered_publications, missing_publications) = match adopted.state {
             Some("recovery_adopted") => (
                 adopted.publication_count.unwrap_or(0),
@@ -1954,22 +2094,30 @@ impl Client {
         ops::run(self.handle()?, op, body).map_err(Error::from)
     }
 
-    /// Adopt a saved candidate with the adopt op of its kind.
+    /// Adopt `staged` if it belongs to this client, is unused, and is one of
+    /// `kinds`. Every check runs before anything changes.
     fn adopt(
         &self,
         op: Op,
-        adopt: fn(&mut Session, candidate::AdoptArgs) -> std::result::Result<candidate::AdoptReply, ApiError>,
-        candidate: &[u8],
-    ) -> Result<candidate::Adopted> {
-                let reply = self.call(op, |session| {
-            adopt(
-                session,
-                candidate::AdoptArgs {
-                    candidate: candidate.to_vec(),
-                },
-            )
-        })?;
-        reply.adopted().map_err(Error::from)
+        staged: &Staged,
+        kinds: &[CandidateKind],
+    ) -> Result<candidate::AdoptReply> {
+        if staged.client != self.handle()? {
+            return Err(Error::from(ApiError::wrong_state(
+                "candidate belongs to another client",
+            )));
+        }
+        let mut token = staged.lock();
+        let value = token
+            .clone()
+            .ok_or_else(|| ApiError::candidate_stale("candidate was already used or discarded"))?;
+        let reply = self.call(op, |session| candidate::adopt_exact(session, kinds, value))?;
+        *token = None;
+        Ok(reply)
+    }
+
+    fn candidate_of(&self, staged: management::StagedCandidate) -> Result<WorkspaceCandidate> {
+        Ok(WorkspaceCandidate::new(self.handle()?, staged.workspace, staged.snapshot))
     }
 
     fn handle(&self) -> Result<i64> {
@@ -1984,23 +2132,6 @@ impl Drop for Client {
         if let Some(handle) = self.handle.take() {
             let _ = crate::registry::close_session(handle);
         }
-    }
-}
-
-fn candidate_of(staged: management::StagedCandidate) -> Result<WorkspaceCandidate> {
-    Ok(WorkspaceCandidate {
-        workspace: staged.workspace,
-        candidate: staged.snapshot,
-    })
-}
-
-fn change_candidate(staged: management::StagedChange) -> Result<WorkspaceCandidate> {
-    match staged {
-        management::StagedChange::Candidate(candidate) => candidate_of(candidate),
-        management::StagedChange::Removal(removal) => Ok(WorkspaceCandidate {
-            workspace: removal.workspace,
-            candidate: removal.snapshot,
-        }),
     }
 }
 

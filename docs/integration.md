@@ -82,7 +82,17 @@ workspace in a private directory. `root` is the host's storage root key.
 `StorageConfig::new` takes any `StorageProvider` implementation;
 `MemoryProvider` is for tests.
 
-A stage op returns an opaque candidate token, never state bytes. The matching
+A stage op returns an opaque candidate, never state bytes. In the typed
+`Client` each kind has its own type (`WorkspaceCandidate`, `InvitationCandidate`,
+`RemovalCandidate`, `JoinCandidate`, `PublicationCandidate`,
+`ProtectedReceptionCandidate`, `RecoveryCandidate`), so a candidate only compiles
+with its own adopt method. A candidate is bound to the client that staged it
+(another client gives `WrongState`) and works one time (a second adoption gives
+`CandidateStale`). `discard()` drops it; a candidate dropped without adoption is
+discarded too. A candidate that is already in storage cannot be discarded. The
+JSON dispatcher returns the token in `candidate`, and each adopt op refuses a
+candidate of another kind (`WrongState`); `discard_candidate {candidate}` drops
+exactly that one. The matching
 adopt op saves the candidate, reads it back, then adopts it. `create_workspace`
 and `begin_join` save their state before they return, so every reply reports
 `durable: true`. `restore_workspace(workspace)` restores what storage holds for

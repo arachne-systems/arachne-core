@@ -97,7 +97,7 @@ pub use client::{
     PublicationCandidate, PublicationCurrent, ProtectedReceptionCandidate,
     ReceivedProtectedPublication, RecoveryAdoption, RecoveryCandidate, RecoveryRangeReady,
     RecoveryRangeRequest, RecoveryRangeStatus, RecoveryStage, Result as ClientResult, RouteHint,
-    RestoredJoin, RestoredWorkspace, RouteKind, WorkspaceCandidate, WorkspaceInfo, WorkspaceMetrics, WorkspaceState,
+    RestoredJoin, RestoredWorkspace, InvitationCandidate, JoinCandidate, RemovalCandidate, RouteKind, WorkspaceCandidate, WorkspaceInfo, WorkspaceMetrics, WorkspaceState,
 };
 pub use client::{OperatorRelay, RelayTrust, TransportInfo, TransportOptions, TransportTimeouts};
 pub use arachne_store::{FreshnessAnchor, MemoryProvider, SqliteProvider, Storage, StorageProvider};

@@ -249,6 +249,13 @@ pub(crate) fn discard_candidate(session: &mut Session) -> Result<Discarded, ApiE
         ));
     }
     let discarded = session.transition.staged.take().is_some();
+    if discarded {
+        // The batch goes back to intake: a retried request is assessed again
+        // instead of waiting for an adoption that will never come. A pending
+        // approval stays pending.
+        session.admission.in_flight.clear();
+        session.admission.staged_approval_id = None;
+    }
     let offer_cancelled = session.membership.offer.take().is_some();
     session.membership.offer_requires_adoption = false;
     session.membership.staged_step_received = false;
