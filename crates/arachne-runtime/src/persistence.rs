@@ -39,8 +39,94 @@ type Migration = fn(&mut SecurityRecords) -> Result<(), ApiError>;
 const MIGRATIONS: &[Migration] = &[];
 const _: () = assert!(MIGRATIONS.len() + 1 == RUNTIME_FORMAT as usize);
 
-// A pending join, with its checkpoint, is one record.
+// A pending join, with its checkpoint, fits one part.
 const _: () = assert!(arachne_security::MAX_SEALED_PENDING_JOIN <= arachne_store::MAX_RECORD_BYTES);
+
+/// A value longer than this is saved as parts (A3g): the MLS ratchet tree of
+/// a large roster is larger than the store's 1 MiB record limit.
+const PART_BYTES: usize = 512 * 1024;
+/// Stored value tags: the value itself, or the number of its parts.
+const WHOLE: u8 = 0;
+const PARTS: u8 = 1;
+/// Parts of `name` are stored at `name`, this marker, and a u32 index.
+/// Record names never contain a NUL byte.
+const PART_MARKER: &[u8] = b"\x00part/";
+const _: () = assert!(PART_BYTES + 1 <= arachne_store::MAX_RECORD_BYTES);
+
+fn is_part(name: &[u8]) -> bool {
+    name.windows(PART_MARKER.len()).any(|window| window == PART_MARKER)
+}
+
+fn part_name(name: &[u8], index: u32) -> Vec<u8> {
+    let mut part = name.to_vec();
+    part.extend(PART_MARKER);
+    part.extend(index.to_be_bytes());
+    part
+}
+
+/// The stored form of `records`: each value tagged, long values in parts.
+fn expand(records: &SecurityRecords) -> Result<SecurityRecords, ApiError> {
+    let mut stored = SecurityRecords::new();
+    for (name, value) in records {
+        if is_part(name) {
+            return Err(ApiError::internal("record name holds the part marker"));
+        }
+        if value.len() <= PART_BYTES {
+            let mut tagged = Zeroizing::new(Vec::with_capacity(value.len() + 1));
+            tagged.push(WHOLE);
+            tagged.extend_from_slice(value);
+            stored.insert(name.clone(), tagged);
+            continue;
+        }
+        let parts = value.chunks(PART_BYTES);
+        let count = u32::try_from(parts.len())
+            .map_err(|_| ApiError::internal("record has too many parts"))?;
+        let mut index = Zeroizing::new(vec![PARTS]);
+        index.extend(count.to_be_bytes());
+        stored.insert(name.clone(), index);
+        for (number, part) in (0..count).zip(parts) {
+            stored.insert(part_name(name, number), Zeroizing::new(part.to_vec()));
+        }
+    }
+    Ok(stored)
+}
+
+/// The records of a store as the runtime wrote them: parts joined, tags removed.
+struct Logical<'a>(&'a dyn Storage);
+
+impl Logical<'_> {
+    fn keys(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
+        self.0
+            .keys(prefix)
+            .into_iter()
+            .filter(|name| !is_part(name))
+            .collect()
+    }
+
+    fn get(&self, name: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>, ApiError> {
+        let Some(stored) = self.0.get(name).map_err(errors::store)? else {
+            return Ok(None);
+        };
+        let corrupt = || ApiError::storage_corrupt("invalid stored record encoding");
+        match stored.split_first() {
+            Some((&WHOLE, value)) => Ok(Some(Zeroizing::new(value.to_vec()))),
+            Some((&PARTS, count)) => {
+                let count = u32::from_be_bytes(count.try_into().map_err(|_| corrupt())?);
+                let mut value = Zeroizing::new(Vec::new());
+                for number in 0..count {
+                    let part = self
+                        .0
+                        .get(&part_name(name, number))
+                        .map_err(errors::store)?
+                        .ok_or_else(corrupt)?;
+                    value.extend_from_slice(&part);
+                }
+                Ok(Some(value))
+            }
+            _ => Err(corrupt()),
+        }
+    }
+}
 
 /// Where a session keeps its workspace records. One store per workspace.
 ///
@@ -149,6 +235,7 @@ impl NativeStore {
             FORMAT.to_vec(),
             Zeroizing::new(RUNTIME_FORMAT.to_be_bytes().to_vec()),
         );
+        let records = expand(&records)?;
         let deleted: Vec<Vec<u8>> = self
             .store
             .keys(b"")
@@ -162,6 +249,11 @@ impl NativeStore {
             }
         }
         changes.extend(deleted.iter().map(|name| (name.as_slice(), None)));
+        let written: Vec<Vec<u8>> = changes
+            .iter()
+            .filter(|(_, value)| value.is_some())
+            .map(|(name, _)| name.to_vec())
+            .collect();
         let revision = self.store.revision();
         let current = self.store.freshness();
         let (scope, anchors) = (self.scope, self.anchors.clone());
@@ -183,7 +275,7 @@ impl NativeStore {
             self.uncertain = true;
             return Err(errors::store(error));
         }
-        if let Err(error) = self.read_back(&records) {
+        if let Err(error) = self.read_back(&records, &written) {
             self.uncertain = true;
             return Err(error);
         }
@@ -203,14 +295,16 @@ impl NativeStore {
         Ok(())
     }
 
-    fn read_back(&self, records: &SecurityRecords) -> Result<(), ApiError> {
+    /// The stored set is exactly `records`, and every record just written
+    /// reads back byte for byte. Unchanged records were not written.
+    fn read_back(&self, records: &SecurityRecords, written: &[Vec<u8>]) -> Result<(), ApiError> {
         let keys = self.store.keys(b"");
         if keys.len() != records.len() || keys.iter().any(|name| !records.contains_key(name)) {
             return Err(ApiError::storage_failed("record set did not read back"));
         }
-        for (name, value) in records {
+        for name in written {
             let stored = self.store.get(name).map_err(errors::store)?;
-            if stored.as_deref() != Some(value.as_ref()) {
+            if stored.as_deref().map(Vec::as_slice) != records.get(name).map(|value| value.as_slice()) {
                 return Err(ApiError::storage_failed("record did not read back"));
             }
         }
@@ -218,8 +312,8 @@ impl NativeStore {
     }
 
     fn terminal(&self) -> Result<bool, ApiError> {
-        Ok(self.store.get(RESET).map_err(errors::store)?.is_some()
-            || self.store.get(REMOVED).map_err(errors::store)?.is_some())
+        let view = Logical(self.store.as_ref());
+        Ok(view.get(RESET)?.is_some() || view.get(REMOVED)?.is_some())
     }
 }
 
@@ -621,7 +715,7 @@ pub(crate) fn restore(
                 .map_err(errors::store)?;
         }
     }
-    let get = |name: &[u8]| store.get(name).map_err(errors::store);
+    let get = |name: &[u8]| Logical(store.as_ref()).get(name);
     let corrupt = |detail: &str| ApiError::storage_corrupt(detail);
     let committed = get(TOKEN)?
         .ok_or_else(|| corrupt("missing native commit token"))?
@@ -643,12 +737,12 @@ pub(crate) fn restore(
     if format != RUNTIME_FORMAT {
         // The migration hook: upgrade every record, then save them as one
         // commit before any is used.
-        let mut records: SecurityRecords = store
-            .store
+        let view = Logical(store.store.as_ref());
+        let mut records: SecurityRecords = view
             .keys(b"")
             .into_iter()
             .map(|name| {
-                let value = store.store.get(&name).map_err(errors::store)?;
+                let value = view.get(&name)?;
                 Ok((name, value.ok_or_else(|| corrupt("missing record"))?))
             })
             .collect::<Result<_, ApiError>>()?;
@@ -658,8 +752,8 @@ pub(crate) fn restore(
         }
     }
     let (store, committed) = (store.store, store.committed);
-    let get = |name: &[u8]| store.get(name).map_err(errors::store);
-    let keys = store.keys(b"");
+    let get = |name: &[u8]| Logical(store.as_ref()).get(name);
+    let keys = Logical(store.as_ref()).keys(b"");
     if let Some(bytes) = get(PENDING)? {
         if keys.iter().any(|name| {
             ![PENDING, TOKEN, ENDPOINT, FORMAT, JOIN_LIFECYCLE, ACTIVITY]
@@ -805,6 +899,7 @@ pub fn seed_workspace(
         FORMAT.to_vec(),
         Zeroizing::new(RUNTIME_FORMAT.to_be_bytes().to_vec()),
     );
+    let store_records = expand(&store_records).map_err(errors::text)?;
     let stale: Vec<Vec<u8>> = store
         .keys(b"")
         .into_iter()
@@ -827,6 +922,49 @@ mod tests {
     fn to_format_two(records: &mut SecurityRecords) -> Result<(), ApiError> {
         records.insert(b"runtime/added".to_vec(), Zeroizing::new(vec![2]));
         Ok(())
+    }
+
+    /// A3g: a record larger than the store's record limit (the MLS tree of a
+    /// large roster) is saved as parts and reads back whole.
+    #[test]
+    fn a_record_above_the_store_limit_is_saved_in_parts() {
+        let provider = MemoryProvider::default();
+        let config = StorageConfig::memory(&provider);
+        let scope = [5; 32];
+        let mut store = NativeStore::new(
+            provider.create(scope).unwrap(),
+            scope,
+            &config,
+            [6; 32],
+            Vec::new(),
+        );
+        let large: Vec<u8> = (0..3 * arachne_store::MAX_RECORD_BYTES + 7)
+            .map(|index| index as u8)
+            .collect();
+        let records = SecurityRecords::from([
+            (b"security/large".to_vec(), Zeroizing::new(large.clone())),
+            (b"security/small".to_vec(), Zeroizing::new(vec![1, 2, 3])),
+        ]);
+        store.commit(records, &candidate_token().unwrap()).unwrap();
+        let view = Logical(store.store.as_ref());
+        assert_eq!(view.get(b"security/large").unwrap().unwrap().as_slice(), large);
+        assert_eq!(view.get(b"security/small").unwrap().unwrap().as_slice(), [1, 2, 3]);
+        assert_eq!(
+            view.keys(b"security/"),
+            vec![b"security/large".to_vec(), b"security/small".to_vec()]
+        );
+        // Shrinking it deletes the parts it no longer needs.
+        let records = SecurityRecords::from([(
+            b"security/large".to_vec(),
+            Zeroizing::new(vec![9]),
+        )]);
+        store.commit(records, &candidate_token().unwrap()).unwrap();
+        assert_eq!(store.store.keys(b"security/").len(), 1);
+        assert_eq!(view_get(&store, b"security/large"), vec![9]);
+    }
+
+    fn view_get(store: &NativeStore, name: &[u8]) -> Vec<u8> {
+        Logical(store.store.as_ref()).get(name).unwrap().unwrap().to_vec()
     }
 
     #[test]

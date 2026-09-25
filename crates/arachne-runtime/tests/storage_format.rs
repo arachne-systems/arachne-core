@@ -24,15 +24,13 @@ fn runtime_records_carry_their_format_and_refuse_others() {
     let created = client.create_workspace("Owner", None).unwrap();
     client.close().unwrap();
     let workspace = created.workspace;
-    assert_eq!(
-        provider.value(workspace, b"runtime/format"),
-        Some(1u32.to_be_bytes().to_vec())
-    );
+    // Stored values carry a one-byte tag (0: the whole value).
+    assert_eq!(provider.value(workspace, b"runtime/format"), Some(vec![0, 0, 0, 0, 1]));
 
     for (format, what) in [
-        (Some(2u32.to_be_bytes().to_vec()), "newer"),
+        (Some(vec![0, 0, 0, 0, 2]), "newer"),
         (None, "no runtime format"),
-        (Some(vec![0, 1]), "invalid"),
+        (Some(vec![0, 0, 1]), "invalid"),
     ] {
         let original = provider.value(workspace, b"runtime/format");
         provider.tamper(workspace, b"runtime/format", format.as_deref());

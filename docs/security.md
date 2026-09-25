@@ -145,6 +145,11 @@ record index when opening the database and authenticates record ciphertext
 when each record is read. The host remains responsible for protecting the root
 key, filesystem access, backups, and concurrent-open lifecycle.
 
+A stored value longer than 512 KiB is saved as parts, each its own store
+record, so no record passes the 1 MiB record limit. The MLS provider keeps the
+ratchet tree as JSON: about 1,270 bytes per member, about 3.7 MB at the roster
+the invitation checkpoint bound allows (about 2,900 members).
+
 Stored data is versioned. A store file carries its format (format 1) in the
 SQLite header and in the authenticated head, and the runtime records carry
 their own format record (format 1). There are no legacy readers: an unknown,
