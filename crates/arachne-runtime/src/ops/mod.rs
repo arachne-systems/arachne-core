@@ -242,13 +242,38 @@ pub(crate) fn run<T>(
     op: Op,
     body: impl FnOnce(&mut Session) -> Result<T, ApiError>,
 ) -> Result<T, ApiError> {
-    let shared = crate::session(handle)?;
+    let entry = crate::registry::entry(handle)?;
+    // The deadline counts from the call, so a wait for the lock counts too.
+    let Some(limit) = entry.deadline() else {
+        return run_locked(handle, &entry.shared, op, None, body);
+    };
+    let deadline = std::time::Instant::now() + limit;
+    let timer = std::sync::Arc::clone(&entry).arm_deadline(limit);
+    let result = run_locked(handle, &entry.shared, op, Some(deadline), body);
+    let fired = timer.finish();
+    match result {
+        Err(_) if fired || crate::deadline::expired(Some(deadline)) => {
+            Err(ApiError::DeadlineExceeded)
+        }
+        result => result,
+    }
+}
+
+fn run_locked<T>(
+    handle: i64,
+    shared: &crate::registry::SharedSession,
+    op: Op,
+    deadline: Option<std::time::Instant>,
+    body: impl FnOnce(&mut Session) -> Result<T, ApiError>,
+) -> Result<T, ApiError> {
     let mut guard = shared
         .lock()
         .map_err(errors::poisoned("node session unavailable"))?;
     let session = guard.as_mut().ok_or_else(errors::closed)?;
     let busy_before = admission_busy(session);
+    session.op_deadline = deadline;
     let result = admit(session, op).and_then(|()| body(session));
+    session.op_deadline = None;
     // Cancel and deadlines act on the op in flight only (ADR step 4). Close
     // removes the handle first; its cancel stays set, so an op queued on
     // this lock cannot delay the close.

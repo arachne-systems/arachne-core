@@ -429,3 +429,64 @@ fn suspend_stops_mdns_announcements_and_resume_restarts_them() {
     assert_eq!(running, 1);
     assert!(after > announced, "resume announces the current addresses");
 }
+
+#[test]
+fn a_deadline_bounds_the_endpoint_bind() {
+    let context = context();
+    // A relay-only endpoint waits for its relay; this one never answers.
+    let started = Instant::now();
+    let error = context
+        .open(ClientConfig {
+            network: Network::RelayOnly,
+            secret: Some([131; 32]),
+            transport: TransportOptions {
+                relay: Some(arachne_runtime::OperatorRelay {
+                    urls: vec!["https://relay.example.invalid".into()],
+                    trust: arachne_runtime::RelayTrust::WebPki,
+                }),
+                public_lookup: Some(false),
+                deadline: Some(Duration::from_millis(300)),
+                ..Default::default()
+            },
+        })
+        .err()
+        .expect("the relay never comes online");
+    let elapsed = started.elapsed();
+    assert_eq!(error.code(), ErrorCode::DeadlineExceeded, "{error}");
+    assert!(elapsed < Duration::from_secs(3), "bind ran {elapsed:?}");
+    // The failed bind returned its session slot.
+    assert_eq!(context.session_count(), 0);
+}
+
+#[test]
+fn the_handle_api_takes_a_per_session_deadline() {
+    use arachne_runtime::{create_with_deadline, execute_with_code, set_deadline};
+    let context = context();
+    let gone = context.open(direct(None)).unwrap();
+    let peer = gone.endpoint().unwrap().endpoint_key;
+    let address = local(&gone);
+    gone.close().unwrap();
+
+    let mut options = arachne_node::NodeOptions::new(arachne_node::NetworkProfile::Direct);
+    options.timeouts.dial = Duration::from_secs(30);
+    options.timeouts.operation = Duration::from_secs(30);
+    options.timeouts.close_drain = Duration::from_secs(1);
+    let handle = create_with_deadline(Some(&[132; 32]), options, 300).unwrap();
+    let call = |request: serde_json::Value| {
+        execute_with_code(handle, &serde_json::to_vec(&request).unwrap())
+    };
+    call(serde_json::json!({"op":"add_address_hint","peer":peer,"address":address})).unwrap();
+    let invite = serde_json::json!({"op":"send_nearby_invitation","peer":peer,"invitation":vec![7u8; 16]});
+    for _ in 0..2 {
+        let started = Instant::now();
+        let error = call(invite.clone()).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::DeadlineExceeded, "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+    // 0 clears it: the op then runs to its own timeouts (not waited for here).
+    set_deadline(handle, 0).unwrap();
+    set_deadline(handle, 200).unwrap();
+    let error = call(invite).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::DeadlineExceeded, "{error}");
+    arachne_runtime::close(handle).unwrap();
+}

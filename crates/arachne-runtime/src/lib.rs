@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 mod client;
 mod committed_view;
 mod context;
+mod deadline;
 mod errors;
 mod events;
 mod json;
@@ -25,7 +26,8 @@ mod session;
 pub use registry::{
     cancel, close, create, create_lan, create_nearby, create_relay, create_relay_with_options,
     create_wan, create_wan_only, create_with_options, describe, wait_for_work,
-    next_event, resume, suspend, wait_for_work_timeout, wake,
+    create_with_deadline, next_event, resume, set_deadline, suspend, wait_for_work_timeout,
+    wake,
 };
 #[cfg(feature = "tor")]
 pub use registry::create_tor;

@@ -36,6 +36,7 @@ fn wan_without_n0_uses_the_operator_relay_and_deadlines() {
             }),
             public_lookup: Some(false),
             timeouts: Some(timeouts),
+            deadline: None,
         },
     )
     .unwrap();

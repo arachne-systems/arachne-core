@@ -36,9 +36,19 @@ pub(crate) struct Entry {
     pub(crate) transport: TransportSummary,
     /// Counts deadline timers, so a late timer never cancels a later op.
     pub(crate) generation: Arc<Mutex<u64>>,
+    /// Per-op deadline of this session (`None`: only each wait's own limit).
+    pub(crate) deadline: Mutex<Option<Duration>>,
 }
 
 impl Entry {
+    pub(crate) fn deadline(&self) -> Option<Duration> {
+        *self.deadline.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub(crate) fn set_deadline(&self, deadline: Option<Duration>) {
+        *self.deadline.lock().unwrap_or_else(|error| error.into_inner()) = deadline;
+    }
+
     /// Start a deadline for one op: at `deadline` it interrupts the op's
     /// outbound control exchanges. `DeadlineTimer::finish` ends it.
     pub(crate) fn arm_deadline(self: Arc<Self>, deadline: Duration) -> DeadlineTimer {
@@ -185,7 +195,7 @@ pub fn create_with_options(
 
 pub(crate) fn create_endpoint(secret: Option<&[u8; 32]>, options: NodeOptions) -> Result<i64, String> {
     default_context()
-        .and_then(|context| open(&context, secret, options))
+        .and_then(|context| open(&context, secret, options, None))
         .map_err(errors::text)
 }
 
@@ -194,7 +204,9 @@ pub(crate) fn open(
     context: &Arc<Context>,
     secret: Option<&[u8; 32]>,
     options: NodeOptions,
+    deadline: Option<Duration>,
 ) -> Result<i64, ApiError> {
+    let bind_deadline = deadline.map(|deadline| std::time::Instant::now() + deadline);
     let profile = options.profile;
     let transport = TransportSummary {
         public_lookup: options.public_lookup,
@@ -214,7 +226,7 @@ pub(crate) fn open(
     tests::pause_bind(secret);
     let (node, receiver) = runtime
         .block_on(async {
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(crate::deadline::cap(bind_deadline, BIND_WAIT), async {
                 let address = ([0, 0, 0, 0], 0).into();
                 let bound =
                     Node::bind_with_options(address, secret, options, connection_budget).await?;
@@ -225,7 +237,13 @@ pub(crate) fn open(
             })
             .await
         })
-        .map_err(|_| ApiError::timeout(None, "node startup timed out"))?
+        .map_err(|_| {
+            if crate::deadline::expired(bind_deadline) {
+                ApiError::DeadlineExceeded
+            } else {
+                ApiError::timeout(None, "node startup timed out")
+            }
+        })?
         .map_err(errors::node)?;
     node.set_timer_scale(context.timer_scale());
     let signal = Arc::new(work_signal::WorkSignal::default());
@@ -263,6 +281,7 @@ pub(crate) fn open(
         cancellation,
         transport,
         generation: Arc::default(),
+        deadline: Mutex::new(deadline),
     });
     directory()?.insert(handle, Arc::clone(&entry));
     reservation.commit(handle);
@@ -376,6 +395,31 @@ pub fn next_event(handle: i64, timeout_ms: u64) -> Result<Option<String>, String
         .transpose()
 }
 
+/// Create an endpoint session in the default context whose blocking ops
+/// (and this bind) end at `deadline_ms` with `DeadlineExceeded` (the SDK
+/// form of `TransportOptions::deadline`). 0: no deadline.
+pub fn create_with_deadline(
+    secret: Option<&[u8; 32]>,
+    options: NodeOptions,
+    deadline_ms: u64,
+) -> Result<i64, String> {
+    let deadline = (deadline_ms != 0).then(|| Duration::from_millis(deadline_ms));
+    default_context()
+        .and_then(|context| open(&context, secret, options, deadline))
+        .map_err(errors::text)
+}
+
+/// Give each later blocking op of this session a deadline of
+/// `deadline_ms` (0: none). At the deadline the op fails with
+/// `DeadlineExceeded` (code 3) and the session stays usable.
+pub fn set_deadline(handle: i64, deadline_ms: u64) -> Result<(), String> {
+    entry(handle)
+        .map(|entry| {
+            entry.set_deadline((deadline_ms != 0).then(|| Duration::from_millis(deadline_ms)))
+        })
+        .map_err(errors::text)
+}
+
 /// Suspend the background work of every session of the default context
 /// (Android host in the background). See `Context::suspend`.
 pub fn suspend() -> Result<(), String> {
@@ -413,6 +457,9 @@ pub(crate) fn wait_session(handle: i64) -> Result<bool, ApiError> {
     let signal = Arc::clone(&entry(handle)?.signal);
     Ok(signal.wait())
 }
+
+/// The longest an endpoint bind waits (a relay-only bind waits for its relay).
+const BIND_WAIT: Duration = Duration::from_secs(10);
 
 /// Time `shutdown_session` allows for local teardown after the peer drain.
 const LOCAL_TEARDOWN: Duration = Duration::from_secs(2);

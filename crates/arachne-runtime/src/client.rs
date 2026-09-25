@@ -42,6 +42,10 @@ pub struct TransportOptions {
     pub public_lookup: Option<bool>,
     /// Deadlines for a slow or constrained link.
     pub timeouts: Option<TransportTimeouts>,
+    /// Per-op deadline for this client's blocking ops, and for its bind.
+    /// At the deadline an op fails with `DeadlineExceeded` and the session
+    /// stays usable. `Client::set_deadline` changes it later.
+    pub deadline: Option<std::time::Duration>,
 }
 
 /// Relays run by the deployment operator.
@@ -760,8 +764,6 @@ pub struct RecoveryAdoption {
 pub struct Client {
     handle: i64,
     closed: std::sync::atomic::AtomicBool,
-    /// Per-op deadline for blocking ops (`None`: only the op's own timeouts).
-    deadline: std::sync::Mutex<Option<std::time::Duration>>,
 }
 
 impl Client {
@@ -782,11 +784,11 @@ impl Client {
             ));
         }
         let options = config.transport.node_options(config.network)?;
-        let handle = crate::registry::open(context, config.secret.as_ref(), options)?;
+        let handle =
+            crate::registry::open(context, config.secret.as_ref(), options, config.transport.deadline)?;
         Ok(Self {
             handle,
             closed: std::sync::atomic::AtomicBool::new(false),
-            deadline: std::sync::Mutex::new(None),
         })
     }
 
@@ -1605,10 +1607,11 @@ impl Client {
     /// Give each later blocking op this deadline. At the deadline the op
     /// fails with `DeadlineExceeded` and the session stays usable.
     pub fn set_deadline(&self, deadline: Option<std::time::Duration>) {
-        *self
-            .deadline
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = deadline;
+        if let Ok(handle) = self.handle()
+            && let Ok(entry) = crate::registry::entry(handle)
+        {
+            entry.set_deadline(deadline);
+        }
     }
 
     /// `set_deadline`, as a builder.
@@ -2042,20 +2045,7 @@ impl Client {
         op: Op,
         body: impl FnOnce(&mut Session) -> std::result::Result<T, ApiError>,
     ) -> Result<T> {
-        let handle = self.handle()?;
-        let deadline = *self
-            .deadline
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let Some(deadline) = deadline else {
-            return ops::run(handle, op, body).map_err(Error::from);
-        };
-        let timer = crate::registry::entry(handle)?.arm_deadline(deadline);
-        let result = ops::run(handle, op, body);
-        if timer.finish() && result.is_err() {
-            return Err(Error::from(ApiError::DeadlineExceeded));
-        }
-        result.map_err(Error::from)
+        ops::run(self.handle()?, op, body).map_err(Error::from)
     }
 
     /// Adopt a saved candidate with the adopt op of its kind.

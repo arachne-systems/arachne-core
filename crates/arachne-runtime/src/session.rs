@@ -129,6 +129,8 @@ pub(crate) struct Session {
     /// Set by an op that ended the session (a removal was adopted or
     /// restored). `ops::run` then takes the session and shuts it down.
     pub(crate) ending: bool,
+    /// When the op in flight must end (`ops::run` sets it).
+    pub(crate) op_deadline: Option<std::time::Instant>,
     /// Ready jobs `next_event` already reported.
     pub(crate) events: crate::events::Reported,
     /// The owning context. Last, so the node closes before a context that
@@ -304,6 +306,7 @@ impl Session {
             presence,
             interests: interest::Updates::default(),
             ending: false,
+            op_deadline: None,
             events: Default::default(),
             context,
         }

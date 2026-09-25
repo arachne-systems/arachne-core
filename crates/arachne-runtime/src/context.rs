@@ -176,7 +176,7 @@ impl Context {
         secret: Option<&[u8; 32]>,
         options: NodeOptions,
     ) -> Result<i64, ApiError> {
-        registry::open(self, secret, options)
+        registry::open(self, secret, options, None)
     }
 
     /// Live sessions of this context.
