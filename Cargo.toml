@@ -35,3 +35,20 @@ homepage = "https://github.com/arachne-systems"
 [patch.crates-io]
 netlink-packet-core = { path = "vendor/netlink-packet-core" }
 hax-lib-macros = { path = "vendor/hax-lib-macros" }
+
+# Test speed. Debug-build openmls, RustCrypto and SQLite dominated the slow
+# runtime tests (12-26 min each). Dependencies build at opt-level 2; the three
+# crates that do the crypto and storage work build at opt-level 1 (debug info
+# stays on, an edit there rebuilds about 5 s slower); the rest of our crates
+# stay at opt-level 0 for fast rebuilds and debugging.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.arachne-security]
+opt-level = 1
+
+[profile.dev.package.arachne-delivery]
+opt-level = 1
+
+[profile.dev.package.arachne-store]
+opt-level = 1
