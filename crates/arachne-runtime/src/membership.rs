@@ -212,7 +212,10 @@ impl JoinStep {
 
 /// Largest encoded membership step this runtime accepts, stores or sends.
 /// A step (with any anchor proof it carries) above this bound is refused on
-/// receipt and never committed, so no node holds a step it cannot serve.
+/// receipt and never committed, so no node holds a step it cannot serve or
+/// store: a history record holds up to 1 MiB, and a step must fit one
+/// control reply. It bounds anchor proofs far below the security crate's
+/// 2 MiB decoder bound.
 pub(crate) const MAX_WIRE_STEP: usize = 96 * 1024;
 
 /// A short, informational name for a step's kind.
@@ -2849,6 +2852,9 @@ pub(super) fn stage_prepared(
     session: &mut Session,
     prepared: arachne_security::PreparedManagement,
 ) -> Result<StagedCandidate, ApiError> {
+    // Never commit a step (with any anchor proof it carries) that no member
+    // could receive: receivers refuse steps above the transport bound.
+    encode_step(&prepared.authorization, &prepared.commit)?;
     let (publisher, inbox) = super::carry_delivery(session, &prepared.workspace)?;
     let snapshot = seal_state(
         session.records.is_some(),
@@ -3111,4 +3117,45 @@ fn a_committed_step_too_large_for_one_request_is_offered_by_digest() {
     let value = receive_offer_digest(&mut session, endpoints[0], &digest).unwrap();
     assert_eq!(value["state"], "membership_offer_pull");
     assert_eq!(session.membership.head, Some((epoch + 1, vec![endpoints[0]])));
+}
+
+/// A revocation step whose anchor proof would make it larger than one
+/// control reply is refused on receipt, before verification: no node
+/// accepts a step it could not store or send on.
+#[test]
+fn a_step_with_an_anchor_proof_past_the_transport_bound_is_refused() {
+    let order = arachne_security::RevocationOrder {
+        kind: arachne_security::RevocationKind::Remove,
+        target: [4; 32],
+        issuer: [5; 32],
+        anchor_epoch: 3,
+        anchor_context: [6; 32],
+        signature: [7; 64],
+    };
+    let step = |checkpoint: usize| {
+        arachne_security::encode_membership_step(
+            &arachne_security::MembershipAuthorization::Revocation(
+                arachne_security::OrderStep::with_proof(
+                    order.clone(),
+                    arachne_security::AnchorProof {
+                        checkpoint: vec![8; checkpoint],
+                        winning: vec![],
+                        losing: vec![],
+                    },
+                ),
+            ),
+            b"commit",
+        )
+        .unwrap()
+    };
+    let small = step(1024);
+    assert!(JoinStep::binary(small.clone(), None).parts().is_ok());
+    assert!(wire_step(&small, None, usize::MAX).is_ok());
+    let large = step(MAX_WIRE_STEP);
+    assert!(large.len() > MAX_WIRE_STEP);
+    let refused = JoinStep::binary(large.clone(), None).parts().err().unwrap();
+    assert_eq!(refused.code(), ErrorCode::LimitReached);
+    assert_eq!(wire_step(&large, None, usize::MAX).unwrap_err().code(), ErrorCode::LimitReached);
+    let (authorization, commit) = arachne_security::decode_membership_step(&large).unwrap();
+    assert_eq!(encode_step(&authorization, &commit).unwrap_err().code(), ErrorCode::LimitReached);
 }
