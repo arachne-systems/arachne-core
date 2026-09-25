@@ -7,17 +7,19 @@ use arachne_delivery::wire;
 use arachne_routing::{Permissions, PublicationContext, RoutingTable, Topic};
 use arachne_security::{PendingJoin, Workspace};
 use std::collections::{BTreeMap, BTreeSet};
+mod common;
+use common::{test_endpoint, test_key};
 
 const REVISION: u64 = 1;
 
 fn author_and_reader() -> (Workspace, Workspace) {
-    let admin = Workspace::create([1; 32], "Publisher").unwrap();
+    let admin = Workspace::create(test_key(1), "Publisher").unwrap();
     let (registered, invite, checkpoint) =
         admin.prepare_invitation(u64::MAX, false, false).unwrap();
     let admin = registered.workspace.provisional_copy().unwrap();
-    let join = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let join = PendingJoin::from_invitation(&invite, &checkpoint, test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], join.admission_request().unwrap())
+        .prepare_admission(test_endpoint(2), join.admission_request().unwrap())
         .unwrap();
     let mut proof = join.join_proof().unwrap();
     proof
@@ -37,14 +39,14 @@ fn policy(workspace: [u8; 32], topics: &BTreeSet<Topic>) -> RoutingTable {
             REVISION,
             BTreeMap::from([
                 (
-                    [1; 32],
+                    test_endpoint(1),
                     Permissions::Selected {
                         publish: topics.clone(),
                         subscribe: BTreeSet::new(),
                     },
                 ),
                 (
-                    [2; 32],
+                    test_endpoint(2),
                     Permissions::Selected {
                         publish: BTreeSet::new(),
                         subscribe: topics.clone(),
