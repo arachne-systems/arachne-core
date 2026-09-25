@@ -314,6 +314,11 @@ pub(crate) fn poll(session: &mut Session, args: PollAdmissionArgs) -> Result<Val
         session.transition.inbound = Some(incoming);
         return Ok(value);
     }
+    if incoming.payload().starts_with(membership::OFFER_DIGEST) {
+        let value = membership::receive_offer_digest(session, incoming.peer(), incoming.payload());
+        let _ = incoming.respond(vec![if value.is_ok() { 2 } else { 0 }]);
+        return Ok(value.unwrap_or_else(|_| json!({"state":"membership_replied"})));
+    }
     if incoming.payload().starts_with(b"DFMO") {
         let offered = membership::receive_offer(session, incoming.payload());
         return match offered {

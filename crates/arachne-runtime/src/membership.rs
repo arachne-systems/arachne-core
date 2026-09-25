@@ -1052,25 +1052,16 @@ fn queue_membership_offer(
     if session.membership.offer.is_some() {
         return Err(ApiError::wrong_state("membership offer already pending"));
     }
-    let packet = {
-        let owner = session
+    let packet = offer_packet(
+        session
             .workspace
             .as_ref()
-            .ok_or_else(errors::no_workspace)?;
-        let mut packet = OFFER.to_vec();
-        packet.extend(owner.id());
-        packet.extend(after.to_be_bytes());
-        packet.extend(owner_wire_step(
-            owner,
-            &authorization,
-            &commit,
-            MAX_OFFER - OFFER_HEADER,
-        )?);
-        if packet.len() > MAX_OFFER {
-            return Err(ApiError::limit_reached("control request", MAX_OFFER as u64, "membership offer exceeds control bound"));
-        }
-        packet
-    };
+            .ok_or_else(errors::no_workspace)?,
+        after,
+        &authorization,
+        &commit,
+        requires_adoption,
+    )?;
     let task = session
         .runtime
         .spawn(session.node.request_control(peer, &packet));
@@ -1184,7 +1175,7 @@ fn poll_with_budget(
             if requires_adoption && bytes.as_slice() != [1] {
                 return Err(ApiError::not_authorized("membership peer rejected the staged administrator handoff"));
             }
-            if !matches!(bytes.as_slice(), [0] | [1]) {
+            if !matches!(bytes.as_slice(), [0] | [1] | [OFFER_PULL]) {
                 return Err(ApiError::transport_failed(None, "invalid membership offer acknowledgment"));
             }
             let next = pending
@@ -2751,6 +2742,81 @@ const _: () = assert!(MAX_WIRE_STEP + 64 <= RANGE_REPLY_STEP_ROOM);
 const OFFER: &[u8; 5] = b"DFMO\x02";
 const OFFER_HEADER: usize = 5 + 32 + 8;
 const MAX_OFFER: usize = 32 * 1024;
+/// `DFMD\x01 | workspace | u64 after | step digest | u32 step size`: an
+/// offer of a committed step too large for one control request. The
+/// receiver pulls the step over the paged range channel from the offerer.
+///
+/// Why not raise the request bound instead: every control request, from
+/// any authenticated peer, may then be that large, and the node queues up
+/// to 512 of them. A digest keeps the request small and moves the bytes to
+/// the reply side, which is already 128 KiB and paged.
+pub(super) const OFFER_DIGEST: &[u8; 5] = b"DFMD\x01";
+const OFFER_DIGEST_LEN: usize = OFFER_HEADER + 32 + 4;
+/// Acknowledgment of a digest offer: the receiver will pull the step.
+const OFFER_PULL: u8 = 2;
+
+/// The packet that offers one step. A step that does not fit one control
+/// request goes by digest when it is committed; a staged step (an offer
+/// that must be adopted before the offerer adopts) must fit, because a
+/// staged step cannot be served from committed history.
+fn offer_packet(
+    owner: &arachne_security::Workspace,
+    after: u64,
+    authorization: &arachne_security::MembershipAuthorization,
+    commit: &[u8],
+    staged: bool,
+) -> Result<Vec<u8>, ApiError> {
+    let step = owner_wire_step(owner, authorization, commit, MAX_OFFER - OFFER_HEADER)?;
+    let mut packet = if OFFER_HEADER + step.len() <= MAX_OFFER {
+        OFFER.to_vec()
+    } else if staged {
+        return Err(ApiError::limit_reached(
+            "control request",
+            MAX_OFFER as u64,
+            "a staged membership offer exceeds the control request bound",
+        ));
+    } else {
+        OFFER_DIGEST.to_vec()
+    };
+    packet.extend(owner.id());
+    packet.extend(after.to_be_bytes());
+    if packet.starts_with(OFFER) {
+        packet.extend(step);
+    } else {
+        use sha2::{Digest, Sha256};
+        let encoded = encode_step(authorization, commit)?;
+        packet.extend(Sha256::digest(&encoded));
+        packet.extend((encoded.len() as u32).to_be_bytes());
+    }
+    Ok(packet)
+}
+
+/// A digest offer: remember the offerer as a source for the next epoch, so
+/// the range pull fetches and verifies the step. The digest names the step;
+/// verification, not the digest, decides whether it applies.
+pub(super) fn receive_offer_digest(
+    session: &mut Session,
+    peer: [u8; 32],
+    packet: &[u8],
+) -> Result<Value, ApiError> {
+    if packet.len() != OFFER_DIGEST_LEN || !packet.starts_with(OFFER_DIGEST) {
+        return Err(ApiError::invalid_input("offer", "invalid membership offer"));
+    }
+    let owner = session.workspace.as_ref().ok_or_else(errors::no_workspace)?;
+    owner
+        .member_id_for_endpoint(peer)
+        .map_err(security(ErrorCode::NotMember))?;
+    let size = u32::from_be_bytes(packet[OFFER_DIGEST_LEN - 4..].try_into().unwrap()) as usize;
+    if packet[5..37] != owner.id()
+        || packet[37..45] != owner.epoch().to_be_bytes()
+        || size == 0
+        || size > MAX_WIRE_STEP
+    {
+        return Err(ApiError::epoch_mismatch("membership offer does not extend current epoch"));
+    }
+    note_head(session, owner.epoch() + 1, peer);
+    Ok(json!({"state":"membership_offer_pull","peer":peer}))
+}
 
 pub(super) fn receive_offer(session: &mut Session, packet: &[u8]) -> Result<Value, ApiError> {
     if packet.len() <= OFFER_HEADER || packet.len() > MAX_OFFER || !packet.starts_with(OFFER) {
@@ -3014,4 +3080,35 @@ fn membership_peer_choice_skips_recent_failures_until_nothing_else_is_left() {
         Some([2; 32])
     );
     assert_eq!(choose_membership_peer(&[], None), None);
+}
+
+/// B3c: a committed step larger than one control request is offered by
+/// digest and pulled over the paged range channel; a staged step, which
+/// cannot be served before adoption, must fit inline.
+#[test]
+fn a_committed_step_too_large_for_one_request_is_offered_by_digest() {
+    let (owner, _, endpoints) = admit_members(31, "Offer member", 1);
+    let authorization = arachne_security::MembershipAuthorization::SelfUpdate;
+    let small = offer_packet(&owner, owner.epoch(), &authorization, &[1; 100], false).unwrap();
+    assert!(small.starts_with(OFFER));
+    let large = vec![1; MAX_OFFER];
+    let digest = offer_packet(&owner, owner.epoch(), &authorization, &large, false).unwrap();
+    assert!(digest.starts_with(OFFER_DIGEST));
+    assert_eq!(digest.len(), OFFER_DIGEST_LEN);
+    assert_eq!(
+        offer_packet(&owner, owner.epoch(), &authorization, &large, true)
+            .unwrap_err()
+            .code(),
+        ErrorCode::LimitReached
+    );
+    let epoch = owner.epoch();
+    let mut session = bare_test_session(owner);
+    // A stranger or a stale epoch is refused; a member becomes a pull source.
+    assert!(receive_offer_digest(&mut session, [250; 32], &digest).is_err());
+    let mut stale = digest.clone();
+    stale[44] ^= 1;
+    assert!(receive_offer_digest(&mut session, endpoints[0], &stale).is_err());
+    let value = receive_offer_digest(&mut session, endpoints[0], &digest).unwrap();
+    assert_eq!(value["state"], "membership_offer_pull");
+    assert_eq!(session.membership.head, Some((epoch + 1, vec![endpoints[0]])));
 }
