@@ -209,18 +209,24 @@ fn typed_clients_persist_authenticated_inbox_objects_before_acknowledging() {
     file.sync_all().unwrap();
     drop(file);
 
+    let reader_anchor = reader.record_freshness().unwrap();
     reader.close().unwrap();
     reader = Client::open(reader_config.clone()).unwrap();
-    reader.restore_workspace(workspace.workspace, None).unwrap();
+    reader
+        .restore_workspace(workspace.workspace, Some(reader_anchor))
+        .unwrap();
     let restored: ReceivedProtectedPublication = reader.poll_pending_object().unwrap().unwrap();
     assert_eq!(restored, pending);
     assert_eq!(fs::read(&recording).unwrap(), payload);
 
     let candidate = reader.stage_object_acknowledgement(&restored).unwrap();
     reader.adopt_protected_reception(&candidate).unwrap();
+    let reader_anchor = reader.record_freshness().unwrap();
     reader.close().unwrap();
     reader = Client::open(reader_config).unwrap();
-    reader.restore_workspace(workspace.workspace, None).unwrap();
+    reader
+        .restore_workspace(workspace.workspace, Some(reader_anchor))
+        .unwrap();
     assert!(reader.poll_pending_object().unwrap().is_none());
 
     reader.close().unwrap();
@@ -254,11 +260,12 @@ fn typed_inbox_requires_native_storage_and_survives_restart() {
     };
     let durable = Client::open(config.clone()).unwrap();
     let workspace = durable.create_workspace("Durable", None).unwrap();
+    let anchor = durable.record_freshness().unwrap();
     durable.close().unwrap();
 
     let durable = Client::open(config).unwrap();
     durable
-        .restore_workspace(workspace.workspace, None)
+        .restore_workspace(workspace.workspace, Some(anchor))
         .unwrap();
     assert!(durable.poll_pending_object().unwrap().is_none());
     durable.close().unwrap();

@@ -1,4 +1,4 @@
-use arachne_runtime::{MemoryProvider, close, describe, execute};
+use arachne_runtime::{MemoryProvider, close, describe, execute, record_freshness};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
@@ -629,12 +629,13 @@ fn iroh_name_checkpoint_recovers_after_renaming_admin_is_demoted() {
     let member_path =
         arachne_runtime::SqliteProvider::new(member_dir.path(), member_root).path(workspace);
     let stale = member_dir.path().join("member-stale.db");
+    let stale_anchor = record_freshness(member).unwrap();
     close(member).unwrap();
     std::fs::copy(&member_path, &stale).unwrap();
     member = open_member();
     call(
         member,
-        json!({"op":"restore_workspace","workspace":workspace}),
+        json!({"op":"restore_workspace","workspace":workspace,"freshness":stale_anchor.to_bytes().to_vec()}),
     )
     .unwrap();
     // The reopened node may bind a new port.
@@ -688,7 +689,7 @@ fn iroh_name_checkpoint_recovers_after_renaming_admin_is_demoted() {
     member = open_member();
     call(
         member,
-        json!({"op":"restore_workspace","workspace":created["workspace"]}),
+        json!({"op":"restore_workspace","workspace":created["workspace"],"freshness":stale_anchor.to_bytes().to_vec()}),
     )
     .unwrap();
     call(
@@ -737,11 +738,12 @@ fn iroh_name_checkpoint_recovers_after_renaming_admin_is_demoted() {
     assert_eq!(adopted["workspace_name"], "Valley Recovery");
     assert_eq!(adopted["workspace_name_missing_history"], 1);
     assert_eq!(adopted["epoch"], 4); // One more for the link registration.
+    let anchor = record_freshness(member).unwrap();
     close(member).unwrap();
     member = open_member();
     let restored = call(
         member,
-        json!({"op":"restore_workspace","workspace":created["workspace"]}),
+        json!({"op":"restore_workspace","workspace":created["workspace"],"freshness":anchor.to_bytes().to_vec()}),
     )
     .unwrap();
     assert_eq!(restored["workspace_name"], "Valley Recovery");

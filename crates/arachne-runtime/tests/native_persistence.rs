@@ -21,10 +21,10 @@ fn open(root: &[u8; 32], directory: &std::path::Path) -> i64 {
     attach_storage(handle, StorageConfig::sqlite(directory, *root)).unwrap();
     handle
 }
-fn restore(handle: i64, workspace: [u8; 32]) -> Result<Value, String> {
+fn restore(handle: i64, workspace: [u8; 32], freshness: FreshnessAnchor) -> Result<Value, String> {
     call(
         handle,
-        json!({"op":"restore_workspace","workspace":workspace}),
+        json!({"op":"restore_workspace","workspace":workspace,"freshness":freshness.to_bytes().to_vec()}),
     )
 }
 fn adopt(handle: i64, staged: &Value, op: &str) -> Value {
@@ -106,9 +106,9 @@ fn restore_with_freshness_anchor_rejects_a_rolled_back_database() {
     )
     .unwrap();
     close(handle).unwrap();
-    // Without a monotonic anchor store the anchor stays optional.
+    // SQLite always requires the caller's out-of-database anchor.
     handle = open(&root, directory.path());
-    restore(handle, workspace).unwrap();
+    assert!(restore(handle, workspace, enabled).is_ok());
     close(handle).unwrap();
     directory.close().unwrap();
 }
@@ -192,9 +192,10 @@ fn hundred_member_runtime_commits_and_reopens() {
                 .unwrap(),
         );
         if [16, 64, 99].contains(&member) {
+            let anchor = record_freshness(handle).unwrap();
             close(handle).unwrap();
             handle = open(&root, directory.path());
-            let restored = restore(handle, workspace).unwrap();
+            let restored = restore(handle, workspace, anchor).unwrap();
             assert_eq!(restored["members"], u64::from(member) + 1);
             revision = restored["epoch"].as_u64().unwrap() + 1;
             println!("runtime reopened members={}", member + 1);
@@ -207,9 +208,10 @@ fn hundred_member_runtime_commits_and_reopens() {
     .unwrap();
     // A staged publication that is never adopted is never saved or sent.
     let abandoned=call(handle,json!({"op":"stage_network_publication","revision":revision,"topic":"streams/opaque","id":vec![9;16],"payload":[9]})).unwrap();
+    let anchor = record_freshness(handle).unwrap();
     close(handle).unwrap();
     handle = open(&root, directory.path());
-    restore(handle, workspace).unwrap();
+    restore(handle, workspace, anchor).unwrap();
     assert!(
         call(
             handle,
@@ -225,9 +227,10 @@ fn hundred_member_runtime_commits_and_reopens() {
     let staged=call(handle,json!({"op":"stage_network_publication","revision":revision,"topic":"streams/opaque","id":vec![1;16],"payload":[9,8,7]})).unwrap();
     assert_eq!(adopt(handle, &staged, "adopt_publication")["sequence"], 1);
     // The adopted publication's counter is in storage before it leaves.
+    let anchor = record_freshness(handle).unwrap();
     close(handle).unwrap();
     handle = open(&root, directory.path());
-    restore(handle, workspace).unwrap();
+    restore(handle, workspace, anchor).unwrap();
     call(
         handle,
         json!({"op":"install_workspace_policy","revision":revision}),
@@ -235,6 +238,7 @@ fn hundred_member_runtime_commits_and_reopens() {
     .unwrap();
     let staged=call(handle,json!({"op":"stage_network_publication","revision":revision,"topic":"streams/opaque","id":vec![2;16],"payload":[6]})).unwrap();
     assert_eq!(adopt(handle, &staged, "adopt_publication")["sequence"], 2);
+    let anchor = record_freshness(handle).unwrap();
     close(handle).unwrap();
     // The encrypted native state preserves the sender counter too.
     let store = arachne_store::Store::open_existing(&path, &root, workspace).unwrap();
@@ -268,7 +272,7 @@ fn hundred_member_runtime_commits_and_reopens() {
     drop(store);
     close(handle).unwrap();
     handle = open(&root, directory.path());
-    assert_eq!(restore(handle, workspace).unwrap()["members"], 100);
+    assert_eq!(restore(handle, workspace, anchor).unwrap()["members"], 100);
     close(handle).unwrap();
     directory.close().unwrap();
 }
@@ -332,12 +336,18 @@ fn seeded_pending_inbox_survives_restart_and_removal_cannot_reopen_active_state(
         panic!("missing candidate")
     };
     let publisher = PublisherLog::new(&reader).unwrap();
-    arachne_runtime::harness::seed_workspace(&provider, &reader, Some(&publisher), Some(&inbox))
-        .unwrap();
-    restore(handle, workspace).unwrap();
+    let anchor = arachne_runtime::harness::seed_workspace(
+        &provider,
+        &reader,
+        Some(&publisher),
+        Some(&inbox),
+    )
+    .unwrap();
+    restore(handle, workspace, anchor).unwrap();
+    let anchor = record_freshness(handle).unwrap();
     close(handle).unwrap();
     handle = open(&root, directory.path());
-    restore(handle, workspace).unwrap();
+    restore(handle, workspace, anchor).unwrap();
     let pending = call(handle, json!({"op":"poll_pending_object"})).unwrap();
     assert_eq!(bytes(&pending["payload"]), b"pending chat");
     let removed = admin
@@ -349,22 +359,25 @@ fn seeded_pending_inbox_survives_restart_and_removal_cannot_reopen_active_state(
     // first only to check acknowledgement persistence before the removal.
     let ack=call(handle,json!({"op":"stage_object_acknowledgement","member":pending["member"],"topic":pending["topic"],"counter":pending["counter"],"id":pending["id"]})).unwrap();
     adopt(handle, &ack, "adopt_reception");
+    let anchor = record_freshness(handle).unwrap();
     close(handle).unwrap();
     handle = open(&root, directory.path());
-    restore(handle, workspace).unwrap();
+    restore(handle, workspace, anchor).unwrap();
     assert_eq!(
         call(handle, json!({"op":"poll_pending_object"})).unwrap(),
         Value::Null
     );
     let removal = call(handle, json!({"op":"stage_admission_update","step":step})).unwrap();
     // Adoption saves the removal first and deletes every active record.
-    assert_eq!(
-        adopt(handle, &removal, "adopt_admission")["state"],
-        "removed"
-    );
+    let removed = adopt(handle, &removal, "adopt_admission");
+    assert_eq!(removed["state"], "removed");
+    let removed_anchor = FreshnessAnchor::from_bytes(&bytes(&removed["freshness"])).unwrap();
     assert!(call(handle, json!({"op":"workspace_state"})).is_err());
     handle = open(&root, directory.path());
-    assert_eq!(restore(handle, workspace).unwrap()["state"], "removed");
+    assert_eq!(
+        restore(handle, workspace, removed_anchor).unwrap()["state"],
+        "removed"
+    );
     handle = open(&root, directory.path());
     // A new join may reuse the store; a new workspace cannot resurrect it.
     let store =
@@ -395,9 +408,10 @@ fn native_pending_join_keeps_identity_until_atomic_admission_commit() {
     )
     .unwrap();
     assert_eq!(pending["durable"], true);
+    let anchor = record_freshness(handle).unwrap();
     close(handle).unwrap();
     handle = open(&root, directory.path());
-    let restored = restore(handle, workspace).unwrap();
+    let restored = restore(handle, workspace, anchor).unwrap();
     assert_eq!(restored["admission_request"], pending["admission_request"]);
     assert_eq!(restored["member"], pending["member"]);
     let endpoint = serde_json::from_value(pending["endpoint"].clone()).unwrap();
@@ -431,10 +445,11 @@ fn native_pending_join_keeps_identity_until_atomic_admission_commit() {
     let abandoned: Value = serde_json::from_slice(&response).unwrap();
     assert_eq!(bytes(&abandoned["candidate"]).len(), 37);
     // A crash before adoption: storage still holds the pending join.
+    let anchor = record_freshness(handle).unwrap();
     close(handle).unwrap();
     handle = open(&root, directory.path());
     assert_eq!(
-        restore(handle, workspace).unwrap()["admission_request"],
+        restore(handle, workspace, anchor).unwrap()["admission_request"],
         pending["admission_request"]
     );
     let staged = call(handle, request).unwrap();
@@ -446,9 +461,10 @@ fn native_pending_join_keeps_identity_until_atomic_admission_commit() {
         .is_err()
     );
     adopt(handle, &staged, "adopt_join");
+    let anchor = record_freshness(handle).unwrap();
     close(handle).unwrap();
     handle = open(&root, directory.path());
-    let joined = restore(handle, workspace).unwrap();
+    let joined = restore(handle, workspace, anchor).unwrap();
     assert_eq!(joined["members"], 2);
     assert_eq!(joined["member"], pending["member"]);
     close(handle).unwrap();

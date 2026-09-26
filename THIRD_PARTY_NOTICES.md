@@ -8,23 +8,19 @@ repository's MPL-2.0 license.
 | Component | Version | License | Upstream | Local record |
 | --- | --- | --- | --- | --- |
 | `arachne-bao-tree` (upstream `bao-tree` 0.16.1) | 0.16.1-arachne.1 | MIT OR Apache-2.0 | [n0-computer/bao-tree](https://github.com/n0-computer/bao-tree) | [licenses](vendor/bao-tree/) · [patch notes](vendor/bao-tree/ARACHNE-PATCH.md) |
-| `hax-lib-macros` | 0.3.7 | Apache-2.0 | [hacspec/hax](https://github.com/hacspec/hax) | [license](vendor/hax-lib-macros/LICENSE) · [patch notes](vendor/hax-lib-macros/ARACHNE-PATCH.md) |
 | `arachne-iroh-blobs` (upstream `iroh-blobs` 0.103.0) | 0.103.0-arachne.1 | MIT OR Apache-2.0 | [n0-computer/iroh-blobs](https://github.com/n0-computer/iroh-blobs) | [licenses](vendor/iroh-blobs/) · [patch notes](vendor/iroh-blobs/ARACHNE-PATCH.md) |
 | `arachne-iroh-gossip` (upstream `iroh-gossip` 0.101.0) | 0.101.0-arachne.1 | MIT OR Apache-2.0 | [n0-computer/iroh-gossip](https://github.com/n0-computer/iroh-gossip) | [licenses](vendor/iroh-gossip/) · [patch notes](vendor/iroh-gossip/ARACHNE-PATCH.md) |
 | `arachne-iroh-tor-transport` (upstream `iroh-tor-transport` 0.1.0) | 0.1.0-arachne.1 | MIT OR Apache-2.0 | [n0-computer/iroh-tor](https://github.com/n0-computer/iroh-tor) | [licenses](vendor/iroh-tor-transport/) · [patch notes](vendor/iroh-tor-transport/ARACHNE-PATCH.md) |
 | `arachne-iroh-mdns-address-lookup` (upstream `iroh-mdns-address-lookup` 0.5.0) | 0.5.0-arachne.1 | MIT OR Apache-2.0 | [n0-computer/iroh-address-lookups](https://github.com/n0-computer/iroh-address-lookups) | [licenses](vendor/iroh-mdns-address-lookup/) · [patch notes](vendor/iroh-mdns-address-lookup/ARACHNE-PATCH.md) |
 | `iroh` | 1.2.0 (local restart fix) | MIT OR Apache-2.0; retained BSD-3-Clause notices | [n0-computer/iroh](https://github.com/n0-computer/iroh) | [licenses](vendor/iroh/) · [patch notes](vendor/iroh/ARACHNE-PATCH.md) |
-| `netlink-packet-core` | 0.8.2 | MIT | [rust-netlink/netlink-packet-core](https://github.com/rust-netlink/netlink-packet-core) | [license](vendor/netlink-packet-core/LICENSE-MIT) · [patch notes](vendor/netlink-packet-core/ARACHNE-PATCH.md) |
 
 This is an inventory of in-tree vendored source, not a complete inventory of
 packages fetched by Cargo. Registry dependencies retain their own terms and are
 version-pinned in [`Cargo.lock`](Cargo.lock). Generate notices for the exact
 platform and feature set before distributing a binary.
 
-The Apache-2.0-only component (`hax-lib-macros`) carries an in-file notice of
-modification (Apache-2.0 section 4(b)) in
-`vendor/hax-lib-macros/src/implementation.rs`. The dual-licensed
-(`MIT OR Apache-2.0`) forks record every change in their `ARACHNE-PATCH.md`.
+The dual-licensed (`MIT OR Apache-2.0`) forks record every change in their
+`ARACHNE-PATCH.md`.
 
 Binary distributions (the SDK `cdylib`, an Android AAR, or an application)
 must carry the MPL-2.0 source pointer and the third-party notices. See

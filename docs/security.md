@@ -359,9 +359,10 @@ need that platform integration to get the atomic anchor behavior below:
 - A missing anchor fails closed. If the anchor save fails, the session stops
   (uncertain outcome) until it is closed and restored.
 
-Without monotonic storage the anchor stays optional. The runtime exposes it
-through `record_freshness`, and `restore_workspace` checks it when the host
-passes the saved anchor. The check is exact equality, not
+Without monotonic storage the runtime exposes the anchor through
+`record_freshness`. SQLite restore requires the host to pass that saved anchor
+to `restore_workspace`; omitting it fails closed before records are read. The
+check is exact equality, not
 "at least this revision". Two stores for the same workspace and root share one
 key, so an old file from an earlier lineage can have a higher revision and
 still authenticate. A rollback that is accepted replays MLS state and reuses
@@ -373,7 +374,9 @@ sender counters, which reuses AES-GCM nonces. Exact equality has a cost:
 - Adopt operations commit and send in one call. The host cannot save the
   anchor between that commit and the send. A crash in that window, followed
   by a rollback to the saved anchor, is not detected.
-- A restore without an anchor does not detect rollback.
+- Custom `StorageProvider` implementations decide whether their own storage
+  needs an external anchor. The built-in in-memory provider is intended for
+  tests and process-local use.
 
 For staged workspace, membership, publication, and recovery operations, core
 saves and reads back the exact candidate before adoption. If a save fails or

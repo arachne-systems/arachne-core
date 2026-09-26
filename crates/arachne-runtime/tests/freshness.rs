@@ -95,6 +95,44 @@ fn a_missing_anchor_fails_closed() {
 }
 
 #[test]
+fn sqlite_restore_requires_a_freshness_anchor() {
+    let directory = common::directory();
+    let root = [95; 32];
+    let storage = || StorageConfig::sqlite(directory.path(), root);
+    let client = open(storage());
+    let created = client.create_workspace("Owner", None).unwrap();
+    let anchor = client.record_freshness().unwrap();
+    client.close().unwrap();
+
+    let client = open(storage());
+    let error = client
+        .restore_workspace(created.workspace, None)
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::CandidateStale, "{error:?}");
+    assert!(error.message().contains("freshness anchor"), "{error:?}");
+    assert!(matches!(
+        client
+            .restore_workspace(created.workspace, Some(anchor))
+            .unwrap(),
+        RestoredWorkspace::Active(_)
+    ));
+    let removed = client
+        .adopt_removal(&client.stage_solo_leave().unwrap())
+        .unwrap();
+    client.close().unwrap();
+
+    let client = open(storage());
+    assert!(matches!(
+        client
+            .restore_workspace(created.workspace, Some(removed.freshness))
+            .unwrap(),
+        RestoredWorkspace::Removed(_)
+    ));
+    client.close().unwrap();
+    directory.close().unwrap();
+}
+
+#[test]
 fn a_crash_after_commit_before_the_anchor_is_confirmed_still_restores() {
     let directory = common::directory();
     let root = [94; 32];

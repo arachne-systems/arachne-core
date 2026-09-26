@@ -196,7 +196,8 @@ Rollback detection needs a freshness anchor kept outside the database. If
 the platform has monotonic storage, give it to core with
 `StorageConfig::with_anchors(anchor_store)`: core saves the anchor with every
 commit and restore requires it (see [Security](security.md#local-persistence)).
-Otherwise the host keeps the anchor:
+Otherwise the host keeps the anchor. SQLite restore fails closed when neither
+an external `AnchorStore` nor an expected anchor is present:
 
 - Call `record_freshness` (or `Client::record_freshness`) after every call that
   can commit, and persist the anchor before you release that call's result.
@@ -206,7 +207,8 @@ Otherwise the host keeps the anchor:
   `Client::restore_workspace(workspace, Some(anchor))`). The store must match
   the anchor exactly. An older store and a newer store are both rejected
   before any record is read, and the session stays empty.
-- Without an anchor, restore does not detect a rollback.
+- If the expected anchor is lost or stale, restore fails with
+  `CandidateStale`; Core does not open the database contents.
 
 ## Routing and permissions
 

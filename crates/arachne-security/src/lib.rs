@@ -523,3 +523,31 @@ fn creation_owns_distinct_groups_and_initial_authority() {
     assert_eq!(&admins[2..34], a._signer.public());
     assert_eq!(&admins[34..], &[0, 0]);
 }
+
+#[test]
+fn untrusted_state_decoders_survive_bounded_adversarial_input() {
+    let key = StorageKey::derive(&[0x51; 32]).unwrap();
+    let endpoint = test_endpoint(51);
+    let workspace = [0x52; 32];
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+
+    for length in 0..=4096usize {
+        seed ^= seed >> 12;
+        seed ^= seed << 25;
+        seed ^= seed >> 27;
+        let mut value = seed.wrapping_mul(0x2545_f491_4f6c_dd1d);
+        let bytes: Vec<u8> = (0..length)
+            .map(|_| {
+                value = value.rotate_left(9).wrapping_add(0xa076_1d64_78bd_642f);
+                value as u8
+            })
+            .collect();
+
+        let _ = Invitation::from_bytes(&bytes);
+        let _ = decode_membership_step(&bytes);
+        let _ = RevocationOrder::from_bytes(&bytes);
+        let _ = PendingJoin::restore(&key, endpoint, workspace, &bytes);
+        let _ = RemovedMembership::restore(&key, endpoint, workspace, &bytes);
+        let _ = object_epoch(&bytes);
+    }
+}

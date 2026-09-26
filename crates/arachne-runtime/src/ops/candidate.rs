@@ -266,10 +266,14 @@ pub(crate) struct Removed {
     pub workspace_ready: bool,
     pub member: MemberView,
     pub commit_digest: [u8; 32],
+    pub freshness: Vec<u8>,
 }
 
 impl Removed {
-    pub(crate) fn of(removed: &arachne_security::RemovedMembership) -> Self {
+    pub(crate) fn of(
+        removed: &arachne_security::RemovedMembership,
+        freshness: arachne_store::FreshnessAnchor,
+    ) -> Self {
         Self {
             workspace: removed.workspace_id(),
             epoch: removed.epoch(),
@@ -280,6 +284,7 @@ impl Removed {
                 display_name: removed.member().display_name().to_owned(),
             },
             commit_digest: removed.commit_digest(),
+            freshness: freshness.to_bytes().to_vec(),
         }
     }
 }
@@ -359,8 +364,9 @@ pub(crate) fn adopt(
             ));
         }
         persistence::commit_candidate(session, &snapshot)?;
+        let freshness = persistence::freshness(session)?;
         let (removed, _) = session.transition.removal.as_ref().unwrap();
-        let value = Removed::of(removed);
+        let value = Removed::of(removed, freshness);
         session.ending = true;
         return Ok(AdoptReply::Removed(value));
     }

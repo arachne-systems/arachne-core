@@ -133,6 +133,37 @@ async fn test_sender_reuses_connection() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn sender_cache_is_bounded() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let mut streams = Vec::new();
+        for _ in 0..65 {
+            streams.push(listener.accept().await?.0);
+        }
+        Ok::<_, std::io::Error>(streams)
+    });
+    let io = Arc::new(TorStreamIo::new(
+        || async { Err(std::io::Error::other("accept not used in this test")) },
+        move |_| async move { TcpStream::connect(addr).await },
+    ));
+    let sender = TorPacketSender::new(io);
+    let packet = TorPacket {
+        from: SecretKey::generate().public(),
+        data: Bytes::from_static(b"bounded"),
+        segment_size: None,
+    };
+
+    for _ in 0..65 {
+        sender.send(SecretKey::generate().public(), &packet).await?;
+    }
+    let streams = server.await??;
+    assert_eq!(streams.len(), 65);
+    assert_eq!(sender.streams.lock().await.len(), 64);
+    Ok(())
+}
+
 #[test]
 fn test_key_conversion() {
     // RFC 8032 section 7.1 TEST 1 seed. Upstream compared the public key that

@@ -226,19 +226,13 @@ this restart fix. The release gate must keep that limit explicit until an
 upstream release carries it or the dependency is published under an approved
 fork policy. No release is authorized by this local integration.
 
-The root `[patch.crates-io]` still selects local copies of
-`netlink-packet-core` and `hax-lib-macros` for this workspace only. Cargo
-ignores `[patch]` in dependencies. Both come in through third-party parents that
-Arachne does not fork (`iroh` -> `netwatch`/`netdev`, and
-`openmls_rust_crypto` -> `hpke-rs` -> `libcrux` -> `hax-lib`), so a renamed
-fork cannot replace them. Downstream consumers (for example the SDK) that want
-the same lockfile must copy these two entries. The patches are not needed for
-correctness: they only remove "unmaintained" advisories (`paste`
-RUSTSEC-2024-0436, `proc-macro-error2` RUSTSEC-2026-0173). `proc-macro-error2`
-is only a `cfg(hax)` dependency and is never compiled in normal builds. The
-clean-consumer check must therefore build without them. Keep their upstream
-copyright, license, and notice files intact, and do not imply that the Arachne
-MPL license replaces their terms.
+The registry graph currently includes two transitive "unmaintained" notices:
+`paste` RUSTSEC-2024-0436 through Iroh's netlink 0.8 stack, and
+`proc-macro-error2` RUSTSEC-2026-0173 through OpenMLS's HPKE/hax stack. Neither
+advisory reports a vulnerability; the latter is only a `cfg(hax)` dependency
+and is not compiled in normal builds. `deny.toml` records these exact temporary
+exceptions. Remove them when the parent dependency chains can upgrade. Do not
+carry source forks whose only effect is hiding these notices.
 
 When updating a patched dependency:
 
@@ -261,9 +255,7 @@ notices when bundling Core into a binary distribution.
 `arachne-node` depends on the two named Arachne Iroh forks, and
 `arachne-iroh-blobs` depends on `arachne-bao-tree`, so their required APIs and
 fixes are ordinary registry dependencies. The Iroh restart fix above is still
-a root patch and must be resolved before a registry-only release. The
-other two vendor patches (`netlink-packet-core`, `hax-lib-macros`) are
-deliberately excluded from publishing.
+a root patch and must be resolved before a registry-only release.
 
 `arachne-bao-tree` is in the workspace `exclude` list (to keep its upstream
 dev-dependencies out of `Cargo.lock`), so release-plz does not publish it.

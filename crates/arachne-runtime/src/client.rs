@@ -23,7 +23,7 @@ const WORKSPACE_KINDS: &[CandidateKind] = &[
 pub use arachne_api::Network;
 
 /// Configuration for one workspace-facing runtime client.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ClientConfig {
     pub network: Network,
@@ -32,6 +32,17 @@ pub struct ClientConfig {
     pub transport: TransportOptions,
     /// Record storage. Required to create, join or restore a workspace.
     pub storage: Option<Arc<StorageConfig>>,
+}
+
+impl std::fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientConfig")
+            .field("network", &self.network)
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .field("transport", &self.transport)
+            .field("storage", &self.storage)
+            .finish()
+    }
 }
 
 /// Transport overrides on top of a `Network` profile. Every field left
@@ -381,6 +392,9 @@ pub struct RemovedMembership {
     pub epoch: u64,
     pub member: MemberId,
     pub commit_digest: Key32,
+    /// Freshness anchor of the durable removal. Save it before returning to
+    /// the event loop; the removed client is already closed.
+    pub freshness: FreshnessAnchor,
 }
 
 /// A nearby endpoint and the name it announced, if it answered.
@@ -1070,12 +1084,7 @@ impl Client {
                 admission_request: pending.admission_request,
             }),
             persistence::Restored::Removed(removed) => {
-                RestoredWorkspace::Removed(RemovedMembership {
-                    workspace: removed.removed.workspace.into(),
-                    epoch: removed.removed.epoch,
-                    member: removed.removed.member.id.into(),
-                    commit_digest: removed.removed.commit_digest.into(),
-                })
+                RestoredWorkspace::Removed(removed_membership(removed.removed)?)
             }
         })
     }
@@ -1531,12 +1540,7 @@ impl Client {
             &[CandidateKind::Removal],
         )?;
         match reply {
-            candidate::AdoptReply::Removed(removed) => Ok(RemovedMembership {
-                workspace: removed.workspace.into(),
-                epoch: removed.epoch,
-                member: removed.member.id.into(),
-                commit_digest: removed.commit_digest.into(),
-            }),
+            candidate::AdoptReply::Removed(removed) => removed_membership(removed),
             candidate::AdoptReply::Adopted(_) => Err(client_error(ApiError::wrong_state(
                 "the candidate was not a removal",
             ))),
@@ -2456,6 +2460,22 @@ fn opened_info(opened: ops::workspace::WorkspaceOpened) -> WorkspaceInfo {
         phase: opened.activity.phase,
         reason: opened.activity.reason,
     }
+}
+
+fn removed_membership(removed: candidate::Removed) -> Result<RemovedMembership> {
+    let freshness = FreshnessAnchor::from_bytes(&removed.freshness).map_err(|parse_error| {
+        error(
+            ErrorKind::Internal,
+            format!("invalid removal freshness anchor: {parse_error}"),
+        )
+    })?;
+    Ok(RemovedMembership {
+        workspace: removed.workspace.into(),
+        epoch: removed.epoch,
+        member: removed.member.id.into(),
+        commit_digest: removed.commit_digest.into(),
+        freshness,
+    })
 }
 
 fn workspace_info(adopted: candidate::Adopted) -> WorkspaceInfo {

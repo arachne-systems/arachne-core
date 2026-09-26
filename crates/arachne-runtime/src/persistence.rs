@@ -139,14 +139,15 @@ impl Logical<'_> {
 ///
 /// With [`StorageConfig::with_anchors`] (monotonic host storage), core saves
 /// the freshness anchor with every commit and restore requires a match: a
-/// rolled-back database is refused. Without it the anchor is optional: the
-/// host may save `record_freshness` itself and pass it to restore.
+/// rolled-back database is refused. SQLite restore otherwise requires the
+/// host to save `record_freshness` and pass it back explicitly.
 #[derive(Clone)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct StorageConfig {
     provider: Arc<dyn StorageProvider>,
     root: Arc<Zeroizing<[u8; 32]>>,
     anchors: Option<Arc<dyn AnchorStore>>,
+    requires_freshness: bool,
 }
 
 impl StorageConfig {
@@ -155,6 +156,7 @@ impl StorageConfig {
             provider,
             root: Arc::new(Zeroizing::new(root)),
             anchors: None,
+            requires_freshness: false,
         }
     }
 
@@ -167,7 +169,9 @@ impl StorageConfig {
 
     /// Encrypted SQLite files in a private directory, all under `root`.
     pub fn sqlite(directory: &Path, root: [u8; 32]) -> Self {
-        Self::new(Arc::new(SqliteProvider::new(directory, root)), root)
+        let mut config = Self::new(Arc::new(SqliteProvider::new(directory, root)), root);
+        config.requires_freshness = true;
+        config
     }
 
     /// Process memory (tests). Clones of `provider` share the stores.
@@ -704,6 +708,11 @@ pub(crate) fn restore(
         .as_ref()
         .ok_or_else(storage_required)?
         .clone();
+    if config.requires_freshness && expected.is_none() && config.anchors.is_none() {
+        return Err(ApiError::candidate_stale(
+            "a freshness anchor is required to restore persistent storage",
+        ));
+    }
     let provider = &config.provider;
     // An absent store must never become a new empty one.
     let store = provider
@@ -837,7 +846,7 @@ pub(crate) fn restore(
             &bytes,
         )
         .map_err(security(ErrorCode::StorageCorrupt))?;
-        let mut value = Removed::of(&removed);
+        let mut value = Removed::of(&removed, store.freshness());
         value.workspace = workspace;
         session.ending = true;
         return Ok(Restored::Removed(RemovedDurably {
@@ -922,7 +931,7 @@ pub fn seed_workspace(
     owner: &Workspace,
     publisher: Option<&arachne_delivery::PublisherLog>,
     inbox: Option<&arachne_delivery::inbox::ObjectInbox>,
-) -> Result<(), String> {
+) -> Result<FreshnessAnchor, String> {
     let (publisher, inbox) = match (publisher, inbox, owner.member().is_some()) {
         (Some(publisher), Some(inbox), _) => (Some(publisher.clone()), Some(inbox.clone())),
         (None, None, true) => (
@@ -969,7 +978,7 @@ pub fn seed_workspace(
     store
         .commit(revision, &changes)
         .map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(store.freshness())
 }
 
 #[cfg(test)]

@@ -1,7 +1,9 @@
 //! B3c self-update policy over real Iroh nodes with native record storage:
 //! a member saves its own update before any peer can adopt it. Its durable
 //! history lets the administrator catch up after the member restarts.
-use arachne_runtime::{StorageConfig, attach_storage, close, create, describe, execute};
+use arachne_runtime::{
+    StorageConfig, attach_storage, close, create, describe, execute, record_freshness,
+};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
@@ -94,6 +96,7 @@ fn a_new_member_saves_its_self_update_before_administrator_adoption() {
     assert_eq!(updated["durable"], true);
     assert_eq!(updated["workspace"], workspace);
 
+    let member_anchor = record_freshness(member).unwrap();
     close(member).unwrap();
     member = create(Some(&[122; 32])).unwrap();
     attach_storage(
@@ -103,7 +106,7 @@ fn a_new_member_saves_its_self_update_before_administrator_adoption() {
     .unwrap();
     let restored = call(
         member,
-        json!({"op":"restore_workspace","workspace":workspace}),
+        json!({"op":"restore_workspace","workspace":workspace,"freshness":member_anchor.to_bytes().to_vec()}),
     );
     assert_eq!(restored["epoch"], updated["epoch"]);
     let member_info = info(member);

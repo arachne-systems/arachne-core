@@ -271,6 +271,8 @@ pub(crate) struct TorPacketSender {
     streams: Mutex<HashMap<EndpointId, Arc<Mutex<TcpStream>>>>,
 }
 
+const MAX_CACHED_STREAMS: usize = 64;
+
 impl TorPacketSender {
     /// Create a new sender with the provided connector.
     pub(crate) fn new(io: Arc<TorStreamIo>) -> Self {
@@ -288,7 +290,13 @@ impl TorPacketSender {
             Ok(()) => Ok(()),
             Err(err) => {
                 drop(guard);
-                self.streams.lock().await.remove(&to);
+                let mut streams = self.streams.lock().await;
+                if streams
+                    .get(&to)
+                    .is_some_and(|cached| Arc::ptr_eq(cached, &stream))
+                {
+                    streams.remove(&to);
+                }
                 Err(err)
             }
         }
@@ -303,7 +311,21 @@ impl TorPacketSender {
         let stream = Arc::new(Mutex::new(stream));
 
         let mut guard = self.streams.lock().await;
-        Ok(guard.entry(to).or_insert_with(|| stream.clone()).clone())
+        if let Some(existing) = guard.get(&to) {
+            return Ok(existing.clone());
+        }
+        if guard.len() >= MAX_CACHED_STREAMS {
+            let idle = guard
+                .iter()
+                .find(|(_, stream)| Arc::strong_count(stream) == 1)
+                .map(|(endpoint, _)| *endpoint)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::WouldBlock, "Tor stream capacity exhausted")
+                })?;
+            guard.remove(&idle);
+        }
+        guard.insert(to, stream.clone());
+        Ok(stream)
     }
 
     /// Close and remove a cached stream for the given endpoint.

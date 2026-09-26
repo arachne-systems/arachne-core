@@ -12,6 +12,18 @@ fn config() -> ClientConfig {
 }
 
 #[test]
+fn client_config_debug_redacts_the_endpoint_secret() {
+    let secret = vec![0xa7; 32];
+    let mut config = config();
+    config.secret = Some(secret.clone());
+
+    let rendered = format!("{config:?}");
+
+    assert!(rendered.contains("secret: Some(\"[REDACTED]\")"));
+    assert!(!rendered.contains(&format!("{secret:?}")));
+}
+
+#[test]
 fn client_uses_api_errors_and_its_context_limits() {
     let limits = Limits::default()
         .with_max_sessions(2)

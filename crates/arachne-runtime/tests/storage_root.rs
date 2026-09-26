@@ -42,12 +42,13 @@ fn a_new_endpoint_identity_keeps_the_store_readable() {
     let storage = || StorageConfig::sqlite(directory.path(), [71; 32]);
     let client = open(Some([72; 32]), storage());
     let created = client.create_workspace("Owner", None).unwrap();
+    let anchor = client.record_freshness().unwrap();
     client.close().unwrap();
 
     // The endpoint identity changes; the storage root does not.
     let rotated = open(Some([73; 32]), storage());
     let error = rotated
-        .restore_workspace(created.workspace, None)
+        .restore_workspace(created.workspace, Some(anchor))
         .unwrap_err();
     assert_eq!(error.code(), ErrorCode::WrongState, "{error:?}");
     assert!(error.message().contains("endpoint"), "{error:?}");
@@ -56,7 +57,9 @@ fn a_new_endpoint_identity_keeps_the_store_readable() {
     // Nothing was lost: the original identity still restores it.
     let client = open(Some([72; 32]), storage());
     assert!(matches!(
-        client.restore_workspace(created.workspace, None).unwrap(),
+        client
+            .restore_workspace(created.workspace, Some(anchor))
+            .unwrap(),
         RestoredWorkspace::Active(_)
     ));
     client.close().unwrap();

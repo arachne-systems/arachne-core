@@ -92,6 +92,8 @@ iroh `SecretKey`, and the Tor key blob is only a SHA-512 expansion.
   `build()` fails with `CreateOnion`, because peers could not reach the
   service. The log line prints the address through `Display`.
 - The SOCKS connect path formats the address with `Display` (same string).
+- The outbound stream cache is capped at 64 peers. A new peer evicts an idle
+  stream; if all cached streams are active, the send fails with backpressure.
 - In-file change notice on line 1.
 
 ### Tests

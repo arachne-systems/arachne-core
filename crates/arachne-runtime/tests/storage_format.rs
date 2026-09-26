@@ -62,6 +62,7 @@ fn a_newer_store_file_format_is_refused_with_its_code() {
     let root = [82; 32];
     let client = open(StorageConfig::sqlite(directory.path(), root));
     let created = client.create_workspace("Owner", None).unwrap();
+    let anchor = client.record_freshness().unwrap();
     client.close().unwrap();
     let path = SqliteProvider::new(directory.path(), root).path((created.workspace).to_bytes());
     // A later build wrote this file.
@@ -70,7 +71,7 @@ fn a_newer_store_file_format_is_refused_with_its_code() {
     drop(connection);
     let client = open(StorageConfig::sqlite(directory.path(), root));
     let error = client
-        .restore_workspace(created.workspace, None)
+        .restore_workspace(created.workspace, Some(anchor))
         .unwrap_err();
     assert_eq!(error.code(), ErrorCode::FormatNotSupported, "{error:?}");
     assert!(error.message().contains("99"), "{error:?}");

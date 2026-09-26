@@ -13,7 +13,7 @@ members = [
     "vendor/iroh-mdns-address-lookup",
 ]
 resolver = "3"
-exclude = ["vendor/iroh", "vendor/bao-tree", "vendor/netlink-packet-core", "vendor/hax-lib-macros"]
+exclude = ["vendor/iroh", "vendor/bao-tree"]
 
 [workspace.package]
 version = "0.1.0"
@@ -28,12 +28,9 @@ homepage = "https://github.com/arachne-systems"
 
 # Cargo ignores dependency-owned patches. Consumers must repeat the Iroh
 # restart fix so every protocol uses one corrected Iroh package identity.
-# The netlink/hax overrides remove transitive advisory warnings only.
 # See docs/development.md for provenance and downstream build requirements.
 [patch.crates-io]
 iroh = { path = "vendor/iroh" }
-netlink-packet-core = { path = "vendor/netlink-packet-core" }
-hax-lib-macros = { path = "vendor/hax-lib-macros" }
 moq-net = { git = "https://github.com/moq-dev/moq", rev = "6ab7d1a223e1949a5c2e10b68e29db2e8ab9bdd1" }
 moq-tokio = { git = "https://github.com/moq-dev/moq", rev = "6ab7d1a223e1949a5c2e10b68e29db2e8ab9bdd1" }
 

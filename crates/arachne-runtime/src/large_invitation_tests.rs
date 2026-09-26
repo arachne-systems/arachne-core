@@ -100,7 +100,7 @@ fn a_joiner_redeems_an_invitation_past_three_hundred_members_over_the_runtime() 
     // The owner keeps records: its roster is seeded into storage and restored.
     let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
     let owner_storage = StorageConfig::sqlite(dirs[0].path(), [241; 32]);
-    persistence::seed_workspace(
+    let anchor = persistence::seed_workspace(
         &arachne_store::SqliteProvider::new(dirs[0].path(), [241; 32]),
         &workspace,
         None,
@@ -110,7 +110,7 @@ fn a_joiner_redeems_an_invitation_past_three_hundred_members_over_the_runtime() 
     attach_storage(owner, owner_storage).unwrap();
     call(
         owner,
-        json!({"op":"restore_workspace","workspace":workspace.id()}),
+        json!({"op":"restore_workspace","workspace":workspace.id(),"freshness":anchor.to_bytes().to_vec()}),
     )
     .unwrap();
     let staged = call(

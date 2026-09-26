@@ -118,7 +118,7 @@ fn saves_stages_and_restores_at(size: usize) -> usize {
     let snapshot_epoch = owner.epoch();
     drop(snapshot);
     let provider = arachne_runtime::SqliteProvider::new(directory.path(), root);
-    arachne_runtime::harness::seed_workspace(&provider, &owner, None, None).unwrap();
+    let anchor = arachne_runtime::harness::seed_workspace(&provider, &owner, None, None).unwrap();
     let workspace = owner.id();
     drop(owner);
 
@@ -153,7 +153,7 @@ fn saves_stages_and_restores_at(size: usize) -> usize {
     .unwrap();
     let restored = call(
         handle,
-        json!({"op":"restore_workspace","workspace":workspace}),
+        json!({"op":"restore_workspace","workspace":workspace,"freshness":anchor.to_bytes().to_vec()}),
     );
     assert_eq!(restored["members"], members);
     // A staged change at this size saves (as parts) and adopts.
@@ -182,6 +182,7 @@ fn saves_stages_and_restores_at(size: usize) -> usize {
         json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     );
     assert_eq!(adopted["members"], members + 1);
+    let anchor = arachne_runtime::record_freshness(handle).unwrap();
     arachne_runtime::close(handle).unwrap();
     let handle = arachne_runtime::create(Some(&secret)).unwrap();
     arachne_runtime::attach_storage(
@@ -191,7 +192,7 @@ fn saves_stages_and_restores_at(size: usize) -> usize {
     .unwrap();
     let restored = call(
         handle,
-        json!({"op":"restore_workspace","workspace":workspace}),
+        json!({"op":"restore_workspace","workspace":workspace,"freshness":anchor.to_bytes().to_vec()}),
     );
     assert_eq!(restored["workspace_name"], "Large");
     assert_eq!(restored["members"], members + 1);
