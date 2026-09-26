@@ -14,6 +14,8 @@ readme = "README.md"
 publish = ["crates-io"]
 
 [features]
+default = []
+moq = ["arachne-node/moq"]
 tor = ["arachne-node/tor"]
 
 [dependencies]

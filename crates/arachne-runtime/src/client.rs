@@ -5,7 +5,9 @@ use serde_json::Value;
 
 use arachne_api::{ApiError, ErrorCode, Event};
 
-use crate::ops::{self, Op, admission, candidate, invitation, join, management, publication, receive};
+use crate::ops::{
+    self, Op, admission, candidate, invitation, join, management, publication, receive,
+};
 use crate::persistence;
 use crate::{FreshnessAnchor, Session, WorkspacePhase};
 
@@ -784,8 +786,12 @@ impl Client {
             ));
         }
         let options = config.transport.node_options(config.network)?;
-        let handle =
-            crate::registry::open(context, config.secret.as_ref(), options, config.transport.deadline)?;
+        let handle = crate::registry::open(
+            context,
+            config.secret.as_ref(),
+            options,
+            config.transport.deadline,
+        )?;
         Ok(Self {
             handle,
             closed: std::sync::atomic::AtomicBool::new(false),
@@ -867,10 +873,26 @@ impl Client {
         Ok(self.call(Op::ResetWorkspace, ops::workspace::reset)?.changed)
     }
 
+    /// Members whose leaf still comes from their KeyPackage: they never
+    /// self-updated. Each adds about 82 bytes to every management commit
+    /// (B3c), so a host can predict commit size and nudge those members.
+    pub fn members_without_self_update(&self) -> Result<usize> {
+        self.call(Op::WorkspaceState, |session| {
+            Ok(session
+                .workspace
+                .as_ref()
+                .ok_or_else(crate::errors::no_workspace)?
+                .members_without_self_update())
+        })
+    }
+
     /// Drop the staged candidate. Returns whether one was staged.
     pub fn discard_workspace_candidate(&self) -> Result<bool> {
         Ok(self
-            .call(Op::DiscardWorkspaceCandidate, ops::workspace::discard_candidate)?
+            .call(
+                Op::DiscardWorkspaceCandidate,
+                ops::workspace::discard_candidate,
+            )?
             .discarded)
     }
 
@@ -953,7 +975,11 @@ impl Client {
     }
 
     /// Restore a pending join sealed by `seal_pending_join`.
-    pub fn restore_pending_join(&self, workspace: [u8; 32], snapshot: &[u8]) -> Result<JoinRequest> {
+    pub fn restore_pending_join(
+        &self,
+        workspace: [u8; 32],
+        snapshot: &[u8],
+    ) -> Result<JoinRequest> {
         stored_input(snapshot)?;
         let pending = self.call(Op::RestorePendingJoin, |session| {
             join::restore_pending(
@@ -1048,7 +1074,10 @@ impl Client {
     /// Mark a pending approval as seen by the administrator's UI.
     pub fn acknowledge_admission_approval(&self, attempt_id: [u8; 32]) -> Result<()> {
         self.call(Op::AcknowledgeAdmissionApproval, |session| {
-            admission::acknowledge_approval(session, admission::AcknowledgeApprovalArgs { attempt_id })
+            admission::acknowledge_approval(
+                session,
+                admission::AcknowledgeApprovalArgs { attempt_id },
+            )
         })?;
         Ok(())
     }
@@ -1350,7 +1379,10 @@ impl Client {
     pub fn adopt_invitation(&self, snapshot: &[u8]) -> Result<InvitationInfo> {
         let adopted = self.adopt(Op::AdoptAdmission, candidate::adopt_admission, snapshot)?;
         let issued = adopted.issued_invitation.ok_or_else(|| {
-            error(ErrorKind::InvalidInput, "candidate did not issue an invitation")
+            error(
+                ErrorKind::InvalidInput,
+                "candidate did not issue an invitation",
+            )
         })?;
         Ok(issued)
     }
@@ -1567,6 +1599,38 @@ impl Client {
             )
         })?;
         Ok(())
+    }
+
+    #[cfg(feature = "moq")]
+    pub fn moq_metrics(&self) -> Result<Value> {
+        self.call(Op::MoqMetrics, |session| {
+            serde_json::to_value(session.node.moq_metrics())
+                .map_err(|error| ApiError::internal(error.to_string()))
+        })
+    }
+
+    /// Opt an authenticated endpoint and topic into protected MoQ delivery.
+    #[cfg(feature = "moq")]
+    pub fn enable_moq_delivery(
+        &self,
+        workspace: [u8; 32],
+        revision: u64,
+        peer_endpoint: [u8; 32],
+        topic: &str,
+    ) -> Result<()> {
+        self.call(Op::EnableMoqDelivery, |session| {
+            let topic = arachne_node::Topic::new(topic.to_owned())
+                .map_err(|error| ApiError::invalid_input("topic", error.to_string()))?;
+            session
+                .runtime
+                .block_on(session.node.enable_moq_delivery(
+                    workspace,
+                    revision,
+                    peer_endpoint,
+                    topic,
+                ))
+                .map_err(crate::errors::node)
+        })
     }
 
     pub fn network_change(&self) -> Result<()> {
@@ -1823,7 +1887,10 @@ impl Client {
     fn stage_inbox_resolution(
         &self,
         op: Op,
-        stage: fn(&mut Session, receive::ResolveArgs) -> std::result::Result<publication::StagedObject, ApiError>,
+        stage: fn(
+            &mut Session,
+            receive::ResolveArgs,
+        ) -> std::result::Result<publication::StagedObject, ApiError>,
         object: &ReceivedProtectedPublication,
     ) -> Result<ProtectedReceptionCandidate> {
         let staged = self.call(op, |session| {
@@ -2052,7 +2119,10 @@ impl Client {
     fn adopt(
         &self,
         op: Op,
-        adopt: fn(&mut Session, candidate::AdoptArgs) -> std::result::Result<candidate::AdoptReply, ApiError>,
+        adopt: fn(
+            &mut Session,
+            candidate::AdoptArgs,
+        ) -> std::result::Result<candidate::AdoptReply, ApiError>,
         snapshot: &[u8],
     ) -> Result<candidate::Adopted> {
         stored_input(snapshot)?;
@@ -2129,9 +2199,12 @@ fn join_request(pending: join::PendingJoinInfo) -> Result<JoinRequest> {
         workspace: pending.workspace,
         member: pending.member.id,
         endpoint: pending.endpoint,
-        admission_request: pending
-            .admission_request
-            .ok_or_else(|| error(ErrorKind::InvalidInput, "invitation has no admission request"))?,
+        admission_request: pending.admission_request.ok_or_else(|| {
+            error(
+                ErrorKind::InvalidInput,
+                "invitation has no admission request",
+            )
+        })?,
     })
 }
 
@@ -2318,9 +2391,15 @@ fn error_kind_comes_from_the_code_table() {
         (crate::errors::unknown_handle(), ErrorKind::Closed),
         (ApiError::Cancelled, ErrorKind::Cancelled),
         (ApiError::DeadlineExceeded, ErrorKind::Cancelled),
-        (ApiError::invalid_input("topic", "bad"), ErrorKind::InvalidInput),
+        (
+            ApiError::invalid_input("topic", "bad"),
+            ErrorKind::InvalidInput,
+        ),
         (ApiError::wrong_state("busy"), ErrorKind::InvalidInput),
-        (ApiError::limit_reached("sessions", 8, "node limit reached"), ErrorKind::Capacity),
+        (
+            ApiError::limit_reached("sessions", 8, "node limit reached"),
+            ErrorKind::Capacity,
+        ),
         (ApiError::candidate_stale("old"), ErrorKind::Storage),
         (
             crate::errors::node(arachne_node::Error::Transport(
@@ -2328,7 +2407,10 @@ fn error_kind_comes_from_the_code_table() {
             )),
             ErrorKind::Transport,
         ),
-        (ApiError::invitation_expired("late"), ErrorKind::InvalidInput),
+        (
+            ApiError::invitation_expired("late"),
+            ErrorKind::InvalidInput,
+        ),
         (ApiError::epoch_mismatch("moved"), ErrorKind::InvalidInput),
         (ApiError::internal("bug"), ErrorKind::Internal),
     ];

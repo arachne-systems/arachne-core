@@ -343,8 +343,9 @@ impl EndpointHooks for Admission {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NetworkProfile, connections::Connections};
+    use crate::{NetworkProfile, Node, Permissions, Topic, connections::Connections};
     use iroh::{Endpoint, EndpointAddr, endpoint::presets};
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     async fn full_server() -> crate::Node {
@@ -913,6 +914,81 @@ mod tests {
             }
             assert_eq!(budget.dials[0].available_permits(), 1);
             assert_eq!(budget.dials[1].available_permits(), 1);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(feature = "moq")]
+    #[tokio::test]
+    async fn exhausted_moq_dial_capacity_is_explicit_and_control_still_works() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut secrets = [[51; 32], [52; 32]];
+            secrets.sort_by_key(|secret| *iroh::SecretKey::from_bytes(secret).public().as_bytes());
+            let (dialer, _) = Node::bind_with_profile(
+                "127.0.0.1:0".parse().unwrap(),
+                Some(&secrets[0]),
+                NetworkProfile::Direct,
+                ConnectionBudget::new([4, 1], [0, 1]),
+            )
+            .await
+            .unwrap();
+            let (mut listener, _) =
+                Node::bind_with_identity("127.0.0.1:0".parse().unwrap(), &secrets[1])
+                    .await
+                    .unwrap();
+            let topic = Topic::new("ptt/audio").unwrap();
+            let policy = BTreeMap::from([
+                (dialer.id(), Permissions::AllTopics),
+                (listener.id(), Permissions::AllTopics),
+            ]);
+            dialer
+                .add_address_hint(listener.id(), listener.address())
+                .await
+                .unwrap();
+            listener
+                .add_address_hint(dialer.id(), dialer.address())
+                .await
+                .unwrap();
+            dialer
+                .install_verified_policy([61; 32], 1, policy.clone())
+                .await
+                .unwrap();
+            listener
+                .install_verified_policy([61; 32], 1, policy)
+                .await
+                .unwrap();
+            listener
+                .enable_moq_delivery([61; 32], 1, dialer.id(), topic.clone())
+                .await
+                .unwrap();
+            assert!(matches!(
+                dialer
+                    .enable_moq_delivery([61; 32], 1, listener.id(), topic)
+                    .await,
+                Err(Error::Backpressure)
+            ));
+
+            let control = tokio::time::timeout(Duration::from_secs(5), async {
+                let request = dialer.request_control(listener.id(), b"control-reserve");
+                tokio::pin!(request);
+                loop {
+                    tokio::select! {
+                        result = &mut request => break result,
+                        _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                            if let Some(request) = listener.poll_control() {
+                                request.respond(b"control-ok".to_vec()).unwrap();
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(control, b"control-ok");
+            dialer.close().await;
+            listener.close().await;
         })
         .await
         .unwrap();

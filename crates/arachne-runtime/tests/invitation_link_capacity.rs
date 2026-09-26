@@ -1,7 +1,7 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use arachne_node::{ConnectionBudget, NetworkProfile, Node};
 use arachne_runtime::harness::{self, Query, StateBasis};
-use arachne_security::{AdmissionAuthorization, Invitation, MembershipAuthorization, PendingJoin};
+use arachne_security::{Invitation, MembershipAuthorization, PendingJoin};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -213,29 +213,6 @@ fn write_receipt(path: Option<&str>, value: &Value) {
     }
 }
 
-fn array32(value: &Value) -> Result<[u8; 32], String> {
-    let bytes: Vec<u8> = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
-    bytes.try_into().map_err(|_| "expected 32 bytes".to_string())
-}
-
-fn array64(value: &Value) -> Result<[u8; 64], String> {
-    let bytes: Vec<u8> = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
-    bytes.try_into().map_err(|_| "expected 64 bytes".to_string())
-}
-
-/// Build the typed admission authorization straight from the admission
-/// reply's `authorization` JSON object (`invitation_key`, `grant_signature`,
-/// `redemption_signature` -- exactly `AdmissionAuthorization`'s public
-/// fields, see `arachne_runtime::lib::RetainedAdmission`'s reply at
-/// lib.rs:1191-1193). No arachne-runtime seam needed for this leg.
-fn build_authorization(value: &Value) -> Result<AdmissionAuthorization, String> {
-    Ok(AdmissionAuthorization {
-        invitation_key: array32(&value["invitation_key"])?,
-        grant_signature: array64(&value["grant_signature"])?,
-        redemption_signature: array64(&value["redemption_signature"])?,
-    })
-}
-
 const ADMISSION_HISTORY_PAGE_REQUEST: &[u8; 5] = b"DFJP\x02";
 
 /// Mirrors `arachne_runtime::admission_history_page_packet`, a wire request
@@ -250,10 +227,8 @@ fn history_page_packet(request: &[u8], _checkpoint: &[u8], offset: u32) -> Vec<u
 }
 
 /// Parse one reply/page's `commits` array into typed (authorization, commit)
-/// steps, matching `arachne_runtime::membership::JoinStep::authorization`
-/// (each step carries exactly one of `authorization` (single Admission) or
-/// `admission_batch` (AdmissionBatch) -- Management steps are not produced
-/// for an open invitation and are treated as an unsupported step here).
+/// steps. Each step carries the binary step codec in `step`, as
+/// `arachne_runtime::membership::JoinStep` reads it.
 fn parse_join_steps(value: &Value) -> Result<Vec<(MembershipAuthorization, Vec<u8>)>, String> {
     let commits = value
         .get("commits")
@@ -263,21 +238,9 @@ fn parse_join_steps(value: &Value) -> Result<Vec<(MembershipAuthorization, Vec<u
     commits
         .iter()
         .map(|step| {
-            let commit: Vec<u8> =
-                serde_json::from_value(step["commit"].clone()).map_err(|e| e.to_string())?;
-            let authorization = if !step["authorization"].is_null() {
-                MembershipAuthorization::Admission(build_authorization(&step["authorization"])?)
-            } else if let Some(batch) = step.get("admission_batch").and_then(Value::as_array) {
-                MembershipAuthorization::AdmissionBatch(
-                    batch
-                        .iter()
-                        .map(build_authorization)
-                        .collect::<Result<_, String>>()?,
-                )
-            } else {
-                return Err("join step is not an admission or admission batch".into());
-            };
-            Ok((authorization, commit))
+            let bytes: Vec<u8> =
+                serde_json::from_value(step["step"].clone()).map_err(|e| e.to_string())?;
+            arachne_security::decode_membership_step(&bytes).map_err(str::to_owned)
         })
         .collect()
 }
@@ -314,7 +277,7 @@ async fn collect_join_steps(
             .await
             .map_err(|error| error.to_string())?;
         let page: Value =
-            serde_json::from_slice(&page_bytes).map_err(|error| error.to_string())?;
+            arachne_runtime::harness::decode_admission_reply(&page_bytes).map_err(|error| error.to_string())?;
         if page["state"] != "admission_replied" || page.get("history_page").is_none() {
             return Err("admission history page was not accepted".into());
         }
@@ -590,7 +553,7 @@ fn one_atak_invitation_link_handles_500_synthetic_joiners() {
                     let pending = PendingJoin::from_invitation(
                         &invitation,
                         &checkpoint,
-                        node.id(),
+                        &**node,
                         &display_name,
                     )
                     .map_err(str::to_owned)?;
@@ -621,7 +584,7 @@ fn one_atak_invitation_link_handles_500_synthetic_joiners() {
                     match result {
                         Ok(reply) => {
                             let value: Value =
-                                serde_json::from_slice(&reply).map_err(|e| e.to_string())?;
+                                arachne_runtime::harness::decode_admission_reply(&reply).map_err(|e| e.to_string())?;
                             if let Some(welcome) = value.get("welcome") {
                                 ready_elapsed_ms.push(started.elapsed().as_millis());
                                 welcomed.insert(
@@ -678,7 +641,7 @@ fn one_atak_invitation_link_handles_500_synthetic_joiners() {
                         match result {
                             Ok(reply) => {
                                 let value: Value =
-                                    serde_json::from_slice(&reply).map_err(|e| e.to_string())?;
+                                    arachne_runtime::harness::decode_admission_reply(&reply).map_err(|e| e.to_string())?;
                                 if let Some(welcome) = value.get("welcome") {
                                     ready_elapsed_ms.push(started.elapsed().as_millis());
                                     welcomed.insert(
@@ -1004,7 +967,7 @@ fn local_full_onboarding_state_machine_rejects_a_corrupted_joiner() {
             let pending = PendingJoin::from_invitation(
                 &invitation,
                 &checkpoint,
-                node.id(),
+                &**node,
                 &display_name,
             )
             .unwrap();
@@ -1022,7 +985,7 @@ fn local_full_onboarding_state_machine_rejects_a_corrupted_joiner() {
                 let deadline = Instant::now() + Duration::from_secs(20);
                 let mut reply = loop {
                     let reply = node.request_control(owner_peer, &packet).await.unwrap();
-                    let value: Value = serde_json::from_slice(&reply).unwrap();
+                    let value: Value = arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
                     if value.get("welcome").is_some() {
                         break value;
                     }
@@ -1040,15 +1003,19 @@ fn local_full_onboarding_state_machine_rejects_a_corrupted_joiner() {
                     // be counted ready.
                     let commits = reply["commits"].as_array_mut().unwrap();
                     let last = commits.last_mut().unwrap();
-                    let signature = if !last["authorization"].is_null() {
-                        &mut last["authorization"]["grant_signature"]
-                    } else {
-                        let batch = last["admission_batch"].as_array_mut().unwrap();
-                        &mut batch.last_mut().unwrap()["grant_signature"]
-                    };
-                    let mut byte = signature[0].as_u64().unwrap();
-                    byte ^= 1;
-                    signature[0] = json!(byte);
+                    let bytes: Vec<u8> = serde_json::from_value(last["step"].clone()).unwrap();
+                    let (mut authorization, commit) =
+                        arachne_security::decode_membership_step(&bytes).unwrap();
+                    match &mut authorization {
+                        MembershipAuthorization::Admission(auth) => auth.grant_signature[0] ^= 1,
+                        MembershipAuthorization::AdmissionBatch(auths) => {
+                            auths.last_mut().unwrap().grant_signature[0] ^= 1
+                        }
+                        _ => panic!("join step is not an admission"),
+                    }
+                    last["step"] = json!(
+                        arachne_security::encode_membership_step(&authorization, &commit).unwrap()
+                    );
                 }
                 let record = full_onboard(
                     node,

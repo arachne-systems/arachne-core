@@ -914,7 +914,7 @@ fn query_and_status_framing_are_bounded_and_canonical() {
             .unwrap(),
         largest_cutoff.to_wire().unwrap()
     );
-    let owner = Workspace::create([1; 32], "Reader").unwrap();
+    let owner = Workspace::create(crate::test_key(1), "Reader").unwrap();
     assert_eq!(
         verify_cutoff_reply(&owner, &cutoff, &denied_reply()).unwrap(),
         None

@@ -19,11 +19,17 @@ mod budget;
 mod connections;
 mod mdns;
 mod control;
+mod endpoint;
+pub use endpoint::IrohEndpointSigner;
 mod overlay;
+#[cfg(feature = "moq")]
+mod streams;
 pub mod resources;
 mod wire;
 pub use budget::{CapacityCounts, ConnectionBudget};
 pub use control::{ControlClient, ControlRequest, ControlTiming, InquiryResponder, MAX_CONTROL_REPLY, Timing};
+#[cfg(feature = "moq")]
+pub use streams::MoqMetrics;
 
 use connections::Connections;
 use arachne_routing::RoutingTable;
@@ -444,6 +450,8 @@ pub struct Node {
     /// while suspended; `resume` rebuilds them.
     parked: Arc<StdMutex<Option<BTreeMap<WorkspaceId, ([u8; overlay::TAG], u64)>>>>,
     membership: overlay::MembershipInbox,
+    #[cfg(feature = "moq")]
+    streams: streams::Streams,
     listener: JoinHandle<()>,
 }
 
@@ -629,12 +637,19 @@ impl Node {
         options: NodeOptions,
         budget: ConnectionBudget,
     ) -> Result<(Self, MessageReceiver)> {
+        let alpns = vec![ALPN.to_vec(), control::ALPN.to_vec(), overlay::ALPN.to_vec()];
+        #[cfg(feature = "moq")]
+        let alpns = {
+            let mut alpns = alpns;
+            alpns.extend(iroh_moq::alpns().into_iter().map(<[u8]>::to_vec));
+            alpns
+        };
         let connections = Connections::bind(
             address,
             &options,
             secret.map(iroh::SecretKey::from_bytes),
             budget.clone(),
-            vec![ALPN.to_vec(), control::ALPN.to_vec(), overlay::ALPN.to_vec()],
+            alpns,
         )
         .await?;
         let routing = Arc::new(Mutex::new(RoutingTable::default()));
@@ -645,6 +660,8 @@ impl Node {
             work: Some(control_signal.clone()),
             ..DeliveryQueue::default()
         };
+        #[cfg(feature = "moq")]
+        let streams = streams::Streams::new(connections.clone(), routing.clone(), events.clone());
         let receiver = MessageReceiver {
             queue: events.clone(),
         };
@@ -657,6 +674,8 @@ impl Node {
         let output = events.clone();
         let accepted_overlays = overlays.clone();
         let accepted_resources = resources.clone();
+        #[cfg(feature = "moq")]
+        let accepted_streams = streams.clone();
         let listener = tokio::spawn(async move {
             // Handshakes release their slot before application work. Slow data
             // peers cannot occupy the slots needed to reach the control budget.
@@ -679,6 +698,8 @@ impl Node {
                 let connections = accepted_connections.clone();
                 let output = output.clone();
                 let resources = accepted_resources.clone();
+                #[cfg(feature = "moq")]
+                let streams = accepted_streams.clone();
                 workers.spawn(async move {
                     let mut stage = "accept connection";
                     let mut remote = None;
@@ -724,6 +745,19 @@ impl Node {
                                 .await.map_err(|_| Error::Timeout("accept gossip"))?.map_err(transport)?;
                             return Ok(());
                         }
+                        #[cfg(feature = "moq")]
+                        if streams::is_moq_alpn(connection.alpn()) {
+                            stage = "accept MoQ";
+                            match streams.accept_connection(sender, connection.clone()).await {
+                                Ok(()) => return Ok(()),
+                                Err(error) => {
+                                    connection.close(0u32.into(), b"unauthorized MoQ");
+                                    return Err(error);
+                                }
+                            }
+                        }
+                        // A removed overlay's already-negotiated ALPN must never
+                        // be interpreted as the direct-frame schema.
                         if !is_control && connection.alpn() != ALPN {
                             return Err(Error::InvalidFrame);
                         }
@@ -832,6 +866,8 @@ impl Node {
                 overlays,
                 parked: Arc::new(StdMutex::new(None)),
                 membership: overlay::MembershipInbox::new(control_signal_for_membership),
+                #[cfg(feature = "moq")]
+                streams,
                 listener,
             },
             receiver,
@@ -997,6 +1033,8 @@ impl Node {
             routing.install_verified_policy(workspace, revision, endpoint_permissions)?;
             self.connections.set_members(routing.endpoints());
         }
+        #[cfg(feature = "moq")]
+        self.streams.policy_changed().await;
         self.resources.policy_changed();
         if let Some(existing) = existing {
             let tag = existing.tag;
@@ -1088,6 +1126,24 @@ impl Node {
     pub async fn with_routing_policy<T>(&self, inspect: impl FnOnce(&RoutingTable) -> T) -> T {
         let routing = self.routing.lock().await;
         inspect(&routing)
+    }
+
+    /// Enable protected MoQ delivery for one authorized peer and topic.
+    #[cfg(feature = "moq")]
+    pub async fn enable_moq_delivery(
+        &self,
+        workspace: WorkspaceId,
+        revision: u64,
+        peer: PeerId,
+        topic: Topic,
+    ) -> Result<()> {
+        self.streams.enable(workspace, revision, peer, topic).await
+    }
+
+    /// Counters distinguish MoQ data packets from the existing direct path.
+    #[cfg(feature = "moq")]
+    pub fn moq_metrics(&self) -> MoqMetrics {
+        self.streams.metrics()
     }
 
     /// Current maintained live neighbors for a workspace overlay. Zero means
@@ -1346,6 +1402,113 @@ impl Node {
         Ok(report)
     }
 
+    /// Route an authenticated protected publication over opted-in MoQ peers.
+    /// Peers without an enabled MoQ route keep the existing data path.
+    #[cfg(feature = "moq")]
+    pub async fn publish_protected_with_class(
+        &self,
+        workspace: WorkspaceId,
+        revision: u64,
+        topic: Topic,
+        sequence: u64,
+        delivery: DeliveryClass,
+        payload: Vec<u8>,
+    ) -> Result<AdmissionReport> {
+        let peers = self
+            .routing
+            .lock()
+            .await
+            .recipients(workspace, revision, self.id(), &topic)?;
+        if !self
+            .streams
+            .any_enabled(workspace, revision, &topic, &peers)
+            .await
+        {
+            return self
+                .publish_with_class(workspace, revision, topic, delivery, payload)
+                .await;
+        }
+        self.streams
+            .publish_selected(
+                sequence,
+                peers,
+                Frame {
+                    workspace,
+                    revision,
+                    topic: topic.as_str().into(),
+                    delivery,
+                    operation: Operation::Publish(payload),
+                },
+            )
+            .await
+    }
+
+    /// Route one protected direct publication over opted-in MoQ peers.
+    #[cfg(feature = "moq")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_protected_to_with_class(
+        &self,
+        workspace: WorkspaceId,
+        revision: u64,
+        topic: Topic,
+        sequence: u64,
+        endpoints: Vec<PeerId>,
+        recipients: Vec<[u8; 32]>,
+        delivery: DeliveryClass,
+        payload: Vec<u8>,
+    ) -> Result<AdmissionReport> {
+        let peers = self.routing.lock().await.direct_recipients(
+            workspace,
+            revision,
+            self.id(),
+            &topic,
+            &endpoints,
+        )?;
+        if !self
+            .streams
+            .any_enabled(workspace, revision, &topic, &peers)
+            .await
+        {
+            return self
+                .publish_to_with_class(
+                    workspace,
+                    revision,
+                    topic,
+                    endpoints,
+                    recipients,
+                    delivery,
+                    payload,
+                )
+                .await;
+        }
+        let skipped: Vec<_> = endpoints
+            .into_iter()
+            .filter(|peer| peers.binary_search(peer).is_err())
+            .collect();
+        let mut report = self
+            .streams
+            .publish_selected(
+                sequence,
+                peers,
+                Frame {
+                    workspace,
+                    revision,
+                    topic: topic.as_str().into(),
+                    delivery,
+                    operation: Operation::DirectPublish {
+                        payload,
+                        recipients,
+                    },
+                },
+            )
+            .await?;
+        report
+            .failed
+            .extend(skipped.into_iter().map(|peer| (peer, Error::NotSubscribed)));
+        report.failed.sort_unstable_by_key(|(peer, _)| *peer);
+        Ok(report)
+    }
+
     fn fanout(
         &self,
         peers: Vec<PeerId>,
@@ -1520,6 +1683,8 @@ impl Node {
     }
 
     pub async fn close(mut self) {
+        #[cfg(feature = "moq")]
+        self.streams.close().await;
         self.resources.close().await;
         self.overlays.lock().await.clear();
         self.connections.close().await;
@@ -1646,6 +1811,8 @@ impl Drop for Node {
     fn drop(&mut self) {
         self.resources.stop();
         self.events.close();
+        #[cfg(feature = "moq")]
+        self.streams.stop();
         self.listener.abort();
     }
 }

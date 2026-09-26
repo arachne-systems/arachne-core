@@ -379,6 +379,11 @@ impl Connections {
         self.endpoint.clone()
     }
 
+    #[cfg(feature = "moq")]
+    pub(super) fn dial_capacity(&self, alpn: &[u8]) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        self.budget.dial(alpn)
+    }
+
     pub(super) async fn wait_online(&self) {
         self.endpoint.online().await;
     }
@@ -483,7 +488,7 @@ impl Connections {
         addresses.insert(peer, address);
         self.unreachable.lock().await.remove(&peer);
         self.memory
-            .add_endpoint_info(EndpointAddr::new(key).with_ip_addr(address));
+            .set_endpoint_info(EndpointAddr::new(key).with_ip_addr(address));
         Ok(())
     }
 
@@ -506,7 +511,7 @@ impl Connections {
             addresses.insert(peer, address);
             if let Ok(key) = PublicKey::from_bytes(&peer) {
                 self.memory
-                    .add_endpoint_info(EndpointAddr::new(key).with_ip_addr(address));
+                    .set_endpoint_info(EndpointAddr::new(key).with_ip_addr(address));
             }
         }
     }
@@ -848,6 +853,51 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn refreshing_an_address_hint_replaces_the_stale_port() {
+        let peer = Endpoint::builder(presets::Minimal)
+            .clear_relay_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let cache = Connections::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            &NodeOptions::new(NetworkProfile::Direct),
+            None,
+            ConnectionBudget::default(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        let stale = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let current = peer.bound_sockets()[0];
+        cache
+            .add_address_hint(*peer.id().as_bytes(), stale)
+            .await
+            .unwrap();
+        cache
+            .add_address_hint(*peer.id().as_bytes(), current)
+            .await
+            .unwrap();
+
+        let known = cache
+            .memory
+            .get_endpoint_info(peer.id())
+            .unwrap()
+            .ip_addrs()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(known, [current]);
+
+        cache.close().await;
+        peer.close().await;
     }
 
     #[tokio::test]

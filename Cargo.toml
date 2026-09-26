@@ -35,6 +35,8 @@ homepage = "https://github.com/arachne-systems"
 [patch.crates-io]
 netlink-packet-core = { path = "vendor/netlink-packet-core" }
 hax-lib-macros = { path = "vendor/hax-lib-macros" }
+moq-net = { git = "https://github.com/moq-dev/moq", rev = "6ab7d1a223e1949a5c2e10b68e29db2e8ab9bdd1" }
+moq-tokio = { git = "https://github.com/moq-dev/moq", rev = "6ab7d1a223e1949a5c2e10b68e29db2e8ab9bdd1" }
 
 # Test speed. Debug-build openmls, RustCrypto and SQLite dominated the slow
 # runtime tests (12-26 min each). Dependencies build at opt-level 2; the three

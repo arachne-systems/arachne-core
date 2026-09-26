@@ -175,7 +175,8 @@ async fn bind_joiner(seed_index: u64, invitation: &Invitation, checkpoint: &[u8]
         .unwrap();
     let node = Arc::new(node);
     let peer = node.id();
-    let pending = PendingJoin::from_invitation(invitation, checkpoint, peer, "Staging member")
+    let _ = peer;
+    let pending = PendingJoin::from_invitation(invitation, checkpoint, &*node, "Staging member")
         .unwrap();
     let packet = admission_packet(
         pending.admission_request().unwrap(),
@@ -300,14 +301,14 @@ fn admission_batch_staging_keeps_committing_under_continuous_intake() {
                         let Ok(reply) = node.request_control(owner_peer, &packet).await else {
                             continue;
                         };
-                        let value: Value = serde_json::from_slice(&reply).unwrap();
+                        let value: Value = arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
                         // A retry here (after a lost/timed-out reply to a
                         // send that the owner actually processed) can land
                         // after the request was already staged and
                         // retained -- that is also success, just observed
                         // late, not a failure.
                         assert!(
-                            value["state"] == "admission_queued" || value["commit"].is_array(),
+                            value["state"] == "admission_queued" || value["commits"].is_array(),
                             "unexpected initial admission reply: {value}"
                         );
                         return;
@@ -337,7 +338,7 @@ fn admission_batch_staging_keeps_committing_under_continuous_intake() {
                         else {
                             continue;
                         };
-                        let value: Value = serde_json::from_slice(&reply).unwrap();
+                        let value: Value = arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
                         if value["state"] != "admission_queued" {
                             // Retained: nothing further to do for this joiner.
                             return;

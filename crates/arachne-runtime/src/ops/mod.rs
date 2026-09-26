@@ -31,6 +31,8 @@ pub(crate) mod workspace;
 pub(crate) enum Op {
     Resource,
     WorkspaceMetrics,
+    MoqMetrics,
+    EnableMoqDelivery,
     WorkspaceState,
     ResetWorkspace,
     DiscardWorkspaceCandidate,
@@ -130,6 +132,7 @@ impl Op {
                 | Op::DriveJoin
                 | Op::WorkspaceState
                 | Op::WorkspaceMetrics
+                | Op::MoqMetrics
                 | Op::NetworkChange
                 | Op::NearbyEndpoints
                 | Op::NearbyWorkspaces

@@ -10,10 +10,12 @@ use serde_json::{Value, json};
 
 use crate::client::DeliveryReport;
 use crate::errors::security;
-use crate::ops::admission::{admission_reply_page, queue_admission_push, send_inbound_admission_reply};
+use crate::ops::admission::{
+    admission_reply_page, queue_admission_push, send_inbound_admission_reply,
+};
+use crate::ops::invitation::invitation_envelope;
 use crate::session::{activity_view, commit_workspace, transition_activity};
 use crate::workspace_activity::ActivityView;
-use crate::ops::invitation::invitation_envelope;
 use crate::{Session, WorkspacePhase, WorkspaceTransition, membership, report};
 
 #[derive(Clone, Debug, Deserialize)]
@@ -42,8 +44,9 @@ impl AdoptKind {
             (
                 AdoptKind::Admission,
                 WorkspaceTransition::Admission
-                    | WorkspaceTransition::Management(_, _)
+                    | WorkspaceTransition::Management(..)
                     | WorkspaceTransition::WorkspaceName
+                    | WorkspaceTransition::SelfUpdate(_)
                     | WorkspaceTransition::Invitation(..)
             ) | (AdoptKind::Join, WorkspaceTransition::Join)
                 | (
@@ -169,7 +172,10 @@ impl AdoptReply {
     }
 }
 
-pub(crate) fn adopt_admission(session: &mut Session, args: AdoptArgs) -> Result<AdoptReply, ApiError> {
+pub(crate) fn adopt_admission(
+    session: &mut Session,
+    args: AdoptArgs,
+) -> Result<AdoptReply, ApiError> {
     adopt(session, AdoptKind::Admission, args.snapshot)
 }
 
@@ -184,11 +190,17 @@ pub(crate) fn adopt_publication(
     adopt(session, AdoptKind::Publication, args.snapshot)
 }
 
-pub(crate) fn adopt_reception(session: &mut Session, args: AdoptArgs) -> Result<AdoptReply, ApiError> {
+pub(crate) fn adopt_reception(
+    session: &mut Session,
+    args: AdoptArgs,
+) -> Result<AdoptReply, ApiError> {
     adopt(session, AdoptKind::Reception, args.snapshot)
 }
 
-pub(crate) fn adopt_recovery(session: &mut Session, args: AdoptArgs) -> Result<AdoptReply, ApiError> {
+pub(crate) fn adopt_recovery(
+    session: &mut Session,
+    args: AdoptArgs,
+) -> Result<AdoptReply, ApiError> {
     adopt(session, AdoptKind::Recovery, args.snapshot)
 }
 
@@ -284,7 +296,10 @@ pub(crate) fn adopt(
     // A step this node committed goes out by gossip. A step it
     // received from a peer is already travelling; gossip relays it.
     let received = std::mem::take(&mut session.membership.staged_step_received);
-    let committed_here = matches!(staged.transition, WorkspaceTransition::Admission) && !received;
+    let committed_here = matches!(
+        staged.transition,
+        WorkspaceTransition::Admission | WorkspaceTransition::SelfUpdate(_)
+    ) && !received;
     match staged.transition {
         WorkspaceTransition::Inbox => value.state = Some("inbox_adopted"),
         WorkspaceTransition::InboxRejected => value.state = Some("inbox_rejection_adopted"),
@@ -308,13 +323,33 @@ pub(crate) fn adopt(
                 stale,
             });
         }
-        WorkspaceTransition::RoutedPublication(context, delivery, packet, endpoints, recipients) => {
+        WorkspaceTransition::RoutedPublication(
+            context,
+            delivery,
+            packet,
+            endpoints,
+            recipients,
+        ) => {
             // Adoption is final even if network admission fails or times out.
             // The send (and its gossip join) also ends at the op deadline.
             let send_limit = crate::deadline::cap(session.op_deadline, Duration::from_secs(10));
             let sent = session.runtime.block_on(async {
                 tokio::time::timeout(send_limit, async {
                     if recipients.is_empty() {
+                        #[cfg(feature = "moq")]
+                        if let Some(sequence) = context.sequence {
+                            return session
+                                .node
+                                .publish_protected_with_class(
+                                    context.workspace,
+                                    context.revision,
+                                    context.topic,
+                                    sequence.get(),
+                                    delivery,
+                                    packet,
+                                )
+                                .await;
+                        }
                         session
                             .node
                             .publish_with_class(
@@ -326,6 +361,22 @@ pub(crate) fn adopt(
                             )
                             .await
                     } else {
+                        #[cfg(feature = "moq")]
+                        if let Some(sequence) = context.sequence {
+                            return session
+                                .node
+                                .publish_protected_to_with_class(
+                                    context.workspace,
+                                    context.revision,
+                                    context.topic,
+                                    sequence.get(),
+                                    endpoints,
+                                    recipients.clone(),
+                                    delivery,
+                                    packet,
+                                )
+                                .await;
+                        }
                         session
                             .node
                             .publish_to_with_class(
@@ -359,11 +410,8 @@ pub(crate) fn adopt(
             }
             value.publication = Some(outcome);
         }
-        WorkspaceTransition::Management(action, commit) => {
-            value.step = Some(membership::step_json(
-                &arachne_security::MembershipAuthorization::Management(action),
-                &commit,
-            ));
+        WorkspaceTransition::Management(_, authorization, commit) => {
+            value.step = Some(membership::step_json(&authorization, &commit));
         }
         WorkspaceTransition::Invitation(invitation, checkpoint, action, commit) => {
             let issued = invitation_envelope(session, &invitation, checkpoint)?;
@@ -417,6 +465,12 @@ pub(crate) fn adopt(
             value.results_pushed = Some(pushed);
         }
         WorkspaceTransition::WorkspaceName => {}
+        WorkspaceTransition::SelfUpdate(commit) => {
+            value.step = Some(membership::step_json(
+                &arachne_security::MembershipAuthorization::SelfUpdate,
+                &commit,
+            ));
+        }
         WorkspaceTransition::Join => {
             session.join.pending = None;
             session.join.lifecycle = None;
@@ -473,16 +527,20 @@ mod tests {
                 .map_err(|error| error.to_string())
         };
         let description: Value = serde_json::from_str(&describe(handle).unwrap()).unwrap();
-        let endpoint = serde_json::from_value(description["endpoint_key"].clone()).unwrap();
+        let _: [u8; 32] = serde_json::from_value(description["endpoint_key"].clone()).unwrap();
         // The runtime session is the administrator; the sender is a member.
-        let admin = Workspace::create(endpoint, "Admin").unwrap();
+        let secret = iroh::SecretKey::from_bytes(&root);
+        let admin =
+            Workspace::create(&arachne_node::IrohEndpointSigner(&secret), "Admin").unwrap();
+        let sender_key = arachne_security::EndpointKey::generate().unwrap();
+        let sender_endpoint = arachne_security::EndpointSigner::endpoint(&sender_key);
         let (registered, invitation, checkpoint) =
             admin.prepare_invitation(u64::MAX, false, false).unwrap();
         let admin = registered.workspace;
         let join =
-            PendingJoin::from_invitation(&invitation, &checkpoint, [106; 32], "Sender").unwrap();
+            PendingJoin::from_invitation(&invitation, &checkpoint, &sender_key, "Sender").unwrap();
         let prepared = admin
-            .prepare_admission([106; 32], join.admission_request().unwrap())
+            .prepare_admission(sender_endpoint, join.admission_request().unwrap())
             .unwrap();
         let mut proof = join.join_proof().unwrap();
         proof

@@ -15,46 +15,41 @@ fn call(handle: i64, request: Value) -> Result<Value, String> {
         .map_err(|error| error.to_string())
 }
 
-fn synthetic(index: usize) -> [u8; 32] {
-    let mut value = [0; 32];
-    value[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
-    value[8..16].copy_from_slice(&(!(index as u64)).to_be_bytes());
-    value
-}
-
-/// An owner workspace for `endpoint` with at least `size` members.
-fn grown(endpoint: [u8; 32], size: usize) -> Workspace {
+/// An owner workspace for `endpoint` with at least `size` members, each with
+/// its own endpoint key.
+fn grown(endpoint: &dyn arachne_security::EndpointSigner, size: usize) -> Workspace {
+    use arachne_security::{EndpointKey, EndpointSigner};
     let owner = Workspace::create(endpoint, "Large owner").unwrap();
     let (registration, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
     let mut owner = registration.workspace;
-    let mut next = 0;
     while owner.member_count() < size {
-        let range = next..(next + MAX_ADMISSION_BATCH);
-        let requests: Vec<_> = range
-            .clone()
-            .map(|index| {
-                PendingJoin::from_invitation(&invitation, &checkpoint, synthetic(index), "Member")
+        let keys: Vec<_> = (0..MAX_ADMISSION_BATCH)
+            .map(|_| EndpointKey::generate().unwrap())
+            .collect();
+        let requests: Vec<_> = keys
+            .iter()
+            .map(|key| {
+                PendingJoin::from_invitation(&invitation, &checkpoint, key, "Member")
                     .unwrap()
                     .admission_request()
                     .unwrap()
                     .to_vec()
             })
             .collect();
-        let validated: Vec<_> = range
-            .clone()
+        let validated: Vec<_> = keys
+            .iter()
             .zip(&requests)
-            .map(|(index, request)| match owner.assess_admission(synthetic(index), request).unwrap() {
+            .map(|(key, request)| match owner.assess_admission(key.endpoint(), request).unwrap() {
                 AdmissionAssessment::Ready(validated) => validated,
                 _ => panic!("open invitation needs no approval"),
             })
             .collect();
-        let entries: Vec<_> = range
-            .clone()
+        let entries: Vec<_> = keys
+            .iter()
             .zip(requests.iter().zip(&validated))
-            .map(|(index, (request, validated))| (synthetic(index), request.as_slice(), validated))
+            .map(|(key, (request, validated))| (key.endpoint(), request.as_slice(), validated))
             .collect();
         owner = owner.prepare_validated_admission_batch(&entries).unwrap().workspace;
-        next = range.end;
     }
     owner
 }
@@ -90,7 +85,9 @@ fn a_joiner_redeems_an_invitation_past_three_hundred_members_over_the_runtime() 
     let address = info["bound_address"].as_str().unwrap().replace("0.0.0.0:", "127.0.0.1:");
 
     // Past 500 members, so the checkpoint spans more than one control reply.
-    let workspace = grown(owner_peer, 520);
+    let secret = iroh::SecretKey::from_bytes(&[241; 32]);
+    assert_eq!(*secret.public().as_bytes(), owner_peer);
+    let workspace = grown(&arachne_node::IrohEndpointSigner(&secret), 520);
     let members = workspace.member_count();
     {
         let shared = session(owner).unwrap();

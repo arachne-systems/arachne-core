@@ -154,7 +154,7 @@ pub(crate) fn create(session: &mut Session, args: CreateArgs) -> Result<Workspac
     }
     transition_activity(session, WorkspacePhase::Creating, None)?;
     let workspace = arachne_security::Workspace::create_named(
-        session.node.id(),
+        &session.node,
         &args.display_name,
         args.workspace_name.as_deref(),
     )
@@ -314,6 +314,7 @@ pub(crate) fn discard_candidate(session: &mut Session) -> Result<Discarded, ApiE
     let discarded = session.transition.staged.take().is_some();
     let offer_cancelled = session.membership.offer.take().is_some();
     session.membership.offer_requires_adoption = false;
+    session.membership.self_update_offered = None;
     session.membership.staged_step_received = false;
     Ok(Discarded {
         state: "workspace_candidate_discarded",

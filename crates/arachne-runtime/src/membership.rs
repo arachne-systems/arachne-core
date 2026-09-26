@@ -4,6 +4,7 @@ use super::*;
 use crate::errors::{self, security};
 use crate::ops::management::{StagedCandidate, StagedChange, StagedRemoval};
 use arachne_api::{ApiError, ErrorCode};
+pub(crate) mod self_update;
 pub(crate) mod wire;
 pub(super) use wire::encode_reply;
 
@@ -26,6 +27,9 @@ impl StateBasis {
         }
     }
 }
+/// A management intent from the host. Remove, Demote and DisableInvitation
+/// become signed revocation orders when staged; a departure is not an
+/// intent here (it is a leave order another member commits).
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(
     tag = "kind",
@@ -37,10 +41,6 @@ pub(super) enum WireManagement {
     Promote([u8; 32]),
     Demote([u8; 32]),
     Remove([u8; 32]),
-    Leave {
-        id: [u8; 32],
-        signature: Vec<u8>,
-    },
     CreateInvitation {
         key: [u8; 32],
         expires_at: u64,
@@ -90,31 +90,37 @@ impl WireManagement {
             Self::DisableInvitation(key) => {
                 arachne_security::ManagementAction::DisableInvitation(*key)
             }
-            Self::Leave { id, signature } => arachne_security::ManagementAction::Leave(
-                *id,
-                signature
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| ApiError::invalid_input("step", "invalid leave signature length"))?,
-            ),
         })
     }
 }
+
+/// One membership step as the host carries it. The general form is the
+/// binary step codec (`step`, `DFMS\x03`), which carries every kind,
+/// including signed revocation orders and self-updates. A joiner may also
+/// carry its own admission in the redemption form (`commit` and
+/// `authorization`, as the admission reply names them). `kind` is
+/// informational only; the binary step is what is verified.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct JoinStep {
-    pub commit: Vec<u8>,
+    #[serde(default)]
+    step: Option<Vec<u8>>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    kind: Option<String>,
+    #[serde(default)]
+    commit: Option<Vec<u8>>,
+    #[serde(default)]
     authorization: Option<JoinAuthorization>,
-    admission_batch: Option<Vec<JoinAuthorization>>,
-    management: Option<WireManagement>,
+    #[serde(default)]
     invitation_checkpoint: Option<InvitationCheckpoint>,
 }
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct InvitationCheckpoint {
-    grant: Vec<u8>,
-    checkpoint: Vec<u8>,
+pub(super) struct InvitationCheckpoint {
+    pub(super) grant: Vec<u8>,
+    pub(super) checkpoint: Vec<u8>,
 }
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -132,118 +138,262 @@ impl JoinStep {
         redemption_signature: Vec<u8>,
     ) -> Self {
         Self {
-            commit,
+            step: None,
+            kind: None,
+            commit: Some(commit),
             authorization: Some(JoinAuthorization {
                 invitation_key,
                 grant_signature,
                 redemption_signature,
             }),
-            admission_batch: None,
-            management: None,
             invitation_checkpoint: None,
         }
     }
 
-    pub(super) fn authorization(&self) -> Result<arachne_security::MembershipAuthorization, ApiError> {
-        let admission = |auth: &JoinAuthorization| {
-            Ok(arachne_security::AdmissionAuthorization {
-                invitation_key: auth.invitation_key,
-                grant_signature: auth
-                    .grant_signature
-                    .clone()
-                    .try_into()
-                    .map_err(|_| ApiError::invalid_input("step", "invalid grant signature length"))?,
-                redemption_signature: auth
-                    .redemption_signature
-                    .clone()
-                    .try_into()
-                    .map_err(|_| ApiError::invalid_input("step", "invalid redemption signature length"))?,
-            })
-        };
-        match (&self.authorization, &self.admission_batch, &self.management) {
-            (Some(auth), None, None) => Ok(arachne_security::MembershipAuthorization::Admission(
-                admission(auth)?,
-            )),
-            (None, Some(auths), None) if !auths.is_empty() => {
-                Ok(arachne_security::MembershipAuthorization::AdmissionBatch(
-                    auths.iter().map(admission).collect::<Result<_, ApiError>>()?,
-                ))
-            }
-            (None, None, Some(action)) => Ok(arachne_security::MembershipAuthorization::Management(
-                action.action()?,
-            )),
-            _ => Err(ApiError::invalid_input("step", "membership step requires exactly one authorization kind")),
+    /// A step in the binary codec, with the invitation checkpoint a
+    /// registration carries.
+    pub(crate) fn binary(step: Vec<u8>, invitation_checkpoint: Option<(Vec<u8>, Vec<u8>)>) -> Self {
+        Self {
+            step: Some(step),
+            kind: None,
+            commit: None,
+            authorization: None,
+            invitation_checkpoint: invitation_checkpoint
+                .map(|(grant, checkpoint)| InvitationCheckpoint { grant, checkpoint }),
         }
+    }
+
+    /// The authorization and the exact commit bytes. Structure only: the
+    /// caller verifies the step against its own state.
+    pub(super) fn parts(
+        &self,
+    ) -> Result<(arachne_security::MembershipAuthorization, Vec<u8>), ApiError> {
+        match (&self.step, &self.commit, &self.authorization) {
+            (Some(step), None, None) => {
+                if step.len() > MAX_WIRE_STEP {
+                    return Err(ApiError::limit_reached(
+                        "membership step",
+                        MAX_WIRE_STEP as u64,
+                        "membership step exceeds transport bound",
+                    ));
+                }
+                arachne_security::decode_membership_step(step)
+                    .map_err(|reason| ApiError::invalid_input("step", reason))
+            }
+            (None, Some(commit), Some(auth)) => Ok((
+                arachne_security::MembershipAuthorization::Admission(
+                    arachne_security::AdmissionAuthorization {
+                        invitation_key: auth.invitation_key,
+                        grant_signature: auth.grant_signature.clone().try_into().map_err(
+                            |_| ApiError::invalid_input("step", "invalid grant signature length"),
+                        )?,
+                        redemption_signature: auth.redemption_signature.clone().try_into().map_err(
+                            |_| {
+                                ApiError::invalid_input(
+                                    "step",
+                                    "invalid redemption signature length",
+                                )
+                            },
+                        )?,
+                    },
+                ),
+                commit.clone(),
+            )),
+            _ => Err(ApiError::invalid_input(
+                "step",
+                "membership step requires a binary step or an admission commit and authorization",
+            )),
+        }
+    }
+
+    pub(super) fn take_invitation_checkpoint(&mut self) -> Option<InvitationCheckpoint> {
+        self.invitation_checkpoint.take()
     }
 }
-pub(super) fn step_json(auth: &arachne_security::MembershipAuthorization, commit: &[u8]) -> Value {
-    let mut value = json!({"commit":commit});
+
+/// Largest encoded membership step this runtime accepts, stores or sends.
+/// A step (with any anchor proof it carries) above this bound is refused on
+/// receipt and never committed, so no node holds a step it cannot serve or
+/// store: a history record holds up to 1 MiB, and a step must fit one
+/// control reply. It bounds anchor proofs far below the security crate's
+/// 2 MiB decoder bound.
+pub(crate) const MAX_WIRE_STEP: usize =
+    arachne_security::MAX_MEMBERSHIP_COMMIT + MAX_STEP_AUTHORIZATION;
+
+/// The largest authorization a step carries besides its commit: a full
+/// admission batch (key and two signatures per admission) and the codec
+/// header. Anchor proofs must fit in this too.
+const MAX_STEP_AUTHORIZATION: usize = 20 * 1024 + 1024;
+
+/// The transport cap and the verifier bound move together (B3c): one step
+/// of the largest verifiable size, plus the reply envelope, fits one
+/// control reply, so every step a node accepts it can also serve.
+const _: () = assert!(
+    arachne_security::MAX_MEMBERSHIP_COMMIT
+        + arachne_security::MAX_ADMISSION_BATCH * (32 + 64 + 64)
+        + 16
+        <= MAX_WIRE_STEP
+);
+const _: () = assert!(MAX_WIRE_STEP + 1024 <= arachne_node::MAX_CONTROL_REPLY);
+
+/// A short, informational name for a step's kind.
+pub(crate) fn step_kind(auth: &arachne_security::MembershipAuthorization) -> &'static str {
+    use arachne_security::{ManagementAction as A, MembershipAuthorization as M, RevocationKind as R};
     match auth {
-        arachne_security::MembershipAuthorization::Admission(auth) => {
-            value["authorization"] = json!({
-            "invitation_key":auth.invitation_key, "grant_signature":auth.grant_signature.as_slice(),
-            "redemption_signature":auth.redemption_signature.as_slice()})
-        }
-        arachne_security::MembershipAuthorization::AdmissionBatch(auths) => {
-            value["admission_batch"] = json!(
-                auths
-                    .iter()
-                    .map(|auth| json!({
-                        "invitation_key":auth.invitation_key,
-                        "grant_signature":auth.grant_signature.as_slice(),
-                        "redemption_signature":auth.redemption_signature.as_slice()
-                    }))
-                    .collect::<Vec<_>>()
-            );
-        }
-        arachne_security::MembershipAuthorization::Management(action) => {
-            let action = match action {
-                arachne_security::ManagementAction::Promote(id) => WireManagement::Promote(*id),
-                arachne_security::ManagementAction::Demote(id) => WireManagement::Demote(*id),
-                arachne_security::ManagementAction::Remove(id) => WireManagement::Remove(*id),
-                arachne_security::ManagementAction::CreateInvitation(key, expires_at, personal) => {
-                    WireManagement::CreateInvitation {
-                        key: *key,
-                        expires_at: *expires_at,
-                        personal: *personal,
-                    }
-                }
-                arachne_security::ManagementAction::CreateAutomaticInvitation(key, expires_at) => {
-                    WireManagement::CreateAutomaticInvitation {
-                        key: *key,
-                        expires_at: *expires_at,
-                    }
-                }
-                arachne_security::ManagementAction::ApproveInvitation(key, package) => {
-                    WireManagement::ApproveInvitation {
-                        key: *key,
-                        package: *package,
-                    }
-                }
-                arachne_security::ManagementAction::CreateRequestInvitation(key, expires_at) => {
-                    WireManagement::CreateRequestInvitation {
-                        key: *key,
-                        expires_at: *expires_at,
-                    }
-                }
-                arachne_security::ManagementAction::DeclineInvitationRequest(key, package) => {
-                    WireManagement::DeclineInvitationRequest {
-                        key: *key,
-                        package: *package,
-                    }
-                }
-                arachne_security::ManagementAction::DisableInvitation(key) => {
-                    WireManagement::DisableInvitation(*key)
-                }
-                arachne_security::ManagementAction::Leave(id, signature) => WireManagement::Leave {
-                    id: *id,
-                    signature: signature.to_vec(),
-                },
-            };
-            value["management"] = json!(action);
-        }
+        M::Admission(_) => "admission",
+        M::AdmissionBatch(_) => "admission_batch",
+        M::SelfUpdate => "self_update",
+        M::Revocation(step) => match step.order.kind {
+            R::Remove => "remove",
+            R::Leave => "leave",
+            R::Demote => "demote",
+            R::DisableInvitation => "disable_invitation",
+        },
+        M::Management(action) => match action {
+            A::Promote(_) => "promote",
+            A::Demote(_) => "demote",
+            A::Remove(_) => "remove",
+            A::CreateInvitation(..) => "create_invitation",
+            A::CreateAutomaticInvitation(..) => "create_automatic_invitation",
+            A::CreateRequestInvitation(..) => "create_request_invitation",
+            A::DeclineInvitationRequest(..) => "decline_invitation_request",
+            A::DisableInvitation(_) => "disable_invitation",
+            A::ApproveInvitation(..) => "approve_invitation",
+        },
     }
-    value
+}
+
+/// Encode one step in the binary codec, bounded by the transport cap.
+pub(crate) fn encode_step(
+    auth: &arachne_security::MembershipAuthorization,
+    commit: &[u8],
+) -> Result<Vec<u8>, ApiError> {
+    let step = arachne_security::encode_membership_step(auth, commit)
+        .map_err(|reason| ApiError::invalid_input("step", reason))?;
+    if step.len() > MAX_WIRE_STEP {
+        return Err(ApiError::limit_reached(
+            "membership step",
+            MAX_WIRE_STEP as u64,
+            "membership step exceeds transport bound",
+        ));
+    }
+    Ok(step)
+}
+
+/// The host JSON of one step: the binary step and its kind.
+pub(crate) fn step_json(auth: &arachne_security::MembershipAuthorization, commit: &[u8]) -> Value {
+    match arachne_security::encode_membership_step(auth, commit) {
+        Ok(step) => json!({"step": step, "kind": step_kind(auth)}),
+        Err(_) => Value::Null,
+    }
+}
+
+/// Whether this member is an administrator of its committed state.
+pub(crate) fn is_administrator(owner: &arachne_security::Workspace) -> bool {
+    let Some(own) = owner.member().map(|member| member.id()) else {
+        return false;
+    };
+    owner
+        .member_roster()
+        .is_ok_and(|roster| roster.iter().any(|m| m.id == own && m.administrator))
+}
+
+/// Step bytes one history page carries: a control reply is 128 KiB, and the
+/// rest holds the envelope and optional records (B3c). A single step larger
+/// than this still travels alone when it fits the reply.
+pub(crate) const PAGE_STEP_BYTES: usize = 96 * 1024;
+
+/// Encode one step for the peer wire. The invitation checkpoint rides along
+/// only while the whole step stays within `room`; it is optional.
+pub(crate) fn wire_step(
+    step: &[u8],
+    invitation_checkpoint: Option<(&[u8], &[u8])>,
+    room: usize,
+) -> Result<Vec<u8>, ApiError> {
+    if step.len() > MAX_WIRE_STEP {
+        return Err(ApiError::limit_reached(
+            "membership step",
+            MAX_WIRE_STEP as u64,
+            "membership step exceeds transport bound",
+        ));
+    }
+    if invitation_checkpoint.is_some()
+        && let Ok(bytes) = wire::encode_wire_step(&wire::WireStep {
+            step,
+            invitation_checkpoint,
+        })
+        && bytes.len() <= room
+    {
+        return Ok(bytes);
+    }
+    wire::encode_wire_step(&wire::WireStep {
+        step,
+        invitation_checkpoint: None,
+    })
+    .map_err(ApiError::internal)
+}
+
+/// The wire form of one host-JSON step (`step` and an optional
+/// `invitation_checkpoint`).
+pub(crate) fn wire_step_from_json(value: &Value, room: usize) -> Result<Vec<u8>, ApiError> {
+    let invalid = || ApiError::invalid_input("step", "invalid membership step");
+    let step: Vec<u8> = serde_json::from_value(value["step"].clone()).map_err(|_| invalid())?;
+    let checkpoint = value
+        .get("invitation_checkpoint")
+        .map(|checkpoint| {
+            let part = |name: &str| {
+                serde_json::from_value::<Vec<u8>>(checkpoint[name].clone()).map_err(|_| invalid())
+            };
+            Ok::<_, ApiError>((part("grant")?, part("checkpoint")?))
+        })
+        .transpose()?;
+    wire_step(
+        &step,
+        checkpoint
+            .as_ref()
+            .map(|(grant, checkpoint)| (grant.as_slice(), checkpoint.as_slice())),
+        room,
+    )
+}
+
+/// The host JSON of one wire step.
+pub(crate) fn wire_step_json(bytes: &[u8]) -> Result<Value, String> {
+    let step = wire::decode_wire_step(bytes)?;
+    let (authorization, _) = arachne_security::decode_membership_step(step.step)
+        .map_err(|_| "invalid membership step")?;
+    let mut value = json!({"step": step.step, "kind": step_kind(&authorization)});
+    if let Some((grant, checkpoint)) = step.invitation_checkpoint {
+        value["invitation_checkpoint"] = json!({"grant":grant,"checkpoint":checkpoint});
+    }
+    Ok(value)
+}
+
+/// The step a peer sent, for staging.
+pub(crate) fn join_step_from_wire(bytes: &[u8]) -> Result<JoinStep, ApiError> {
+    let step = wire::decode_wire_step(bytes)
+        .map_err(|reason| ApiError::invalid_input("step", reason))?;
+    Ok(JoinStep::binary(
+        step.step.to_vec(),
+        step.invitation_checkpoint
+            .map(|(grant, checkpoint)| (grant.to_vec(), checkpoint.to_vec())),
+    ))
+}
+
+/// This owner's wire step, with the invitation checkpoint it retained.
+fn owner_wire_step(
+    owner: &arachne_security::Workspace,
+    auth: &arachne_security::MembershipAuthorization,
+    commit: &[u8],
+    room: usize,
+) -> Result<Vec<u8>, ApiError> {
+    let step = encode_step(auth, commit)?;
+    let checkpoint = match auth {
+        arachne_security::MembershipAuthorization::Management(action) => {
+            owner.retained_invitation_checkpoint(action)
+        }
+        _ => None,
+    };
+    wire_step(&step, checkpoint, room)
 }
 
 fn step_with_retained_checkpoint(
@@ -923,30 +1073,25 @@ fn queue_membership_offer(
     if session.membership.offer.is_some() {
         return Err(ApiError::wrong_state("membership offer already pending"));
     }
-    let packet = {
-        let owner = session
+    let packet = offer_packet(
+        session
             .workspace
             .as_ref()
-            .ok_or_else(errors::no_workspace)?;
-        let mut packet = b"DFMO\x01".to_vec();
-        packet.extend(owner.id());
-        packet.extend(after.to_be_bytes());
-        packet.extend(
-            serde_json::to_vec(&step_with_retained_checkpoint(
-                owner,
-                &authorization,
-                &commit,
-            ))
-            .map_err(errors::encode)?,
-        );
-        if packet.len() > 32 * 1024 {
-            return Err(ApiError::limit_reached("control request", 32 * 1024, "membership offer exceeds control bound"));
-        }
-        packet
-    };
-    let task = session
-        .runtime
-        .spawn(session.node.request_control(peer, &packet));
+            .ok_or_else(errors::no_workspace)?,
+        after,
+        &authorization,
+        &commit,
+        requires_adoption,
+    )?;
+    // The outcome wakes the host drain, as a query reply does: a staged
+    // self-update waits on it (B3c).
+    let request = session.node.request_control(peer, &packet);
+    let wake = session.node.control_signal();
+    let task = session.runtime.spawn(async move {
+        let reply = request.await;
+        wake.notify_one();
+        reply
+    });
     session.membership.offer = Some(PendingControl {
         query: after,
         peer,
@@ -1026,22 +1171,17 @@ fn poll_with_budget(
                     .transition.staged
                     .as_ref()
                     .ok_or_else(|| ApiError::wrong_state("workspace candidate is not staged"))?;
-                let WorkspaceTransition::Management(action, commit) = &staged.transition else {
+                let WorkspaceTransition::Management(action, authorization, commit) =
+                    &staged.transition
+                else {
                     return Err(ApiError::wrong_state("staged membership offer requires a management transition"));
                 };
                 if !matches!(action, arachne_security::ManagementAction::Promote(_)) {
                     return Err(ApiError::unsupported("staged membership offer only supports administrator promotion"));
                 }
-                (owner.epoch(), *action, commit.clone())
+                (owner.epoch(), authorization.clone(), commit.clone())
             };
-            queue_membership_offer(
-                session,
-                peer,
-                after,
-                arachne_security::MembershipAuthorization::Management(action),
-                commit,
-                true,
-            )
+            queue_membership_offer(session, peer, after, action, commit, true)
         }
         Reconcile::PollOffer => {
             if !session
@@ -1062,7 +1202,7 @@ fn poll_with_budget(
             if requires_adoption && bytes.as_slice() != [1] {
                 return Err(ApiError::not_authorized("membership peer rejected the staged administrator handoff"));
             }
-            if !matches!(bytes.as_slice(), [0] | [1]) {
+            if !matches!(bytes.as_slice(), [0] | [1] | [OFFER_PULL]) {
                 return Err(ApiError::transport_failed(None, "invalid membership offer acknowledgment"));
             }
             let next = pending
@@ -1302,8 +1442,10 @@ pub(super) fn admit_members(
     Vec<arachne_security::Workspace>,
     Vec<[u8; 32]>,
 ) {
+    let _ = seed;
+    let owner_key = arachne_security::EndpointKey::generate().unwrap();
     let (registered, invitation, checkpoint) =
-        arachne_security::Workspace::create([seed; 32], "Coordinator")
+        arachne_security::Workspace::create(&owner_key, "Coordinator")
             .unwrap()
             .prepare_invitation(0, false, false)
             .unwrap();
@@ -1311,44 +1453,12 @@ pub(super) fn admit_members(
     let mut members = Vec::with_capacity(count as usize);
     let mut endpoints = Vec::with_capacity(count as usize);
     for i in 0..count {
-        let endpoint = [
-            i as u8,
-            (i >> 8) as u8,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-            seed,
-        ];
+        let key = arachne_security::EndpointKey::generate().unwrap();
+        let endpoint = arachne_security::EndpointSigner::endpoint(&key);
         let pending = arachne_security::PendingJoin::from_invitation(
             &invitation,
             &checkpoint,
-            endpoint,
+            &key,
             &format!("{name_prefix} {i}"),
         )
         .unwrap();
@@ -1580,7 +1690,8 @@ fn budget_pressure_never_fails_member_roster_or_poll_membership_update() {
 #[test]
 fn a_signed_profile_is_about_150_bytes_and_the_retained_set_fits_1000_members() {
     let name = "Field member 123";
-    let workspace = arachne_security::Workspace::create([14; 32], name).unwrap();
+    let key = arachne_security::EndpointKey::generate().unwrap();
+    let workspace = arachne_security::Workspace::create(&key, name).unwrap();
     let profile = workspace.sign_member_profile().unwrap();
     assert_eq!(profile.len(), 5 + 32 + 32 + name.len() + 64);
     assert_eq!(profile.len(), 149);
@@ -1666,7 +1777,7 @@ fn missing_names_come_back_from_one_peer_in_pages() {
         .map(|member| member.sign_member_profile().unwrap())
         .collect();
     let owner = Arc::new(owner);
-    let answerer_endpoint = [16; 32]; // admit_members creates the owner at [seed; 32]
+    let answerer_endpoint = owner.endpoint();
     let mut answerer = bare_test_session(owner.clone());
     for chunk in profiles.chunks(MAX_REQUEST_PROFILES) {
         roster_value(&mut answerer, chunk).unwrap();
@@ -1795,15 +1906,14 @@ fn a_range_serves_consecutive_steps_to_members_only() {
     assert_eq!(range.len() as u64, owner.epoch() - 1);
     for (next, step) in (1..).zip(&range) {
         let (authorization, commit) = owner.membership_update_for(member, next).unwrap().unwrap();
+        // Binary on the wire (B3c): the step codec, not JSON numbers.
+        let wire = wire::decode_wire_step(step).unwrap();
+        assert!(wire.step.starts_with(b"DFMS\x03"));
         assert_eq!(
-            *step,
-            serde_json::to_vec(&step_with_retained_checkpoint(
-                &owner,
-                &authorization,
-                &commit
-            ))
-            .unwrap()
+            wire.step,
+            arachne_security::encode_membership_step(&authorization, &commit).unwrap()
         );
+        assert!(join_step_from_wire(step).unwrap().parts().is_ok());
     }
     // Never past the requested end or the local head.
     assert_eq!(
@@ -1850,7 +1960,9 @@ fn a_range_serves_consecutive_steps_to_members_only() {
 
 #[test]
 fn membership_metadata_requires_an_admitted_peer_and_exact_workspace_query() {
-    let owner = arachne_security::Workspace::create([1; 32], "Coordinator").unwrap();
+    let key = arachne_security::EndpointKey::generate().unwrap();
+    let owner = arachne_security::Workspace::create(&key, "Coordinator").unwrap();
+    let own = owner.endpoint();
     let make_query = |epoch| {
         wire::encode_query(&wire::Query {
             workspace: owner.id(),
@@ -1866,41 +1978,42 @@ fn membership_metadata_requires_an_admitted_peer_and_exact_workspace_query() {
     };
     let mut query = make_query(0);
     assert_eq!(
-        reply(Some(&owner), [1; 32], &query)["state"],
+        reply(Some(&owner), own, &query)["state"],
         "membership_current"
     );
     assert_eq!(
         reply(Some(&owner), [2; 32], &query)["state"],
         "membership_denied"
     );
-    assert_eq!(reply(None, [1; 32], &query)["state"], "membership_denied");
+    assert_eq!(reply(None, own, &query)["state"], "membership_denied");
     for length in 0..query.len() {
         assert_eq!(
-            reply(Some(&owner), [1; 32], &query[..length])["state"],
+            reply(Some(&owner), own, &query[..length])["state"],
             "membership_denied"
         );
     }
     query[5] ^= 1;
     assert_eq!(
-        reply(Some(&owner), [1; 32], &query)["state"],
+        reply(Some(&owner), own, &query)["state"],
         "membership_denied"
     );
     query[5] ^= 1;
     query = make_query(1);
     assert_eq!(
-        reply(Some(&owner), [1; 32], &query)["state"],
+        reply(Some(&owner), own, &query)["state"],
         "membership_unavailable"
     );
     query.push(0);
     assert_eq!(
-        reply(Some(&owner), [1; 32], &query)["state"],
+        reply(Some(&owner), own, &query)["state"],
         "membership_denied"
     );
 }
 
 #[test]
 fn equal_epoch_needs_matching_fingerprint_and_malformed_claims_are_not_current() {
-    let owner = arachne_security::Workspace::create([7; 32], "Coordinator").unwrap();
+    let key = arachne_security::EndpointKey::generate().unwrap();
+    let owner = arachne_security::Workspace::create(&key, "Coordinator").unwrap();
     let mut response = json!({"epoch":owner.epoch(),"epoch_fingerprint":owner.epoch_fingerprint()});
     assert_eq!(agreement(&owner, &response).unwrap(), "membership_current");
     for invalid in [
@@ -1935,50 +2048,82 @@ fn equal_epoch_needs_matching_fingerprint_and_malformed_claims_are_not_current()
     assert!(agreement(&owner, &response).is_err());
 }
 
+/// An administrator's clock this far from ours is worth a warning. It is
+/// never a reason to reject: verifiers must agree, and clocks differ.
+const ADMISSION_CLOCK_SKEW: Duration = Duration::from_secs(10 * 60);
+
+/// Warn when an admission's asserted time is far from the local clock
+/// (ADR A2 section 7). Verification already checked it against expiry.
+fn warn_on_clock_skew(commit: &[u8]) {
+    let Some(asserted) = arachne_security::admission_asserted_time(commit) else {
+        return;
+    };
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return;
+    };
+    let skew = now.as_secs().abs_diff(asserted);
+    if skew > ADMISSION_CLOCK_SKEW.as_secs() {
+        tracing::warn!(target: "data_fabric_transport", skew_seconds = skew, "ADMISSION_CLOCK_SKEW");
+    }
+}
+
 pub(super) fn stage_update(
     session: &mut Session,
-    step: JoinStep,
+    mut step: JoinStep,
 ) -> Result<StagedChange, ApiError> {
     check_epoch_transition(session)?;
     session.membership.staged_step_received = false;
-    let authorization = step.authorization()?;
+    let (authorization, commit) = step.parts()?;
     let owner = session
         .workspace
         .as_ref()
         .ok_or_else(errors::no_workspace)?;
-    let invitation_checkpoint = step.invitation_checkpoint;
-    let prepared = match authorization {
+    let invitation_checkpoint = step.take_invitation_checkpoint();
+    if invitation_checkpoint.is_some()
+        && !matches!(
+            authorization,
+            arachne_security::MembershipAuthorization::Management(_)
+        )
+    {
+        return Err(ApiError::invalid_input(
+            "step",
+            "only an invitation step can carry an invitation checkpoint",
+        ));
+    }
+    let prepared = match &authorization {
         arachne_security::MembershipAuthorization::Admission(auth) => {
-            if invitation_checkpoint.is_some() {
-                return Err(ApiError::invalid_input("step", "admission update cannot carry an invitation checkpoint"));
-            }
+            warn_on_clock_skew(&commit);
             arachne_security::PreparedManagementUpdate::Active(Box::new(
                 owner
-                    .prepare_admission_update(&auth, &step.commit)
+                    .prepare_admission_update(auth, &commit)
                     .map_err(security(ErrorCode::InvalidInput))?,
             ))
         }
         arachne_security::MembershipAuthorization::AdmissionBatch(auths) => {
-            if invitation_checkpoint.is_some() {
-                return Err(ApiError::invalid_input("step", "admission update cannot carry an invitation checkpoint"));
-            }
+            warn_on_clock_skew(&commit);
             arachne_security::PreparedManagementUpdate::Active(Box::new(
                 owner
-                    .prepare_admission_batch_update(&auths, &step.commit)
+                    .prepare_admission_batch_update(auths, &commit)
                     .map_err(security(ErrorCode::InvalidInput))?,
             ))
         }
-        arachne_security::MembershipAuthorization::Management(action) => {
+        // Class 2 management, revocation orders and self-updates are all
+        // verified against this state by the same step update.
+        _ => {
             let mut prepared = owner
-                .prepare_management_update(action, &step.commit)
+                .prepare_step_update(&authorization, &commit)
                 .map_err(security(ErrorCode::InvalidInput))?;
-            if let Some(checkpoint) = invitation_checkpoint {
+            if let (
+                Some(checkpoint),
+                arachne_security::MembershipAuthorization::Management(action),
+            ) = (invitation_checkpoint, &authorization)
+            {
                 let arachne_security::PreparedManagementUpdate::Active(workspace) = &mut prepared
                 else {
                     return Err(ApiError::invalid_input("step", "removal cannot carry an invitation checkpoint"));
                 };
                 workspace
-                    .retain_invitation_checkpoint(action, &checkpoint.grant, &checkpoint.checkpoint)
+                    .retain_invitation_checkpoint(*action, &checkpoint.grant, &checkpoint.checkpoint)
                     .map_err(security(ErrorCode::InvalidInput))?;
             }
             prepared
@@ -2275,7 +2420,7 @@ pub(super) fn stage_gossiped_step(session: &mut Session) -> Result<Option<Value>
     let Some(bytes) = session.membership.steps_ahead.remove(&epoch) else {
         return Ok(None);
     };
-    let Ok(step) = serde_json::from_slice::<JoinStep>(&bytes) else {
+    let Ok(step) = join_step_from_wire(&bytes) else {
         return Ok(None);
     };
     match stage_update(session, step).and_then(|change| serde_json::to_value(change).map_err(errors::encode)) {
@@ -2559,29 +2704,7 @@ pub(super) fn range_reply(
         (Some(owner), Ok(query))
             if query.workspace == owner.id() && owner.member_id_for_endpoint(peer).is_ok() =>
         {
-            let mut steps = Vec::new();
-            let mut size = 256;
-            let mut next = query.after;
-            while next < query.until.min(owner.epoch()) && steps.len() < wire::MAX_RANGE_STEPS {
-                let Ok(Some((authorization, commit))) = owner.membership_update_for(peer, next)
-                else {
-                    break;
-                };
-                let Ok(step) = serde_json::to_vec(&step_with_retained_checkpoint(
-                    owner,
-                    &authorization,
-                    &commit,
-                )) else {
-                    break;
-                };
-                size += step.len() + 8;
-                if size > arachne_node::MAX_CONTROL_REPLY {
-                    break;
-                }
-                steps.push(step);
-                next += 1;
-            }
-            (owner.id(), query.after, steps)
+            (owner.id(), query.after, range_page(owner, peer, query.after, query.until))
         }
         _ => ([0; 32], 0, Vec::new()),
     };
@@ -2595,18 +2718,140 @@ pub(super) fn range_reply(
     .unwrap_or_default()
 }
 
+/// One page of consecutive steps from `after` toward `until`: at most
+/// `PAGE_STEP_BYTES` of steps, but always the first step when it alone fits
+/// the reply. The requester asks again from where the page ended (the
+/// cursor is `after` plus the steps it got), so it applies page by page.
+fn range_page(
+    owner: &arachne_security::Workspace,
+    peer: [u8; 32],
+    after: u64,
+    until: u64,
+) -> Vec<Vec<u8>> {
+    let mut steps: Vec<Vec<u8>> = Vec::new();
+    let mut size = 0;
+    let mut next = after;
+    while next < until.min(owner.epoch()) && steps.len() < wire::MAX_RANGE_STEPS {
+        let Ok(Some((authorization, commit))) = owner.membership_update_for(peer, next) else {
+            break;
+        };
+        let room = PAGE_STEP_BYTES.saturating_sub(size);
+        let Ok(step) = owner_wire_step(owner, &authorization, &commit, room) else {
+            break;
+        };
+        let budget = if steps.is_empty() {
+            RANGE_REPLY_STEP_ROOM
+        } else {
+            PAGE_STEP_BYTES
+        };
+        if size + step.len() > budget {
+            break;
+        }
+        size += step.len();
+        steps.push(step);
+        next += 1;
+    }
+    steps
+}
+
+/// Room for the steps of a range reply: the reply bound less its envelope
+/// (prefix, workspace, cursor and per-step lengths).
+const RANGE_REPLY_STEP_ROOM: usize = arachne_node::MAX_CONTROL_REPLY - 1024;
+const _: () = assert!(MAX_WIRE_STEP + 64 <= RANGE_REPLY_STEP_ROOM);
+
 /// Accept a carrier's signed next transition, not the carrier as membership authority.
 /// Responses reveal no roster, fingerprint, current epoch, Welcome or invitation.
+/// `DFMO\x02 | workspace | u64 after | wire step`: a member offers the step
+/// that extends `after`. A control request is at most 32 KiB.
+const OFFER: &[u8; 5] = b"DFMO\x02";
+const OFFER_HEADER: usize = 5 + 32 + 8;
+const MAX_OFFER: usize = 32 * 1024;
+/// `DFMD\x01 | workspace | u64 after | step digest | u32 step size`: an
+/// offer of a committed step too large for one control request. The
+/// receiver pulls the step over the paged range channel from the offerer.
+///
+/// Why not raise the request bound instead: every control request, from
+/// any authenticated peer, may then be that large, and the node queues up
+/// to 512 of them. A digest keeps the request small and moves the bytes to
+/// the reply side, which is already 128 KiB and paged.
+pub(super) const OFFER_DIGEST: &[u8; 5] = b"DFMD\x01";
+const OFFER_DIGEST_LEN: usize = OFFER_HEADER + 32 + 4;
+/// Acknowledgment of a digest offer: the receiver will pull the step.
+const OFFER_PULL: u8 = 2;
+
+/// The packet that offers one step. A step that does not fit one control
+/// request goes by digest when it is committed; a staged step (an offer
+/// that must be adopted before the offerer adopts) must fit, because a
+/// staged step cannot be served from committed history.
+fn offer_packet(
+    owner: &arachne_security::Workspace,
+    after: u64,
+    authorization: &arachne_security::MembershipAuthorization,
+    commit: &[u8],
+    staged: bool,
+) -> Result<Vec<u8>, ApiError> {
+    let step = owner_wire_step(owner, authorization, commit, MAX_OFFER - OFFER_HEADER)?;
+    let mut packet = if OFFER_HEADER + step.len() <= MAX_OFFER {
+        OFFER.to_vec()
+    } else if staged {
+        return Err(ApiError::limit_reached(
+            "control request",
+            MAX_OFFER as u64,
+            "a staged membership offer exceeds the control request bound",
+        ));
+    } else {
+        OFFER_DIGEST.to_vec()
+    };
+    packet.extend(owner.id());
+    packet.extend(after.to_be_bytes());
+    if packet.starts_with(OFFER) {
+        packet.extend(step);
+    } else {
+        use sha2::{Digest, Sha256};
+        let encoded = encode_step(authorization, commit)?;
+        packet.extend(Sha256::digest(&encoded));
+        packet.extend((encoded.len() as u32).to_be_bytes());
+    }
+    Ok(packet)
+}
+
+/// A digest offer: remember the offerer as a source for the next epoch, so
+/// the range pull fetches and verifies the step. The digest names the step;
+/// verification, not the digest, decides whether it applies.
+pub(super) fn receive_offer_digest(
+    session: &mut Session,
+    peer: [u8; 32],
+    packet: &[u8],
+) -> Result<Value, ApiError> {
+    if packet.len() != OFFER_DIGEST_LEN || !packet.starts_with(OFFER_DIGEST) {
+        return Err(ApiError::invalid_input("offer", "invalid membership offer"));
+    }
+    let owner = session.workspace.as_ref().ok_or_else(errors::no_workspace)?;
+    owner
+        .member_id_for_endpoint(peer)
+        .map_err(security(ErrorCode::NotMember))?;
+    let size = u32::from_be_bytes(packet[OFFER_DIGEST_LEN - 4..].try_into().unwrap()) as usize;
+    if packet[5..37] != owner.id()
+        || packet[37..45] != owner.epoch().to_be_bytes()
+        || size == 0
+        || size > MAX_WIRE_STEP
+    {
+        return Err(ApiError::epoch_mismatch("membership offer does not extend current epoch"));
+    }
+    note_head(session, owner.epoch() + 1, peer);
+    Ok(json!({"state":"membership_offer_pull","peer":peer}))
+}
+
 pub(super) fn receive_offer(session: &mut Session, packet: &[u8]) -> Result<Value, ApiError> {
-    if packet.len() <= 45 || packet.len() > 32 * 1024 || !packet.starts_with(b"DFMO\x01") {
+    if packet.len() <= OFFER_HEADER || packet.len() > MAX_OFFER || !packet.starts_with(OFFER) {
         return Err(ApiError::invalid_input("offer", "invalid membership offer"));
     }
     let owner = session.workspace.as_ref().ok_or_else(|| ApiError::wrong_state("no workspace"))?;
     if packet[5..37] != owner.id() || packet[37..45] != owner.epoch().to_be_bytes() {
         return Err(ApiError::epoch_mismatch("membership offer does not extend current epoch"));
     }
-    let step: JoinStep =
-        serde_json::from_slice(&packet[45..]).map_err(|_| ApiError::invalid_input("offer", "invalid offered transition"))?;
+    let step = join_step_from_wire(&packet[OFFER_HEADER..])
+        .map_err(|_| ApiError::invalid_input("offer", "invalid offered transition"))?;
     serde_json::to_value(stage_update(session, step)?).map_err(errors::encode)
 }
 
@@ -2628,6 +2873,9 @@ pub(super) fn stage_prepared(
     session: &mut Session,
     prepared: arachne_security::PreparedManagement,
 ) -> Result<StagedCandidate, ApiError> {
+    // Never commit a step (with any anchor proof it carries) that no member
+    // could receive: receivers refuse steps above the transport bound.
+    encode_step(&prepared.authorization, &prepared.commit)?;
     let (publisher, inbox) = super::carry_delivery(session, &prepared.workspace)?;
     let snapshot = seal_state(
         session.records.is_some(),
@@ -2650,26 +2898,205 @@ pub(super) fn stage_prepared(
     session.transition.staged = Some(StagedWorkspace {
         publisher,
         inbox,
-        transition: WorkspaceTransition::Management(prepared.action, prepared.commit),
+        transition: WorkspaceTransition::Management(
+            prepared.action,
+            prepared.authorization,
+            prepared.commit,
+        ),
         workspace: prepared.workspace,
         snapshot,
     });
     Ok(value)
 }
 
-const LEAVE: &[u8; 5] = b"DFLV\x01";
+/// Start this member's self-update when the policy says it is due (B3c,
+/// ADR A2 section 7). Returns `None` when nothing starts.
+///
+/// The member stages its update path commit and offers it to an
+/// administrator, who must adopt it before the member does (the staged
+/// offer handshake). Until fork resolution exists (ADR A2 steps 8-13), a
+/// local self-update that raced an administrator's commit at the same epoch
+/// would strand this member on a losing branch. The only administrator
+/// stages its own and adopts it directly. Only a node that has reached the
+/// newest head it heard starts one.
+pub(crate) fn start_self_update(
+    session: &mut Session,
+    now: std::time::Instant,
+) -> Result<Option<Value>, ApiError> {
+    if crate::ops::admission_busy(session)
+        || session.membership.offer.is_some()
+        || !session.membership.steps_ahead.is_empty()
+        || session.membership.range_pull.is_some()
+    {
+        return Ok(None);
+    }
+    let Some(owner) = session.workspace.as_ref() else {
+        return Ok(None);
+    };
+    if session
+        .membership
+        .head
+        .as_ref()
+        .is_some_and(|(head, _)| *head > owner.epoch())
+        || !session
+            .membership
+            .self_update
+            .due(now, owner.needs_self_update())
+    {
+        return Ok(None);
+    }
+    let own = owner.member().map(|member| member.id());
+    let roster = owner.member_roster().map_err(security(ErrorCode::WrongState))?;
+    let administrator = roster
+        .iter()
+        .any(|member| Some(member.id) == own && member.administrator);
+    let mut admins: Vec<PeerChoice> = roster
+        .iter()
+        .filter(|member| member.administrator && Some(member.id) != own)
+        .map(|member| PeerChoice {
+            endpoint: member.endpoint,
+            preferred: presence::contact_age(&session.presence, member.endpoint, now)
+                .is_some_and(|age| age < MEMBERSHIP_PEER_RECENT),
+            cooling: session
+                .membership
+                .peer_failures
+                .get(&member.endpoint)
+                .is_some_and(|failed| {
+                    now.saturating_duration_since(*failed) < MEMBERSHIP_PEER_COOLDOWN
+                }),
+        })
+        .collect();
+    admins.sort_unstable_by_key(|peer| peer.endpoint);
+    let peer = choose_membership_peer(&admins, None);
+    // Every administrator failed recently (for example all are offline):
+    // defer without staging, so gossip and range steps keep landing.
+    let reachable = peer.is_some_and(|peer| {
+        admins
+            .iter()
+            .any(|admin| admin.endpoint == peer && !admin.cooling)
+    });
+    if !reachable && (peer.is_some() || !administrator) {
+        session.membership.self_update.refused(now);
+        return Ok(None);
+    }
+    let epoch = owner.epoch();
+    let prepared = owner
+        .prepare_self_update()
+        .map_err(security(ErrorCode::WrongState))?;
+    encode_step(&arachne_security::MembershipAuthorization::SelfUpdate, &prepared.commit)?;
+    let (publisher, inbox) = super::carry_delivery(session, &prepared.workspace)?;
+    let snapshot = seal_state(
+        session.records.is_some(),
+        &prepared.workspace,
+        session
+            .storage_key
+            .as_ref()
+            .ok_or_else(errors::no_root_key)?,
+        publisher.as_ref(),
+        inbox.as_ref(),
+    )?;
+    let mut value = serde_json::to_value(StagedCandidate::new(
+        prepared.workspace.id(),
+        prepared
+            .workspace
+            .workspace_name()
+            .map_err(security(ErrorCode::WrongState))?,
+        snapshot.clone(),
+    ))
+    .map_err(errors::encode)?;
+    value["self_update"] = json!(true);
+    let commit = prepared.commit.clone();
+    session.transition.staged = Some(StagedWorkspace {
+        publisher,
+        inbox,
+        transition: WorkspaceTransition::SelfUpdate(prepared.commit),
+        workspace: prepared.workspace,
+        snapshot,
+    });
+    let Some(peer) = peer else {
+        // The only administrator: no one else commits at this epoch.
+        return Ok(Some(value));
+    };
+    if let Err(error) = queue_membership_offer(
+        session,
+        peer,
+        epoch,
+        arachne_security::MembershipAuthorization::SelfUpdate,
+        commit,
+        true,
+    ) {
+        session.transition.staged = None;
+        session.membership.self_update.refused(now);
+        return Err(error);
+    }
+    session.membership.self_update_offered = Some(peer);
+    Ok(Some(json!({"state":"self_update_offered","peer":peer})))
+}
 
-fn leave_parts(bytes: &[u8]) -> Result<(u64, arachne_security::ManagementAction), ApiError> {
-    if bytes.len() <= 13 || bytes.len() > 2048 || !bytes.starts_with(LEAVE) {
-        return Err(ApiError::invalid_input("request", "invalid leave request"));
+/// This member's self-update offer is still out.
+pub(crate) fn self_update_pending(session: &Session) -> bool {
+    session.membership.self_update_offered.is_some()
+}
+
+/// The outcome of this member's self-update offer, once it finished:
+/// `Some(true)` when the administrator adopted it (the staged candidate may
+/// now be saved and adopted), `Some(false)` when it was refused or failed
+/// (the candidate is discarded). `None` while it is pending.
+pub(crate) fn finish_self_update_offer(
+    session: &mut Session,
+    now: std::time::Instant,
+) -> Option<bool> {
+    let peer = session.membership.self_update_offered?;
+    let outcome = poll_with_budget(session, Reconcile::PollOffer, MAX_PROFILE_SET_BYTES);
+    if matches!(outcome, Ok(Value::Null)) {
+        return None;
     }
-    let wire: WireManagement =
-        serde_json::from_slice(&bytes[13..]).map_err(|_| ApiError::invalid_input("request", "invalid leave request"))?;
-    let action = wire.action()?;
-    if !matches!(action, arachne_security::ManagementAction::Leave(..)) {
-        return Err(ApiError::invalid_input("request", "expected self-authorized leave"));
+    session.membership.self_update_offered = None;
+    let accepted = outcome.is_ok();
+    if !accepted {
+        // Unreachable (not a refusal): try another administrator next time.
+        if outcome
+            .as_ref()
+            .is_err_and(|error| error.code() != ErrorCode::NotAuthorized)
+        {
+            session.membership.peer_failures.insert(peer, now);
+        }
+        if matches!(
+            session.transition.staged.as_ref().map(|staged| &staged.transition),
+            Some(WorkspaceTransition::SelfUpdate(_))
+        ) {
+            session.transition.staged = None;
+        }
+        session.membership.self_update.refused(now);
     }
-    Ok((u64::from_be_bytes(bytes[5..13].try_into().unwrap()), action))
+    Some(accepted)
+}
+
+/// `DFLV\x02 | u64 epoch | revocation order`: a signed departure that the
+/// receiving member commits (ADR A2 section 3). The order is anchored at the
+/// leaver's state, so the receiver must be at the same epoch.
+const LEAVE: &[u8; 5] = b"DFLV\x02";
+
+fn leave_parts(bytes: &[u8]) -> Result<(u64, arachne_security::RevocationOrder), ApiError> {
+    let invalid = || ApiError::invalid_input("request", "invalid leave request");
+    let body = bytes.strip_prefix(LEAVE).ok_or_else(invalid)?;
+    if body.len() <= 8 {
+        return Err(invalid());
+    }
+    let order = arachne_security::RevocationOrder::from_bytes(&body[8..]).map_err(|_| invalid())?;
+    if order.kind != arachne_security::RevocationKind::Leave {
+        return Err(ApiError::invalid_input("request", "expected a signed leave order"));
+    }
+    Ok((u64::from_be_bytes(body[..8].try_into().unwrap()), order))
+}
+
+/// The committed step carries exactly this leave order.
+fn carries_order(
+    auth: &arachne_security::MembershipAuthorization,
+    order: &arachne_security::RevocationOrder,
+) -> bool {
+    matches!(auth, arachne_security::MembershipAuthorization::Revocation(step)
+        if step.order.digest() == order.digest())
 }
 
 pub(super) fn leave_reply(
@@ -2677,16 +3104,15 @@ pub(super) fn leave_reply(
     peer: [u8; 32],
     bytes: &[u8],
 ) -> Result<Vec<u8>, ApiError> {
-    let (epoch, action) = leave_parts(bytes)?;
+    let (epoch, order) = leave_parts(bytes)?;
     let (auth, commit) = owner
         .membership_update_for(peer, epoch)
         .map_err(security(ErrorCode::InvalidInput))?
         .ok_or_else(|| ApiError::wrong_state("leave outcome unavailable"))?;
-    if !matches!(&auth, arachne_security::MembershipAuthorization::Management(accepted) if *accepted == action)
-    {
+    if !carries_order(&auth, &order) {
         return Err(ApiError::invalid_input("request", "leave outcome does not match request"));
     }
-    serde_json::to_vec(&step_json(&auth, &commit)).map_err(errors::encode)
+    encode_step(&auth, &commit)
 }
 
 pub(super) fn receive_leave(
@@ -2694,7 +3120,7 @@ pub(super) fn receive_leave(
     peer: [u8; 32],
     bytes: &[u8],
 ) -> Result<Value, ApiError> {
-    let (epoch, action) = leave_parts(bytes)?;
+    let (epoch, order) = leave_parts(bytes)?;
     let owner = session
         .workspace
         .as_ref()
@@ -2703,11 +3129,19 @@ pub(super) fn receive_leave(
         return Ok(json!({"state":"reply_ready","leaving":true}));
     }
     if owner.epoch() != epoch
-        || owner.member_id_for_endpoint(peer).map_err(security(ErrorCode::NotMember))? != action.target()
+        || order.anchor_epoch != epoch
+        || owner.member_id_for_endpoint(peer).map_err(security(ErrorCode::NotMember))? != order.target
     {
         return Err(ApiError::not_authorized("leave requester does not match member or epoch"));
     }
-    let mut staged = stage_management(session, action)?;
+    check_epoch_transition(session)?;
+    let prepared = session
+        .workspace
+        .as_ref()
+        .ok_or_else(errors::no_workspace)?
+        .prepare_revocation(&arachne_security::OrderStep::new(order))
+        .map_err(security(ErrorCode::InvalidInput))?;
+    let mut staged = stage_prepared(session, prepared)?;
     staged.leaving = Some(true);
     serde_json::to_value(staged).map_err(errors::encode)
 }
@@ -2724,36 +3158,30 @@ pub(super) fn leave_via_peer(
     if peer == owner.endpoint() || owner.member_id_for_endpoint(peer).is_err() {
         return Err(ApiError::invalid_input("peer", "leave requires another admitted peer"));
     }
-    let action = owner.leave_action().map_err(security(ErrorCode::WrongState))?;
-    let arachne_security::ManagementAction::Leave(id, signature) = action else {
-        unreachable!()
-    };
+    let order = owner.leave_order().map_err(security(ErrorCode::WrongState))?;
     let mut packet = LEAVE.to_vec();
     packet.extend(owner.epoch().to_be_bytes());
-    packet.extend(
-        serde_json::to_vec(&WireManagement::Leave {
-            id,
-            signature: signature.to_vec(),
-        })
-        .map_err(errors::encode)?,
-    );
+    packet.extend(order.to_bytes());
     let bytes = session.runtime.block_on(session.node.request_control(peer, &packet)).map_err(|_| {
         ApiError::peer_unreachable(
             Some(arachne_api::EndpointId::from_bytes(peer)),
             "Couldn't finish leaving. Resume this workspace and try again when another member is reachable.",
         )
     })?;
-    let step: JoinStep = serde_json::from_slice(&bytes).map_err(|_| {
+    let refused = || {
         ApiError::transport_failed(
             Some(arachne_api::EndpointId::from_bytes(peer)),
             "The other member couldn't accept the departure. Synchronize and try again.",
         )
-    })?;
-    if !matches!(step.authorization()?, arachne_security::MembershipAuthorization::Management(accepted) if accepted == action)
-    {
+    };
+    if bytes.len() > MAX_WIRE_STEP {
+        return Err(refused());
+    }
+    let (auth, _) = arachne_security::decode_membership_step(&bytes).map_err(|_| refused())?;
+    if !carries_order(&auth, &order) {
         return Err(ApiError::transport_failed(Some(arachne_api::EndpointId::from_bytes(peer)), "leave reply does not match request"));
     }
-    stage_update(session, step)
+    stage_update(session, JoinStep::binary(bytes, None))
 }
 
 pub(super) fn stage_removal(
@@ -2842,4 +3270,272 @@ fn membership_peer_choice_skips_recent_failures_until_nothing_else_is_left() {
         Some([2; 32])
     );
     assert_eq!(choose_membership_peer(&[], None), None);
+}
+
+/// B3c: a committed step larger than one control request is offered by
+/// digest and pulled over the paged range channel; a staged step, which
+/// cannot be served before adoption, must fit inline.
+#[test]
+fn a_committed_step_too_large_for_one_request_is_offered_by_digest() {
+    let (owner, _, endpoints) = admit_members(31, "Offer member", 1);
+    let authorization = arachne_security::MembershipAuthorization::SelfUpdate;
+    let small = offer_packet(&owner, owner.epoch(), &authorization, &[1; 100], false).unwrap();
+    assert!(small.starts_with(OFFER));
+    let large = vec![1; MAX_OFFER];
+    let digest = offer_packet(&owner, owner.epoch(), &authorization, &large, false).unwrap();
+    assert!(digest.starts_with(OFFER_DIGEST));
+    assert_eq!(digest.len(), OFFER_DIGEST_LEN);
+    assert_eq!(
+        offer_packet(&owner, owner.epoch(), &authorization, &large, true)
+            .unwrap_err()
+            .code(),
+        ErrorCode::LimitReached
+    );
+    let epoch = owner.epoch();
+    let mut session = bare_test_session(owner);
+    // A stranger or a stale epoch is refused; a member becomes a pull source.
+    assert!(receive_offer_digest(&mut session, [250; 32], &digest).is_err());
+    let mut stale = digest.clone();
+    stale[44] ^= 1;
+    assert!(receive_offer_digest(&mut session, endpoints[0], &stale).is_err());
+    let value = receive_offer_digest(&mut session, endpoints[0], &digest).unwrap();
+    assert_eq!(value["state"], "membership_offer_pull");
+    assert_eq!(session.membership.head, Some((epoch + 1, vec![endpoints[0]])));
+}
+
+/// A revocation step whose anchor proof would make it larger than one
+/// control reply is refused on receipt, before verification: no node
+/// accepts a step it could not store or send on.
+#[test]
+fn a_step_with_an_anchor_proof_past_the_transport_bound_is_refused() {
+    let order = arachne_security::RevocationOrder {
+        kind: arachne_security::RevocationKind::Remove,
+        target: [4; 32],
+        issuer: [5; 32],
+        anchor_epoch: 3,
+        anchor_context: [6; 32],
+        signature: [7; 64],
+    };
+    let step = |checkpoint: usize| {
+        arachne_security::encode_membership_step(
+            &arachne_security::MembershipAuthorization::Revocation(
+                arachne_security::OrderStep::with_proof(
+                    order.clone(),
+                    arachne_security::AnchorProof {
+                        checkpoint: vec![8; checkpoint],
+                        winning: vec![],
+                        losing: vec![],
+                    },
+                ),
+            ),
+            b"commit",
+        )
+        .unwrap()
+    };
+    let small = step(1024);
+    assert!(JoinStep::binary(small.clone(), None).parts().is_ok());
+    assert!(wire_step(&small, None, usize::MAX).is_ok());
+    let large = step(MAX_WIRE_STEP);
+    assert!(large.len() > MAX_WIRE_STEP);
+    let refused = JoinStep::binary(large.clone(), None).parts().err().unwrap();
+    assert_eq!(refused.code(), ErrorCode::LimitReached);
+    assert_eq!(wire_step(&large, None, usize::MAX).unwrap_err().code(), ErrorCode::LimitReached);
+    let (authorization, commit) = arachne_security::decode_membership_step(&large).unwrap();
+    assert_eq!(encode_step(&authorization, &commit).unwrap_err().code(), ErrorCode::LimitReached);
+}
+
+/// B3c, runtime level (no network): past 785 members a link registration
+/// and a Remove succeed once members self-updated. The owner commits both;
+/// the runtime bounds each step, serves it as one binary range page
+/// (range_reply) and decodes it (JoinStep); a member verifies it with
+/// prepare_step_update, the call stage_update makes. Staging itself cannot
+/// run at this size yet: the OpenMLS tree record is over the store's 1 MiB
+/// record bound (A3g/A5), see the note below.
+///
+/// Growth: batches of 128 through the security API, one fresh link per
+/// batch. After each batch, its first and last joiners self-update (the
+/// policy's "right after the Welcome"); the owner applies each. The
+/// populated interior nodes collapse the owner's copath, so every commit
+/// stays under the old 64 KiB bound even though most members never
+/// self-updated. Without self-updates a registration at 897 members was
+/// over 64 KiB (ADR A2, B3c measurements).
+#[test]
+#[ignore = "B3c capacity run: ~900 members; slow in debug"]
+fn a_registration_and_remove_past_785_members_succeed_after_self_updates() {
+    use arachne_security::{
+        AdmissionAssessment, EndpointKey, EndpointSigner, MAX_ADMISSION_BATCH,
+        MembershipAuthorization, PendingJoin, PreparedManagementUpdate,
+    };
+    const MEMBERS: usize = 900;
+    let started = std::time::Instant::now();
+    let active = |update: PreparedManagementUpdate| match update {
+        PreparedManagementUpdate::Active(workspace) => *workspace,
+        PreparedManagementUpdate::Removed(_) => panic!("unexpected removal"),
+    };
+    let owner_key = EndpointKey::generate().unwrap();
+    let grow = |with_self_updates: bool| {
+        let mut owner = arachne_security::Workspace::create(&owner_key, "Owner").unwrap();
+        let mut receiver: Option<(arachne_security::Workspace, [u8; 32])> = None;
+        let mut self_updates = 0;
+        while owner.member_count() < MEMBERS {
+            let (registration, invitation, checkpoint) =
+                owner.prepare_invitation(0, false, false).unwrap();
+            owner = registration.workspace;
+            let count = (MEMBERS - owner.member_count()).min(MAX_ADMISSION_BATCH);
+            let keys: Vec<_> = (0..count).map(|_| EndpointKey::generate().unwrap()).collect();
+            let joins: Vec<_> = keys
+                .iter()
+                .map(|key| PendingJoin::from_invitation(&invitation, &checkpoint, key, "Member").unwrap())
+                .collect();
+            let requests: Vec<_> = joins
+                .iter()
+                .map(|join| join.admission_request().unwrap().to_vec())
+                .collect();
+            let validated: Vec<_> = keys
+                .iter()
+                .zip(&requests)
+                .map(|(key, request)| match owner.assess_admission(key.endpoint(), request).unwrap() {
+                    AdmissionAssessment::Ready(validated) => validated,
+                    _ => panic!("open invitation needs no approval"),
+                })
+                .collect();
+            let entries: Vec<_> = keys
+                .iter()
+                .zip(requests.iter().zip(&validated))
+                .map(|(key, (request, validated))| (key.endpoint(), request.as_slice(), validated))
+                .collect();
+            let prepared = owner.prepare_validated_admission_batch(&entries).unwrap();
+            let authorization = if count == 1 {
+                MembershipAuthorization::Admission(prepared.replies[0].authorization.clone())
+            } else {
+                MembershipAuthorization::AdmissionBatch(
+                    prepared.replies.iter().map(|reply| reply.authorization.clone()).collect(),
+                )
+            };
+            owner = prepared.workspace;
+            let join = |index: usize| {
+                let mut proof = joins[index].join_proof().unwrap();
+                proof.apply_transition(&authorization, &prepared.commit).unwrap();
+                joins[index].prepare_workspace(&proof, &prepared.welcome).unwrap()
+            };
+            if !with_self_updates {
+                continue;
+            }
+            // The batch's first and last joiners self-update, in turn.
+            let mut last = join(count - 1);
+            if count > 1 {
+                let first = join(0).prepare_self_update().unwrap();
+                owner = active(owner.prepare_self_update_update(&first.commit).unwrap());
+                last = active(last.prepare_self_update_update(&first.commit).unwrap());
+                self_updates += 1;
+            }
+            let update = last.prepare_self_update().unwrap();
+            owner = active(owner.prepare_self_update_update(&update.commit).unwrap());
+            self_updates += 1;
+            receiver = Some((update.workspace, keys[count - 1].endpoint()));
+        }
+        (owner, receiver, self_updates)
+    };
+    // Counterfactual: nobody self-updates. A registration at this size is
+    // over the old 64 KiB bound, and now within MAX_MEMBERSHIP_COMMIT.
+    let (plain, _, _) = grow(false);
+    let registration = plain.prepare_invitation(0, false, false).unwrap().0;
+    eprintln!("B3c runtime: registration without self-updates {} bytes", registration.commit.len());
+    assert!(registration.commit.len() > 64 * 1024);
+    assert!(registration.commit.len() <= arachne_security::MAX_MEMBERSHIP_COMMIT);
+    drop((plain, registration));
+    let (owner, receiver, self_updates) = grow(true);
+    let (receiver, receiver_endpoint) = receiver.unwrap();
+    assert!(owner.member_count() > 785);
+    eprintln!(
+        "B3c runtime: {} members, {self_updates} self-updates, {} without, grown in {:?}",
+        owner.member_count(),
+        owner.members_without_self_update(),
+        started.elapsed()
+    );
+
+    // The runtime cannot persist a workspace this large yet: the OpenMLS
+    // tree record passes the store's 1 MiB record bound (~1.37 MB at 900
+    // members), so staging with native records fails before any commit is
+    // made. The owner therefore commits through the security API; the
+    // runtime's transport bound, binary range page and step decoding are
+    // exercised, and the receiver verifies with prepare_step_update, the
+    // call stage_update makes.
+    let tree = owner
+        .export_records()
+        .unwrap()
+        .iter()
+        .map(|(name, value)| (value.len(), name.starts_with(b"security/provider/Tree")))
+        .filter(|(_, tree)| *tree)
+        .map(|(size, _)| size)
+        .max()
+        .unwrap_or(0);
+    eprintln!("B3c runtime: largest OpenMLS tree record {tree} bytes");
+    let mut owner = owner;
+    let mut receiver = receiver;
+    let mut sizes = Vec::new();
+    for change in ["registration", "remove"] {
+        let after = owner.epoch();
+        let prepared = match change {
+            "registration" => owner.prepare_invitation(0, false, false).unwrap().0,
+            _ => {
+                let target = owner
+                    .member_roster()
+                    .unwrap()
+                    .into_iter()
+                    .find(|member| !member.administrator && member.endpoint != receiver_endpoint)
+                    .unwrap()
+                    .id;
+                owner
+                    .prepare_management(arachne_security::ManagementAction::Remove(target))
+                    .unwrap()
+            }
+        };
+        // The runtime's commit-side bound (stage_prepared).
+        encode_step(&prepared.authorization, &prepared.commit).unwrap();
+        sizes.push((change, prepared.commit.len()));
+        // The old 64 KiB bound: the self-updates did the work, not the raise.
+        assert!(prepared.commit.len() < 64 * 1024, "{change}: {} bytes", prepared.commit.len());
+        owner = prepared.workspace;
+        // The member pulls it as one binary range page.
+        let query = wire::encode_range_query(&wire::RangeQuery {
+            workspace: owner.id(),
+            after,
+            until: owner.epoch(),
+        })
+        .unwrap();
+        let page = range_reply(Some(&owner), receiver_endpoint, &query);
+        assert!(page.len() <= arachne_node::MAX_CONTROL_REPLY);
+        let reply = wire::decode_range_reply(&page).unwrap();
+        assert_eq!((reply.after, reply.steps.len()), (after, 1));
+        let (authorization, commit) = join_step_from_wire(reply.steps[0]).unwrap().parts().unwrap();
+        assert_eq!(
+            step_kind(&authorization),
+            if change == "remove" { "remove" } else { "create_invitation" }
+        );
+        receiver = active(receiver.prepare_step_update(&authorization, &commit).unwrap());
+        assert_eq!(receiver.epoch_fingerprint(), owner.epoch_fingerprint());
+    }
+    eprintln!("B3c runtime: commit sizes {sizes:?}, total {:?}", started.elapsed());
+}
+
+/// A member whose administrators all failed recently defers its
+/// self-update without staging, so steps keep landing while the
+/// administrators are offline (B3c policy).
+#[test]
+fn a_self_update_waits_while_every_administrator_is_unreachable() {
+    let (owner, members, _) = admit_members(41, "Waiting member", 1);
+    let admin = owner.endpoint();
+    let mut session = bare_test_session(members.into_iter().next().unwrap());
+    let now = std::time::Instant::now();
+    session.membership.peer_failures.insert(admin, now);
+    assert!(start_self_update(&mut session, now).unwrap().is_none());
+    assert!(session.transition.staged.is_none());
+    // Deferred, not retried at once.
+    session.membership.peer_failures.clear();
+    assert!(start_self_update(&mut session, now).unwrap().is_none());
+    // Due again after the wait: it goes on to stage (this bare session has
+    // no storage key, so staging reports that).
+    let later = now + self_update::SELF_UPDATE_RETRY;
+    assert!(start_self_update(&mut session, later).is_err());
 }

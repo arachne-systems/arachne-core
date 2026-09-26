@@ -83,13 +83,24 @@ fn rename_preserves_legacy_and_native_pending_delivery_across_interruption() {
     let root = [173; 32];
     let mut handle = create(Some(&root)).unwrap();
     let endpoint: [u8; 32] = serde_json::from_value(serde_json::from_str::<Value>(&arachne_runtime::describe(handle).unwrap()).unwrap()["endpoint_key"].clone()).unwrap();
-    let mut creator = Workspace::create_named(endpoint, "Alex", Some("Storm Assessment")).unwrap();
+    let _ = endpoint;
+    let secret = iroh::SecretKey::from_bytes(&root);
+    let mut creator = Workspace::create_named(
+        &arachne_node::IrohEndpointSigner(&secret),
+        "Alex",
+        Some("Storm Assessment"),
+    )
+    .unwrap();
     let (registered, invitation, checkpoint) = creator.prepare_invitation(0, false, false).unwrap();
     creator = registered.workspace;
+    let jordan_key = arachne_security::EndpointKey::generate().unwrap();
     let pending =
-        PendingJoin::from_invitation(&invitation, &checkpoint, [174; 32], "Jordan").unwrap();
+        PendingJoin::from_invitation(&invitation, &checkpoint, &jordan_key, "Jordan").unwrap();
     let add = creator
-        .prepare_admission([174; 32], pending.admission_request().unwrap())
+        .prepare_admission(
+            arachne_security::EndpointSigner::endpoint(&jordan_key),
+            pending.admission_request().unwrap(),
+        )
         .unwrap();
     let mut proof = pending.join_proof().unwrap();
     proof.apply_add(&add.authorization, &add.commit).unwrap();
@@ -407,6 +418,18 @@ fn rust_workspace_driver_converges_same_epoch_name_from_presence() {
         json!({"op":"add_address_hint","peer":admin_info["endpoint_key"],"address":loopback(&admin_info)}),
     )
     .unwrap();
+    // The new member's Rust driver self-updates through the administrator
+    // first (B3c policy); the rename below then lands at the same epoch.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        call(admin, json!({"op":"drive_workspace"})).unwrap();
+        let value = call(member, json!({"op":"drive_workspace"})).unwrap();
+        if value["state"] == "self_update_committed" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no self-update: {value}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     // Consume the initial announcement so the rename below must trigger its
     // own native presence packet.
     call(
@@ -437,7 +460,10 @@ fn rust_workspace_driver_converges_same_epoch_name_from_presence() {
     let committed = loop {
         call(member, json!({"op":"poll_admission"})).unwrap();
         call(admin, json!({"op":"poll_workspace_presence"})).unwrap();
-        call(admin, json!({"op":"poll_admission"})).unwrap();
+        // The admin's Rust driver, like a host: it saves and adopts what it
+        // stages (for example the member's own self-update, B3c).
+        let tick = call(admin, json!({"op":"drive_workspace"})).unwrap();
+        let _ = tick;
         let value = call(member, json!({"op":"drive_workspace"})).unwrap();
         if value["state"] == "workspace_name_committed" {
             break value;

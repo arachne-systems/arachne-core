@@ -72,15 +72,8 @@ impl Workspace {
         if processed.aad() != context {
             return Err("application routing context mismatch");
         }
-        let credential = BasicCredential::try_from(processed.credential().clone())
-            .map_err(|_| "unsupported application author")?;
-        let identity = credential
-            .identity()
-            .strip_prefix(b"data-fabric/candidate-member/v2/")
-            .filter(|identity| identity.len() == 64)
-            .ok_or("application author lacks member identity")?;
-        let member = identity[..32].try_into().unwrap();
-        let endpoint = identity[32..].try_into().unwrap();
+        let (member, endpoint) = super::bootstrap::binding(processed.credential())
+            .map_err(|_| "application author lacks member identity")?;
         let ProcessedMessageContent::ApplicationMessage(message) = processed.into_content() else {
             return Err("membership operation on application channel");
         };
@@ -98,12 +91,12 @@ impl Workspace {
 
 #[test]
 fn application_authentication_replay_and_restart() {
-    let admin = Workspace::create([1; 32], "Alex").unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Alex").unwrap();
     let (registration, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let admin = registration.workspace;
-    let pending = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Jordan").unwrap();
+    let pending = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Jordan").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], pending.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
         .unwrap();
     let mut proof = pending.join_proof().unwrap();
     proof
@@ -126,9 +119,9 @@ fn application_authentication_replay_and_restart() {
     );
     // Persist/reopen the advanced sender before releasing ciphertext.
     sender =
-        Workspace::restore(&sender_key, [1; 32], id, &sender.seal(&sender_key).unwrap()).unwrap();
+        Workspace::restore(&sender_key, crate::test_endpoint(1), id, &sender.seal(&sender_key).unwrap()).unwrap();
     let before = receiver.seal(&receiver_key).unwrap();
-    let mut wrong_context = Workspace::restore(&receiver_key, [2; 32], id, &before).unwrap();
+    let mut wrong_context = Workspace::restore(&receiver_key, crate::test_endpoint(2), id, &before).unwrap();
     assert!(
         wrong_context
             .unprotect_application(b"other topic", &ciphertext)
@@ -136,9 +129,9 @@ fn application_authentication_replay_and_restart() {
     );
     let mut damaged = ciphertext.clone();
     *damaged.last_mut().unwrap() ^= 1;
-    let mut tampered = Workspace::restore(&receiver_key, [2; 32], id, &before).unwrap();
+    let mut tampered = Workspace::restore(&receiver_key, crate::test_endpoint(2), id, &before).unwrap();
     assert!(tampered.unprotect_application(context, &damaged).is_err());
-    let mut outsider = Workspace::create([3; 32], "Other workspace").unwrap();
+    let mut outsider = Workspace::create(crate::test_key(3), "Other workspace").unwrap();
     assert!(
         outsider
             .unprotect_application(context, &ciphertext)
@@ -147,32 +140,32 @@ fn application_authentication_replay_and_restart() {
     let mut trailing = ciphertext.clone();
     trailing.push(0);
     assert!(receiver.unprotect_application(context, &trailing).is_err());
-    receiver = Workspace::restore(&receiver_key, [2; 32], id, &before).unwrap();
+    receiver = Workspace::restore(&receiver_key, crate::test_endpoint(2), id, &before).unwrap();
     assert!(
         receiver
             .unprotect_application(context, &prepared.commit)
             .is_err()
     );
-    receiver = Workspace::restore(&receiver_key, [2; 32], id, &before).unwrap();
+    receiver = Workspace::restore(&receiver_key, crate::test_endpoint(2), id, &before).unwrap();
     let received = receiver
         .unprotect_application(context, &ciphertext)
         .unwrap();
     assert_eq!(received.member, sender.member().unwrap().id());
-    assert_eq!(received.endpoint, [1; 32]);
+    assert_eq!(received.endpoint, crate::test_endpoint(1));
     assert_eq!(received.payload, payload);
     let received_snapshot = receiver.seal(&receiver_key).unwrap();
-    receiver = Workspace::restore(&receiver_key, [2; 32], id, &received_snapshot).unwrap();
+    receiver = Workspace::restore(&receiver_key, crate::test_endpoint(2), id, &received_snapshot).unwrap();
     assert!(
         receiver
             .unprotect_application(context, &ciphertext)
             .is_err()
     );
-    receiver = Workspace::restore(&receiver_key, [2; 32], id, &received_snapshot).unwrap();
+    receiver = Workspace::restore(&receiver_key, crate::test_endpoint(2), id, &received_snapshot).unwrap();
     let next = sender
         .protect_application(context, b"next generation")
         .unwrap();
     sender =
-        Workspace::restore(&sender_key, [1; 32], id, &sender.seal(&sender_key).unwrap()).unwrap();
+        Workspace::restore(&sender_key, crate::test_endpoint(1), id, &sender.seal(&sender_key).unwrap()).unwrap();
     assert_eq!(
         receiver
             .unprotect_application(context, &next)
@@ -187,7 +180,7 @@ fn application_authentication_replay_and_restart() {
         .unwrap();
     assert!(large.len() <= MAX_APPLICATION_CIPHERTEXT);
     sender =
-        Workspace::restore(&sender_key, [1; 32], id, &sender.seal(&sender_key).unwrap()).unwrap();
+        Workspace::restore(&sender_key, crate::test_endpoint(1), id, &sender.seal(&sender_key).unwrap()).unwrap();
     assert_eq!(
         receiver
             .unprotect_application(&large_context, &large)
@@ -197,7 +190,7 @@ fn application_authentication_replay_and_restart() {
     );
     receiver = Workspace::restore(
         &receiver_key,
-        [2; 32],
+        crate::test_endpoint(2),
         id,
         &receiver.seal(&receiver_key).unwrap(),
     )
@@ -208,7 +201,7 @@ fn application_authentication_replay_and_restart() {
     let _persisted = receiver.seal(&receiver_key).unwrap();
     let reply = sender.unprotect_application(context, &reverse).unwrap();
     assert_eq!(reply.member, receiver.member().unwrap().id());
-    assert_eq!(reply.endpoint, [2; 32]);
+    assert_eq!(reply.endpoint, crate::test_endpoint(2));
     assert_eq!(reply.payload, b"reply from member");
     let _persisted = sender.seal(&sender_key).unwrap();
     assert!(
@@ -225,13 +218,13 @@ fn application_authentication_replay_and_restart() {
 
 #[test]
 fn selective_subscription_requires_bounded_ratchet_recovery() {
-    let admin = Workspace::create([1; 32], "Publisher").unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     let (registration, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let admin = registration.workspace;
     let pending =
-        PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Subscriber").unwrap();
+        PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Subscriber").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], pending.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
         .unwrap();
     let mut proof = pending.join_proof().unwrap();
     proof
@@ -257,7 +250,7 @@ fn selective_subscription_requires_bounded_ratchet_recovery() {
             beyond = packet;
         }
     }
-    let mut candidate = Workspace::restore(&key, [2; 32], sender.id(), &before).unwrap();
+    let mut candidate = Workspace::restore(&key, crate::test_endpoint(2), sender.id(), &before).unwrap();
     assert!(
         candidate
             .unprotect_application(b"busy/topic", &beyond)
@@ -265,7 +258,7 @@ fn selective_subscription_requires_bounded_ratchet_recovery() {
     );
     // Rejected candidates are discarded. An available intermediate ciphertext
     // permits bounded advancement, but the runtime does not retrieve it yet.
-    let mut candidate = Workspace::restore(&key, [2; 32], sender.id(), &before).unwrap();
+    let mut candidate = Workspace::restore(&key, crate::test_endpoint(2), sender.id(), &before).unwrap();
     assert_eq!(
         candidate
             .unprotect_application(b"busy/topic", &edge)
@@ -274,7 +267,7 @@ fn selective_subscription_requires_bounded_ratchet_recovery() {
         1000u32.to_be_bytes()
     );
     let saved = candidate.seal(&key).unwrap();
-    let mut recovered = Workspace::restore(&key, [2; 32], sender.id(), &saved).unwrap();
+    let mut recovered = Workspace::restore(&key, crate::test_endpoint(2), sender.id(), &saved).unwrap();
     assert_eq!(
         recovered
             .unprotect_application(b"busy/topic", &beyond)
@@ -288,13 +281,13 @@ fn selective_subscription_requires_bounded_ratchet_recovery() {
 fn sparse_empty_control_messages_recover_skipped_topics() {
     // Candidate experiment only: ordinary MLS applications, no new crypto or
     // runtime repair protocol. The receiver never receives busy payload packets.
-    let admin = Workspace::create([1; 32], "Publisher").unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     let (registration, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let admin = registration.workspace;
     let pending =
-        PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Subscriber").unwrap();
+        PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Subscriber").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], pending.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
         .unwrap();
     let mut proof = pending.join_proof().unwrap();
     proof
@@ -310,7 +303,7 @@ fn sparse_empty_control_messages_recover_skipped_topics() {
     let workspace = sender.id();
     let epoch = sender.epoch();
     let restore =
-        |snapshot: &[u8]| Workspace::restore(&receiver_key, [2; 32], workspace, snapshot).unwrap();
+        |snapshot: &[u8]| Workspace::restore(&receiver_key, crate::test_endpoint(2), workspace, snapshot).unwrap();
     let repair_context = b"candidate/empty-ratchet-control/v1";
     let quiet_context = b"quiet/subscribed-topic";
     let mut controls = Vec::new();
@@ -338,7 +331,7 @@ fn sparse_empty_control_messages_recover_skipped_topics() {
         .protect_application(quiet_context, b"current subscribed message")
         .unwrap();
     let sender_snapshot = sender.seal(&sender_key).unwrap();
-    let sender = Workspace::restore(&sender_key, [1; 32], workspace, &sender_snapshot).unwrap();
+    let sender = Workspace::restore(&sender_key, crate::test_endpoint(1), workspace, &sender_snapshot).unwrap();
     assert_eq!(sender.epoch(), epoch); // No membership commit or epoch reset.
     assert!(
         restore(&initial)
@@ -362,7 +355,7 @@ fn sparse_empty_control_messages_recover_skipped_topics() {
             .unprotect_application(repair_context, &damaged)
             .is_err()
     );
-    let mut outsider = Workspace::create([3; 32], "Other workspace").unwrap();
+    let mut outsider = Workspace::create(crate::test_key(3), "Other workspace").unwrap();
     assert!(
         outsider
             .unprotect_application(repair_context, &controls[0])
@@ -379,7 +372,7 @@ fn sparse_empty_control_messages_recover_skipped_topics() {
             .unprotect_application(repair_context, control)
             .unwrap();
         assert!(decoded.payload.is_empty());
-        assert_eq!(decoded.endpoint, [1; 32]);
+        assert_eq!(decoded.endpoint, crate::test_endpoint(1));
         assert_eq!(decoded.member, sender.member().unwrap().id());
         let saved = candidate.seal(&receiver_key).unwrap();
         recovered = restore(&saved);
@@ -417,7 +410,7 @@ fn sparse_empty_control_messages_recover_skipped_topics() {
         .unwrap();
     assert_eq!(decoded.payload, b"current subscribed message");
     assert_eq!(decoded.member, sender.member().unwrap().id());
-    assert_eq!(decoded.endpoint, [1; 32]);
+    assert_eq!(decoded.endpoint, crate::test_endpoint(1));
     let saved = recovered.seal(&receiver_key).unwrap();
     assert!(
         restore(&saved)
@@ -432,7 +425,7 @@ fn sparse_empty_control_messages_recover_skipped_topics() {
         let mut wanted = Vec::new();
         for (deliver, context, ciphertext) in steps {
             let message = candidate.unprotect_application(context, ciphertext)?;
-            if message.endpoint != [1; 32] || message.member != sender.member().unwrap().id() {
+            if message.endpoint != crate::test_endpoint(1) || message.member != sender.member().unwrap().id() {
                 return Err("batch author mismatch");
             }
             if *deliver {

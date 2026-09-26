@@ -1,6 +1,8 @@
 //! B7 on the object path: automatic recovery of large objects is served as
 //! the largest author-signed prefix that fits one reply, and the requester
 //! continues from it until the whole history is covered.
+mod common;
+use common::{test_endpoint, test_key};
 use arachne_delivery::inbox::{InboxStage, ObjectInbox};
 use arachne_delivery::{PublisherLog, wire};
 use arachne_routing::{Permissions, PublicationContext, RoutingTable, Topic};
@@ -12,13 +14,13 @@ const REVISION: u64 = 1;
 /// Register an invitation, then admit `[2; 32]`. Returns (author, reader)
 /// at the same epoch.
 fn author_and_reader() -> (Workspace, Workspace) {
-    let admin = Workspace::create([1; 32], "Publisher").unwrap();
+    let admin = Workspace::create(test_key(1), "Publisher").unwrap();
     let (registered, invite, checkpoint) =
         admin.prepare_invitation(u64::MAX, false, false).unwrap();
     let admin = registered.workspace.provisional_copy().unwrap();
-    let join = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let join = PendingJoin::from_invitation(&invite, &checkpoint, test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], join.admission_request().unwrap())
+        .prepare_admission(test_endpoint(2), join.admission_request().unwrap())
         .unwrap();
     let mut proof = join.join_proof().unwrap();
     proof
@@ -69,14 +71,14 @@ fn automatic_recovery_serves_byte_bounded_prefix_and_continues() {
             REVISION,
             BTreeMap::from([
                 (
-                    [1; 32],
+                    test_endpoint(1),
                     Permissions::Selected {
                         publish: topics.clone(),
                         subscribe: BTreeSet::new(),
                     },
                 ),
                 (
-                    [2; 32],
+                    test_endpoint(2),
                     Permissions::Selected {
                         publish: BTreeSet::new(),
                         subscribe: topics.clone(),
@@ -223,14 +225,14 @@ fn full_size_history(head: u64) -> History {
             REVISION,
             BTreeMap::from([
                 (
-                    [1; 32],
+                    test_endpoint(1),
                     Permissions::Selected {
                         publish: topics.clone(),
                         subscribe: BTreeSet::new(),
                     },
                 ),
                 (
-                    [2; 32],
+                    test_endpoint(2),
                     Permissions::Selected {
                         publish: BTreeSet::new(),
                         subscribe: topics.clone(),
