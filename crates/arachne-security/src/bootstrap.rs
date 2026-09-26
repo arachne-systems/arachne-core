@@ -140,8 +140,16 @@ fn encode_checkpoint(
         .export_ratchet_tree()
         .tls_serialize_detached()
         .map_err(|_| "checkpoint encoding failed")?;
+    checkpoint_from_parts(&pin, &tree, bound)
+}
+
+pub(super) fn checkpoint_from_parts(
+    pin: &[u8],
+    tree: &[u8],
+    bound: CheckpointBound,
+) -> Result<Vec<u8>, &'static str> {
     let mut bytes = CHECKPOINT_MAGIC.to_vec();
-    for part in [&pin, &tree] {
+    for part in [pin, tree] {
         bytes.extend(
             u32::try_from(part.len())
                 .map_err(|_| "checkpoint exceeds bounds")?

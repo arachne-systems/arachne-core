@@ -12,6 +12,9 @@ use zeroize::Zeroizing;
 pub(crate) const PREFIX: &[u8] = b"runtime/branch/";
 const META: &[u8] = b"runtime/branch/meta";
 const SNAPSHOT: &[u8] = b"runtime/branch/snapshot/";
+const ANCHOR: &[u8] = b"runtime/branch/anchor/";
+const MAX_PUBLIC_ANCHORS: usize = arachne_security::ORDER_WINDOW as usize + 1;
+type PublicAnchors = BTreeMap<u64, Vec<u8>>;
 const ORDER: &[u8] = b"runtime/branch/order/";
 const ACTIONS: &[u8] = b"runtime/branch/actions";
 const MAX_OWN_ACTIONS: usize = 64;
@@ -70,6 +73,7 @@ fn encode_actions(actions: &[OwnAction]) -> Result<Vec<u8>, ApiError> {
 struct BranchCandidate {
     token: Vec<u8>,
     branch: BranchState,
+    anchors: PublicAnchors,
     orders: Vec<OrderStep>,
     republications: Vec<StagePublicationArgs>,
     actions: Vec<OwnAction>,
@@ -98,6 +102,7 @@ impl EpochView {
 #[derive(Default)]
 pub(crate) struct ForkState {
     pub(crate) retained: Option<BranchState>,
+    anchors: PublicAnchors,
     carried: Vec<OrderStep>,
     shared_orders: Arc<transfer::Orders>,
     order_pull: Option<PendingControl<transfer::Reference>>,
@@ -167,6 +172,22 @@ pub(crate) fn prepare_candidate(session: &mut Session) -> Result<(), ApiError> {
             Err(reason) => return Err(security(ErrorCode::StorageFailed)(reason)),
         }
     }
+    let mut anchors = session.membership.fork.anchors.clone();
+    if let Some(previous) = &session.workspace
+        && staged.workspace.epoch() > previous.epoch()
+    {
+        match previous.public_checkpoint_pin() {
+            Ok(pin) => {
+                anchors.insert(previous.epoch(), pin);
+            }
+            // Public evidence is optional retention. Its fixed bound cannot
+            // block a membership commit that the normal verifier accepts.
+            Err("checkpoint pin exceeds bounds") => {}
+            Err(reason) => return Err(security(ErrorCode::StorageFailed)(reason)),
+        }
+    }
+    prune_anchors(&mut anchors, staged.workspace.epoch());
+    validate_anchors(&staged.workspace, &anchors)?;
     let mut orders = Vec::new();
     if let Some(previous) = &session.workspace {
         for order in &session.membership.fork.carried {
@@ -205,6 +226,7 @@ pub(crate) fn prepare_candidate(session: &mut Session) -> Result<(), ApiError> {
         token: staged.snapshot.clone(),
         actions,
         branch,
+        anchors,
         orders,
         republications: session.membership.fork.republications.iter().filter(|publication| {
             !matches!(&staged.transition, WorkspaceTransition::Republication(context, ..) if context.id == publication.id)
@@ -235,6 +257,7 @@ pub(crate) fn adopt_candidate(session: &mut Session, token: &[u8]) -> Result<boo
         .eq(candidate.orders.iter().map(|step| step.order.digest()));
     session.membership.fork.shared_orders = shared_order_bytes(&candidate.orders)?;
     session.membership.fork.retained = Some(candidate.branch);
+    session.membership.fork.anchors = candidate.anchors;
     session.membership.fork.carried = candidate.orders;
     session.membership.fork.republications = candidate.republications;
     session.membership.fork.actions = candidate.actions;
@@ -285,6 +308,34 @@ pub(crate) fn records(session: &Session, candidate: bool) -> Result<SecurityReco
         let mut name = SNAPSHOT.to_vec();
         name.extend(epoch.to_be_bytes());
         records.insert(name, Zeroizing::new(sealed.to_vec()));
+    }
+    let anchors = if candidate {
+        session
+            .membership
+            .fork
+            .candidate
+            .as_ref()
+            .map(|candidate| &candidate.anchors)
+    } else {
+        Some(&session.membership.fork.anchors)
+    };
+    if let Some(anchors) = anchors {
+        let owner = if candidate {
+            session
+                .transition
+                .staged
+                .as_ref()
+                .map(|staged| &staged.workspace)
+        } else {
+            session.workspace.as_deref()
+        }
+        .ok_or_else(errors::no_workspace)?;
+        validate_anchors(owner, anchors)?;
+        for (epoch, pin) in anchors {
+            let mut name = ANCHOR.to_vec();
+            name.extend(epoch.to_be_bytes());
+            records.insert(name, Zeroizing::new(pin.clone()));
+        }
     }
     let orders = if candidate {
         session
@@ -344,7 +395,11 @@ pub(crate) fn records(session: &Session, candidate: bool) -> Result<SecurityReco
     Ok(records)
 }
 
-pub(crate) fn restore(session: &mut Session, records: &SecurityRecords) -> Result<(), ApiError> {
+pub(crate) fn restore(
+    session: &mut Session,
+    records: &SecurityRecords,
+    owner: &Workspace,
+) -> Result<(), ApiError> {
     let Some(meta) = records.get(META) else {
         if records.is_empty() {
             return Ok(());
@@ -352,11 +407,26 @@ pub(crate) fn restore(session: &mut Session, records: &SecurityRecords) -> Resul
         return Err(ApiError::storage_corrupt("missing branch metadata"));
     };
     let mut snapshots = Vec::new();
+    let mut anchors = PublicAnchors::new();
     let mut orders = Vec::new();
     let mut republications: Vec<StagePublicationArgs> = Vec::new();
     let mut actions: Vec<OwnAction> = Vec::new();
     for (name, value) in records {
         if name == META {
+            continue;
+        }
+        if let Some(epoch) = name.strip_prefix(ANCHOR) {
+            if epoch.len() != 8
+                || value.is_empty()
+                || value.len() > arachne_security::MAX_CHECKPOINT_PIN
+                || anchors.len() == MAX_PUBLIC_ANCHORS
+            {
+                return Err(ApiError::storage_corrupt("invalid public anchor record"));
+            }
+            anchors.insert(
+                u64::from_be_bytes(epoch.try_into().unwrap()),
+                value.to_vec(),
+            );
             continue;
         }
         if name == ACTIONS {
@@ -419,12 +489,38 @@ pub(crate) fn restore(session: &mut Session, records: &SecurityRecords) -> Resul
     }
     let branch =
         BranchState::from_parts(meta, &snapshots).map_err(security(ErrorCode::StorageCorrupt))?;
+    validate_anchors(owner, &anchors)?;
     session.membership.fork.shared_orders = shared_order_bytes(&orders)?;
     session.membership.fork.retained = Some(branch);
+    session.membership.fork.anchors = anchors;
     session.membership.fork.carried = orders;
     session.membership.fork.republications = republications;
     session.membership.fork.actions = actions;
     session.membership.fork.settlement_pending = true;
+    Ok(())
+}
+
+fn prune_anchors(anchors: &mut PublicAnchors, epoch: u64) {
+    anchors.retain(|at, _| *at <= epoch && epoch - *at <= arachne_security::ORDER_WINDOW);
+}
+
+fn validate_anchors(owner: &Workspace, anchors: &PublicAnchors) -> Result<(), ApiError> {
+    if anchors.len() > MAX_PUBLIC_ANCHORS {
+        return Err(ApiError::storage_corrupt(
+            "public anchor count exceeds bounds",
+        ));
+    }
+    for (epoch, pin) in anchors {
+        if *epoch > owner.epoch()
+            || owner.epoch() - epoch > arachne_security::ORDER_WINDOW
+            || owner
+                .checkpoint_pin_epoch(pin)
+                .map_err(security(ErrorCode::StorageCorrupt))?
+                != *epoch
+        {
+            return Err(ApiError::storage_corrupt("invalid public anchor epoch"));
+        }
+    }
     Ok(())
 }
 
@@ -763,25 +859,22 @@ pub(crate) fn stage(session: &mut Session, epoch: u64, step: JoinStep) -> Result
             // Keep the winning authority, but carry the intent onto it.
             if local != remote
                 && let MembershipAuthorization::Revocation(order) = &authorization
-                && let Some(snapshot) = branch.snapshot(epoch)
             {
-                let key = persistence::record_key(session)?;
-                let mut common = Workspace::restore_branch_snapshot(
-                    &key,
-                    owner.endpoint(),
-                    owner.id(),
-                    snapshot,
-                )
-                .map_err(security(ErrorCode::StorageCorrupt))?;
-                if common.epoch() != epoch {
-                    return Err(ApiError::storage_corrupt(
-                        "branch snapshot has the wrong epoch",
-                    ));
-                }
-                common
-                    .restore_branch_history(owner)
-                    .map_err(security(ErrorCode::StorageCorrupt))?;
-                if let Ok(order) = owner.rebase_revocation(order, owner, &common)
+                let carried = match owner.extend_revocation(order) {
+                    Ok(order) => Some(order),
+                    Err(_) => match session.membership.fork.anchors.get(&epoch) {
+                        Some(pin) => {
+                            let checkpoint = owner
+                                .public_checkpoint_from_pin(epoch, pin)
+                                .map_err(security(ErrorCode::StorageCorrupt))?;
+                            owner
+                                .rebase_revocation_from_checkpoint(order, owner, &checkpoint)
+                                .ok()
+                        }
+                        None => None,
+                    },
+                };
+                if let Some(order) = carried
                     && let Some(staged) = receive_order(
                         session,
                         &order
@@ -901,6 +994,12 @@ pub(crate) fn stage(session: &mut Session, epoch: u64, step: JoinStep) -> Result
         }
     };
     let orphaned = branch.is_orphaned();
+    let mut anchors = session.membership.fork.anchors.clone();
+    if !orphaned {
+        anchors.retain(|at, _| *at <= epoch);
+    }
+    prune_anchors(&mut anchors, next.epoch());
+    validate_anchors(&next, &anchors)?;
     let snapshot = seal_state(session.records.is_some())?;
     let mut value = serde_json::to_value(StagedCandidate::new(
         next.id(),
@@ -921,6 +1020,7 @@ pub(crate) fn stage(session: &mut Session, epoch: u64, step: JoinStep) -> Result
     session.membership.fork.candidate = Some(BranchCandidate {
         token: snapshot.clone(),
         branch,
+        anchors,
         orders,
         republications,
         actions,
@@ -1219,6 +1319,7 @@ fn stage_orders(
     session.membership.fork.candidate = Some(BranchCandidate {
         token: snapshot.clone(),
         branch,
+        anchors: session.membership.fork.anchors.clone(),
         orders,
         republications: session.membership.fork.republications.clone(),
         actions: session.membership.fork.actions.clone(),
