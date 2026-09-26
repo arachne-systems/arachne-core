@@ -207,20 +207,39 @@ link in that last case. Retry state and recovery queues are in the same native
 transaction as the branch. Outcomes are drive-call results, not a separate
 acknowledged event inbox.
 
-### Current transport bounds
+### Membership proof transfer and bounds
 
-Binary membership steps use at most 117 KiB inside a 128 KiB control reply.
-Admission batches can contain 128 members. Paged join history has both a
-4,096-step cap and a 16 MiB total byte cap; a maximum-size checkpoint plus
-64 maximum-size steps fits that byte cap. Larger steps do not bypass the
-per-step limit.
+Proof fragments use the existing authenticated Iroh control connection.
+Control requests remain at most 32 KiB and replies remain at most 128 KiB.
+A fragment carries at most 96 KiB of proof bytes. A reference names the
+workspace, step epoch or order digest, total byte count, and SHA-256 digest.
+The receiver requires consecutive offsets, bounded non-empty fragments and
+the exact final digest. It then applies the normal cryptographic verifier.
+A hash or a relay endpoint does not supply membership authority.
 
-A carried revocation proof must currently fit one runtime step. A large
-roster checkpoint or a long anchor proof can exceed it even when the security
-codec can verify the proof. The runtime then refuses the change. A separate
-paged proof transport is still required for those cases. The large native
-store test proves storage capacity; it does not prove large-roster fork
-recovery over the network.
+Ordinary membership steps fit the 117 KiB inline budget. A large step can
+use up to 96 KiB of commit, 2 MiB of anchor proof, and 1 KiB of codec space.
+One page can refer to at most one large step. A transfer has a 30-second
+limit and a fragment-count limit derived from its declared byte count.
+Unchanged proof depth and 64-epoch validity bounds still apply.
+
+Roster queries, range catch-up, fork pulls, carried-order notices and
+admission history use the same fragment reader. The committed view serves
+only saved bytes. Current members can request accepted steps. A removed
+member can request only its own terminal removal step, under the existing
+security rule. A carried order is served only to a current member.
+
+Admission batches can contain 128 members. Join history has both a
+4,096-step cap and a 16 MiB total expanded-byte cap. A maximum checkpoint
+plus 64 maximum inline steps fits that byte cap. Large proofs use their
+actual byte size within the same total limit. The held-step queue has a
+32-step cap and a separate 16 MiB byte cap. Carried orders have a 64-order
+cap and a separate 16 MiB byte cap. These are not increases to the private
+rollback snapshot budget.
+
+The wire versions are `DFMR` 3, `DFMT` 3, `DFAY` 2 and `DFGO` 2. `DFRF` 1
+names an object; `DFFQ` 1 requests a fragment and `DFFP` 1 answers it. Earlier
+versions are rejected. Nodes need the same protocol generation.
 
 ## Network metadata and availability
 

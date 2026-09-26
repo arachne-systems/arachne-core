@@ -9,6 +9,7 @@ mod fork_tests;
 pub(crate) mod fork;
 pub(crate) mod self_update;
 pub(crate) mod wire;
+pub(crate) mod transfer;
 pub(super) use wire::encode_reply;
 
 /// The accepted local state an exchange was based on, not a remote claim.
@@ -214,30 +215,12 @@ impl JoinStep {
     }
 }
 
-/// Largest encoded membership step this runtime accepts, stores or sends.
-/// A step (with any anchor proof it carries) above this bound is refused on
-/// receipt and never committed, so no node holds a step it cannot serve or
-/// store: a history record holds up to 1 MiB, and a step must fit one
-/// control reply. It bounds anchor proofs far below the security crate's
-/// 2 MiB decoder bound.
+/// Ordinary commits fit one reply. Anchor proofs can use bounded fragments.
+pub(crate) const MAX_INLINE_STEP: usize =
+    arachne_security::MAX_MEMBERSHIP_COMMIT + 21 * 1024;
 pub(crate) const MAX_WIRE_STEP: usize =
-    arachne_security::MAX_MEMBERSHIP_COMMIT + MAX_STEP_AUTHORIZATION;
-
-/// The largest authorization a step carries besides its commit: a full
-/// admission batch (key and two signatures per admission) and the codec
-/// header. Anchor proofs must fit in this too.
-const MAX_STEP_AUTHORIZATION: usize = 20 * 1024 + 1024;
-
-/// The transport cap and the verifier bound move together (B3c): one step
-/// of the largest verifiable size, plus the reply envelope, fits one
-/// control reply, so every step a node accepts it can also serve.
-const _: () = assert!(
-    arachne_security::MAX_MEMBERSHIP_COMMIT
-        + arachne_security::MAX_ADMISSION_BATCH * (32 + 64 + 64)
-        + 16
-        <= MAX_WIRE_STEP
-);
-const _: () = assert!(MAX_WIRE_STEP + 1024 <= arachne_node::MAX_CONTROL_REPLY);
+    arachne_security::MAX_MEMBERSHIP_COMMIT + arachne_security::MAX_ANCHOR_PROOF + 1024;
+const _: () = assert!(MAX_INLINE_STEP + 1024 <= arachne_node::MAX_CONTROL_REPLY);
 
 /// A short, informational name for a step's kind.
 pub(crate) fn step_kind(auth: &arachne_security::MembershipAuthorization) -> &'static str {
@@ -1051,9 +1034,13 @@ fn start_query(
     // The reply is an outbound event, so it does not enqueue a control
     // request locally. Wake the existing host drain when it completes.
     let request = session.node.request_control(peer, &query);
+    let client = session.node.control_client();
     let wake = session.node.control_signal();
     let task = session.runtime.spawn(async move {
-        let reply = request.await;
+        let reply = match request.await {
+            Ok(bytes) => wire::resolve_reply(client, peer, &bytes).await,
+            Err(error) => Err(error),
+        };
         wake.notify_one();
         reply
     });
@@ -1262,7 +1249,7 @@ fn poll_with_budget(
             {
                 return Ok(json!({"state":"membership_update_stale"}));
             }
-            let mut value = wire::decode_reply(&bytes)
+            let mut value = wire::decode_resolved_reply(&bytes)
                 .map_err(|reason| ApiError::transport_failed(None, reason))?;
             if value["state"] == "membership_denied" {
                 return Ok(value);
@@ -2285,6 +2272,7 @@ impl GossipCounts {
     }
 }
 const MAX_GOSSIP_STEPS_AHEAD: usize = 32;
+const MAX_HELD_STEP_BYTES: usize = 16 * 1024 * 1024;
 
 /// A non-administrator author when there is one; the local endpoint spreads
 /// members over the choices. `authors` is never empty here.
@@ -2394,9 +2382,7 @@ pub(super) fn stage_gossiped_step(session: &mut Session) -> Result<Option<Value>
             && payload.starts_with(fork::GOSSIP_ORDER)
             && payload[fork::GOSSIP_ORDER.len()..fork::GOSSIP_ORDER.len() + 32] == id
         {
-            if let Some(staged) = fork::receive_order(session, &payload[fork::GOSSIP_ORDER.len() + 32..])? {
-                return Ok(Some(staged));
-            }
+            fork::receive_order_notice(session, &payload[fork::GOSSIP_ORDER.len() + 32..]);
             continue;
         }
         if workspace == id
@@ -2515,11 +2501,14 @@ fn start_range_pull(session: &mut Session, epoch: u64) {
         return;
     };
     let request = session.node.request_control(author, &query);
+    let client = session.node.control_client();
     let wake = session.node.control_signal();
     let task = session.runtime.spawn(async move {
-        let reply = tokio::time::timeout(RANGE_PULL_TIMEOUT, request)
-            .await
-            .unwrap_or(Err(arachne_node::Error::Timeout("membership range")));
+        let reply = match tokio::time::timeout(RANGE_PULL_TIMEOUT, request).await
+            .unwrap_or(Err(arachne_node::Error::Timeout("membership range"))) {
+            Ok(bytes) => wire::resolve_range_reply(client, author, &bytes).await,
+            Err(error) => Err(error),
+        };
         wake.notify_one();
         reply
     });
@@ -2552,20 +2541,18 @@ fn finish_range_pull(session: &mut Session) {
     let bytes = reply.ok();
     let mut pulled = 0;
     if let Some(bytes) = bytes
-        && let Ok(reply) = wire::decode_range_reply(&bytes)
+        && let Ok(reply) = wire::decode_resolved_range_reply(&bytes)
         && Some(reply.workspace) == id
         && reply.after == pending.query
     {
+        let mut held_bytes: usize = session.membership.steps_ahead.values().map(Vec::len).sum();
         for (after, step) in (pending.query..).zip(reply.steps) {
-            if !session.membership.steps_ahead.contains_key(&after)
-                && session.membership.steps_ahead.len() >= MAX_GOSSIP_STEPS_AHEAD
-            {
-                break;
+            if !session.membership.steps_ahead.contains_key(&after) {
+                if session.membership.steps_ahead.len() >= MAX_GOSSIP_STEPS_AHEAD
+                    || held_bytes.saturating_add(step.len()) > MAX_HELD_STEP_BYTES { break; }
+                held_bytes += step.len();
+                session.membership.steps_ahead.insert(after, step.to_vec());
             }
-            session
-                .membership.steps_ahead
-                .entry(after)
-                .or_insert_with(|| step.to_vec());
             pulled += 1;
         }
     }
@@ -2771,6 +2758,13 @@ fn range_page(
         let Ok(step) = owner_wire_step(owner, &authorization, &commit, room) else {
             break;
         };
+        if step.len() > MAX_INLINE_STEP {
+            let Ok(raw) = encode_step(&authorization, &commit) else { break };
+            let Ok(reference) = transfer::Reference::new(owner.id(), transfer::Object::Step(next), &raw)
+                .and_then(|reference| reference.encode()) else { break };
+            steps.push(reference);
+            break; // At most one expanded proof per page.
+        }
         let budget = if steps.is_empty() {
             RANGE_REPLY_STEP_ROOM
         } else {
@@ -2789,7 +2783,7 @@ fn range_page(
 /// Room for the steps of a range reply: the reply bound less its envelope
 /// (prefix, workspace, cursor and per-step lengths).
 const RANGE_REPLY_STEP_ROOM: usize = arachne_node::MAX_CONTROL_REPLY - 1024;
-const _: () = assert!(MAX_WIRE_STEP + 64 <= RANGE_REPLY_STEP_ROOM);
+const _: () = assert!(MAX_INLINE_STEP + 64 <= RANGE_REPLY_STEP_ROOM);
 
 /// Accept a carrier's signed next transition, not the carrier as membership authority.
 /// Responses reveal no roster, fingerprint, current epoch, Welcome or invitation.
@@ -3208,11 +3202,10 @@ fn a_committed_step_too_large_for_one_request_is_offered_by_digest() {
     assert_eq!(session.membership.head, Some((epoch + 1, vec![endpoints[0]])));
 }
 
-/// A revocation step whose anchor proof would make it larger than one
-/// control reply is refused on receipt, before verification: no node
-/// accepts a step it could not store or send on.
+/// Proofs can exceed a control reply, but cannot exceed the logical bound.
+/// The security decoder keeps its separate proof-depth and proof-byte bounds.
 #[test]
-fn a_step_with_an_anchor_proof_past_the_transport_bound_is_refused() {
+fn a_step_with_an_anchor_proof_uses_the_fragment_bound() {
     let order = arachne_security::RevocationOrder {
         kind: arachne_security::RevocationKind::Remove,
         target: [4; 32],
@@ -3240,13 +3233,15 @@ fn a_step_with_an_anchor_proof_past_the_transport_bound_is_refused() {
     let small = step(1024);
     assert!(JoinStep::binary(small.clone(), None).parts().is_ok());
     assert!(wire_step(&small, None, usize::MAX).is_ok());
-    let large = step(MAX_WIRE_STEP);
-    assert!(large.len() > MAX_WIRE_STEP);
-    let refused = JoinStep::binary(large.clone(), None).parts().err().unwrap();
+    let large = step(arachne_node::MAX_CONTROL_REPLY);
+    assert!(large.len() > arachne_node::MAX_CONTROL_REPLY);
+    let (authorization, commit) = JoinStep::binary(large.clone(), None).parts().unwrap();
+    assert!(wire_step(&large, None, usize::MAX).is_ok());
+    assert_eq!(encode_step(&authorization, &commit).unwrap(), large);
+    let oversized = vec![0; MAX_WIRE_STEP + 1];
+    let refused = JoinStep::binary(oversized.clone(), None).parts().err().unwrap();
     assert_eq!(refused.code(), ErrorCode::LimitReached);
-    assert_eq!(wire_step(&large, None, usize::MAX).unwrap_err().code(), ErrorCode::LimitReached);
-    let (authorization, commit) = arachne_security::decode_membership_step(&large).unwrap();
-    assert_eq!(encode_step(&authorization, &commit).unwrap_err().code(), ErrorCode::LimitReached);
+    assert_eq!(wire_step(&oversized, None, usize::MAX).unwrap_err().code(), ErrorCode::LimitReached);
 }
 
 /// B3c, runtime level (no network): past 785 members a link registration
@@ -3441,10 +3436,18 @@ fn a_self_update_stages_locally_without_an_administrator_handshake() {
 }
 
 #[test]
-fn the_history_byte_budget_holds_one_full_chunk_of_maximum_wire_steps() {
+fn the_history_byte_budget_holds_one_full_chunk_of_inline_steps() {
     let chunk = arachne_security::MAX_CHECKPOINT
-        + arachne_security::HISTORY_CHUNK_STEPS * MAX_WIRE_STEP + 1024;
+        + arachne_security::HISTORY_CHUNK_STEPS * MAX_INLINE_STEP + 1024;
     assert!(arachne_security::MAX_JOIN_HISTORY_BYTES >= chunk,
         "history budget {} cannot hold a complete bounded chunk of {chunk} bytes",
         arachne_security::MAX_JOIN_HISTORY_BYTES);
+}
+
+
+#[test]
+fn a_membership_step_can_carry_the_supported_anchor_proof() {
+    assert!(MAX_WIRE_STEP >= arachne_security::MAX_MEMBERSHIP_COMMIT
+        + arachne_security::MAX_ANCHOR_PROOF,
+        "fragment transfer must carry a valid anchor proof without raising control packet limits");
 }

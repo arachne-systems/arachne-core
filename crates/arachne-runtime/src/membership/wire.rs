@@ -6,12 +6,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const QUERY: &[u8] = b"DFMQ\x01";
-const REPLY: &[u8] = b"DFMR\x02";
+const REPLY: &[u8] = b"DFMR\x03";
 const MAX_QUERY: usize = 256 + 2 * arachne_security::MAX_MEMBER_PROFILE;
 /// Range query prefix. It shares `DFMS` with the binary step codec
 /// (`DFMS\x03`), so dispatch must match this exact prefix.
 pub(crate) const RANGE_QUERY: &[u8] = b"DFMS\x01";
-const RANGE_REPLY: &[u8] = b"DFMT\x02";
+const RANGE_REPLY: &[u8] = b"DFMT\x03";
 const MAX_RANGE_QUERY: usize = 64;
 /// Steps in one range reply. Matches the held-step bound, so a whole reply
 /// always fits where steps wait for their turn.
@@ -126,11 +126,37 @@ pub(super) fn encode_range_reply(reply: &RangeReply<'_>) -> Result<Vec<u8>, Stri
 }
 
 pub(super) fn decode_range_reply(bytes: &[u8]) -> Result<RangeReply<'_>, String> {
-    let reply: RangeReply<'_> = decode(RANGE_REPLY, bytes, arachne_node::MAX_CONTROL_REPLY)?;
+    decode_range_reply_with_limit(bytes, arachne_node::MAX_CONTROL_REPLY)
+}
+
+pub(super) fn decode_resolved_range_reply(bytes: &[u8]) -> Result<RangeReply<'_>, String> {
+    decode_range_reply_with_limit(bytes, super::transfer::RESOLVED_PAGE_BYTES)
+}
+
+fn decode_range_reply_with_limit(bytes: &[u8], limit: usize) -> Result<RangeReply<'_>, String> {
+    let reply: RangeReply<'_> = decode(RANGE_REPLY, bytes, limit)?;
     if reply.steps.len() > MAX_RANGE_STEPS || reply.steps.iter().any(|step| step.is_empty()) {
         return Err("invalid membership range".into());
     }
     Ok(reply)
+}
+
+pub(super) async fn resolve_range_reply(
+    client: arachne_node::ControlClient, peer: [u8; 32], bytes: &[u8],
+) -> Result<Vec<u8>, arachne_node::Error> {
+    let reply = decode_range_reply(bytes).map_err(|_| arachne_node::Error::InvalidFrame)?;
+    for (index, step) in reply.steps.iter().enumerate() {
+        if super::transfer::is_reference(step) {
+            let reference = super::transfer::decode_reference(step)?;
+            if reference.object != super::transfer::Object::Step(reply.after.saturating_add(index as u64)) {
+                return Err(arachne_node::Error::InvalidFrame);
+            }
+        }
+    }
+    let steps = super::transfer::resolve_steps(client, peer, reply.workspace, &reply.steps, true).await?;
+    encode(RANGE_REPLY, &RangeReply { workspace: reply.workspace, after: reply.after,
+        steps: steps.iter().map(Vec::as_slice).collect() }, super::transfer::RESOLVED_PAGE_BYTES)
+        .map_err(|_| arachne_node::Error::InvalidFrame)
 }
 
 /// Bounded hints for finding the first distinct committed step. The receiver
@@ -266,18 +292,25 @@ pub(super) fn decode_query(bytes: &[u8]) -> Result<Query<'_>, String> {
 }
 
 pub(crate) fn encode_reply(value: &Value) -> Result<Vec<u8>, String> {
-    let metadata =
+    let metadata: Metadata =
         serde_json::from_value(value.clone()).map_err(|_| "invalid membership metadata")?;
     let state =
         serde_json::from_value(value["state"].clone()).map_err(|_| "invalid membership state")?;
     // The step travels binary; its optional invitation checkpoint only
     // while the reply keeps room for the envelope.
-    let step = value
+    let mut step = value
         .get("step")
         .map(|step| super::wire_step_from_json(step, super::PAGE_STEP_BYTES))
         .transpose()
         .map_err(|error| error.message().to_owned())?
         .unwrap_or_default();
+    if step.len() > super::MAX_INLINE_STEP {
+        let bare = decode_wire_step(&step)?.step;
+        step = super::transfer::Reference::new(
+            metadata.workspace.ok_or("step missing workspace")?,
+            super::transfer::Object::Step(metadata.after.ok_or("step missing epoch")?), bare,
+        ).and_then(|reference| reference.encode()).map_err(|error| error.to_string())?;
+    }
     let record: Vec<u8> =
         serde_json::from_value(value.get("name_record").cloned().unwrap_or(json!([])))
             .map_err(|_| "invalid name record")?;
@@ -304,10 +337,37 @@ pub(crate) fn encode_reply(value: &Value) -> Result<Vec<u8>, String> {
     encode(REPLY, &reply, arachne_node::MAX_CONTROL_REPLY)
 }
 
+pub(super) async fn resolve_reply(
+    client: arachne_node::ControlClient, peer: [u8; 32], bytes: &[u8],
+) -> Result<Vec<u8>, arachne_node::Error> {
+    use arachne_node::Error;
+    let reply: Reply<'_> = decode(REPLY, bytes, arachne_node::MAX_CONTROL_REPLY).map_err(|_| Error::InvalidFrame)?;
+    if !super::transfer::is_reference(reply.records[0]) { return Ok(bytes.to_vec()); }
+    let reference = super::transfer::decode_reference(reply.records[0])?;
+    if Some(reference.workspace) != reply.metadata.workspace
+        || Some(reference.object) != reply.metadata.after.map(super::transfer::Object::Step) {
+        return Err(Error::InvalidFrame);
+    }
+    let step = super::transfer::fetch(client, peer, reference).await?;
+    let step = super::wire_step(&step, None, usize::MAX).map_err(|_| Error::InvalidFrame)?;
+    let mut records = reply.records;
+    records[0] = &step;
+    encode(REPLY, &Reply { records, ..reply }, super::transfer::RESOLVED_PAGE_BYTES)
+        .map_err(|_| Error::InvalidFrame)
+}
+
 pub fn decode_reply(bytes: &[u8]) -> Result<Value, String> {
-    let reply: Reply<'_> = decode(REPLY, bytes, arachne_node::MAX_CONTROL_REPLY)?;
+    decode_reply_with_limit(bytes, arachne_node::MAX_CONTROL_REPLY)
+}
+
+pub(super) fn decode_resolved_reply(bytes: &[u8]) -> Result<Value, String> {
+    decode_reply_with_limit(bytes, super::transfer::RESOLVED_PAGE_BYTES)
+}
+
+fn decode_reply_with_limit(bytes: &[u8], limit: usize) -> Result<Value, String> {
+    let reply: Reply<'_> = decode(REPLY, bytes, limit)?;
     let limits = [
-        arachne_node::MAX_CONTROL_REPLY,
+        super::MAX_WIRE_STEP + 16,
         arachne_security::MAX_WORKSPACE_NAME_RECORD,
         arachne_security::MAX_WORKSPACE_NAME_CHECKPOINT,
         arachne_security::MAX_MEMBER_PROFILE,

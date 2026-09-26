@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::errors::{self, security};
 use crate::membership::JoinStep;
 use crate::ops::admission::{
-    admission_history_page_packet, decode_admission_reply, admission_offer_candidate, admission_request_packet, live,
+    admission_history_page_packet, resolve_admission_reply, admission_offer_candidate, admission_request_packet, live,
     live_mut, parse_admission_offer,
 };
 use crate::ops::candidate::{self, AdoptArgs, MemberView};
@@ -349,8 +349,9 @@ pub(crate) fn request_admission(
     // responder stayed inside the control-reply bound while rolling a long
     // history over many pages.
     let mut page_bytes = vec![reply.len()];
-    let mut reply: Value =
-        decode_admission_reply(&reply).map_err(|_| from_peer("invalid admission reply"))?;
+    let (mut reply, first_bytes) = session.runtime.block_on(resolve_admission_reply(
+        session.node.control_client(), peer, &reply))
+        .map_err(|_| from_peer("invalid admission reply"))?;
     if reply
         .get("history_complete")
         .is_some_and(|complete| !complete.as_bool().unwrap_or(false))
@@ -368,7 +369,7 @@ pub(crate) fn request_admission(
         // whole exchange, not just each page: pages, steps and total bytes
         // held for this pending join all fail closed, so a faulty or
         // hostile member cannot grow this session one small page at a time.
-        let mut total_bytes: usize = page_bytes.iter().sum();
+        let mut total_bytes = first_bytes;
         while !reply["history_complete"].as_bool().unwrap_or(false) {
             page_count += 1;
             // Rollover means more pages, never a bigger page: a page still
@@ -382,13 +383,14 @@ pub(crate) fn request_admission(
                 .runtime
                 .block_on(session.node.request_control(peer, &page))
                 .map_err(errors::node)?;
-            total_bytes = total_bytes.saturating_add(page.len());
+            page_bytes.push(page.len());
+            let (page, expanded_bytes) = session.runtime.block_on(resolve_admission_reply(
+                session.node.control_client(), peer, &page))
+                .map_err(|_| from_peer("invalid admission history page"))?;
+            total_bytes = total_bytes.saturating_add(expanded_bytes);
             if total_bytes > arachne_security::MAX_JOIN_HISTORY_BYTES {
                 return Err(too_much("admission history exceeds transport bounds"));
             }
-            page_bytes.push(page.len());
-            let page: Value = decode_admission_reply(&page)
-                .map_err(|_| from_peer("invalid admission history page"))?;
             // A served page carries the retained reply plus its paging
             // markers; only a refusal carries a `state`. Requiring both was
             // unreachable, and no branch short enough to fit one page ever
@@ -973,7 +975,7 @@ async fn request_join_exchange(
         Err(error) => return join_attempt_error(error, true),
     };
     let mut page_bytes = vec![first.len()];
-    let mut reply: Value = match decode_admission_reply(&first) {
+    let (mut reply, first_bytes) = match resolve_admission_reply(client.clone(), peer, &first).await {
         Ok(value) => value,
         Err(_) => return JoinAttemptOutcome::Failed("invalid admission reply".into()),
     };
@@ -996,7 +998,7 @@ async fn request_join_exchange(
             }
         };
         let mut page_count = 0;
-        let mut total_bytes = first.len();
+        let mut total_bytes = first_bytes;
         while !reply["history_complete"].as_bool().unwrap_or(false) {
             page_count += 1;
             if page_count > arachne_security::MAX_JOIN_HISTORY_STEPS {
@@ -1012,19 +1014,15 @@ async fn request_join_exchange(
                 Ok(page) => page,
                 Err(error) => return join_attempt_error(error, false),
             };
-            total_bytes = total_bytes.saturating_add(page.len());
-            if total_bytes > arachne_security::MAX_JOIN_HISTORY_BYTES {
-                return JoinAttemptOutcome::Failed(
-                    "admission history exceeds transport bounds".into(),
-                );
-            }
             page_bytes.push(page.len());
-            let page: Value = match decode_admission_reply(&page) {
+            let (page, expanded_bytes) = match resolve_admission_reply(client.clone(), peer, &page).await {
                 Ok(value) => value,
-                Err(_) => {
-                    return JoinAttemptOutcome::Failed("invalid admission history page".into());
-                }
+                Err(_) => return JoinAttemptOutcome::Failed("invalid admission history page".into()),
             };
+            total_bytes = total_bytes.saturating_add(expanded_bytes);
+            if total_bytes > arachne_security::MAX_JOIN_HISTORY_BYTES {
+                return JoinAttemptOutcome::Failed("admission history exceeds transport bounds".into());
+            }
             if page.get("history_page").and_then(Value::as_bool) != Some(true) {
                 return JoinAttemptOutcome::Failed(
                     "admission history page was not accepted".into(),

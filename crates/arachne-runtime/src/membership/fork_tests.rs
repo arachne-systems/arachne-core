@@ -5,6 +5,7 @@ use crate::session::{activity_value, activity_view};
 use arachne_security::{ManagementAction, PreparedManagementUpdate, Workspace};
 
 mod convergence;
+mod proof_pages;
 
 fn owner(session: &Session) -> &Workspace {
     session.workspace.as_deref().unwrap()

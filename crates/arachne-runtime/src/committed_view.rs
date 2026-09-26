@@ -11,6 +11,7 @@ pub(super) struct CommittedView {
     workspace: Arc<arachne_security::Workspace>,
     /// This member's own endpoint, as the facilitator named in checkpoint proofs.
     endpoint: [u8; 32],
+    orders: Arc<membership::transfer::Orders>,
 }
 
 /// The published view of one session. `None` until a workspace is committed.
@@ -38,11 +39,12 @@ impl Published {
         Arc::clone(&self.profiles)
     }
 
-    pub(super) fn publish(&self, workspace: Arc<arachne_security::Workspace>, endpoint: [u8; 32]) {
+    pub(super) fn publish(&self, workspace: Arc<arachne_security::Workspace>, endpoint: [u8; 32], orders: Arc<membership::transfer::Orders>) {
         *self.view.write().unwrap_or_else(|error| error.into_inner()) =
             Some(Arc::new(CommittedView {
                 workspace,
                 endpoint,
+                orders,
             }));
     }
 
@@ -140,6 +142,9 @@ impl CommittedView {
         if payload.starts_with(membership::wire::BRANCH_QUERY) {
             return Some(membership::fork::reply(Some(&self.workspace), peer, payload));
         }
+        if payload.starts_with(membership::transfer::QUERY) {
+            return Some(membership::transfer::reply(Some(&self.workspace), &self.orders, peer, payload));
+        }
         // A range pull reads committed steps only.
         if payload.starts_with(membership::wire::RANGE_QUERY) {
             return Some(membership::range_reply(
@@ -173,7 +178,7 @@ fn a_membership_query_answer_is_the_host_answer() {
     let owner = Arc::new(owner);
     let mut host = membership::bare_test_session(owner.clone());
     let mut view = membership::bare_test_session(owner.clone());
-    view.committed.publish(owner.clone(), view.node.id());
+    view.committed.publish(owner.clone(), view.node.id(), Default::default());
     let responder = view.committed.responder();
     let profiles: Vec<Vec<u8>> = members
         .iter()

@@ -112,8 +112,21 @@ impl Workspace {
             .filter(|entry| entry.reply.epoch <= self.epoch())
             .cloned()
             .collect();
-        // Checkpoints are availability metadata. The winning public steps
-        // can supply them again; copying losing suffix records is unsafe.
+        // Keep links issued at or before this common state. A losing-suffix
+        // link cannot cross the fork; an older valid link must still serve
+        // the exact checkpoint that its invitation pins.
+        self.invitation_checkpoints.clear();
+        for saved in &current.invitation_checkpoints {
+            if bootstrap::checkpoint_info(&saved.checkpoint)?
+                .epoch()
+                .as_u64()
+                <= self.epoch()
+            {
+                self.invitation_checkpoints.push(saved.clone());
+            }
+        }
+        self.prune_invitation_checkpoints()?;
+        self.verify_retained_invitation_checkpoints()?;
         Ok(())
     }
 
@@ -342,6 +355,41 @@ mod tests {
         let mut wrong =
             Workspace::restore_branch_snapshot(&key, owner.endpoint(), owner.id(), &wrong).unwrap();
         assert!(wrong.restore_branch_history(&promote.workspace).is_err());
+    }
+
+    #[test]
+    fn restoring_a_common_branch_keeps_its_links_and_excludes_losing_links() {
+        let (owner, _) = team(1);
+        let (common, _, _) = owner.prepare_invitation(0, false, false).unwrap();
+        let MembershipAuthorization::Management(common_action) = &common.authorization else {
+            panic!()
+        };
+        let key = crate::StorageKey::derive(&[83; 32]).unwrap();
+        let snapshot = common.workspace.seal_branch_snapshot(&key).unwrap();
+        let (losing, _, _) = common
+            .workspace
+            .prepare_invitation(0, false, false)
+            .unwrap();
+        let MembershipAuthorization::Management(losing_action) = &losing.authorization else {
+            panic!()
+        };
+        let mut restored =
+            Workspace::restore_branch_snapshot(&key, owner.endpoint(), owner.id(), &snapshot)
+                .unwrap();
+        restored.restore_branch_history(&losing.workspace).unwrap();
+        assert!(
+            restored
+                .retained_invitation_checkpoint(common_action)
+                .is_some(),
+            "a link issued before the fork must remain available"
+        );
+        assert!(
+            restored
+                .retained_invitation_checkpoint(losing_action)
+                .is_none(),
+            "a losing-suffix link must not cross the fork"
+        );
+        restored.verify_retained_invitation_checkpoints().unwrap();
     }
 
     #[test]

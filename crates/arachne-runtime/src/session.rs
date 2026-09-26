@@ -354,7 +354,7 @@ pub(crate) fn commit_workspace(session: &mut Session, workspace: arachne_securit
     let workspace = Arc::new(workspace);
     session
         .committed
-        .publish(workspace.clone(), session.node.id());
+        .publish(workspace.clone(), session.node.id(), membership::fork::shared_orders(session));
     session.workspace = Some(workspace);
     // Any committed workspace change, including a name-only update, must be
     // advertised on the next native presence drain.  Otherwise peers keep
