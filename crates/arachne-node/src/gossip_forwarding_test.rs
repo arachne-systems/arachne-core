@@ -1,6 +1,55 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
-use arachne_node::{Error, Node, Permissions, Topic};
+use iroh::endpoint::{AfterHandshakeOutcome, BeforeConnectOutcome, EndpointHooks};
+
+use crate::{Error, Node, PeerId, Permissions, Topic};
+
+/// A per-endpoint test link control. Gossip can learn addresses from neighbors,
+/// so an address-hint chain alone does not enforce the fixture's network path.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BlockedPeer(Arc<RwLock<Option<PeerId>>>);
+
+impl BlockedPeer {
+    fn set(&self, peer: Option<PeerId>) {
+        *self.0.write().unwrap() = peer;
+    }
+
+    fn blocks(&self, peer: PeerId) -> bool {
+        *self.0.read().unwrap() == Some(peer)
+    }
+}
+
+impl EndpointHooks for BlockedPeer {
+    async fn before_connect<'a>(
+        &'a self,
+        remote: &'a iroh::EndpointAddr,
+        _alpn: &'a [u8],
+    ) -> BeforeConnectOutcome {
+        if self.blocks(*remote.id.as_bytes()) {
+            BeforeConnectOutcome::Reject
+        } else {
+            BeforeConnectOutcome::Accept
+        }
+    }
+
+    async fn after_handshake<'a>(
+        &'a self,
+        connection: &'a iroh::endpoint::Connection,
+    ) -> AfterHandshakeOutcome {
+        if self.blocks(*connection.remote_id().as_bytes()) {
+            AfterHandshakeOutcome::Reject {
+                error_code: 403u32.into(),
+                reason: b"test link blocked".to_vec(),
+            }
+        } else {
+            AfterHandshakeOutcome::Accept
+        }
+    }
+}
 
 #[tokio::test]
 async fn workspace_publication_crosses_an_intermediate_without_a_direct_route() {
@@ -15,6 +64,8 @@ async fn workspace_publication_crosses_an_intermediate_without_a_direct_route() 
         let (c, mut received) = Node::bind_with_identity("127.0.0.1:0".parse().unwrap(), &[73; 32])
             .await
             .unwrap();
+        a.connections.blocked_peer.set(Some(c.id()));
+        c.connections.blocked_peer.set(Some(a.id()));
         let workspace = [44; 32];
         let topic = Topic::new("streams/opaque").unwrap();
         let offline = *iroh::SecretKey::from_bytes(&[74; 32]).public().as_bytes();
@@ -30,7 +81,8 @@ async fn workspace_publication_crosses_an_intermediate_without_a_direct_route() 
                 .unwrap();
         }
 
-        // A and C know only B. The direct Arachne A-to-C path is unavailable.
+        // A and C initially know only B. The test-only Iroh hooks also block
+        // their direct link after Gossip learns the other endpoint's address.
         a.add_address_hint(b.id(), b.address()).await.unwrap();
         b.add_address_hint(a.id(), a.address()).await.unwrap();
         b.add_address_hint(c.id(), c.address()).await.unwrap();
@@ -132,7 +184,10 @@ async fn workspace_publication_crosses_an_intermediate_without_a_direct_route() 
             .add_address_hint(b.id(), b.address())
             .await
             .unwrap();
-        outsider.enable_gossip(workspace, 1, &workspace).await.unwrap();
+        outsider
+            .enable_gossip(workspace, 1, &workspace)
+            .await
+            .unwrap();
         assert!(matches!(
             outsider
                 .publish(workspace, 1, topic.clone(), b"denied".to_vec())
@@ -144,7 +199,16 @@ async fn workspace_publication_crosses_an_intermediate_without_a_direct_route() 
 
         // Losing the forwarding neighbor must repair to another authorized path.
         b.close().await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !a.live_neighbors(workspace).await.is_empty()
+            || !c.live_neighbors(workspace).await.is_empty()
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "forwarding link did not close"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let disconnected = a
             .publish(
                 workspace,
@@ -153,10 +217,10 @@ async fn workspace_publication_crosses_an_intermediate_without_a_direct_route() 
                 b"before-route-refresh".to_vec(),
             )
             .await;
-        let disconnected = disconnected.unwrap();
-        assert!(disconnected.queued);
-        assert!(disconnected.failed.is_empty());
+        assert!(matches!(disconnected, Err(Error::MissingPeer)));
         assert!(received.try_recv().is_err());
+        a.connections.blocked_peer.set(None);
+        c.connections.blocked_peer.set(None);
         a.add_address_hint(c.id(), c.address()).await.unwrap();
         c.add_address_hint(a.id(), a.address()).await.unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -211,7 +275,10 @@ async fn workspace_publication_crosses_an_intermediate_without_a_direct_route() 
             .await
             .unwrap();
         removed.add_address_hint(c.id(), c.address()).await.unwrap();
-        removed.enable_gossip(workspace, 1, &workspace).await.unwrap();
+        removed
+            .enable_gossip(workspace, 1, &workspace)
+            .await
+            .unwrap();
         assert!(matches!(
             removed
                 .publish(workspace, 1, topic.clone(), b"stale-member".to_vec())

@@ -110,19 +110,33 @@ run both `record_storage` tests, and use the exact `native_persistence` filter
 `hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots`.
 Keep the CPU set and cache settings the same for each comparison.
 
-The lower-crate check compiled and ran all 27 unit and integration test binaries
+The initial lower-crate check compiled and ran all 27 unit and integration test binaries
 for `arachne-node`, `arachne-security`, `arachne-delivery`, and `arachne-store`
 with the default test thread count on CPUs 8–11: **204 passed, 1 failed, 7
 ignored**. All four crate unit-test binaries passed. No check showed a need to
 serialize tests across a binary.
 
-The red integration test is
+The red integration test was
 `gossip_forwarding::workspace_publication_crosses_an_intermediate_without_a_direct_route`.
 It also failed when its binary ran with `--test-threads=1`. At line 52, it assumes
 that C cannot have A as a neighbor after the fixture seeds A↔B↔C addresses.
 Gossip can learn addresses and create the A↔C path. The fixture must enforce
 its intended chain before its forwarding assertions can give valid evidence.
-This check is still red; the full workspace suite is not reported as green.
+At this checkpoint, the full workspace suite was not green.
+
+The follow-up fixture uses Iroh endpoint hooks under `cfg(test)` to block the
+A–C link until the route-refresh step. The scenario now runs in the node unit
+test binary, so no production option or routing rule is needed. Once the only
+neighbor closes, the fixture waits for neighbor loss and checks the existing
+`MissingPeer` result. It preserves forwarding through B, original authorship,
+duplicate suppression, queue pressure, outsider rejection, reconnection, and
+removed-member rejection. The exact scenario passed with serial and default
+test threads (7.391 s and 7.384 s).
+
+The complete follow-up for the same four lower crates passed **205 tests, with
+0 failures and 7 ignored**, across 26 unit and integration test binaries. It
+used default features and the default test thread count on CPUs 8–11. The
+forwarding scenario also passed alongside the other node unit tests.
 
 ### Dependency checks
 

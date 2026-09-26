@@ -17,6 +17,8 @@ use std::{
 
 mod budget;
 mod connections;
+#[cfg(test)]
+mod gossip_forwarding_test;
 mod mdns;
 mod control;
 mod endpoint;
