@@ -224,24 +224,25 @@ impl Streams {
             .map_err(transport)
     }
 
-    pub(super) async fn any_enabled(
+    pub(super) async fn enabled_peers(
         &self,
         workspace: WorkspaceId,
         revision: u64,
         topic: &Topic,
-        peers: &[PeerId],
-    ) -> bool {
+    ) -> Vec<PeerId> {
         let routes = self.0.routes.lock().await;
-        peers.iter().any(|peer| {
-            routes.get(peer).is_some_and(|route| {
-                route.scope
+        routes
+            .iter()
+            .filter_map(|(peer, route)| {
+                (route.scope
                     == (Scope {
                         workspace,
                         revision,
                     })
-                    && route.topic == *topic
+                    && route.topic == *topic)
+                    .then_some(*peer)
             })
-        })
+            .collect()
     }
 
     pub(super) async fn publish_selected(
@@ -573,11 +574,14 @@ async fn receive_session(
         .map_err(|_| Error::Timeout("subscribe MoQ broadcast"))?
         .map_err(transport)?;
     let track = broadcast.track(topic.as_str()).map_err(transport)?;
-    // The zero-age default skips a group as soon as its successor arrives.
-    // Keep the publisher's bounded window so bursts do not discard adjacent frames.
+    // Lite05 encodes start 0 as omitted, which starts at the latest group even
+    // with max_age set. Protected sequences start at 1: request that floor and
+    // let max_age bound the recent window instead of discarding its prefix.
     let mut subscriber = track
         .subscribe(Some(
-            track::Subscription::default().with_max_age(track::DEFAULT_MAX_AGE),
+            track::Subscription::default()
+                .with_start(track::Position::group(1))
+                .with_max_age(track::DEFAULT_MAX_AGE),
         ))
         .await
         .map_err(transport)?;

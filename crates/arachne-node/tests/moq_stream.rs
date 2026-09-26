@@ -497,6 +497,123 @@ async fn opted_in_peers_exchange_packets_over_moq_and_reject_an_outsider() {
     .unwrap();
 }
 
+#[tokio::test]
+async fn enabled_stream_keeps_recent_publications_until_interest_arrives() {
+    tokio::time::timeout(Duration::from_secs(12), async {
+        let (sender, _) = Node::bind_with_identity(unused_address(), &[83; 32])
+            .await
+            .unwrap();
+        let (receiver, mut incoming) = Node::bind_with_identity(unused_address(), &[84; 32])
+            .await
+            .unwrap();
+        let workspace = [48; 32];
+        let topic = Topic::new("streams/example").unwrap();
+        let policy = BTreeMap::from([
+            (sender.id(), access(&topic)),
+            (receiver.id(), access(&topic)),
+        ]);
+        sender
+            .install_verified_policy(workspace, 1, policy.clone())
+            .await
+            .unwrap();
+        receiver
+            .install_verified_policy(workspace, 1, policy)
+            .await
+            .unwrap();
+        sender
+            .add_address_hint(receiver.id(), receiver.address())
+            .await
+            .unwrap();
+        receiver
+            .add_address_hint(sender.id(), sender.address())
+            .await
+            .unwrap();
+        sender
+            .enable_moq_delivery(workspace, 1, receiver.id(), topic.clone())
+            .await
+            .unwrap();
+        // A restored reader can be authorized before its interest reaches the publisher.
+        for sequence in 1..=3 {
+            sender
+                .publish_protected_with_class(
+                    workspace,
+                    1,
+                    topic.clone(),
+                    sequence,
+                    DeliveryClass::Critical,
+                    vec![sequence as u8],
+                )
+                .await
+                .unwrap();
+        }
+        for sequence in 4..=6 {
+            sender
+                .publish_protected_to_with_class(
+                    workspace,
+                    1,
+                    topic.clone(),
+                    sequence,
+                    vec![receiver.id()],
+                    vec![[1; 32]],
+                    DeliveryClass::Critical,
+                    vec![sequence as u8],
+                )
+                .await
+                .unwrap();
+        }
+        assert!(
+            sender
+                .publish_protected_with_class(
+                    workspace,
+                    1,
+                    topic.clone(),
+                    7,
+                    DeliveryClass::Critical,
+                    vec![0; 16 * 1024 + 1]
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            sender
+                .publish_protected_to_with_class(
+                    workspace,
+                    1,
+                    topic.clone(),
+                    7,
+                    vec![receiver.id()],
+                    vec![],
+                    DeliveryClass::Critical,
+                    vec![7]
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(sender.moq_metrics().packets_sent, 6);
+        receiver
+            .subscribe(workspace, 1, topic.clone())
+            .await
+            .unwrap();
+        receiver
+            .enable_moq_delivery(workspace, 1, sender.id(), topic.clone())
+            .await
+            .unwrap();
+        wait_for_sessions(&sender, &receiver, 1).await;
+        let mut received = BTreeSet::new();
+        while received.len() < 6 {
+            if let Ok(message) = incoming.try_recv() {
+                received.insert(message.payload);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(received, (1..=6).map(|value| vec![value]).collect());
+        sender.close().await;
+        receiver.close().await;
+    })
+    .await
+    .expect("an enabled stream dropped its prefix before the reader subscribed");
+}
+
 async fn outsider_moq_connect(
     address: iroh::EndpointAddr,
     workspace: [u8; 32],
