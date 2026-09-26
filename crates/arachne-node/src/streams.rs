@@ -449,18 +449,15 @@ async fn reconnect_peer(
 ) {
     let mut delay = Duration::from_millis(250);
     loop {
-        let reason = session.closed().await;
-        if let Some(counters) = counters.upgrade() {
-            *counters.last_error.lock().unwrap() = Some(format!(
-                "reconnect {}: closed {reason}; transport={:?}",
-                address.id,
-                session.conn().close_reason(),
-            ));
-        }
+        let _reason = session.closed().await;
         tokio::time::sleep(delay).await;
         let permit = match connections.dial_capacity(iroh_moq::ALPN) {
             Ok(permit) => permit,
-            Err(_) => {
+            Err(error) => {
+                if let Some(counters) = counters.upgrade() {
+                    *counters.last_error.lock().unwrap() =
+                        Some(format!("reconnect {}: capacity failed {error:?}", address.id));
+                }
                 delay = (delay * 2).min(Duration::from_secs(5));
                 continue;
             }
