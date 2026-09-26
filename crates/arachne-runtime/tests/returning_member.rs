@@ -365,6 +365,7 @@ fn simultaneous_presence_and_self_updates_converge_and_survive_restart() {
         call(from, json!({"op":"poll_workspace_presence","announce":true}));
     }
 
+    let admin_info: Value = serde_json::from_str(&describe(admin).unwrap()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut self_updated = [false; 3];
     let mut events = Vec::new();
@@ -382,14 +383,29 @@ fn simultaneous_presence_and_self_updates_converge_and_survive_restart() {
             && rosters.iter().all(|roster| roster["members"].as_array().unwrap().len() == 3)
             && rosters.iter().all(|roster| roster["epoch"] == rosters[0]["epoch"])
         {
-            break rosters[0]["epoch"].clone();
+            // Equal heights can still hold different self-update branches.
+            // Let the driver finish fork recovery before calling this converged.
+            let mut authority_matches = true;
+            for (index, peer) in [(1, existing), (2, newer)] {
+                call(peer, json!({"op":"fetch_membership_update","peer":admin_info["endpoint_key"],"replace_pending":true}));
+                let agreed = loop {
+                    let value = call(peer, json!({"op":"poll_membership_update"}));
+                    if !value.is_null() { break value; }
+                    assert!(Instant::now() < deadline, "membership agreement stalled: events={events:?}");
+                    std::thread::sleep(Duration::from_millis(5));
+                };
+                let state = agreed["state"].as_str().unwrap();
+                assert!(matches!(state, "membership_current" | "membership_branch_mismatch"), "{agreed}");
+                authority_matches &= state == "membership_current";
+                events.push((index, state.to_owned(), agreed["epoch"].clone()));
+            }
+            if authority_matches { break rosters[0]["epoch"].clone(); }
         }
         assert!(Instant::now() < deadline, "three-member sync stalled: rosters={rosters:?}; events={events:?}");
         std::thread::sleep(Duration::from_millis(5));
     };
     // Equal epoch numbers alone do not prove equal membership authority.
     // A current reply verifies the peer's epoch fingerprint against ours.
-    let admin_info: Value = serde_json::from_str(&describe(admin).unwrap()).unwrap();
     for peer in [existing, newer] {
         call(peer, json!({"op":"fetch_membership_update","peer":admin_info["endpoint_key"],"replace_pending":true}));
         let agreed = poll(peer, "poll_membership_update");
