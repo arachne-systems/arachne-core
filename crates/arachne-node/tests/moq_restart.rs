@@ -22,6 +22,16 @@ impl Drop for PeerProcess {
 }
 
 fn spawn_peer(root: &Path, secret: [u8; 32], parent: &Node) -> PeerProcess {
+    spawn_peer_with_witness(root, secret, parent, None, 0)
+}
+
+fn spawn_peer_with_witness(
+    root: &Path,
+    secret: [u8; 32],
+    parent: &Node,
+    witness: Option<&Node>,
+    sequence: u64,
+) -> PeerProcess {
     std::fs::create_dir(root).unwrap();
     let config = root.join("config.json");
     std::fs::write(
@@ -30,6 +40,8 @@ fn spawn_peer(root: &Path, secret: [u8; 32], parent: &Node) -> PeerProcess {
             "secret": secret,
             "parent": parent.id(),
             "address": parent.address().to_string(),
+            "witness": witness.map(|node| (node.id(), node.address().to_string())),
+            "sequence": sequence,
         }))
         .unwrap(),
     )
@@ -141,6 +153,98 @@ async fn either_peer_can_restore_a_stream_after_an_unannounced_restart() {
 }
 
 #[tokio::test]
+async fn repeated_restart_delivers_the_whole_burst_with_a_third_peer() {
+    three_peer_restarts(Duration::ZERO).await;
+}
+
+#[tokio::test]
+async fn repeated_restart_delivers_paced_packets_with_a_third_peer() {
+    three_peer_restarts(Duration::from_millis(75)).await;
+}
+
+async fn three_peer_restarts(cadence: Duration) {
+    tokio::time::timeout(Duration::from_secs(45), async {
+        let secrets = [[81; 32], [82; 32], [83; 32]];
+        let child_id = *iroh::SecretKey::from_bytes(&secrets[2]).public().as_bytes();
+        let (parent, mut parent_messages) =
+            Node::bind_with_identity("127.0.0.1:0".parse().unwrap(), &secrets[0])
+                .await
+                .unwrap();
+        let (witness, mut witness_messages) =
+            Node::bind_with_identity("127.0.0.1:0".parse().unwrap(), &secrets[1])
+                .await
+                .unwrap();
+        let policy = BTreeMap::from([
+            (parent.id(), Permissions::AllTopics),
+            (witness.id(), Permissions::AllTopics),
+            (child_id, Permissions::AllTopics),
+        ]);
+        let topic = Topic::new("shared/stream").unwrap();
+        for (node, other) in [(&parent, &witness), (&witness, &parent)] {
+            node.install_verified_policy(WORKSPACE, 1, policy.clone()).await.unwrap();
+            node.subscribe(WORKSPACE, 1, topic.clone()).await.unwrap();
+            node.add_address_hint(other.id(), other.address()).await.unwrap();
+            node.enable_moq_delivery(WORKSPACE, 1, other.id(), topic.clone()).await.unwrap();
+        }
+        let root = tempfile::tempdir().unwrap();
+        for round in 0..12u64 {
+            let directory = root.path().join(format!("restart-{round}"));
+            let child = spawn_peer_with_witness(
+                &directory, secrets[2], &parent, Some(&witness), round * 1000,
+            );
+            wait_file(&directory.join("address")).await;
+            let address = std::fs::read_to_string(directory.join("address")).unwrap();
+            for node in [&parent, &witness] {
+                node.add_address_hint(child_id, address.parse().unwrap()).await.unwrap();
+                node.enable_moq_delivery(WORKSPACE, 1, child_id, topic.clone()).await.unwrap();
+            }
+            let mut parent_received = std::collections::BTreeSet::new();
+            let mut witness_received = std::collections::BTreeSet::new();
+            let result = tokio::time::timeout(Duration::from_secs(3), async {
+                // This is the app harness's aggregate readiness condition for
+                // two selected tablets in a three-member workspace. There is
+                // deliberately no settling delay before the first publication.
+                wait_file(&directory.join("ready")).await;
+                while parent.moq_metrics().sessions_active == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                for packet in 0..13u8 {
+                    let mut payload = vec![0; 2048];
+                    payload[..2].copy_from_slice(&[round as u8, packet]);
+                    parent.publish_protected_with_class(
+                        WORKSPACE, 1, topic.clone(), round * 13 + u64::from(packet) + 1,
+                        DeliveryClass::Critical, payload,
+                    ).await.unwrap();
+                    if !cadence.is_zero() {
+                        tokio::time::sleep(cadence).await;
+                    }
+                }
+                while parent_received.len() != 13 || witness_received.len() != 13 {
+                    tokio::select! {
+                        message = parent_messages.recv() => {
+                            let message = message.unwrap();
+                            if message.sender == child_id && message.payload.first() == Some(&(round as u8)) {
+                                parent_received.insert(message.payload[1]);
+                            }
+                        }
+                        message = witness_messages.recv() => {
+                            let message = message.unwrap();
+                            if message.sender == child_id && message.payload.first() == Some(&(round as u8)) {
+                                witness_received.insert(message.payload[1]);
+                            }
+                        }
+                    }
+                }
+            }).await;
+            drop(child);
+            assert!(result.is_ok(), "restart {round}: parent got {parent_received:?}, witness got {witness_received:?}; parent metrics {:?}, witness metrics {:?}", parent.moq_metrics(), witness.moq_metrics());
+        }
+        parent.close().await;
+        witness.close().await;
+    }).await.expect("three-peer restart fixture timed out");
+}
+
+#[tokio::test]
 #[ignore = "subprocess helper for the restart test"]
 async fn restarted_peer_process() {
     let config =
@@ -156,27 +260,37 @@ async fn restarted_peer_process() {
     node.add_address_hint(parent, config["address"].as_str().unwrap().parse().unwrap())
         .await
         .unwrap();
-    node.install_verified_policy(
-        WORKSPACE,
-        1,
-        BTreeMap::from([
-            (node.id(), Permissions::AllTopics),
-            (parent, Permissions::AllTopics),
-        ]),
-    )
-    .await
-    .unwrap();
+    let witness: Option<([u8; 32], String)> =
+        serde_json::from_value(config["witness"].clone()).unwrap();
+    let mut policy = BTreeMap::from([
+        (node.id(), Permissions::AllTopics),
+        (parent, Permissions::AllTopics),
+    ]);
+    if let Some((peer, address)) = &witness {
+        policy.insert(*peer, Permissions::AllTopics);
+        node.add_address_hint(*peer, address.parse().unwrap())
+            .await
+            .unwrap();
+    }
+    node.install_verified_policy(WORKSPACE, 1, policy)
+        .await
+        .unwrap();
     let topic = Topic::new("shared/stream").unwrap();
     node.subscribe(WORKSPACE, 1, topic.clone()).await.unwrap();
     node.enable_moq_delivery(WORKSPACE, 1, parent, topic.clone())
         .await
         .unwrap();
+    if let Some((peer, _)) = witness {
+        node.enable_moq_delivery(WORKSPACE, 1, peer, topic.clone())
+            .await
+            .unwrap();
+    }
     std::fs::write(root.join("address"), node.address().to_string()).unwrap();
     while node.moq_metrics().sessions_active == 0 {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     std::fs::write(root.join("ready"), b"ready").unwrap();
-    let mut sequence = 0;
+    let mut sequence = config["sequence"].as_u64().unwrap();
     loop {
         let message = messages.recv().await.unwrap();
         if message.sender == parent {
