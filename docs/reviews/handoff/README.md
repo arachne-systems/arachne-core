@@ -5,8 +5,9 @@
 ## BLUF
 
 H1, H2, H3, H4 and H6 are merged locally on `integrate/wave1`. H5 has a
-separate generated SDK checkpoint. H7 passes on combined Core `05434f86`:
-706 tests passed, zero failed, 21 ignored. H8 and consumer upgrade gates need
+separate generated SDK checkpoint. H7's deadline follow-up `2b568922` passes
+710 tests, zero failed, 21 ignored. Final strict checks await the remaining
+stream work. H8 and consumer upgrade gates need
 owner decisions.
 The [work tracker](../2026-09-24-work-tracker.md) separates implementation
 evidence from these open gates.
@@ -19,7 +20,7 @@ evidence from these open gates.
 | Tracker (status of every finding) | `docs/reviews/2026-09-24-work-tracker.md` |
 | Design decisions | `docs/reviews/adr-a1-a4-sdk-contract.md`, `docs/reviews/adr-a2-commit-ordering.md`, `docs/reviews/spike-a1-uniffi.md` |
 | Delivery spec | `docs/delivery.md` (on `integrate/wave1`) |
-| Review docs branch | `review/core-architecture`, worktree `~/development/worktrees/arachne-core-arch-review` |
+| Review docs branch | `review/core-architecture` is retained; its documents are in the integration worktree |
 | Integration branch (all merged work) | `integrate/wave1`, worktree `~/development/worktrees/arachne-core-integrate`, H7 base `ad31b97`; later checkpoints are in the work tracker |
 | Core repo | `https://github.com/arachne-systems/arachne-core` (local worktrees under `~/development/worktrees/arachne-core-*`) |
 | SDK repo | `https://github.com/arachne-systems/arachne-sdk` (worktrees `~/development/worktrees/arachne-sdk-*`) |
@@ -34,9 +35,9 @@ Nothing is pushed. All branches are local.
 | [H2](H2-a5-storage.md) | Native storage, opaque candidates, physical parts, branch records | `codex/night-h2-storage` | `840c25a` merged as `0d5e071`; old-data upgrade is a release gate | — |
 | [H3](H3-test-speed.md) | Optimize dependencies in test builds | `a6619db` | merged as `688946b`; same-source before/after measurements are in `docs/development.md` | — |
 | [H4](H4-core-ffi-api.md) | Core-owned typed API and UniFFI metadata | `codex/night-h2-storage` | `91ce5b1` merged as `e420a52`; dispatcher caller migration remains open | H2 |
-| [H5](H5-sdk-completion.md) | Generated bindings and Android packaging | SDK `codex/night-h5-bindings` | `3c750fb` on Core `e420a52`; four languages and AAR builds green, SDK-line/ATAK decisions open | H1, H2, H4 |
+| [H5](H5-sdk-completion.md) | Generated bindings and Android packaging | SDK `codex/night-h5-refresh` | `0d857b7` on Core `05434f86`; 15 generated files, four languages and AAR builds green. MoQ is opt-in; the default AAR excludes it. SDK-line/ATAK decisions open | H1, H2, H4 |
 | [H6](H6-crypto-dependency-bumps.md) | SHA-2 0.11, HKDF/HMAC 0.13 and SFrame check | `codex/night-h6-crypto` | `fc06673` merged as `ad31b97`; MSRV, deny and corrected full suite green | H1, H2 |
-| [H7](H7-final-integration.md) | Integrated qualification, cleanup and merge summary | `codex/night-h7-integration` | final source `05434f86`: 706/0/21 across 120 executables; Clippy, MSRV, deny and format green; target cleaned | all |
+| [H7](H7-final-integration.md) | Integrated qualification, cleanup and merge summary | `codex/night-h7-integration` | first source `05434f86`: 706/0/21 and strict checks green; deadline source `2b568922`: 710/0/21; counters compile at `7f99bfa`; final stream qualification pending, target kept warm | all |
 | [H8](H8-owner-decisions.md) | Owner decisions and outward actions | — | open | — |
 
 ## Rules every agent must follow

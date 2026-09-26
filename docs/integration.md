@@ -86,14 +86,25 @@ thread can wake or close the client.
 | `wait_for_work(timeout)` | Wait for any work, then poll or use `next_event`. `false` can mean timeout, wake or close. |
 | `wake()` | Release one parked waiter without creating a work item. |
 | `drive_workspace()` | Service native membership work and read `WorkspaceProgress`, including activity and branch outcomes. |
-| `cancel()` | Interrupt the current blocking exchange. The cancellation does not remain set for the next operation. |
-| `set_deadline(...)` | Set the deadline for later blocking operations. A deadline failure leaves the session usable. |
+| `cancel()` | Interrupt control exchanges for this session. The next operation clears the cancellation latch. |
+| `set_deadline(...)` | Set the deadline for later foreground waits. A deadline failure leaves the session and background work usable. |
 | `close()` | Close once, wake waiters and drain transport for at most `close_drain` (5 s by default). Repeated close is safe. |
 
 Rust timeout and deadline values are `Option<Duration>`. `None` means no
 specified timeout or deadline. `TransportOptions.deadline` also applies when
 the endpoint binds. The separate transport timeouts bound dial, exchange,
 gossip join and close drain.
+
+An operation deadline limits its foreground network waits. It does not cancel
+background presence, membership or recovery requests, including requests
+started during that operation. Explicit `cancel()` and `close()` retain their
+session-wide control cancellation. See the
+[deadline isolation proof](evidence/foreground-deadline-isolation-2026-09-26.md).
+
+The deadline starts when the operation is called. The session mutex can delay
+the caller beyond that time. After the caller gets the lock, an expired
+operation fails before its body starts. The deadline does not interrupt
+synchronous cryptography or storage work.
 
 Queue events repeat until their work is drained. Job-ready events occur once
 per completed job. An event carries a scheduling signal; received content

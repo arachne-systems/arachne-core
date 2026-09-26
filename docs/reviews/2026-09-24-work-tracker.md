@@ -7,9 +7,10 @@ test is red → green and the crate tests pass.
 
 H1, H2, H3, H4 and H6 are merged locally on `integrate/wave1`. Core has API
 version 6, native storage, opaque candidates, generated binding metadata and
-bounded fork recovery. H5 proves the generated SDK on Core `e420a52`. H7 passes
-on final Core `05434f86`: 706 passed, zero failed, 21 ignored. Owner decisions
-and unproved consumer upgrades stay open below.
+bounded fork recovery. H5 proves SDK `0d857b7` on Core `05434f86`. H7 passes
+on the deadline follow-up `2b568922`: 710 passed, zero failed, 21 ignored.
+The receive-counter source `7f99bfa` compiles; final strict checks await the
+next source freeze. Owner decisions and unproved consumer upgrades stay open.
 
 ## Integration evidence (2026-09-26)
 
@@ -19,10 +20,10 @@ and unproved consumer upgrades stay open below.
 | H2 | `840c25a`; merge `0d5e071` | [Native storage report](../evidence/h2-night-2026-09-26.md) |
 | H3 | `a6619db`; merge `688946b` | [Measured test profile](handoff/H3-test-speed.md) |
 | H4 | `91ce5b1`; merge `e420a52` | [Core binding report](../evidence/h4-night-2026-09-26.md) |
-| H5 (SDK) | SDK `3c750fb`, Core `e420a52` | Four language flows, Rust, AAR, R8 and Android test APK passed; device/ATAK gates remain |
+| H5 (SDK) | SDK `0d857b7`, Core `05434f86` | Fifteen generated files refreshed; four language flows, Rust, AAR, R8 and Android test APK passed. MoQ is forwarded as an opt-in feature; the default AAR excludes it. Device/ATAK gates remain |
 | H6 | `fc06673`; merge `ad31b97` | [Crypto report](../evidence/h6-night-2026-09-26.md): 681 passed, 0 failed, 20 ignored; MSRV and deny green |
 | Typed publication options | `db57185`; merge `05434f8` | [Audience, Bulk and Current proof](2026-09-26-typed-publication-options.md); included in H7 |
-| H7 | Final source `05434f86`; code cleanup `7ef4004`, `381f451`, `0cb8c7f`, `911ecce`; format `70b8c75` | [Final report](../evidence/h7-night-2026-09-26.md): uninterrupted 706 passed, 0 failed, 21 ignored across 120 executables; strict Clippy, deny, MSRV and format green; 12.0 GiB target cleaned |
+| H7 | First source `05434f86`; deadline follow-up `2b568922`; counter source `7f99bfa` | [Report](../evidence/h7-night-2026-09-26.md): first 706/0/21 plus all strict gates; later uninterrupted 710/0/21 across 120 executables. Counters compile and format green; final strict checks pending. First 12.0 GiB target cleaned; current target retained for stream diagnosis |
 
 The H6 total includes 18 tests in 20 example harnesses. It is a corrected
 aggregate with the original failures and reruns retained in its receipts.
@@ -100,7 +101,7 @@ and a different Core pin. Core work that each plan step depends on:
 - [x] Extend generated Client groups (Core `91ce5b1`, SDK `3c750fb`): 95 Client methods plus Context, storage, candidates, admission, management, current/direct/range recovery and resources.
 - [x] Core step 6 binding blockers (Core `91ce5b1`): Core-owned UniFFI derives, stable IDs/errors/network enum, `Event::ALL`, fixed-width counts, typed driver results and opaque received proofs. Four generated language flows pass in H5.
 - [x] Delete SDK `ffi.rs`, C header and hand bindings (SDK `3c750fb`). The SDK no longer copies Core domain or persistence logic.
-- [ ] Reconcile the live Kotlin branch and select the SDK line. The owner decides. H5's default SDK build still needs the PTT line's `moq` feature forwarding before streaming calls are available.
+- [ ] Reconcile the live Kotlin branch and select the SDK line. The owner decides. H5 now forwards the `moq` feature as an opt-in. The default AAR excludes MoQ; select and qualify the intended consumer build.
 
 ## SDK-facing notes from core changes
 

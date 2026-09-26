@@ -2,11 +2,13 @@
 
 ## BLUF
 
-H1–H6 are implemented and merged locally. H7 passes on Core `05434f86`:
-706 tests passed, zero failed and 21 were ignored. Strict lint, Rust 1.91,
-dependency and format checks pass. This lane removed its 12.0 GiB build cache.
-No branch has been pushed or published. Existing tablet data is not yet
-qualified for the new storage format.
+Core H1, H2, H3, H4 and H6 are merged locally; H5 has a separate SDK proof.
+The H7 deadline follow-up on `2b568922` passes 710 tests, with zero failures
+and 21 ignored. The earlier `05434f86` passed all strict checks. New receive
+counters on `7f99bfa` compile. Final qualification waits for the stream fixes.
+Keep the current target warm; the first 12.0 GiB cache was removed. No branch
+has been pushed or published. Existing tablet data is not yet qualified for
+the new storage format.
 
 ## What changed
 
@@ -44,13 +46,15 @@ qualified for the new storage format.
 The [H7 report](../evidence/h7-night-2026-09-26.md) keeps the initial integrated
 RED, unchanged repetitions, fixes, final checks and their source revisions.
 The [tracker](2026-09-24-work-tracker.md) links each earlier package's proof.
-H5's SDK checkpoint `3c750fb` passed four generated language flows and Android
-packaging on Core `e420a52`. That result does not replace a final SDK pin check
-or the existing-data device upgrade gate.
+H5's SDK checkpoint `0d857b7` refreshed all 15 generated files and passed four
+language flows and Android packaging on Core `05434f86`. Its `moq` feature
+forwards to Core. The default AAR excludes streaming support. These results
+do not replace the final SDK pin check or the existing-data device upgrade gate.
 
-Final test source is `05434f86f4297b33620502dc3385f31953ff5889`. Strict Clippy,
+The first qualified test source is `05434f86f4297b33620502dc3385f31953ff5889`. Strict Clippy,
 Rust 1.91 workspace/default-feature compilation, dependency policy and format
 checks pass. The final 120-executable run is uninterrupted: 706 passed, zero
 failed and 21 ignored. The report retains the earlier 687/2/21 and 701/1/21
-runs separately from the corrected run. H7 documentation follows the frozen
-source; it does not change production code.
+runs separately from the corrected run. The deadline follow-up adds an uninterrupted 710/0/21 result on `2b568922`.
+The counter follow-up has compile and format evidence only; a final full
+qualification will follow the remaining stream work.
