@@ -15,7 +15,7 @@
 //! needs a gap-filler exemption like the per-author one (B7c).
 use arachne_delivery::inbox::{InboxStage, ObjectInbox, PENDING_INBOX_FULL};
 use arachne_routing::{PublicationContext, Topic};
-use arachne_security::{PendingJoin, PreparedManagementUpdate, Workspace};
+use arachne_security::{EndpointKey, EndpointSigner, PendingJoin, PreparedManagementUpdate, Workspace};
 
 const REVISION: u64 = 1;
 
@@ -29,15 +29,17 @@ fn active(update: PreparedManagementUpdate) -> Workspace {
 /// Admin (author 1) admits authors 2 and 3, then the reader. Every earlier
 /// member applies each later step. Returns ([authors], reader) at one epoch.
 fn three_authors_and_reader() -> (Vec<Workspace>, Workspace) {
-    let mut admin = Workspace::create([1; 32], "Author 1").unwrap();
+    let admin_key = EndpointKey::generate().unwrap();
+    let mut admin = Workspace::create(&admin_key, "Author 1").unwrap();
     let mut members: Vec<Workspace> = Vec::new();
-    for (endpoint, name) in [([2; 32], "Author 2"), ([3; 32], "Author 3"), ([4; 32], "Reader")] {
+    for name in ["Author 2", "Author 3", "Reader"] {
+        let key = EndpointKey::generate().unwrap();
         let (registered, invite, checkpoint) =
             admin.prepare_invitation(u64::MAX, false, false).unwrap();
         let invited = registered.workspace.provisional_copy().unwrap();
-        let join = PendingJoin::from_invitation(&invite, &checkpoint, endpoint, name).unwrap();
+        let join = PendingJoin::from_invitation(&invite, &checkpoint, &key, name).unwrap();
         let admission = invited
-            .prepare_admission(endpoint, join.admission_request().unwrap())
+            .prepare_admission(key.endpoint(), join.admission_request().unwrap())
             .unwrap();
         let mut proof = join.join_proof().unwrap();
         proof
