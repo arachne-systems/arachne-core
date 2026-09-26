@@ -444,6 +444,9 @@ async fn opted_in_peers_exchange_packets_over_moq_and_reject_an_outsider() {
         let receive_metrics = receiver.moq_metrics();
         assert_eq!(send_metrics.packets_sent, 1);
         assert_eq!(receive_metrics.packets_received, 1);
+        assert_eq!(receive_metrics.groups_received, 1);
+        assert_eq!(receive_metrics.frames_received, 1);
+        assert_eq!(receive_metrics.groups_completed, 1);
         assert_eq!(send_metrics.sessions_total, 1);
         assert_eq!(receive_metrics.sessions_total, 1);
         println!(

@@ -1612,6 +1612,9 @@ impl Client {
                 "sessions_active": metrics.sessions_active,
                 "packets_sent": metrics.packets_sent,
                 "packets_received": metrics.packets_received,
+                "groups_received": metrics.groups_received,
+                "frames_received": metrics.frames_received,
+                "groups_completed": metrics.groups_completed,
                 "rejected_sessions": metrics.rejected_sessions,
             }))
         })
