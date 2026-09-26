@@ -2,18 +2,29 @@
 //! only steps verified against our own history can replace authority.
 use super::*;
 use arachne_security::{
-    BranchDecision, BranchState, PreparedManagementUpdate, SecurityRecords, Workspace,
+    BranchDecision, BranchState, MembershipAuthorization, OrderStep, PreparedManagementUpdate,
+    SecurityRecords, Workspace,
 };
 use zeroize::Zeroizing;
 
 pub(crate) const PREFIX: &[u8] = b"runtime/branch/";
 const META: &[u8] = b"runtime/branch/meta";
 const SNAPSHOT: &[u8] = b"runtime/branch/snapshot/";
+const ORDER: &[u8] = b"runtime/branch/order/";
+pub(super) const GOSSIP_ORDER: &[u8] = b"DFGO\x01";
+const MAX_CARRIED_ORDERS: usize = 64;
+
+struct BranchCandidate {
+    token: Vec<u8>,
+    branch: BranchState,
+    orders: Vec<OrderStep>,
+}
 
 #[derive(Default)]
 pub(crate) struct ForkState {
     pub(crate) retained: Option<BranchState>,
-    candidate: Option<(Vec<u8>, BranchState)>,
+    carried: Vec<OrderStep>,
+    candidate: Option<BranchCandidate>,
     query: Option<PendingControl<wire::BranchQuery>>,
     pull: Option<PendingControl<wire::RangeQuery>>,
 }
@@ -41,7 +52,7 @@ pub(crate) fn prepare_candidate(session: &mut Session) -> Result<(), ApiError> {
         .fork
         .candidate
         .as_ref()
-        .is_some_and(|(token, _)| *token == staged.snapshot)
+        .is_some_and(|candidate| candidate.token == staged.snapshot)
     {
         return Ok(());
     }
@@ -68,23 +79,37 @@ pub(crate) fn prepare_candidate(session: &mut Session) -> Result<(), ApiError> {
             Err(reason) => return Err(security(ErrorCode::StorageFailed)(reason)),
         }
     }
-    session.membership.fork.candidate = Some((staged.snapshot.clone(), branch));
+    let mut orders = Vec::new();
+    if let Some(previous) = &session.workspace {
+        for order in &session.membership.fork.carried {
+            match staged.workspace.advance_revocation(order, previous) {
+                Ok(order) => orders.push(order),
+                Err(reason) => eprintln!("arachne: carried revocation discarded: {reason}"),
+            }
+        }
+    }
+    session.membership.fork.candidate = Some(BranchCandidate {
+        token: staged.snapshot.clone(),
+        branch,
+        orders,
+    });
     Ok(())
 }
 
 pub(crate) fn adopt_candidate(session: &mut Session, token: &[u8]) -> Result<(), ApiError> {
-    let (expected, branch) = session
+    let candidate = session
         .membership
         .fork
         .candidate
         .take()
         .ok_or_else(|| ApiError::candidate_stale("branch candidate is missing"))?;
-    if expected != token {
+    if candidate.token != token {
         return Err(ApiError::candidate_stale(
             "branch candidate does not match workspace candidate",
         ));
     }
-    session.membership.fork.retained = Some(branch);
+    session.membership.fork.retained = Some(candidate.branch);
+    session.membership.fork.carried = candidate.orders;
     Ok(())
 }
 
@@ -96,7 +121,7 @@ pub(crate) fn records(session: &Session, candidate: bool) -> Result<SecurityReco
             .fork
             .candidate
             .as_ref()
-            .map(|(_, branch)| branch)
+            .map(|candidate| &candidate.branch)
     } else {
         session.membership.fork.retained.as_ref()
     };
@@ -118,6 +143,29 @@ pub(crate) fn records(session: &Session, candidate: bool) -> Result<SecurityReco
         name.extend(epoch.to_be_bytes());
         records.insert(name, Zeroizing::new(sealed.to_vec()));
     }
+    let orders = if candidate {
+        session
+            .membership
+            .fork
+            .candidate
+            .as_ref()
+            .map(|candidate| candidate.orders.as_slice())
+            .unwrap_or_default()
+    } else {
+        &session.membership.fork.carried
+    };
+    for order in orders {
+        let mut name = ORDER.to_vec();
+        name.extend(order.order.digest());
+        records.insert(
+            name,
+            Zeroizing::new(
+                order
+                    .to_bytes()
+                    .map_err(security(ErrorCode::StorageFailed))?,
+            ),
+        );
+    }
     Ok(records)
 }
 
@@ -129,8 +177,23 @@ pub(crate) fn restore(session: &mut Session, records: &SecurityRecords) -> Resul
         return Err(ApiError::storage_corrupt("missing branch metadata"));
     };
     let mut snapshots = Vec::new();
+    let mut orders = Vec::new();
     for (name, value) in records {
         if name == META {
+            continue;
+        }
+        if let Some(digest) = name.strip_prefix(ORDER) {
+            let order =
+                OrderStep::from_bytes(value).map_err(security(ErrorCode::StorageCorrupt))?;
+            if digest != order.order.digest()
+                || value.len() > MAX_WIRE_STEP
+                || orders.len() == MAX_CARRIED_ORDERS
+            {
+                return Err(ApiError::storage_corrupt(
+                    "invalid carried revocation record",
+                ));
+            }
+            orders.push(order);
             continue;
         }
         let epoch = name
@@ -145,10 +208,11 @@ pub(crate) fn restore(session: &mut Session, records: &SecurityRecords) -> Resul
     let branch =
         BranchState::from_parts(meta, &snapshots).map_err(security(ErrorCode::StorageCorrupt))?;
     session.membership.fork.retained = Some(branch);
+    session.membership.fork.carried = orders;
     Ok(())
 }
 
-pub(crate) fn require_send(session: &Session) -> Result<(), ApiError> {
+pub(crate) fn require_active_branch(session: &Session) -> Result<(), ApiError> {
     if session
         .membership
         .fork
@@ -161,6 +225,38 @@ pub(crate) fn require_send(session: &Session) -> Result<(), ApiError> {
         ));
     }
     Ok(())
+}
+
+pub(crate) fn require_send(session: &Session) -> Result<(), ApiError> {
+    require_active_branch(session)?;
+    if session
+        .membership
+        .fork
+        .carried
+        .iter()
+        .any(|order| order.order.kind.removes())
+    {
+        return Err(ApiError::wrong_state(
+            "workspace transmission waits for a carried revocation",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn has_carried_work(session: &Session) -> bool {
+    let own_id = session
+        .workspace
+        .as_ref()
+        .and_then(|owner| owner.member())
+        .map(|member| member.id());
+    own_id.is_some_and(|id| {
+        session
+            .membership
+            .fork
+            .carried
+            .iter()
+            .any(|order| !(order.order.kind.removes() && order.order.target == id))
+    })
 }
 
 /// Compare one conflicting step at its parent epoch. The remote class is
@@ -185,8 +281,39 @@ pub(crate) fn stage(session: &mut Session, epoch: u64, step: JoinStep) -> Result
         .retained
         .as_ref()
         .unwrap_or(&initial);
-    let (next, branch, publisher, inbox) = match branch.resolve(epoch, local, remote) {
-        BranchDecision::Keep => return Ok(json!({"state":"membership_branch_kept"})),
+    let (next, branch, publisher, inbox, orders) = match branch.resolve(epoch, local, remote) {
+        BranchDecision::Keep => {
+            // A losing commit still carries an independently signed intent.
+            // Keep the winning authority, but carry the intent onto it.
+            if local != remote
+                && let MembershipAuthorization::Revocation(order) = &authorization
+                && let Some(snapshot) = branch.snapshot(epoch)
+            {
+                let key = persistence::record_key(session)?;
+                let mut common =
+                    Workspace::restore_branch_snapshot(&key, owner.endpoint(), owner.id(), snapshot)
+                        .map_err(security(ErrorCode::StorageCorrupt))?;
+                if common.epoch() != epoch {
+                    return Err(ApiError::storage_corrupt(
+                        "branch snapshot has the wrong epoch",
+                    ));
+                }
+                common
+                    .restore_branch_history(owner)
+                    .map_err(security(ErrorCode::StorageCorrupt))?;
+                if let Ok(order) = owner.rebase_revocation(order, owner, &common)
+                    && let Some(staged) = receive_order(
+                        session,
+                        &order
+                            .to_bytes()
+                            .map_err(security(ErrorCode::InvalidInput))?,
+                    )?
+                {
+                    return Ok(staged);
+                }
+            }
+            return Ok(json!({"state":"membership_branch_kept"}));
+        }
         BranchDecision::Orphaned(branch) => (
             owner
                 .provisional_copy()
@@ -194,6 +321,7 @@ pub(crate) fn stage(session: &mut Session, epoch: u64, step: JoinStep) -> Result
             branch,
             session.delivery.publisher.clone(),
             session.delivery.inbox.clone(),
+            session.membership.fork.carried.clone(),
         ),
         BranchDecision::Switch(prepared) => {
             let key = persistence::record_key(session)?;
@@ -212,8 +340,7 @@ pub(crate) fn stage(session: &mut Session, epoch: u64, step: JoinStep) -> Result
             at_fork
                 .restore_branch_history(owner)
                 .map_err(security(ErrorCode::StorageCorrupt))?;
-            let next = match at_fork
-                .prepare_step_update(&authorization, &commit)
+            let next = match prepare_step(&at_fork, &authorization, &commit)
                 .map_err(security(ErrorCode::InvalidInput))?
             {
                 PreparedManagementUpdate::Active(next) => *next,
@@ -222,6 +349,22 @@ pub(crate) fn stage(session: &mut Session, epoch: u64, step: JoinStep) -> Result
                         .map_err(errors::encode);
                 }
             };
+            let mut orders = Vec::new();
+            let mut lost = session.membership.fork.carried.clone();
+            for previous in epoch..owner.epoch() {
+                if let Some((MembershipAuthorization::Revocation(order), _)) = owner
+                    .history_step(previous)
+                    .map_err(security(ErrorCode::StorageCorrupt))?
+                {
+                    lost.push(order);
+                }
+            }
+            for order in lost {
+                match next.rebase_revocation(&order, owner, &at_fork) {
+                    Ok(order) => retain_order(&next, &mut orders, order)?,
+                    Err(reason) => eprintln!("arachne: losing revocation discarded: {reason}"),
+                }
+            }
             let publisher = session
                 .delivery
                 .publisher
@@ -240,7 +383,7 @@ pub(crate) fn stage(session: &mut Session, epoch: u64, step: JoinStep) -> Result
                 .map(|inbox| inbox.rebase(owner, epoch, &next))
                 .transpose()
                 .map_err(crate::errors::delivery(ErrorCode::StorageCorrupt))?;
-            (next, prepared.into_parts().1, publisher, inbox)
+            (next, prepared.into_parts().1, publisher, inbox, orders)
         }
     };
     let orphaned = branch.is_orphaned();
@@ -258,7 +401,11 @@ pub(crate) fn stage(session: &mut Session, epoch: u64, step: JoinStep) -> Result
         "branch_switch_staged"
     });
     value["fork_epoch"] = json!(epoch);
-    session.membership.fork.candidate = Some((snapshot.clone(), branch));
+    session.membership.fork.candidate = Some(BranchCandidate {
+        token: snapshot.clone(),
+        branch,
+        orders,
+    });
     session.transition.staged = Some(StagedWorkspace {
         publisher,
         inbox,
@@ -272,11 +419,195 @@ pub(crate) fn stage(session: &mut Session, epoch: u64, step: JoinStep) -> Result
     Ok(value)
 }
 
+fn prepare_step(
+    owner: &Workspace,
+    authorization: &MembershipAuthorization,
+    commit: &[u8],
+) -> Result<PreparedManagementUpdate, &'static str> {
+    Ok(match authorization {
+        MembershipAuthorization::Admission(auth) => PreparedManagementUpdate::Active(Box::new(
+            owner.prepare_admission_update(auth, commit)?,
+        )),
+        MembershipAuthorization::AdmissionBatch(auths) => PreparedManagementUpdate::Active(
+            Box::new(owner.prepare_admission_batch_update(auths, commit)?),
+        ),
+        _ => owner.prepare_step_update(authorization, commit)?,
+    })
+}
+
+fn retain_order(
+    owner: &Workspace,
+    orders: &mut Vec<OrderStep>,
+    order: OrderStep,
+) -> Result<(), ApiError> {
+    if orders
+        .iter()
+        .any(|old| old.order.digest() == order.order.digest())
+    {
+        return Ok(());
+    }
+    if order.order.kind.removes()
+        && !owner
+            .member_roster()
+            .map_err(security(ErrorCode::StorageCorrupt))?
+            .iter()
+            .any(|member| member.id == order.order.target)
+    {
+        return Ok(());
+    }
+    if orders.len() == MAX_CARRIED_ORDERS
+        || order
+            .to_bytes()
+            .map_err(security(ErrorCode::InvalidInput))?
+            .len()
+            > MAX_WIRE_STEP
+    {
+        return Err(ApiError::invalid_input(
+            "order",
+            "carried revocation exceeds runtime bounds",
+        ));
+    }
+    orders.push(order);
+    orders.sort_by_key(|step| step.order.digest());
+    Ok(())
+}
+
+/// Commit one carried order. Receiving remains available during quarantine.
+pub(crate) fn stage_carried(session: &mut Session) -> Result<Option<Value>, ApiError> {
+    if session.transition.staged.is_some() || session.transition.removal.is_some() {
+        return Ok(None);
+    }
+    require_active_branch(session)?;
+    let Some(owner) = &session.workspace else {
+        return Ok(None);
+    };
+    let own_id = owner.member().ok_or_else(errors::no_workspace)?.id();
+    let Some(order) = session
+        .membership
+        .fork
+        .carried
+        .iter()
+        .find(|order| !(order.order.kind.removes() && order.order.target == own_id))
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let prepared = match owner.prepare_revocation(&order) {
+        Ok(prepared) => prepared,
+        Err(reason) => {
+            let orders = session
+                .membership
+                .fork
+                .carried
+                .iter()
+                .filter(|pending| pending.order.digest() != order.order.digest())
+                .cloned()
+                .collect();
+            let mut value = stage_orders(session, orders, "carried_revocation_discarded")?;
+            value["reason"] = json!(reason);
+            return Ok(Some(value));
+        }
+    };
+    let value = stage_prepared(session, prepared)?;
+    let mut value = serde_json::to_value(value).map_err(errors::encode)?;
+    value["carried_revocation"] = json!(order.order.digest());
+    Ok(Some(value))
+}
+
+pub(crate) fn announce_orders(session: &Session) {
+    let Some(owner) = &session.workspace else {
+        return;
+    };
+    for order in &session.membership.fork.carried {
+        let Ok(bytes) = order.to_bytes() else {
+            continue;
+        };
+        let mut payload = GOSSIP_ORDER.to_vec();
+        payload.extend(owner.id());
+        payload.extend(bytes);
+        let send = session.node.broadcast_membership(owner.id(), payload);
+        session.runtime.spawn(async move {
+            let _ = send.await;
+        });
+    }
+}
+
+/// A signed order can arrive from any relay. Verification binds its anchor
+/// and winning path to this workspace before it can quarantine transmission.
+pub(crate) fn receive_order(
+    session: &mut Session,
+    bytes: &[u8],
+) -> Result<Option<Value>, ApiError> {
+    if bytes.len() > MAX_WIRE_STEP || session.transition.staged.is_some() {
+        return Ok(None);
+    }
+    let Some(owner) = &session.workspace else {
+        return Ok(None);
+    };
+    let Ok(order) = OrderStep::from_bytes(bytes).and_then(|step| owner.extend_revocation(&step))
+    else {
+        return Ok(None);
+    };
+    let mut orders = session.membership.fork.carried.clone();
+    let count = orders.len();
+    retain_order(owner, &mut orders, order)?;
+    if orders.len() == count {
+        return Ok(None);
+    }
+    stage_orders(session, orders, "carried_revocation_received").map(Some)
+}
+
+fn stage_orders(
+    session: &mut Session,
+    orders: Vec<OrderStep>,
+    state: &'static str,
+) -> Result<Value, ApiError> {
+    let owner = session
+        .workspace
+        .as_ref()
+        .ok_or_else(errors::no_workspace)?;
+    let next = owner
+        .provisional_copy()
+        .map_err(security(ErrorCode::StorageCorrupt))?;
+    let publisher = session.delivery.publisher.clone();
+    let inbox = session.delivery.inbox.clone();
+    let snapshot = seal_state(session.records.is_some())?;
+    let branch = session
+        .membership
+        .fork
+        .retained
+        .clone()
+        .unwrap_or_else(|| BranchState::new(owner.epoch()));
+    let mut value = serde_json::to_value(StagedCandidate::new(
+        next.id(),
+        next.workspace_name()
+            .map_err(security(ErrorCode::StorageCorrupt))?,
+        snapshot.clone(),
+    ))
+    .map_err(errors::encode)?;
+    value["branch_state"] = json!(state);
+    session.membership.fork.candidate = Some(BranchCandidate {
+        token: snapshot.clone(),
+        branch,
+        orders,
+    });
+    session.transition.staged = Some(StagedWorkspace {
+        publisher,
+        inbox,
+        transition: WorkspaceTransition::Admission,
+        workspace: next,
+        snapshot,
+    });
+    session.membership.staged_step_received = true;
+    Ok(value)
+}
+
 /// Serve only the public steps this authenticated peer may already read.
 pub(crate) fn reply(owner: Option<&Workspace>, peer: [u8; 32], bytes: &[u8]) -> Vec<u8> {
     let build = || -> Result<Vec<u8>, ApiError> {
         let owner = owner.ok_or_else(errors::no_workspace)?;
-        let query = wire::decode_branch_query(bytes).map_err(|reason| ApiError::invalid_input("branch", reason))?;
+        let query = wire::decode_branch_query(bytes)
+            .map_err(|reason| ApiError::invalid_input("branch", reason))?;
         if query.workspace != owner.id() {
             return Err(ApiError::not_authorized("wrong workspace"));
         }
@@ -408,7 +739,8 @@ pub(crate) fn poll(session: &mut Session) -> Result<Option<Value>, ApiError> {
                     after: epoch,
                     until: epoch.saturating_add(1),
                 };
-                let bytes = wire::encode_range_query(&query).map_err(|reason| ApiError::invalid_input("branch", reason))?;
+                let bytes = wire::encode_range_query(&query)
+                    .map_err(|reason| ApiError::invalid_input("branch", reason))?;
                 let request = session.node.request_control(pending.peer, &bytes);
                 let wake = session.node.control_signal();
                 let task = session.runtime.spawn(async move {

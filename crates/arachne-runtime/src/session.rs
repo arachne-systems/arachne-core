@@ -385,7 +385,7 @@ pub(crate) fn seal_state(native: bool) -> Result<Vec<u8>, ApiError> {
 // Pending application objects never block a membership step: they are
 // authenticated plaintext and `carry_delivery` keeps them (A3).
 pub(crate) fn check_epoch_transition(session: &mut Session) -> Result<(), ApiError> {
-    membership::fork::require_send(session)?;
+    membership::fork::require_active_branch(session)?;
     session
         .workspace
         .as_ref()

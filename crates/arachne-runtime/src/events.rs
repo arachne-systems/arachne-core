@@ -72,6 +72,7 @@ fn probe(session: &Session) -> Probe {
         controls: session.node.has_queued_controls() || session.node.has_deferred_controls(),
         admissions: !session.admission.queue.is_empty(),
         membership: session.node.has_membership_gossip()
+            || crate::membership::fork::has_carried_work(session)
             || session.membership.fork.has_result()
             || session.membership.update.as_ref().is_some_and(|job| job.task.is_finished())
             || session.membership.offer.as_ref().is_some_and(|job| job.task.is_finished())
