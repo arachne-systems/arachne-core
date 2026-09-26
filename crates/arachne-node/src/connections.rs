@@ -277,9 +277,9 @@ impl Connections {
         if !profile.uses_tor() {
             builder = builder.address_lookup(memory.clone());
         }
-        // Disable GSO on Android x86_64: multi-packet replies fail on the tested
-        // emulator path.
-        #[cfg(all(target_os = "android", target_arch = "x86_64"))]
+        // Use individual UDP sends on Android. This setting passed the tablet
+        // restart comparison and the tested emulator path.
+        #[cfg(target_os = "android")]
         {
             builder = builder.transport_config(
                 iroh::endpoint::QuicTransportConfig::builder()
