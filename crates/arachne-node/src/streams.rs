@@ -988,3 +988,136 @@ mod tests {
         .expect("unfinished group fixture timed out");
     }
 }
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+    use crate::{Node, Permissions};
+    use std::collections::BTreeSet;
+
+    #[tokio::test]
+    async fn duplicate_session_keeps_delivering_after_its_first_group() {
+        duplicate_handoff().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_duplicate_session_keeps_delivering_after_its_first_group() {
+        duplicate_handoff().await;
+    }
+
+    async fn duplicate_handoff() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let (sender, _sender_messages) =
+                Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let (receiver, mut messages) =
+                Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let workspace = [55; 32];
+            let topic = Topic::new("shared/stream").unwrap();
+            let policy = BTreeMap::from([
+                (sender.id(), Permissions::AllTopics),
+                (receiver.id(), Permissions::AllTopics),
+            ]);
+            for (node, peer) in [(&sender, &receiver), (&receiver, &sender)] {
+                node.install_verified_policy(workspace, 1, policy.clone())
+                    .await
+                    .unwrap();
+                node.subscribe(workspace, 1, topic.clone()).await.unwrap();
+                node.add_address_hint(peer.id(), peer.address())
+                    .await
+                    .unwrap();
+                node.enable_moq_delivery(workspace, 1, peer.id(), topic.clone())
+                    .await
+                    .unwrap();
+            }
+            while sender.moq_metrics().sessions_active != 1
+                || receiver.moq_metrics().sessions_active != 1
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            sender
+                .publish_protected_with_class(
+                    workspace,
+                    1,
+                    topic.clone(),
+                    1,
+                    DeliveryClass::Critical,
+                    vec![1; 2048],
+                )
+                .await
+                .unwrap();
+            assert_eq!(messages.recv().await.unwrap().payload, vec![1; 2048]);
+            let previous = receiver.moq_metrics();
+            let route = sender
+                .streams
+                .0
+                .routes
+                .lock()
+                .await
+                .get(&receiver.id())
+                .cloned()
+                .unwrap();
+            // Force a second transport for the same live publishing origin.
+            // Moq::connect would reuse the first one and hide this handoff.
+            let (duplicate, driver) = MoqSession::connect(
+                &sender.connections.endpoint(),
+                EndpointAddr::new(PublicKey::from_bytes(&receiver.id()).unwrap())
+                    .with_ip_addr(receiver.address()),
+                route.moq.origin(),
+            )
+            .await
+            .unwrap();
+            let driver = tokio::spawn(driver.run());
+            let result = tokio::time::timeout(Duration::from_secs(3), async {
+                // The replacement has subscribed and consumed the old prefix.
+                // All later groups must arrive on that same receive future.
+                while receiver.moq_metrics().sessions_total <= previous.sessions_total
+                    || receiver.moq_metrics().packets_received <= previous.packets_received
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                for sequence in 2..=14u64 {
+                    sender
+                        .publish_protected_with_class(
+                            workspace,
+                            1,
+                            topic.clone(),
+                            sequence,
+                            DeliveryClass::Critical,
+                            vec![sequence as u8; 2048],
+                        )
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(75)).await;
+                }
+                let mut received = BTreeSet::new();
+                while received.len() != 13 {
+                    let message = messages.recv().await.unwrap();
+                    if message.sender == sender.id() && message.payload[0] >= 2 {
+                        assert_eq!(message.payload.len(), 2048);
+                        assert!(
+                            message
+                                .payload
+                                .iter()
+                                .all(|byte| *byte == message.payload[0])
+                        );
+                        received.insert(message.payload[0]);
+                    }
+                }
+                assert_eq!(received, (2..=14u8).collect());
+            })
+            .await;
+            let metrics = receiver.moq_metrics();
+            duplicate.close(moq_net::Error::Cancel);
+            driver.abort();
+            let _ = driver.await;
+            sender.close().await;
+            receiver.close().await;
+            assert!(
+                result.is_ok(),
+                "same-origin handoff stopped after its cached prefix: {metrics:?}"
+            );
+        })
+        .await
+        .expect("duplicate session fixture timed out");
+    }
+}
