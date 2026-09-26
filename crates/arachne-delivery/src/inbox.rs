@@ -651,6 +651,31 @@ pub struct PendingObject {
     pub current: Option<current::CurrentMetadata>,
 }
 
+/// This node's authenticated plaintext recovered from its retained losing
+/// branch publications. The runtime can protect it again with the same id.
+pub struct OwnPublication {
+    pub context: PublicationContext,
+    pub payload: Vec<u8>,
+    pub recipients: Vec<[u8; 32]>,
+    pub current: Option<current::CurrentMetadata>,
+}
+
+impl OwnPublication {
+    fn open(owner: &arachne_security::Workspace, context: PublicationContext, ciphertext: &[u8],
+        recipients: Vec<[u8; 32]>, current: Option<current::CurrentMetadata>) -> Result<Self, &'static str> {
+        let aad = match current {
+            Some(metadata) => metadata.authenticated_context(&context),
+            None if recipients.is_empty() => context.authenticated_bytes(),
+            None => context.direct_authenticated_bytes(&recipients)?,
+        };
+        let object = owner.unprotect_object(context.topic.namespace().as_bytes(), &aad, ciphertext)?;
+        if owner.member().map(|member| member.id()) != Some(object.message.member) {
+            return Err("only an object's author can re-publish it");
+        }
+        Ok(Self { context, payload: object.message.payload, recipients, current })
+    }
+}
+
 /// A caller-local scheduling hint, never an acknowledgement or rejection.
 /// Deferring the entire scope prevents later objects in it from overtaking.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -848,6 +873,49 @@ impl ObjectInbox {
         });
         moved.snapshot()?;
         Ok(moved)
+    }
+
+    /// Recover only this author's retained objects above the fork epoch.
+    /// Foreign pending plaintext is never a source for re-publication.
+    pub fn own_losing_publications(&self, owner: &arachne_security::Workspace,
+        publisher: &PublisherLog, fork_epoch: u64) -> Result<Vec<OwnPublication>, &'static str> {
+        self.validate_owner(owner)?;
+        publisher.validate_owner(owner)?;
+        let mut own = Vec::new();
+        for epoch in publisher.epochs().into_iter().filter(|epoch| *epoch > fork_epoch) {
+            for record in publisher.epoch_log(epoch).ok_or("missing publisher epoch")?.publications() {
+                let publication = if let Ok(live) = current::LiveCurrentPacket::from_wire(&record.ciphertext) {
+                    let (context, ciphertext) = PublicationContext::unpack(record.context.workspace,
+                        record.context.revision, record.context.topic.clone(), &live.packet)?;
+                    if context != record.context { return Err("retained current context mismatch") }
+                    OwnPublication::open(owner, context, ciphertext, Vec::new(), Some(live.metadata))?
+                } else {
+                    OwnPublication::open(owner, record.context.clone(), &record.ciphertext, Vec::new(), None)?
+                };
+                own.push(publication);
+            }
+        }
+        let author = owner.member().ok_or("publisher requires member identity")?.id();
+        for stream in self.direct.iter().filter(|stream| stream.author == author) {
+            for record in &stream.records {
+                if arachne_security::object_epoch(&record.object).is_none_or(|epoch| epoch <= fork_epoch) { continue }
+                let context = PublicationContext { workspace: self.workspace, revision: record.revision,
+                    topic: Topic::new(&stream.topic).map_err(|_| "invalid direct topic")?, id: record.id,
+                    sequence: std::num::NonZeroU64::new(record.sequence) };
+                own.push(OwnPublication::open(owner, context, &record.object, stream.recipients.clone(), None)?);
+            }
+        }
+        // A current index can outlive the publisher log's byte budget.
+        if let Some(current) = &self.current {
+            for (context, metadata, ciphertext) in current.publications()? {
+                if !own.iter().any(|publication| publication.context.id == context.id)
+                    && arachne_security::object_epoch(&ciphertext).is_some_and(|epoch| epoch > fork_epoch)
+                {
+                    own.push(OwnPublication::open(owner, context, &ciphertext, Vec::new(), Some(metadata))?);
+                }
+            }
+        }
+        Ok(own)
     }
 
     /// Direct sequences given up as missed since this inbox was created or

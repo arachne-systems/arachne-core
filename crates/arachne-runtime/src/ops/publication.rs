@@ -11,7 +11,7 @@ use crate::session::seal_state;
 use crate::{Session, StagedWorkspace, WorkspaceTransition};
 
 /// Latest-value metadata of a protected publication.
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CurrentPublication {
     pub(crate) selector: [u8; 32],
@@ -21,7 +21,7 @@ pub(crate) struct CurrentPublication {
     pub(crate) tombstone: bool,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StagePublicationArgs {
     /// When present, must name the session workspace; checked before staging.
@@ -163,6 +163,14 @@ pub(crate) fn hold_object(
 
 /// Stage one outgoing protected object. Adopting it sends it.
 pub(crate) fn stage(session: &mut Session, args: StagePublicationArgs) -> Result<StagedObject, ApiError> {
+    stage_publication(session, args, false)
+}
+
+pub(crate) fn stage_republication(session: &mut Session, args: StagePublicationArgs) -> Result<StagedObject, ApiError> {
+    stage_publication(session, args, true)
+}
+
+fn stage_publication(session: &mut Session, args: StagePublicationArgs, recovering: bool) -> Result<StagedObject, ApiError> {
     let owner = session
         .workspace
         .as_ref()
@@ -347,13 +355,11 @@ pub(crate) fn stage(session: &mut Session, args: StagePublicationArgs) -> Result
             )
             .map_err(delivery(ErrorCode::InvalidInput))?;
     }
-    let transition = WorkspaceTransition::RoutedPublication(
-        context,
-        delivery_class,
-        packet,
-        endpoints,
-        recipients,
-    );
+    let transition = if recovering {
+        WorkspaceTransition::Republication(context, delivery_class, packet, endpoints, recipients)
+    } else {
+        WorkspaceTransition::RoutedPublication(context, delivery_class, packet, endpoints, recipients)
+    };
     let publisher = match publisher {
         Some(publisher) => publisher,
         None => arachne_delivery::PublisherLog::new(owner).map_err(delivery(ErrorCode::Internal))?,
@@ -367,6 +373,6 @@ pub(crate) fn stage(session: &mut Session, args: StagePublicationArgs) -> Result
         publisher,
         inbox,
         transition,
-        "awaiting_publication_save",
+        if recovering { "awaiting_save" } else { "awaiting_publication_save" },
     )
 }

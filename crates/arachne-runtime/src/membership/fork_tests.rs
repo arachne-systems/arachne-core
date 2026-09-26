@@ -519,3 +519,100 @@ fn removal_epoch_waits_for_the_window_when_the_removed_member_cannot_report() {
             .is_some()
     );
 }
+
+#[test]
+fn own_losing_publication_is_reencrypted_once_with_its_stable_id() {
+    use crate::ops::publication::{self, StagePublicationArgs};
+    let (first, second, mut members) = two_admins(2);
+    let removed = members.remove(0);
+    let removal = first
+        .prepare_management(ManagementAction::Remove(removed.member().unwrap().id()))
+        .unwrap();
+    let losing = second
+        .prepare_management(ManagementAction::CreateInvitation([91; 32], 0, false))
+        .unwrap();
+    let on_loser = active(
+        removed
+            .prepare_step_update(&losing.authorization, &losing.commit)
+            .unwrap(),
+    );
+    let mut session = bare_test_session(members.remove(0));
+    session.storage_key = Some(StorageKey::derive(&[89; 32]).unwrap());
+    let fork_epoch = owner(&session).epoch();
+    let encoded = encode_step(&losing.authorization, &losing.commit).unwrap();
+    stage_update(&mut session, JoinStep::binary(encoded, None)).unwrap();
+    adopt_staged(&mut session);
+    let id = [92; 16];
+    let staged = publication::stage(
+        &mut session,
+        StagePublicationArgs {
+            workspace: None,
+            revision: 7,
+            topic: "chat/room".to_owned(),
+            id,
+            payload: b"retained on the losing branch".to_vec(),
+            recipients: Vec::new(),
+            current: None,
+            bulk: false,
+        },
+    )
+    .unwrap();
+    adopt(&mut session, AdoptKind::Publication, staged.snapshot).unwrap();
+    let packet = offer_packet(
+        &first,
+        fork_epoch,
+        &removal.authorization,
+        &removal.commit,
+        false,
+    )
+    .unwrap();
+    receive_offer(&mut session, &packet).unwrap();
+    adopt_staged(&mut session);
+    let branch_records = fork::records(&session, false).unwrap();
+    assert!(branch_records.contains_key(b"runtime/branch/republications".as_slice()));
+    let mut restored = bare_test_session(owner(&session).provisional_copy().unwrap());
+    restored.storage_key = Some(StorageKey::derive(&[89; 32]).unwrap());
+    restored.delivery.publisher = session.delivery.publisher.clone();
+    restored.delivery.inbox = session.delivery.inbox.clone();
+    fork::restore(&mut restored, &branch_records).unwrap();
+    session = restored;
+    assert!(
+        fork::stage_republication(&mut session).unwrap().is_some(),
+        "own losing data must survive the switch for re-publication"
+    );
+    adopt_staged(&mut session);
+    assert!(
+        fork::stage_republication(&mut session).unwrap().is_none(),
+        "one saved publication drains one recovery item"
+    );
+    let log = session
+        .delivery
+        .publisher
+        .as_ref()
+        .unwrap()
+        .epoch_log(owner(&session).epoch())
+        .unwrap();
+    let records = log.publications();
+    assert_eq!(records.len(), 1);
+    let published = records[0];
+    assert_eq!(published.context.id, id);
+    let opened = removal
+        .workspace
+        .unprotect_object(
+            b"chat",
+            &published.context.authenticated_bytes(),
+            &published.ciphertext,
+        )
+        .unwrap();
+    assert_eq!(opened.message.payload, b"retained on the losing branch");
+    assert!(
+        on_loser
+            .unprotect_object(
+                b"chat",
+                &published.context.authenticated_bytes(),
+                &published.ciphertext
+            )
+            .is_err(),
+        "the removed member cannot open the new object"
+    );
+}

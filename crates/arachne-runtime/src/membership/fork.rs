@@ -1,6 +1,7 @@
 //! Fork choice and retained pre-commit state (ADR A2). Peers carry hints;
 //! only steps verified against our own history can replace authority.
 use super::*;
+use crate::ops::publication::{CurrentPublication, StagePublicationArgs};
 use arachne_security::{
     BranchDecision, BranchState, MembershipAuthorization, OrderStep, PreparedManagementUpdate,
     SecurityRecords, Workspace,
@@ -12,6 +13,9 @@ pub(crate) const PREFIX: &[u8] = b"runtime/branch/";
 const META: &[u8] = b"runtime/branch/meta";
 const SNAPSHOT: &[u8] = b"runtime/branch/snapshot/";
 const ORDER: &[u8] = b"runtime/branch/order/";
+const REPUBLICATIONS: &[u8] = b"runtime/branch/republications";
+const MAX_REPUBLICATION_BYTES: usize = 512 * 1024;
+const MAX_REPUBLICATIONS: usize = 512;
 pub(super) const GOSSIP_ORDER: &[u8] = b"DFGO\x01";
 const MAX_CARRIED_ORDERS: usize = 64;
 
@@ -19,6 +23,7 @@ struct BranchCandidate {
     token: Vec<u8>,
     branch: BranchState,
     orders: Vec<OrderStep>,
+    republications: Vec<StagePublicationArgs>,
 }
 
 #[derive(Clone)]
@@ -45,6 +50,7 @@ impl EpochView {
 pub(crate) struct ForkState {
     pub(crate) retained: Option<BranchState>,
     carried: Vec<OrderStep>,
+    republications: Vec<StagePublicationArgs>,
     observed: BTreeMap<[u8; 32], (u64, [u8; 32])>,
     views: BTreeMap<u64, EpochView>,
     settlement_pending: bool,
@@ -121,6 +127,9 @@ pub(crate) fn prepare_candidate(session: &mut Session) -> Result<(), ApiError> {
         token: staged.snapshot.clone(),
         branch,
         orders,
+        republications: session.membership.fork.republications.iter().filter(|publication| {
+            !matches!(&staged.transition, WorkspaceTransition::Republication(context, ..) if context.id == publication.id)
+        }).cloned().collect(),
     });
     Ok(())
 }
@@ -139,6 +148,7 @@ pub(crate) fn adopt_candidate(session: &mut Session, token: &[u8]) -> Result<(),
     }
     session.membership.fork.retained = Some(candidate.branch);
     session.membership.fork.carried = candidate.orders;
+    session.membership.fork.republications = candidate.republications;
     let fork = &mut session.membership.fork;
     fork.views.retain(|epoch, _| {
         fork.retained
@@ -210,6 +220,23 @@ pub(crate) fn records(session: &Session, candidate: bool) -> Result<SecurityReco
             ),
         );
     }
+    let republications = if candidate {
+        session
+            .membership
+            .fork
+            .candidate
+            .as_ref()
+            .map(|candidate| candidate.republications.as_slice())
+            .unwrap_or_default()
+    } else {
+        &session.membership.fork.republications
+    };
+    if !republications.is_empty() {
+        records.insert(
+            REPUBLICATIONS.to_vec(),
+            Zeroizing::new(encode_republications(republications)?),
+        );
+    }
     Ok(records)
 }
 
@@ -222,8 +249,23 @@ pub(crate) fn restore(session: &mut Session, records: &SecurityRecords) -> Resul
     };
     let mut snapshots = Vec::new();
     let mut orders = Vec::new();
+    let mut republications: Vec<StagePublicationArgs> = Vec::new();
     for (name, value) in records {
         if name == META {
+            continue;
+        }
+        if name == REPUBLICATIONS {
+            if value.len() > MAX_REPUBLICATION_BYTES {
+                return Err(ApiError::storage_corrupt(
+                    "re-publication record exceeds bounds",
+                ));
+            }
+            let bytes = value
+                .strip_prefix(b"DFRP\x01")
+                .ok_or_else(|| ApiError::storage_corrupt("unsupported re-publication record"))?;
+            republications = postcard::from_bytes(bytes)
+                .map_err(|_| ApiError::storage_corrupt("invalid re-publication record"))?;
+            encode_republications(&republications)?;
             continue;
         }
         if let Some(digest) = name.strip_prefix(ORDER) {
@@ -253,6 +295,7 @@ pub(crate) fn restore(session: &mut Session, records: &SecurityRecords) -> Resul
         BranchState::from_parts(meta, &snapshots).map_err(security(ErrorCode::StorageCorrupt))?;
     session.membership.fork.retained = Some(branch);
     session.membership.fork.carried = orders;
+    session.membership.fork.republications = republications;
     session.membership.fork.settlement_pending = true;
     Ok(())
 }
@@ -302,6 +345,33 @@ pub(crate) fn has_carried_work(session: &Session) -> bool {
             .iter()
             .any(|order| !(order.order.kind.removes() && order.order.target == id))
     })
+}
+
+pub(crate) fn has_republication_work(session: &Session) -> bool {
+    !session.membership.fork.republications.is_empty() && require_send(session).is_ok()
+}
+
+fn encode_republications(publications: &[StagePublicationArgs]) -> Result<Vec<u8>, ApiError> {
+    if publications.len() > MAX_REPUBLICATIONS {
+        return Err(ApiError::limit_reached(
+            "re-publications",
+            MAX_REPUBLICATIONS as u64,
+            "re-publication queue is full",
+        ));
+    }
+    let mut bytes = b"DFRP\x01".to_vec();
+    bytes.extend(
+        postcard::to_allocvec(publications)
+            .map_err(|_| ApiError::storage_failed("re-publication encoding failed"))?,
+    );
+    if bytes.len() > MAX_REPUBLICATION_BYTES {
+        return Err(ApiError::limit_reached(
+            "re-publication bytes",
+            MAX_REPUBLICATION_BYTES as u64,
+            "re-publication queue is full",
+        ));
+    }
+    Ok(bytes)
 }
 
 /// The caller has verified the member's signed head or authenticated its
@@ -412,6 +482,7 @@ pub(crate) fn stage(session: &mut Session, epoch: u64, step: JoinStep) -> Result
         .retained
         .as_ref()
         .unwrap_or(&initial);
+    let mut republications = session.membership.fork.republications.clone();
     let (next, branch, publisher, inbox, orders) = match branch.resolve(epoch, local, remote) {
         BranchDecision::Keep => {
             // A losing commit still carries an independently signed intent.
@@ -502,6 +573,37 @@ pub(crate) fn stage(session: &mut Session, epoch: u64, step: JoinStep) -> Result
                     Err(reason) => eprintln!("arachne: losing revocation discarded: {reason}"),
                 }
             }
+            if let (Some(publisher), Some(inbox)) =
+                (&session.delivery.publisher, &session.delivery.inbox)
+            {
+                for publication in inbox
+                    .own_losing_publications(owner, publisher, epoch)
+                    .map_err(crate::errors::delivery(ErrorCode::StorageCorrupt))?
+                {
+                    if republications
+                        .iter()
+                        .any(|pending| pending.id == publication.context.id)
+                    {
+                        continue;
+                    }
+                    republications.push(StagePublicationArgs {
+                        workspace: Some(publication.context.workspace),
+                        revision: publication.context.revision,
+                        topic: publication.context.topic.as_str().to_owned(),
+                        id: publication.context.id,
+                        payload: publication.payload,
+                        recipients: publication.recipients,
+                        bulk: false,
+                        current: publication.current.map(|current| CurrentPublication {
+                            selector: current.selector,
+                            replacement_key: current.replacement_key,
+                            expires_at: current.expires_at,
+                            tombstone: current.tombstone,
+                        }),
+                    });
+                }
+                encode_republications(&republications)?;
+            }
             let publisher = session
                 .delivery
                 .publisher
@@ -551,6 +653,7 @@ pub(crate) fn stage(session: &mut Session, epoch: u64, step: JoinStep) -> Result
         token: snapshot.clone(),
         branch,
         orders,
+        republications,
     });
     session.transition.staged = Some(StagedWorkspace {
         publisher,
@@ -660,6 +763,57 @@ pub(crate) fn stage_carried(session: &mut Session) -> Result<Option<Value>, ApiE
     Ok(Some(value))
 }
 
+pub(crate) fn stage_republication(session: &mut Session) -> Result<Option<Value>, ApiError> {
+    if session.transition.staged.is_some()
+        || session.transition.removal.is_some()
+        || !has_republication_work(session)
+    {
+        return Ok(None);
+    }
+    let mut publication = session.membership.fork.republications[0].clone();
+    let owner = session
+        .workspace
+        .as_ref()
+        .ok_or_else(errors::no_workspace)?;
+    if let Some(revision) = session.runtime.block_on(
+        session
+            .node
+            .with_routing_policy(|routing| routing.installed_revision(owner.id())),
+    ) {
+        publication.revision = revision;
+    }
+    let direct = !publication.recipients.is_empty();
+    publication
+        .recipients
+        .retain(|member| owner.endpoints_for_members(&[*member]).is_ok());
+    let expired = publication.current.is_some_and(|current| {
+        arachne_delivery::UnixSeconds::now()
+            .is_ok_and(|now| !now.before_local_expiry(current.expires_at))
+    });
+    if (direct && publication.recipients.is_empty()) || expired {
+        let orders = session.membership.fork.carried.clone();
+        let mut value = stage_orders(session, orders, "republication_discarded")?;
+        value["reason"] = json!(if expired {
+            "expired"
+        } else {
+            "no_remaining_recipient"
+        });
+        session
+            .membership
+            .fork
+            .candidate
+            .as_mut()
+            .unwrap()
+            .republications
+            .remove(0);
+        return Ok(Some(value));
+    }
+    let staged = crate::ops::publication::stage_republication(session, publication)?;
+    let mut value = serde_json::to_value(staged).map_err(errors::encode)?;
+    value["republication"] = json!(true);
+    Ok(Some(value))
+}
+
 pub(crate) fn announce_orders(session: &Session) {
     let Some(owner) = &session.workspace else {
         return;
@@ -745,6 +899,7 @@ fn stage_orders(
         token: snapshot.clone(),
         branch,
         orders,
+        republications: session.membership.fork.republications.clone(),
     });
     session.transition.staged = Some(StagedWorkspace {
         publisher,

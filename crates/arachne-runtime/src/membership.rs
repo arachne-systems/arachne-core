@@ -2438,6 +2438,7 @@ pub(super) fn stage_gossiped_step(session: &mut Session) -> Result<Option<Value>
     if let Some(staged) = fork::poll(session)? { return Ok(Some(staged)) }
     if let Some(staged) = fork::stage_carried(session)? { return Ok(Some(staged)) }
     if let Some(staged) = fork::stage_settlement(session)? { return Ok(Some(staged)) }
+    if let Some(staged) = fork::stage_republication(session)? { return Ok(Some(staged)) }
     finish_range_pull(session);
     finish_profile_pull(session);
     session

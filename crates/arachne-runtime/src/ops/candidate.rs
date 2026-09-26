@@ -46,6 +46,7 @@ impl AdoptKind {
                     | WorkspaceTransition::WorkspaceName
                     | WorkspaceTransition::SelfUpdate(_)
                     | WorkspaceTransition::Invitation(..)
+                    | WorkspaceTransition::Republication(..)
             ) | (AdoptKind::Join, WorkspaceTransition::Join)
                 | (
                     AdoptKind::Recovery,
@@ -315,7 +316,8 @@ pub(crate) fn adopt(
                 stale,
             });
         }
-        WorkspaceTransition::RoutedPublication(context, delivery, packet, endpoints, recipients) => {
+        WorkspaceTransition::RoutedPublication(context, delivery, packet, endpoints, recipients)
+        | WorkspaceTransition::Republication(context, delivery, packet, endpoints, recipients) => {
             // Adoption is final even if network admission fails or times out.
             // The send (and its gossip join) also ends at the op deadline.
             let send_limit = crate::deadline::cap(session.op_deadline, Duration::from_secs(10));

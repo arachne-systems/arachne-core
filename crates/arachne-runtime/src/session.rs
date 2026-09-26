@@ -30,6 +30,15 @@ pub(crate) enum WorkspaceTransition {
         Vec<[u8; 32]>,
         Vec<[u8; 32]>,
     ),
+    /// An automatic re-publication after fork recovery. The workspace
+    /// driver saves it and adopts it through its own transition lifecycle.
+    Republication(
+        arachne_routing::PublicationContext,
+        arachne_node::DeliveryClass,
+        Vec<u8>,
+        Vec<[u8; 32]>,
+        Vec<[u8; 32]>,
+    ),
     Inbox,
     InboxRejected,
     InboxRecovery {
