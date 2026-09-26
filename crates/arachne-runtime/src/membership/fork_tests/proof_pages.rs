@@ -47,7 +47,7 @@ fn apply(workspace: &Workspace, auth: &MembershipAuthorization, commit: &[u8]) -
     }
 }
 
-fn grow(nodes: &[Session], size: usize) -> Vec<Workspace> {
+pub(super) fn grow(nodes: &[Session], size: usize) -> Vec<Workspace> {
     let creator = Workspace::create(&nodes[0].node, "Proof owner").unwrap();
     let (registration, invitation, checkpoint) =
         creator.prepare_invitation(0, false, false).unwrap();
@@ -283,6 +283,7 @@ fn proof_transfer(size: usize) {
         crate::session::commit_workspace(node, state);
     }
     let common = owner(&nodes[0]).epoch();
+    let public_pin = owner(&nodes[0]).public_checkpoint_pin().unwrap();
     let targets: Vec<_> = owner(&nodes[0])
         .member_roster()
         .unwrap()
@@ -319,8 +320,13 @@ fn proof_transfer(size: usize) {
     let (order_id, order_bytes) = orders.first_key_value().unwrap();
     assert!(order_bytes.len() > arachne_node::MAX_CONTROL_REPLY);
     eprintln!(
-        "proof_capacity members={size} order_bytes={} growth_ms={}",
+        "proof_capacity members={size} order_bytes={} pin_bytes={} checkpoint_bytes={} growth_ms={}",
         order_bytes.len(),
+        public_pin.len(),
+        owner(&nodes[0])
+            .public_checkpoint_from_pin(common, &public_pin)
+            .unwrap()
+            .len(),
         started.elapsed().as_millis()
     );
 

@@ -872,7 +872,7 @@ pub(crate) fn restore(
             Ok((name.clone(), get(name)?.ok_or_else(|| corrupt("missing branch record"))?))
         })
         .collect::<Result<SecurityRecords, ApiError>>()?;
-    membership::fork::restore(session, &branch_records)?;
+    membership::fork::restore(session, &branch_records, &owner)?;
     session.activity = activity;
     session.delivery.publisher = publisher;
     session.delivery.inbox = inbox;

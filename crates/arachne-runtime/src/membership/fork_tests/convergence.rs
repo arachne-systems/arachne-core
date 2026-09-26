@@ -256,7 +256,7 @@ fn a_fork_below_sixty_four_snapshots_requires_fresh_admission() {
     let records = fork::records(&node, false).unwrap();
     let mut restored = bare_test_session(owner(&node).provisional_copy().unwrap());
     restored.storage = node.storage.clone();
-    fork::restore(&mut restored, &records).unwrap();
+    fork::restore(&mut restored, &records, owner(&node)).unwrap();
     assert!(fork::require_send(&restored).is_err());
 
     // An administrator must remove the stale identity and authorize a fresh
