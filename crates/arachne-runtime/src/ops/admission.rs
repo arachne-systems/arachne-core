@@ -192,14 +192,16 @@ pub(crate) fn poll(session: &mut Session, args: PollAdmissionArgs) -> Result<Val
     // waited past the puller's limit (tablets, fix16).
     if let Some(incoming) = session
         .node
-        .poll_control_first(|payload| payload.starts_with(membership::wire::RANGE_QUERY), RANGE_SCAN_DEPTH)
+        .poll_control_first(|payload| payload.starts_with(membership::wire::RANGE_QUERY)
+            || payload.starts_with(membership::transfer::QUERY), RANGE_SCAN_DEPTH)
     {
         let waited_ms = incoming.waited().as_millis() as u64;
-        let reply = membership::range_reply(
-            session.workspace.as_deref(),
-            incoming.peer(),
-            incoming.payload(),
-        );
+        let reply = if incoming.payload().starts_with(membership::transfer::QUERY) {
+            membership::transfer::reply(session.workspace.as_deref(), &membership::fork::shared_orders(session),
+                incoming.peer(), incoming.payload())
+        } else {
+            membership::range_reply(session.workspace.as_deref(), incoming.peer(), incoming.payload())
+        };
         tracing::info!(target: "data_fabric_transport", waited_ms, "RANGE_REQUEST_SERVED");
         let _ = incoming.respond(reply);
         return Ok(json!({"state":"membership_replied", "remote_receipt":false}));
@@ -358,6 +360,12 @@ pub(crate) fn poll(session: &mut Session, args: PollAdmissionArgs) -> Result<Val
     }
     if incoming.payload().starts_with(membership::wire::BRANCH_QUERY) {
         let reply = membership::fork::reply(session.workspace.as_deref(), incoming.peer(), incoming.payload());
+        let _ = incoming.respond(reply);
+        return Ok(json!({"state":"membership_replied", "remote_receipt":false}));
+    }
+    if incoming.payload().starts_with(membership::transfer::QUERY) {
+        let reply = membership::transfer::reply(session.workspace.as_deref(), &membership::fork::shared_orders(session),
+            incoming.peer(), incoming.payload());
         let _ = incoming.respond(reply);
         return Ok(json!({"state":"membership_replied", "remote_receipt":false}));
     }
@@ -819,7 +827,7 @@ fn reply_too_large(detail: &str) -> ApiError {
 /// Binary admission reply (B3c): the history steps in the binary step codec,
 /// and on the final page the Welcome and the admission's authorization. The
 /// admission commit travels once, as the last step.
-const ADMISSION_REPLY: &[u8; 5] = b"DFAY\x01";
+const ADMISSION_REPLY: &[u8; 5] = b"DFAY\x02";
 
 #[derive(Serialize, Deserialize)]
 struct AdmissionReplyWire<'a> {
@@ -845,10 +853,22 @@ fn encode_admission_page(
 ) -> Result<Vec<u8>, ApiError> {
     let index = |value: usize| u32::try_from(value).map_err(|_| reply_too_large("admission history is too long"));
     let paged = !(offset == 0 && next == total && welcome);
+    let mut encoded_steps = Vec::new();
+    for (index, step) in steps[offset..next].iter().enumerate() {
+        if step.len() > membership::MAX_INLINE_STEP {
+            let first_epoch = reply.epoch.checked_sub(total as u64)
+                .ok_or_else(|| ApiError::invalid_input("history", "admission history epoch underflow"))?;
+            let reference = membership::transfer::Reference::new(reply.workspace,
+                membership::transfer::Object::Step(first_epoch + offset as u64 + index as u64), step)
+                .and_then(|reference| reference.encode())
+                .map_err(|_| reply_too_large("admission proof exceeds fragment bound"))?;
+            encoded_steps.push(reference);
+        } else { encoded_steps.push(step.clone()); }
+    }
     let wire = AdmissionReplyWire {
         workspace: reply.workspace,
         epoch: reply.epoch,
-        steps: steps[offset..next].iter().map(Vec::as_slice).collect(),
+        steps: encoded_steps.iter().map(Vec::as_slice).collect(),
         welcome: welcome.then(|| {
             (
                 reply.welcome.as_slice(),
@@ -925,13 +945,17 @@ fn admission_history_page(
 /// join path uses: `commits` (host-JSON steps), paging fields, and on the
 /// final page `welcome` and `authorization`. A refusal is JSON.
 pub fn decode_admission_reply(bytes: &[u8]) -> Result<Value, String> {
+    decode_admission_reply_with_limit(bytes, arachne_node::MAX_CONTROL_REPLY)
+}
+
+fn decode_admission_reply_with_limit(bytes: &[u8], limit: usize) -> Result<Value, String> {
     let Some(body) = bytes.strip_prefix(ADMISSION_REPLY) else {
         if bytes.starts_with(b"DFAY") {
             return Err("unsupported admission reply version".into());
         }
         return serde_json::from_slice(bytes).map_err(|_| "invalid admission reply".into());
     };
-    if bytes.len() > arachne_node::MAX_CONTROL_REPLY {
+    if bytes.len() > limit {
         return Err("admission reply exceeds bound".into());
     }
     let (wire, trailing): (AdmissionReplyWire<'_>, _) =
@@ -972,6 +996,29 @@ pub fn decode_admission_reply(bytes: &[u8]) -> Result<Value, String> {
         return Err("an unpaged admission reply needs its Welcome".into());
     }
     Ok(value)
+}
+
+/// Resolve large proof references before the native join verifier sees the
+/// page. Return expanded bytes for the whole-history allocation budget.
+pub(crate) async fn resolve_admission_reply(
+    client: arachne_node::ControlClient, peer: [u8; 32], bytes: &[u8],
+) -> Result<(Value, usize), arachne_node::Error> {
+    use arachne_node::Error;
+    if bytes.len() > arachne_node::MAX_CONTROL_REPLY { return Err(Error::TooLarge); }
+    let Some(body) = bytes.strip_prefix(ADMISSION_REPLY) else {
+        return decode_admission_reply(bytes).map(|value| (value, bytes.len())).map_err(|_| Error::InvalidFrame);
+    };
+    let (wire, trailing): (AdmissionReplyWire<'_>, _) = postcard::take_from_bytes(body).map_err(|_| Error::InvalidFrame)?;
+    if !trailing.is_empty() || wire.steps.len() > arachne_security::MAX_JOIN_HISTORY_STEPS {
+        return Err(Error::InvalidFrame);
+    }
+    let steps = membership::transfer::resolve_steps(client, peer, wire.workspace, &wire.steps, false).await?;
+    let wire = AdmissionReplyWire { steps: steps.iter().map(Vec::as_slice).collect(), ..wire };
+    let mut expanded = ADMISSION_REPLY.to_vec();
+    expanded.extend(postcard::to_allocvec(&wire).map_err(|_| Error::InvalidFrame)?);
+    let value = decode_admission_reply_with_limit(&expanded, membership::transfer::RESOLVED_PAGE_BYTES)
+        .map_err(|_| Error::InvalidFrame)?;
+    Ok((value, expanded.len()))
 }
 
 pub(crate) fn send_inbound_admission_reply(session: &mut Session) -> Result<ReplySent, ApiError> {
@@ -1190,11 +1237,9 @@ pub(crate) fn queue_admission_push(
     reply: &[u8],
     route: Option<SocketAddr>,
 ) -> bool {
-    if serde_json::from_slice::<Value>(reply)
-        .ok()
-        .and_then(|value| value.get("history_complete").and_then(Value::as_bool))
-        == Some(false)
-    {
+    // Fragment references and paged history use the retained retry path.
+    // A push must be self-contained within one control request.
+    if !decode_admission_reply(reply).is_ok_and(|value| value.get("history_page").is_none()) {
         return false;
     }
     let Ok(packet) = admission_offer_packet(reply) else {

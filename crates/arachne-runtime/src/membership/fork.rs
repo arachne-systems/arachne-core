@@ -15,12 +15,13 @@ const SNAPSHOT: &[u8] = b"runtime/branch/snapshot/";
 const ORDER: &[u8] = b"runtime/branch/order/";
 const ACTIONS: &[u8] = b"runtime/branch/actions";
 const MAX_OWN_ACTIONS: usize = 64;
-const MAX_ACTION_BYTES: usize = MAX_OWN_ACTIONS * (MAX_WIRE_STEP + 64);
+const MAX_ACTION_BYTES: usize = MAX_OWN_ACTIONS * (MAX_INLINE_STEP + 64);
 const REPUBLICATIONS: &[u8] = b"runtime/branch/republications";
 const MAX_REPUBLICATION_BYTES: usize = 512 * 1024;
 const MAX_REPUBLICATIONS: usize = 4096;
-pub(super) const GOSSIP_ORDER: &[u8] = b"DFGO\x01";
+pub(super) const GOSSIP_ORDER: &[u8] = b"DFGO\x02";
 const MAX_CARRIED_ORDERS: usize = 64;
+const MAX_CARRIED_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct OwnAction {
@@ -47,7 +48,7 @@ fn encode_actions(actions: &[OwnAction]) -> Result<Vec<u8>, ApiError> {
     if actions.len() > MAX_OWN_ACTIONS
         || actions
             .iter()
-            .any(|action| action.step.len() > MAX_WIRE_STEP)
+            .any(|action| action.step.len() > MAX_INLINE_STEP)
     {
         return Err(ApiError::storage_corrupt(
             "local action record exceeds bounds",
@@ -98,6 +99,8 @@ impl EpochView {
 pub(crate) struct ForkState {
     pub(crate) retained: Option<BranchState>,
     carried: Vec<OrderStep>,
+    shared_orders: Arc<transfer::Orders>,
+    order_pull: Option<PendingControl<transfer::Reference>>,
     republications: Vec<StagePublicationArgs>,
     actions: Vec<OwnAction>,
     observed: BTreeMap<[u8; 32], (u64, [u8; 32])>,
@@ -112,13 +115,17 @@ impl ForkState {
     pub(crate) fn has_result(&self) -> bool {
         self.settlement_pending
             || self
+                .order_pull
+                .as_ref()
+                .is_some_and(|job| job.task.is_finished())
+            || self
                 .query
                 .as_ref()
                 .is_some_and(|job| job.task.is_finished())
             || self.pull.as_ref().is_some_and(|job| job.task.is_finished())
     }
     pub(crate) fn is_running(&self) -> bool {
-        self.query.is_some() || self.pull.is_some()
+        self.query.is_some() || self.pull.is_some() || self.order_pull.is_some()
     }
 }
 
@@ -219,9 +226,14 @@ pub(crate) fn adopt_candidate(session: &mut Session, token: &[u8]) -> Result<boo
             "branch candidate does not match workspace candidate",
         ));
     }
-    let orders_changed = !session.membership.fork.carried.iter()
+    let orders_changed = !session
+        .membership
+        .fork
+        .carried
+        .iter()
         .map(|step| step.order.digest())
         .eq(candidate.orders.iter().map(|step| step.order.digest()));
+    session.membership.fork.shared_orders = shared_order_bytes(&candidate.orders)?;
     session.membership.fork.retained = Some(candidate.branch);
     session.membership.fork.carried = candidate.orders;
     session.membership.fork.republications = candidate.republications;
@@ -285,6 +297,7 @@ pub(crate) fn records(session: &Session, candidate: bool) -> Result<SecurityReco
     } else {
         &session.membership.fork.carried
     };
+    shared_order_bytes(orders)?;
     for order in orders {
         let mut name = ORDER.to_vec();
         name.extend(order.order.digest());
@@ -406,12 +419,38 @@ pub(crate) fn restore(session: &mut Session, records: &SecurityRecords) -> Resul
     }
     let branch =
         BranchState::from_parts(meta, &snapshots).map_err(security(ErrorCode::StorageCorrupt))?;
+    session.membership.fork.shared_orders = shared_order_bytes(&orders)?;
     session.membership.fork.retained = Some(branch);
     session.membership.fork.carried = orders;
     session.membership.fork.republications = republications;
     session.membership.fork.actions = actions;
     session.membership.fork.settlement_pending = true;
     Ok(())
+}
+
+fn shared_order_bytes(orders: &[OrderStep]) -> Result<Arc<transfer::Orders>, ApiError> {
+    let mut bytes = 0usize;
+    let mut shared = transfer::Orders::new();
+    for order in orders {
+        let value = order
+            .to_bytes()
+            .map_err(security(ErrorCode::StorageFailed))?;
+        bytes = bytes.saturating_add(value.len());
+        if orders.len() > MAX_CARRIED_ORDERS
+            || value.len() > MAX_WIRE_STEP
+            || bytes > MAX_CARRIED_BYTES
+        {
+            return Err(ApiError::storage_corrupt(
+                "carried revocation records exceed bounds",
+            ));
+        }
+        shared.insert(order.order.digest(), Arc::from(value));
+    }
+    Ok(Arc::new(shared))
+}
+
+pub(crate) fn shared_orders(session: &Session) -> Arc<transfer::Orders> {
+    session.membership.fork.shared_orders.clone()
 }
 
 /// Read projection only. Accepted membership and lifecycle records stay
@@ -947,6 +986,26 @@ fn retain_order(
             "carried revocation exceeds runtime bounds",
         ));
     }
+    let total = orders
+        .iter()
+        .try_fold(0usize, |bytes, step| {
+            step.to_bytes()
+                .map(|value| bytes.saturating_add(value.len()))
+        })
+        .map_err(security(ErrorCode::InvalidInput))?
+        .saturating_add(
+            order
+                .to_bytes()
+                .map_err(security(ErrorCode::InvalidInput))?
+                .len(),
+        );
+    if total > MAX_CARRIED_BYTES {
+        return Err(ApiError::limit_reached(
+            "carried revocations",
+            MAX_CARRIED_BYTES as u64,
+            "carried revocation byte budget is full",
+        ));
+    }
     orders.push(order);
     orders.sort_by_key(|step| step.order.digest());
     Ok(())
@@ -1050,18 +1109,57 @@ pub(crate) fn announce_orders(session: &Session) {
     let Some(owner) = &session.workspace else {
         return;
     };
-    for order in &session.membership.fork.carried {
-        let Ok(bytes) = order.to_bytes() else {
+    for (id, bytes) in session.membership.fork.shared_orders.iter() {
+        let Ok(reference) =
+            transfer::Reference::new(owner.id(), transfer::Object::Order(*id), bytes)
+                .and_then(|reference| reference.encode())
+        else {
             continue;
         };
         let mut payload = GOSSIP_ORDER.to_vec();
         payload.extend(owner.id());
-        payload.extend(bytes);
+        payload.extend(session.node.id());
+        payload.extend(reference);
         let send = session.node.broadcast_membership(owner.id(), payload);
         session.runtime.spawn(async move {
             let _ = send.await;
         });
     }
+}
+
+pub(crate) fn receive_order_notice(session: &mut Session, bytes: &[u8]) {
+    if bytes.len() < 32 || bytes.len() > 192 || session.membership.fork.order_pull.is_some() {
+        return;
+    }
+    let peer: [u8; 32] = bytes[..32].try_into().unwrap();
+    let Ok(reference) = transfer::decode_reference(&bytes[32..]) else {
+        return;
+    };
+    let transfer::Object::Order(id) = reference.object else {
+        return;
+    };
+    let Some(owner) = &session.workspace else {
+        return;
+    };
+    if reference.workspace != owner.id()
+        || peer == session.node.id()
+        || owner.member_id_for_endpoint(peer).is_err()
+        || session.membership.fork.shared_orders.contains_key(&id)
+    {
+        return;
+    }
+    let client = session.node.control_client();
+    let wake = session.node.control_signal();
+    let task = session.runtime.spawn(async move {
+        let reply = transfer::fetch(client, peer, reference).await;
+        wake.notify_one();
+        reply
+    });
+    session.membership.fork.order_pull = Some(PendingControl {
+        peer,
+        query: reference,
+        task,
+    });
 }
 
 /// A signed order can arrive from any relay. Verification binds its anchor
@@ -1243,6 +1341,23 @@ pub(crate) fn poll(session: &mut Session) -> Result<Option<Value>, ApiError> {
     if session
         .membership
         .fork
+        .order_pull
+        .as_ref()
+        .is_some_and(|job| job.task.is_finished())
+    {
+        let mut pending = session.membership.fork.order_pull.take().unwrap();
+        if let Ok(Ok(bytes)) = session.runtime.block_on(&mut pending.task)
+            && OrderStep::from_bytes(&bytes).is_ok_and(|order| {
+                pending.query.object == transfer::Object::Order(order.order.digest())
+            })
+            && let Some(staged) = receive_order(session, &bytes)?
+        {
+            return Ok(Some(staged));
+        }
+    }
+    if session
+        .membership
+        .fork
         .query
         .as_ref()
         .is_some_and(|pending| pending.task.is_finished())
@@ -1286,11 +1401,17 @@ pub(crate) fn poll(session: &mut Session) -> Result<Option<Value>, ApiError> {
                 let bytes = wire::encode_range_query(&query)
                     .map_err(|reason| ApiError::invalid_input("branch", reason))?;
                 let request = session.node.request_control(pending.peer, &bytes);
+                let client = session.node.control_client();
+                let peer = pending.peer;
                 let wake = session.node.control_signal();
                 let task = session.runtime.spawn(async move {
-                    let reply = tokio::time::timeout(RANGE_PULL_TIMEOUT, request)
+                    let reply = match tokio::time::timeout(RANGE_PULL_TIMEOUT, request)
                         .await
-                        .unwrap_or(Err(arachne_node::Error::Timeout("branch step")));
+                        .unwrap_or(Err(arachne_node::Error::Timeout("branch step")))
+                    {
+                        Ok(bytes) => wire::resolve_range_reply(client, peer, &bytes).await,
+                        Err(error) => Err(error),
+                    };
                     wake.notify_one();
                     reply
                 });
@@ -1324,7 +1445,7 @@ pub(crate) fn poll(session: &mut Session) -> Result<Option<Value>, ApiError> {
         .ok()
         .and_then(Result::ok);
     if let Some(bytes) = bytes
-        && let Ok(reply) = wire::decode_range_reply(&bytes)
+        && let Ok(reply) = wire::decode_resolved_range_reply(&bytes)
         && reply.workspace == pending.query.workspace
         && reply.after == pending.query.after
         && let Some(step) = reply.steps.first()
