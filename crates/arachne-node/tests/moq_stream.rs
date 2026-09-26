@@ -664,3 +664,94 @@ async fn outsider_moq_connect(
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn publication_sequence_gap_does_not_stop_later_stream_groups() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (sender, _sender_messages) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let (receiver, mut messages) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let workspace = [56; 32];
+        let topic = Topic::new("shared/stream").unwrap();
+        let policy = BTreeMap::from([
+            (sender.id(), Permissions::AllTopics),
+            (receiver.id(), Permissions::AllTopics),
+        ]);
+        for (node, peer) in [(&sender, &receiver), (&receiver, &sender)] {
+            node.install_verified_policy(workspace, 1, policy.clone()).await.unwrap();
+            node.subscribe(workspace, 1, topic.clone()).await.unwrap();
+            node.add_address_hint(peer.id(), peer.address()).await.unwrap();
+            node.enable_moq_delivery(workspace, 1, peer.id(), topic.clone()).await.unwrap();
+        }
+        while sender.moq_metrics().sessions_active != 1 || receiver.moq_metrics().sessions_active != 1 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        for sequence in (13236..=13247u64).chain(13249..=13251) {
+            sender.publish_protected_with_class(
+                workspace, 1, topic.clone(), sequence, DeliveryClass::Critical,
+                sequence.to_be_bytes().to_vec(),
+            ).await.unwrap();
+            let delivered = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let message = messages.recv().await.unwrap();
+                    if message.sender == sender.id() && message.payload == sequence.to_be_bytes() {
+                        break;
+                    }
+                }
+            }).await;
+            assert!(delivered.is_ok(), "publication gap blocked sequence {sequence}; receiver {:?}", receiver.moq_metrics());
+        }
+        sender.close().await;
+        receiver.close().await;
+    }).await.expect("publication gap fixture timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cached_high_sequence_prefix_and_gap_do_not_stop_later_groups() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (sender, _sender_messages) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let (receiver, mut messages) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let workspace = [56; 32];
+        let topic = Topic::new("shared/stream").unwrap();
+        let policy = BTreeMap::from([
+            (sender.id(), Permissions::AllTopics),
+            (receiver.id(), Permissions::AllTopics),
+        ]);
+        for (node, peer) in [(&sender, &receiver), (&receiver, &sender)] {
+            node.install_verified_policy(workspace, 1, policy.clone()).await.unwrap();
+            node.subscribe(workspace, 1, topic.clone()).await.unwrap();
+            node.add_address_hint(peer.id(), peer.address()).await.unwrap();
+            if node.id() == sender.id() {
+                node.enable_moq_delivery(workspace, 1, peer.id(), topic.clone()).await.unwrap();
+            }
+        }
+        for sequence in 13236..=13247u64 {
+            sender.publish_protected_with_class(
+                workspace, 1, topic.clone(), sequence, DeliveryClass::Critical,
+                sequence.to_be_bytes().to_vec(),
+            ).await.unwrap();
+        }
+        receiver.enable_moq_delivery(workspace, 1, sender.id(), topic.clone()).await.unwrap();
+        while sender.moq_metrics().sessions_active != 1 || receiver.moq_metrics().sessions_active != 1 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        for sequence in 13249..=13251u64 {
+            sender.publish_protected_with_class(
+                workspace, 1, topic.clone(), sequence, DeliveryClass::Critical,
+                sequence.to_be_bytes().to_vec(),
+            ).await.unwrap();
+        }
+        let mut received = BTreeSet::new();
+        let delivered = tokio::time::timeout(Duration::from_secs(1), async {
+            while received.len() != 15 {
+                let message = messages.recv().await.unwrap();
+                if message.sender == sender.id() {
+                    received.insert(u64::from_be_bytes(message.payload.try_into().unwrap()));
+                }
+            }
+        }).await;
+        assert!(delivered.is_ok(), "cached prefix/gap blocked later groups: {received:?}; receiver {:?}", receiver.moq_metrics());
+        assert_eq!(received, (13236..=13247u64).chain(13249..=13251).collect());
+        sender.close().await;
+        receiver.close().await;
+    }).await.expect("publication gap fixture timed out");
+}

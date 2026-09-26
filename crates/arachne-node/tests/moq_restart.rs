@@ -22,7 +22,7 @@ impl Drop for PeerProcess {
 }
 
 fn spawn_peer(root: &Path, secret: [u8; 32], parent: &Node) -> PeerProcess {
-    spawn_peer_with_witness(root, secret, parent, None, 0)
+    spawn_peer_with_witness(root, secret, parent, None, 0, false, Duration::ZERO)
 }
 
 fn spawn_peer_with_witness(
@@ -31,6 +31,8 @@ fn spawn_peer_with_witness(
     parent: &Node,
     witness: Option<&Node>,
     sequence: u64,
+    proactive: bool,
+    cadence: Duration,
 ) -> PeerProcess {
     std::fs::create_dir(root).unwrap();
     let config = root.join("config.json");
@@ -42,6 +44,8 @@ fn spawn_peer_with_witness(
             "address": parent.address().to_string(),
             "witness": witness.map(|node| (node.id(), node.address().to_string())),
             "sequence": sequence,
+            "proactive": proactive,
+            "cadence_ms": cadence.as_millis() as u64,
         }))
         .unwrap(),
     )
@@ -51,7 +55,7 @@ fn spawn_peer_with_witness(
             .args([
                 "--ignored",
                 "--exact",
-                "restarted_peer_process",
+                if proactive { "restarted_peer_process_multithread" } else { "restarted_peer_process" },
                 "--nocapture",
             ])
             .env(CHILD_CONFIG, config)
@@ -154,15 +158,20 @@ async fn either_peer_can_restore_a_stream_after_an_unannounced_restart() {
 
 #[tokio::test]
 async fn repeated_restart_delivers_the_whole_burst_with_a_third_peer() {
-    three_peer_restarts(Duration::ZERO).await;
+    three_peer_restarts(Duration::ZERO, false).await;
 }
 
 #[tokio::test]
 async fn repeated_restart_delivers_paced_packets_with_a_third_peer() {
-    three_peer_restarts(Duration::from_millis(75)).await;
+    three_peer_restarts(Duration::from_millis(75), false).await;
 }
 
-async fn three_peer_restarts(cadence: Duration) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restarted_peer_can_publish_before_any_peer_packet_arrives() {
+    three_peer_restarts(Duration::from_millis(75), true).await;
+}
+
+async fn three_peer_restarts(cadence: Duration, proactive: bool) {
     tokio::time::timeout(Duration::from_secs(45), async {
         let secrets = [[81; 32], [82; 32], [83; 32]];
         let child_id = *iroh::SecretKey::from_bytes(&secrets[2]).public().as_bytes();
@@ -190,7 +199,7 @@ async fn three_peer_restarts(cadence: Duration) {
         for round in 0..12u64 {
             let directory = root.path().join(format!("restart-{round}"));
             let child = spawn_peer_with_witness(
-                &directory, secrets[2], &parent, Some(&witness), round * 1000,
+                &directory, secrets[2], &parent, Some(&witness), round * 1000, proactive, cadence,
             );
             wait_file(&directory.join("address")).await;
             let address = std::fs::read_to_string(directory.join("address")).unwrap();
@@ -208,7 +217,7 @@ async fn three_peer_restarts(cadence: Duration) {
                 while parent.moq_metrics().sessions_active == 0 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                for packet in 0..13u8 {
+                for packet in 0..if proactive { 0 } else { 13u8 } {
                     let mut payload = vec![0; 2048];
                     payload[..2].copy_from_slice(&[round as u8, packet]);
                     parent.publish_protected_with_class(
@@ -247,6 +256,16 @@ async fn three_peer_restarts(cadence: Duration) {
 #[tokio::test]
 #[ignore = "subprocess helper for the restart test"]
 async fn restarted_peer_process() {
+    peer_process().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "subprocess helper for the restart test"]
+async fn restarted_peer_process_multithread() {
+    peer_process().await;
+}
+
+async fn peer_process() {
     let config =
         PathBuf::from(std::env::var_os(CHILD_CONFIG).expect("parent supplies the fixture"));
     let root = config.parent().unwrap();
@@ -291,6 +310,21 @@ async fn restarted_peer_process() {
     }
     std::fs::write(root.join("ready"), b"ready").unwrap();
     let mut sequence = config["sequence"].as_u64().unwrap();
+    if config["proactive"].as_bool().unwrap() {
+        let round = (sequence / 1000) as u8;
+        let cadence = Duration::from_millis(config["cadence_ms"].as_u64().unwrap());
+        for packet in 0..13u8 {
+            sequence += 1;
+            let mut payload = vec![0; 2048];
+            payload[..2].copy_from_slice(&[round, packet]);
+            node.publish_protected_with_class(
+                WORKSPACE, 1, topic.clone(), sequence, DeliveryClass::Critical, payload,
+            ).await.unwrap();
+            if !cadence.is_zero() {
+                tokio::time::sleep(cadence).await;
+            }
+        }
+    }
     loop {
         let message = messages.recv().await.unwrap();
         if message.sender == parent {
