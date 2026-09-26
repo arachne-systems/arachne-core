@@ -1,5 +1,9 @@
 # Core development guide
 
+**BLUF:** Use the pinned toolchain and the default test thread count. Dependencies
+use optimization level 2; workspace crates stay unoptimized. Disable incremental
+compilation and debug information when a small local build cache is required.
+
 ## Repository layout
 
 ```text
@@ -29,26 +33,18 @@ Use the Rust 1.98.0 toolchain recorded in the root README:
 
 ```sh
 cargo +1.98.0 check --locked --workspace
-cargo +1.98.0 test --locked --workspace --exclude arachne-runtime -- --test-threads=1
-cargo +1.98.0 test --locked -p arachne-runtime
+cargo +1.98.0 test --locked --workspace
 ```
 
 Published manifests declare Rust 1.91 as the MSRV. Verify that claim with
 `cargo +1.91.0 check --locked --workspace` before changing the dependency lock.
 
-Run from the repository root. `arachne-runtime` tests run with the default
-thread count: each session belongs to a `Context` with its own limits,
-connection budget and runtime (the default context allows 64 sessions), and
-no runtime test holds a process-wide lock except `tests/nearby_invitation.rs`,
-whose scenarios share LAN discovery. The other crates still run serially.
-Some runtime tests are slow in a debug build and CPU-bound, not serialized
-(measured on a 4-CPU slice): the lib test
-`membership::gossiped_names_from_a_join_wave_survive_until_their_steps_land`
-(about 12 minutes), `tests/record_storage.rs` (about 12 minutes), and
-`hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots`
-in `tests/native_persistence.rs` (about 26 minutes alone). The
-workspace build and tests are Rust checks; they do not build the Android plugin,
-load the library through JNI, or validate an ATAK host/device deployment.
+Run from the repository root with the default test thread count. Each runtime
+session belongs to a `Context` with its own limits, connection budget and
+runtime (the default context allows 64 sessions). Tests in
+`tests/nearby_invitation.rs` protect their shared LAN discovery fixture locally.
+The workspace build and tests are Rust checks; they do not build the Android
+plugin, load the library through JNI, or validate an ATAK host/device deployment.
 
 Useful focused checks while iterating:
 
@@ -57,12 +53,81 @@ cargo +1.98.0 test --locked -p arachne-security
 cargo +1.98.0 test --locked -p arachne-routing
 cargo +1.98.0 test --locked -p arachne-delivery
 cargo +1.98.0 test --locked -p arachne-store
-cargo +1.98.0 test --locked -p arachne-node -- --test-threads=1
+cargo +1.98.0 test --locked -p arachne-node
 cargo +1.98.0 test --locked -p arachne-runtime
 ```
 
-Supply-chain checks (`.github/workflows/supply-chain.yml` runs the same on each
-PR, on `main` and weekly):
+### Test speed and build cache size
+
+The development profile builds dependencies at optimization level 2. Workspace
+crates stay at level 0. The test profile inherits this setting. Debug assertions
+and overflow checks remain enabled. No release profile is needed for tests.
+
+For a small local build cache, set these variables before the commands above:
+
+```sh
+export CARGO_BUILD_JOBS=4 CARGO_INCREMENTAL=0
+export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+```
+
+Keep a separate target directory for each worktree. After its last check,
+`cargo +1.98.0 clean --profile dev` removes rebuildable development and test
+artifacts. Do not clean a target while its build or test process is active.
+
+The H3 comparison on 2026-09-26 used the same source based on `7ab2ec6`, Rust
+1.98.0, and an AMD Ryzen 9 9950X. The baseline removed all package profile
+overrides. The second build used only `[profile.dev.package."*"] opt-level = 2`.
+Both clean builds used four Cargo jobs, no incremental compilation, and no debug
+information. Each test case ran directly from its compiled binary, outside the
+shared build lock, with `nice -n 19 taskset -c 8-11` and the default test thread
+count. No other test from this lane ran at the same time.
+
+| Measurement | No package optimization | Dependencies at level 2 |
+| --- | ---: | ---: |
+| Membership join wave | 860.546 s | 56.068 s |
+| `record_storage` (two tests) | 931.209 s | 101.361 s |
+| Native persistence with 100 members | 1862.810 s | 273.523 s |
+| Total test time | 3654.565 s | 430.952 s |
+| Clean build for these binaries | 55.04 s | 146.84 s |
+| Target directory after that build (`du -sb`) | 1,511,738,651 bytes | 1,279,393,248 bytes |
+
+All four tests passed in both runs. The test cases were 6.81 to 15.35 times
+faster. This gain does not require optimization of workspace crates. Cargo's
+build records confirmed optimization level 2 for OpenMLS, level 0 for Arachne
+security, delivery, store, and runtime, and enabled debug assertions and overflow
+checks. These are single runs on a shared machine, not a statistical benchmark.
+
+Build the same test binaries with:
+
+```sh
+cargo +1.98.0 test --locked -p arachne-runtime --lib \
+  --test record_storage --test native_persistence --no-run
+```
+
+For test-only timings, run the executable paths that Cargo prints. Use the exact
+lib filter `membership::gossiped_names_from_a_join_wave_survive_until_their_steps_land`,
+run both `record_storage` tests, and use the exact `native_persistence` filter
+`hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots`.
+Keep the CPU set and cache settings the same for each comparison.
+
+The lower-crate check compiled and ran all 27 unit and integration test binaries
+for `arachne-node`, `arachne-security`, `arachne-delivery`, and `arachne-store`
+with the default test thread count on CPUs 8–11: **204 passed, 1 failed, 7
+ignored**. All four crate unit-test binaries passed. No check showed a need to
+serialize tests across a binary.
+
+The red integration test is
+`gossip_forwarding::workspace_publication_crosses_an_intermediate_without_a_direct_route`.
+It also failed when its binary ran with `--test-threads=1`. At line 52, it assumes
+that C cannot have A as a neighbor after the fixture seeds A↔B↔C addresses.
+Gossip can learn addresses and create the A↔C path. The fixture must enforce
+its intended chain before its forwarding assertions can give valid evidence.
+This check is still red; the full workspace suite is not reported as green.
+
+### Dependency checks
+
+The `.github/workflows/supply-chain.yml` workflow runs these checks on each PR,
+on `main`, and weekly:
 
 ```sh
 cargo +1.98.0 check --locked --workspace --all-targets --all-features
