@@ -736,6 +736,31 @@ pub struct PublicationCurrent {
     pub tombstone: bool,
 }
 
+/// Delivery mode for a protected publication. The default is `Critical`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum PublicationMode {
+    /// Use the Critical queue.
+    #[default]
+    Critical,
+    /// Use the Bulk queue.
+    Bulk,
+    /// Publish a replaceable current value to the workspace.
+    Current { metadata: PublicationCurrent },
+}
+
+/// Audience and delivery mode for a protected publication.
+/// The default is an empty audience (workspace members) and `Critical` mode.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct PublicationOptions {
+    /// Empty means the workspace audience. Otherwise, provide at most 64 current
+    /// member IDs, sorted in ascending byte order, without duplicates or self.
+    /// A directed audience cannot use `Current` mode.
+    pub recipients: Vec<MemberId>,
+    pub mode: PublicationMode,
+}
+
 candidate_type!(
     /// A protected incoming publication, or an acknowledgement or rejection
     /// of a pending object. The authenticated plaintext is withheld until
@@ -1858,6 +1883,7 @@ impl Client {
         Ok(())
     }
 
+    /// Stage a workspace publication with the default `Critical` delivery mode.
     pub fn stage_protected_publication(
         &self,
         workspace: WorkspaceId,
@@ -1869,6 +1895,7 @@ impl Client {
         self.stage_protected_publication_with_current(workspace, revision, topic, id, payload, None)
     }
 
+    /// Stage a workspace publication. `None` uses `Critical`; `Some` uses `Current`.
     pub fn stage_protected_publication_with_current(
         &self,
         workspace: WorkspaceId,
@@ -1878,6 +1905,37 @@ impl Client {
         payload: Vec<u8>,
         current: Option<PublicationCurrent>,
     ) -> Result<Arc<PublicationCandidate>> {
+        self.stage_protected_publication_with_options(
+            workspace,
+            revision,
+            topic,
+            id,
+            payload,
+            PublicationOptions {
+                recipients: Vec::new(),
+                mode: current.map_or(PublicationMode::Critical, |metadata| {
+                    PublicationMode::Current { metadata }
+                }),
+            },
+        )
+    }
+
+    /// Stage a protected publication with an explicit audience and delivery mode.
+    /// Core validates the audience and saves the publication when it is adopted.
+    pub fn stage_protected_publication_with_options(
+        &self,
+        workspace: WorkspaceId,
+        revision: u64,
+        topic: &str,
+        id: RecordId,
+        payload: Vec<u8>,
+        options: PublicationOptions,
+    ) -> Result<Arc<PublicationCandidate>> {
+        let (current, bulk) = match options.mode {
+            PublicationMode::Critical => (None, false),
+            PublicationMode::Bulk => (None, true),
+            PublicationMode::Current { metadata } => (Some(metadata), false),
+        };
         let staged = self.call(Op::StageNetworkPublication, |session| {
             publication::stage(
                 session,
@@ -1887,14 +1945,18 @@ impl Client {
                     topic: topic.to_owned(),
                     id: id.to_bytes(),
                     payload,
-                    recipients: Vec::new(),
+                    recipients: options
+                        .recipients
+                        .into_iter()
+                        .map(MemberId::to_bytes)
+                        .collect(),
                     current: current.map(|current| publication::CurrentPublication {
                         selector: current.selector.to_bytes(),
                         replacement_key: current.replacement_key.to_bytes(),
                         expires_at: current.expires_at,
                         tombstone: current.tombstone,
                     }),
-                    bulk: false,
+                    bulk,
                 },
             )
         })?;
@@ -2526,6 +2588,14 @@ pub use resources::*;
 mod progress;
 pub use progress::*;
 
+/// Native publication defaults for foreign bindings: workspace audience and
+/// `Critical` mode. Set `recipients` for a directed audience, or `mode` for Bulk
+/// or Current delivery.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn default_publication_options() -> PublicationOptions {
+    PublicationOptions::default()
+}
+
 /// Native transport defaults for foreign bindings.
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub fn default_transport_options() -> TransportOptions {
@@ -2543,3 +2613,6 @@ pub fn default_client_config(network: Network) -> ClientConfig {
         storage: None,
     }
 }
+
+#[cfg(test)]
+mod publication_tests;
