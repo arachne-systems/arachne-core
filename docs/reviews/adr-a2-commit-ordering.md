@@ -326,3 +326,30 @@ These corrections replace the text above where they conflict.
 API note: `BranchState` uses `first_unsettled` (= `settled_epoch + 1`). `prepare_branch_switch`
 takes no steps; unseal and replay belong to the wiring (step 8). The switched state keeps the
 snapshot at the fork epoch F, so replay retains from F+1.
+
+## Corrections found during steps 2–6 (`feat/a2-security-wiring`)
+
+1. **Self-contained anchor proof.** The proof is a public checkpoint at a common ancestor C, the
+   winning steps from C to the parent, and the losing steps from C to the anchor. The verifier
+   replays the winning steps and requires its own GroupContext exactly. It never rebuilds from local
+   history: members whose history starts after C would disagree.
+2. An order without a proof is valid only when its anchor is the parent state.
+3. **Single use.** An order is rejected if a winning step in its proof already carries the same
+   order digest.
+4. The admin's asserted time is in the Add commit's authenticated data
+   (`arachne/asserted-time/v1 || u64`), not in the step codec.
+5. The step codec v3 carries an explicit class byte; SelfUpdate is tag 12.
+
+## B3c measurements (release, batches of 128, bytes)
+
+| Members | No self-updates: registration / Remove | Self-updated: registration / Remove / largest self-update |
+| --- | --- | --- |
+| 385 | 32,405 / 32,167 | 1,801 / 1,415 / 11,365 |
+| 769 | 63,932 / 63,694 | 2,140 / 1,532 / 11,482 |
+| 1,025 | 84,959 / 84,721 (refused) | 2,405 / 1,649 / 11,599 |
+
+The 64 KiB ceiling counts members that never self-updated, not all members. Runtime policy:
+self-update right after adopting a Welcome, then every 24 h or 10,000 sent objects. Transport:
+binary steps, paged history replies (≤ ~96 KiB of steps per reply), DFMO by digest or a raised
+bound, then raise `MAX_BYTES` and the transport cap together. Bound the anchor proof so a node never
+accepts a step it cannot store or send.
