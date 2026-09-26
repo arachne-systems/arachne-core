@@ -565,6 +565,19 @@ fn drive_workspace_step(session: &mut Session) -> Result<Value, ApiError> {
                 .get("state")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
+            if state.as_deref() == Some("membership_update_available") {
+                let step = serde_json::from_value(membership["step"].clone())
+                    .map_err(|_| ApiError::transport_failed(None, "invalid membership step"))?;
+                let change = ops::nested(session, Op::StageAdmissionUpdate, |session| {
+                    management::stage_admission_update(session, management::AdmissionUpdateArgs { step })
+                })?;
+                let snapshot = match change {
+                    management::StagedChange::Candidate(candidate) => candidate.snapshot,
+                    management::StagedChange::Removal(removal) => removal.snapshot,
+                };
+                persistence::commit_candidate(session, &snapshot)?;
+                return adopt_admission_value(session, snapshot);
+            }
             if matches!(
                 state.as_deref(),
                 Some("workspace_name_update_available" | "workspace_name_checkpoint_available")
