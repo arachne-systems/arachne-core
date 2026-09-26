@@ -590,8 +590,31 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
         committed["reply_queued"] = json!(reply.queued);
     }
     committed["state"] = json!("workspace_committed");
+    copy_branch_outcome(&staged, &mut committed);
     committed["activity"] = activity_value(live(session)?);
     Ok(committed)
+}
+
+fn copy_branch_outcome(staged: &Value, committed: &mut Value) {
+    for name in ["branch_state", "fork_epoch", "first_unsettled", "action_id", "reason",
+        "carried_revocation", "republication", "republication_lost", "publication_id"] {
+        if let Some(value) = staged.get(name) {
+            committed[name] = value.clone();
+        }
+    }
+}
+
+#[test]
+fn a_saved_branch_outcome_reaches_the_host() {
+    let staged = json!({"state":"awaiting_save", "candidate":[1,2],
+        "branch_state":"action_lost", "action_id":[3], "reason":"retry_already_used"});
+    let mut committed = json!({"state":"workspace_committed", "durable":true});
+    copy_branch_outcome(&staged, &mut committed);
+    assert_eq!(committed["branch_state"], "action_lost");
+    assert_eq!(committed["action_id"], json!([3]));
+    assert_eq!(committed["reason"], "retry_already_used");
+    assert_eq!(committed["state"], "workspace_committed");
+    assert!(committed.get("candidate").is_none());
 }
 
 /// Save and adopt this member's staged self-update, then announce the head.

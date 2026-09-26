@@ -875,6 +875,17 @@ impl ObjectInbox {
         moved.retained_current_views.clear();
         moved.current_progress.clear();
         for stream in &mut moved.direct {
+            // Direct scopes span epochs. Rewind their sequence frontier with
+            // the discarded suffix, or re-publication starts behind a hole
+            // that only existed on the losing branch.
+            if let Some(first_lost) = stream.records.iter().filter(|record| {
+                arachne_security::object_epoch(&record.object).is_some_and(|epoch| epoch > fork_epoch)
+            }).map(|record| record.sequence).min() {
+                let through = first_lost.saturating_sub(1);
+                stream.known_head = stream.known_head.min(through);
+                stream.floor = stream.floor.min(through);
+                stream.recovery_floor = stream.recovery_floor.min(through);
+            }
             stream.records.retain(|record| {
                 arachne_security::object_epoch(&record.object).is_some_and(kept)
             });
@@ -1293,7 +1304,21 @@ impl ObjectInbox {
         }
         let identity = publication_identity(author, context.id);
         if self.recent.contains(&identity) {
-            return Ok(InboxStage::Duplicate);
+            if recipients.is_empty() || sequence == 0 || self.direct.iter().any(|stream| {
+                stream.author == author && stream.revision == context.revision
+                    && stream.topic == context.topic.as_str() && stream.recipients == recipients
+                    && (stream.closed(sequence) || stream.records.iter().any(|record| record.id == context.id))
+            }) {
+                return Ok(InboxStage::Duplicate);
+            }
+            // The app already accepted this id on another branch or scope.
+            // Keep its newly authenticated sequence proof without delivering
+            // the plaintext twice. Otherwise the next direct object waits
+            // behind a gap that duplicate suppression can never fill.
+            let mut next = self.clone();
+            next.retain_direct(author, context, recipients, object)?;
+            next.snapshot()?;
+            return Ok(InboxStage::Prepared(Box::new(next)));
         }
         // B7e: a direct sequence at or below its scope floor was accepted or
         // given up as missed. A late copy is dropped, never delivered after
@@ -1808,6 +1833,9 @@ impl ObjectInbox {
 
     /// A direct object waits while an earlier sequence of its scope is missing.
     fn behind_direct_gap(&self, pending: &Pending) -> bool {
+        // Already authenticated losing plaintext remains deliverable even
+        // though its ciphertext sequence has left the accepted branch.
+        if pending.from_losing_branch { return false; }
         if pending.recipients.is_empty() || pending.sequence == 0 {
             return false;
         }

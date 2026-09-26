@@ -527,7 +527,15 @@ fn removal_epoch_waits_for_the_window_when_the_removed_member_cannot_report() {
 
 #[test]
 fn own_losing_publication_is_reencrypted_once_with_its_stable_id() {
-    use crate::ops::publication::{self, StagePublicationArgs};
+    for kind in 0..4 {
+        check_own_republication(kind);
+    }
+}
+
+fn check_own_republication(kind: u8) {
+    use crate::ops::publication::{self, CurrentPublication, StagePublicationArgs};
+    use arachne_delivery::inbox::{InboxStage, ObjectInbox};
+    use arachne_routing::PublicationContext;
     let (first, second, mut members) = two_admins(2);
     let removed = members.remove(0);
     let removal = first
@@ -547,6 +555,18 @@ fn own_losing_publication_is_reencrypted_once_with_its_stable_id() {
     stage_update(&mut session, JoinStep::binary(encoded, None)).unwrap();
     adopt_staged(&mut session);
     let id = [92; 16];
+    let mut recipients = match kind {
+        1 => vec![first.member().unwrap().id(), removed.member().unwrap().id()],
+        3 => vec![first.member().unwrap().id()],
+        _ => Vec::new(),
+    };
+    recipients.sort_unstable();
+    let current = (kind == 2).then_some(CurrentPublication {
+        selector: [12; 32],
+        replacement_key: [13; 32],
+        expires_at: u64::MAX,
+        tombstone: false,
+    });
     let staged = publication::stage(
         &mut session,
         StagePublicationArgs {
@@ -555,12 +575,49 @@ fn own_losing_publication_is_reencrypted_once_with_its_stable_id() {
             topic: "chat/room".to_owned(),
             id,
             payload: b"retained on the losing branch".to_vec(),
-            recipients: Vec::new(),
-            current: None,
+            recipients,
+            current,
             bulk: false,
         },
     )
     .unwrap();
+    let accepted_before_switch = if kind == 3 {
+        let receiver = active(
+            first
+                .prepare_step_update(&losing.authorization, &losing.commit)
+                .unwrap(),
+        );
+        let WorkspaceTransition::RoutedPublication(context, _, packet, _, recipients) =
+            &session.transition.staged.as_ref().unwrap().transition
+        else {
+            panic!("publication")
+        };
+        let (_, ciphertext) = PublicationContext::unpack(
+            context.workspace,
+            context.revision,
+            context.topic.clone(),
+            packet,
+        )
+        .unwrap();
+        let InboxStage::Prepared(inbox) = ObjectInbox::new(receiver.id(), receiver.epoch())
+            .stage_with_recipients(&receiver, context, recipients, ciphertext)
+            .unwrap()
+        else {
+            panic!("new direct object")
+        };
+        let pending = inbox.pending(&receiver).unwrap().unwrap();
+        let inbox = inbox
+            .acknowledge(
+                pending.message.member,
+                &context.topic,
+                pending.counter,
+                pending.context.id,
+            )
+            .unwrap();
+        Some((receiver, inbox))
+    } else {
+        None
+    };
     adopt(&mut session, AdoptKind::Publication, staged.snapshot).unwrap();
     let packet = offer_packet(
         &first,
@@ -583,39 +640,202 @@ fn own_losing_publication_is_reencrypted_once_with_its_stable_id() {
         fork::stage_republication(&mut session).unwrap().is_some(),
         "own losing data must survive the switch for re-publication"
     );
+    let WorkspaceTransition::Republication(context, _, packet, _, recipients) =
+        &session.transition.staged.as_ref().unwrap().transition
+    else {
+        panic!("expected recovery publication")
+    };
+    let context = context.clone();
+    let recipients = recipients.clone();
+    let live = (kind == 2)
+        .then(|| arachne_delivery::current::LiveCurrentPacket::from_wire(packet).unwrap());
+    let (_, ciphertext) = PublicationContext::unpack(
+        context.workspace,
+        context.revision,
+        context.topic.clone(),
+        live.as_ref()
+            .map_or(packet.as_slice(), |live| live.packet.as_slice()),
+    )
+    .unwrap();
+    let ciphertext = ciphertext.to_vec();
+    let aad = if let Some(live) = &live {
+        live.metadata.authenticated_context(&context)
+    } else if recipients.is_empty() {
+        context.authenticated_bytes()
+    } else {
+        context.direct_authenticated_bytes(&recipients).unwrap()
+    };
     adopt_staged(&mut session);
     assert!(
         fork::stage_republication(&mut session).unwrap().is_none(),
         "one saved publication drains one recovery item"
     );
-    let log = session
-        .delivery
-        .publisher
-        .as_ref()
-        .unwrap()
-        .epoch_log(owner(&session).epoch())
-        .unwrap();
-    let records = log.publications();
-    assert_eq!(records.len(), 1);
-    let published = records[0];
-    assert_eq!(published.context.id, id);
+    assert_eq!(context.id, id);
     let opened = removal
         .workspace
-        .unprotect_object(
-            b"chat",
-            &published.context.authenticated_bytes(),
-            &published.ciphertext,
-        )
+        .unprotect_object(b"chat", &aad, &ciphertext)
         .unwrap();
     assert_eq!(opened.message.payload, b"retained on the losing branch");
     assert!(
         on_loser
-            .unprotect_object(
-                b"chat",
-                &published.context.authenticated_bytes(),
-                &published.ciphertext
-            )
+            .unprotect_object(b"chat", &aad, &ciphertext)
             .is_err(),
         "the removed member cannot open the new object"
     );
+    let inbox = ObjectInbox::new(removal.workspace.id(), removal.workspace.epoch());
+    let staged = if let Some(live) = live {
+        inbox.stage_live_current(&removal.workspace, &context, live.metadata, &ciphertext)
+    } else {
+        inbox.stage_with_recipients(&removal.workspace, &context, &recipients, &ciphertext)
+    }
+    .unwrap();
+    let InboxStage::Prepared(inbox) = staged else {
+        panic!("expected new publication")
+    };
+    assert!(
+        inbox.pending(&removal.workspace).unwrap().is_some(),
+        "re-published kind {kind} must not wait behind a lost sequence"
+    );
+    if let Some((receiver, prior)) = accepted_before_switch {
+        let prior = prior
+            .rebase(&receiver, fork_epoch, &removal.workspace)
+            .unwrap();
+        let staged = prior
+            .stage_with_recipients(&removal.workspace, &context, &recipients, &ciphertext)
+            .unwrap();
+        let InboxStage::Prepared(prior) = staged else {
+            panic!("a duplicate direct object must retain its new branch sequence proof")
+        };
+        assert!(
+            prior.pending(&removal.workspace).unwrap().is_none(),
+            "stable id suppresses a second application delivery"
+        );
+        let staged = publication::stage(
+            &mut session,
+            StagePublicationArgs {
+                workspace: None,
+                revision: 7,
+                topic: "chat/room".to_owned(),
+                id: [93; 16],
+                payload: b"next".to_vec(),
+                recipients: recipients.clone(),
+                current: None,
+                bulk: false,
+            },
+        )
+        .unwrap();
+        let WorkspaceTransition::RoutedPublication(context, _, packet, _, recipients) =
+            &session.transition.staged.as_ref().unwrap().transition
+        else {
+            panic!("publication")
+        };
+        let (_, ciphertext) = PublicationContext::unpack(
+            context.workspace,
+            context.revision,
+            context.topic.clone(),
+            packet,
+        )
+        .unwrap();
+        let InboxStage::Prepared(next) = prior
+            .stage_with_recipients(&removal.workspace, context, recipients, ciphertext)
+            .unwrap()
+        else {
+            panic!("new direct object")
+        };
+        assert_eq!(
+            next.pending(&removal.workspace)
+                .unwrap()
+                .unwrap()
+                .message
+                .payload,
+            b"next"
+        );
+        adopt(&mut session, AdoptKind::Publication, staged.snapshot).unwrap();
+    }
+}
+
+#[test]
+fn the_losing_administrator_retries_its_own_action_once() {
+    let (first, second, members) = two_admins(2);
+    let epoch = first.epoch();
+    let mut first = bare_test_session(first);
+    let mut second = bare_test_session(second);
+    stage_management(
+        &mut first,
+        ManagementAction::Promote(members[0].member().unwrap().id()),
+    )
+    .unwrap();
+    stage_management(
+        &mut second,
+        ManagementAction::CreateInvitation([94; 32], 0, false),
+    )
+    .unwrap();
+    adopt_staged(&mut first);
+    adopt_staged(&mut second);
+    let (winner, loser) =
+        if owner(&first).branch_key(epoch).unwrap() < owner(&second).branch_key(epoch).unwrap() {
+            (&first, &mut second)
+        } else {
+            (&second, &mut first)
+        };
+    let (lost_auth, _) = owner(loser).history_step(epoch).unwrap().unwrap();
+    let (auth, commit) = owner(winner).history_step(epoch).unwrap().unwrap();
+    receive_offer(
+        loser,
+        &offer_packet(owner(winner), epoch, &auth, &commit, false).unwrap(),
+    )
+    .unwrap();
+    adopt_staged(loser);
+    assert_eq!(
+        owner(loser).epoch_fingerprint(),
+        owner(winner).epoch_fingerprint()
+    );
+    let records = fork::records(loser, false).unwrap();
+    let mut restored = bare_test_session(owner(loser).provisional_copy().unwrap());
+    restored.storage = loser.storage.clone();
+    fork::restore(&mut restored, &records).unwrap();
+    *loser = restored;
+    assert!(
+        fork::stage_retry(loser).unwrap().is_some(),
+        "the losing administrator must retry its own valid action"
+    );
+    adopt_staged(loser);
+    let (retried_auth, _) = owner(loser).history_step(epoch + 1).unwrap().unwrap();
+    match (lost_auth, retried_auth) {
+        (
+            arachne_security::MembershipAuthorization::Management(expected),
+            arachne_security::MembershipAuthorization::Management(actual),
+        ) => assert_eq!(expected, actual),
+        _ => panic!("expected management retry"),
+    }
+    assert!(fork::stage_retry(loser).unwrap().is_none());
+    let records = fork::records(loser, false).unwrap();
+    let mut restored = bare_test_session(owner(loser).provisional_copy().unwrap());
+    restored.storage = loser.storage.clone();
+    fork::restore(&mut restored, &records).unwrap();
+    *loser = restored;
+    // A second loss does not reset the one-retry allowance, even after restart.
+    let removal = owner(winner)
+        .prepare_management(ManagementAction::Remove(members[1].member().unwrap().id()))
+        .unwrap();
+    receive_offer(
+        loser,
+        &offer_packet(
+            owner(winner),
+            epoch + 1,
+            &removal.authorization,
+            &removal.commit,
+            false,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    adopt_staged(loser);
+    let value = fork::stage_retry(loser).unwrap().unwrap();
+    assert_eq!(value["branch_state"], "action_lost");
+    assert_eq!(value["reason"], "retry_already_used");
+    let before = owner(loser).epoch();
+    adopt_staged(loser);
+    assert_eq!(owner(loser).epoch(), before);
+    assert!(fork::stage_retry(loser).unwrap().is_none());
 }

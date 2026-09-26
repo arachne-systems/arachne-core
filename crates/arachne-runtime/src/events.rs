@@ -74,6 +74,7 @@ fn probe(session: &Session) -> Probe {
         membership: session.node.has_membership_gossip()
             || crate::membership::fork::has_carried_work(session)
             || crate::membership::fork::has_republication_work(session)
+            || crate::membership::fork::has_retry_work(session)
             || session.membership.fork.has_result()
             || session.membership.update.as_ref().is_some_and(|job| job.task.is_finished())
             || session.membership.offer.as_ref().is_some_and(|job| job.task.is_finished())
