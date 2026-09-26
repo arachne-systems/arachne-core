@@ -5,8 +5,9 @@
 ## BLUF
 
 H1, H2, H3, H4 and H6 are merged locally on `integrate/wave1`. H5 has a
-separate generated SDK checkpoint. H7 checks the combined Core and records
-remaining defects. H8 and consumer upgrade gates need owner decisions.
+separate generated SDK checkpoint. H7 passes on combined Core `05434f86`:
+706 tests passed, zero failed, 21 ignored. H8 and consumer upgrade gates need
+owner decisions.
 The [work tracker](../2026-09-24-work-tracker.md) separates implementation
 evidence from these open gates.
 
@@ -29,13 +30,13 @@ Nothing is pushed. All branches are local.
 
 | ID | Package | Branch (worktree) | State | Depends on |
 | --- | --- | --- | --- | --- |
-| [H1](H1-a2-fork-healing.md) | A2 fork healing, revocation carry, re-publication and settlement | `codex/night-h1-forks` and follow-ups | `3379267` and fragment checkpoint `5a80e43` merged; public anchors `08d021a` and scheduler `21054c4` merged; final H7 qualification pending | — |
+| [H1](H1-a2-fork-healing.md) | A2 fork healing, revocation carry, re-publication and settlement | `codex/night-h1-forks` and follow-ups | `3379267` and fragment checkpoint `5a80e43` merged; public anchors `08d021a` and scheduler `21054c4` merged; included in final H7 qualification | — |
 | [H2](H2-a5-storage.md) | Native storage, opaque candidates, physical parts, branch records | `codex/night-h2-storage` | `840c25a` merged as `0d5e071`; old-data upgrade is a release gate | — |
 | [H3](H3-test-speed.md) | Optimize dependencies in test builds | `a6619db` | merged as `688946b`; same-source before/after measurements are in `docs/development.md` | — |
 | [H4](H4-core-ffi-api.md) | Core-owned typed API and UniFFI metadata | `codex/night-h2-storage` | `91ce5b1` merged as `e420a52`; dispatcher caller migration remains open | H2 |
 | [H5](H5-sdk-completion.md) | Generated bindings and Android packaging | SDK `codex/night-h5-bindings` | `3c750fb` on Core `e420a52`; four languages and AAR builds green, SDK-line/ATAK decisions open | H1, H2, H4 |
 | [H6](H6-crypto-dependency-bumps.md) | SHA-2 0.11, HKDF/HMAC 0.13 and SFrame check | `codex/night-h6-crypto` | `fc06673` merged as `ad31b97`; MSRV, deny and corrected full suite green | H1, H2 |
-| [H7](H7-final-integration.md) | Integrated qualification, cleanup and merge summary | `codex/night-h7-integration` | format `70b8c75` and strict Clippy green; complete combined suite running | all |
+| [H7](H7-final-integration.md) | Integrated qualification, cleanup and merge summary | `codex/night-h7-integration` | final source `05434f86`: 706/0/21 across 120 executables; Clippy, MSRV, deny and format green; target cleaned | all |
 | [H8](H8-owner-decisions.md) | Owner decisions and outward actions | — | open | — |
 
 ## Rules every agent must follow

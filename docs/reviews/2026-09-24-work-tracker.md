@@ -7,21 +7,22 @@ test is red → green and the crate tests pass.
 
 H1, H2, H3, H4 and H6 are merged locally on `integrate/wave1`. Core has API
 version 6, native storage, opaque candidates, generated binding metadata and
-bounded fork recovery. H5 proves the generated SDK on Core `e420a52`. H7 now
-checks the combined Core branch. Owner decisions and unproved consumer upgrades
-stay open below.
+bounded fork recovery. H5 proves the generated SDK on Core `e420a52`. H7 passes
+on final Core `05434f86`: 706 passed, zero failed, 21 ignored. Owner decisions
+and unproved consumer upgrades stay open below.
 
 ## Integration evidence (2026-09-26)
 
 | Package | Implementation and merge | Evidence |
 | --- | --- | --- |
-| H1 | `3379267`, `5a80e43`; merges `3ab4486`, `0808c38` | [Fork and proof-transfer report](../evidence/h1-night-2026-09-26.md) |
+| H1 | `3379267`, `5a80e43`, `08d021a`, `21054c4`; merges `3ab4486`, `0808c38`, `ffda4b4`, `94e30da` | [Fork, proof-transfer, public-anchor and driver report](../evidence/h1-night-2026-09-26.md) |
 | H2 | `840c25a`; merge `0d5e071` | [Native storage report](../evidence/h2-night-2026-09-26.md) |
 | H3 | `a6619db`; merge `688946b` | [Measured test profile](handoff/H3-test-speed.md) |
 | H4 | `91ce5b1`; merge `e420a52` | [Core binding report](../evidence/h4-night-2026-09-26.md) |
 | H5 (SDK) | SDK `3c750fb`, Core `e420a52` | Four language flows, Rust, AAR, R8 and Android test APK passed; device/ATAK gates remain |
 | H6 | `fc06673`; merge `ad31b97` | [Crypto report](../evidence/h6-night-2026-09-26.md): 681 passed, 0 failed, 20 ignored; MSRV and deny green |
-| H7 | `codex/night-h7-integration`, base `ad31b97` | Initial RED retained; H1 driver fix imported; strict Clippy, deny and MSRV green; format `70b8c75`; final suite pending |
+| Typed publication options | `db57185`; merge `05434f8` | [Audience, Bulk and Current proof](2026-09-26-typed-publication-options.md); included in H7 |
+| H7 | Final source `05434f86`; code cleanup `7ef4004`, `381f451`, `0cb8c7f`, `911ecce`; format `70b8c75` | [Final report](../evidence/h7-night-2026-09-26.md): uninterrupted 706 passed, 0 failed, 21 ignored across 120 executables; strict Clippy, deny, MSRV and format green; 12.0 GiB target cleaned |
 
 The H6 total includes 18 tests in 20 example harnesses. It is a corrected
 aggregate with the original failures and reruns retained in its receipts.
