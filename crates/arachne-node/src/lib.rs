@@ -1804,6 +1804,13 @@ async fn send_frame(
             stats = ?observed_connection.as_ref().map(|connection| connection.stats()),
             "TRANSPORT_SEND_STATS");
     }
+    // A timed-out data exchange must not pin every later retry to the same
+    // stalled connection. Policy rejection alone does not break the transport.
+    if matches!(result, Err(Error::Timeout(_) | Error::Transport(_)))
+        && matches!(stage, "open stream" | "write frame" | "read acknowledgment")
+    {
+        connections.discard(peer, ALPN).await;
+    }
     result
 }
 

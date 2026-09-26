@@ -10,6 +10,86 @@ use std::{
 const CONTROL: &[u8] = b"arachne/control/1";
 
 #[tokio::test]
+async fn subscription_retry_replaces_a_connection_that_did_not_acknowledge() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut options = arachne_node::NodeOptions::new(arachne_node::NetworkProfile::Direct);
+        options.timeouts.operation = Duration::from_millis(400);
+        let (node, _) = Node::bind_with_options(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            options,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let peer = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .clear_relay_transports()
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .alpns(vec![b"arachne/data/1".to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let peer_id = *peer.id().as_bytes();
+        node.add_address_hint(peer_id, peer.bound_sockets()[0])
+            .await
+            .unwrap();
+        let workspace = [47; 32];
+        node.install_verified_policy(
+            workspace,
+            1,
+            std::collections::BTreeMap::from([
+                (node.id(), arachne_node::Permissions::AllTopics),
+                (peer_id, arachne_node::Permissions::AllTopics),
+            ]),
+        )
+        .await
+        .unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = accepted.clone();
+        let endpoint = peer.clone();
+        let server = tokio::spawn(async move {
+            let mut workers = tokio::task::JoinSet::new();
+            while let Some(incoming) = endpoint.accept().await {
+                let attempt = count.fetch_add(1, Ordering::Relaxed);
+                workers.spawn(async move {
+                    let connection = incoming.await.unwrap();
+                    let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+                    assert!(!recv.read_to_end(1024).await.unwrap().is_empty());
+                    if attempt == 0 {
+                        // Keep the connection open but stop servicing its streams.
+                        std::future::pending::<()>().await;
+                    }
+                    send.write_all(&[1]).await.unwrap();
+                    send.finish().unwrap();
+                    connection.closed().await;
+                });
+            }
+        });
+        let topic = arachne_node::Topic::new("shared/content").unwrap();
+        let first = node.subscribe(workspace, 1, topic.clone()).await.unwrap();
+        assert!(matches!(
+            first.failed.as_slice(),
+            [(_, arachne_node::Error::Timeout("read acknowledgment"))]
+        ));
+        let retry = node.subscribe(workspace, 1, topic).await.unwrap();
+        assert!(
+            retry.failed.is_empty(),
+            "retry reused the stalled connection: {:?}",
+            retry.failed
+        );
+        assert!(retry.admitted.contains(&peer_id));
+        assert_eq!(accepted.load(Ordering::Relaxed), 2);
+        node.close().await;
+        peer.close().await;
+        server.abort();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn stalled_frame_times_out_without_closing_other_exchanges() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let (node, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
@@ -155,9 +235,11 @@ async fn late_reply_after_caller_timeout_does_not_poison_reused_connection() {
 
         let mut first = tokio::spawn(sender.request_control(receiver.id(), b"late-admission"));
         let request = next_request(&mut receiver).await;
-        assert!(tokio::time::timeout(Duration::from_millis(25), &mut first)
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut first)
+                .await
+                .is_err()
+        );
         first.abort();
         assert!(first.await.unwrap_err().is_cancelled());
 
