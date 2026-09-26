@@ -9,7 +9,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicI64, Ordering},
+        atomic::{AtomicI64, Ordering},
     },
     time::Duration,
 };
@@ -34,8 +34,6 @@ pub(crate) struct Entry {
     pub(crate) signal: Arc<work_signal::WorkSignal>,
     pub(crate) cancellation: watch::Sender<bool>,
     pub(crate) transport: TransportSummary,
-    /// Counts deadline timers, so a late timer never cancels a later op.
-    pub(crate) generation: Arc<Mutex<u64>>,
     /// Per-op deadline of this session (`None`: only each wait's own limit).
     pub(crate) deadline: Mutex<Option<Duration>>,
 }
@@ -47,62 +45,6 @@ impl Entry {
 
     pub(crate) fn set_deadline(&self, deadline: Option<Duration>) {
         *self.deadline.lock().unwrap_or_else(|error| error.into_inner()) = deadline;
-    }
-
-    /// Start a deadline for one op: at `deadline` it interrupts the op's
-    /// outbound control exchanges. `DeadlineTimer::finish` ends it.
-    pub(crate) fn arm_deadline(self: Arc<Self>, deadline: Duration) -> DeadlineTimer {
-        let token = {
-            let mut generation = self
-                .generation
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            *generation += 1;
-            *generation
-        };
-        let fired = Arc::new(AtomicBool::new(false));
-        let generation = Arc::clone(&self.generation);
-        let cancellation = self.cancellation.clone();
-        let fire = Arc::clone(&fired);
-        let task = self.context.handle().spawn(async move {
-            tokio::time::sleep(deadline).await;
-            let current = generation.lock().unwrap_or_else(|error| error.into_inner());
-            if *current == token {
-                fire.store(true, Ordering::Release);
-                cancellation.send_replace(true);
-            }
-        });
-        DeadlineTimer {
-            entry: self,
-            fired,
-            task,
-        }
-    }
-}
-
-/// One op's deadline. Its task ends at `finish` or at the deadline.
-pub(crate) struct DeadlineTimer {
-    entry: Arc<Entry>,
-    fired: Arc<AtomicBool>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl DeadlineTimer {
-    /// End the deadline. `true`: it fired while the op ran. The cancel it
-    /// sent is cleared unless the session is closing.
-    pub(crate) fn finish(self) -> bool {
-        // Under the generation lock, so a timer cannot fire after this.
-        *self
-            .entry
-            .generation
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) += 1;
-        self.task.abort();
-        let fired = self.fired.load(Ordering::Acquire);
-        if fired && !self.entry.signal.is_closed() {
-            crate::ops::clear_cancel(&self.entry.cancellation);
-        }
-        fired
     }
 }
 
@@ -280,7 +222,6 @@ pub(crate) fn open(
         signal,
         cancellation,
         transport,
-        generation: Arc::default(),
         deadline: Mutex::new(deadline),
     });
     directory()?.insert(handle, Arc::clone(&entry));
@@ -493,6 +434,104 @@ pub(crate) fn shutdown_session(mut session: Session) -> Result<(), ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_operation_deadline_preserves_an_earlier_background_control_exchange() {
+        deadline_preserves_background_control(false);
+    }
+
+    #[test]
+    fn an_operation_deadline_preserves_a_concurrent_background_control_exchange() {
+        deadline_preserves_background_control(true);
+    }
+
+    #[test]
+    fn an_expired_operation_does_not_enter_its_body() {
+        let context = Context::new(Default::default()).unwrap();
+        let handle = open(&context, None, NodeOptions::new(NetworkProfile::Direct), None).unwrap();
+        entry(handle).unwrap().set_deadline(Some(Duration::ZERO));
+        let outcome: Result<(), ApiError> =
+            crate::ops::run(handle, crate::ops::Op::ControlExchange, |_| {
+                panic!("expired operation body was entered")
+            });
+        assert_eq!(outcome, Err(ApiError::DeadlineExceeded));
+        close(handle).unwrap();
+    }
+
+    fn deadline_preserves_background_control(start_during_op: bool) {
+        let context = Context::new(Default::default()).unwrap();
+        let handle = open(&context, None, NodeOptions::new(NetworkProfile::Direct), None).unwrap();
+        let entry = entry(handle).unwrap();
+        let runtime = context.handle();
+        let (mut peer, _) = runtime
+            .block_on(Node::bind("127.0.0.1:0".parse().unwrap()))
+            .unwrap();
+        let control = {
+            let guard = entry.shared.lock().unwrap();
+            let session = guard.as_ref().unwrap();
+            runtime
+                .block_on(session.node.add_address_hint(peer.id(), peer.address()))
+                .unwrap();
+            session.node.control_client()
+        };
+        let start_background = |peer: &mut Node| {
+            let background = runtime.spawn(control.clone().request_control(peer.id(), b"background"));
+            let held = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if let Some(request) = peer.poll_control() {
+                            assert_eq!(request.payload(), b"background");
+                            break request;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap()
+            });
+            (background, held)
+        };
+        let mut background = (!start_during_op).then(|| start_background(&mut peer));
+        // The concurrent case includes a real local request before the foreground
+        // wait. Its larger bound gives that exchange time to reach the peer.
+        let limit = Duration::from_millis(if start_during_op { 200 } else { 20 });
+        entry.set_deadline(Some(limit));
+        let started = std::time::Instant::now();
+        let foreground = crate::ops::run(handle, crate::ops::Op::ControlExchange, |session| {
+            if start_during_op {
+                // This independent client starts while the foreground deadline is
+                // active. It must not inherit ambient operation cancellation.
+                background = Some(start_background(&mut peer));
+            }
+            crate::ops::debug::control_exchange(
+                session,
+                crate::ops::debug::ControlExchangeArgs {
+                    peer: peer.id(),
+                    address: None,
+                    payload: b"foreground".to_vec(),
+                },
+            )
+        });
+        assert_eq!(foreground.unwrap_err().code(), ErrorCode::DeadlineExceeded);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let (mut background, held) = background.unwrap();
+        let early = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(100), &mut background).await
+        });
+        assert!(early.is_err(), "unrelated background exchange ended: {early:?}");
+        held.respond(b"background survived".to_vec()).unwrap();
+        let reply = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), background)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(reply, b"background survived");
+        entry.set_deadline(None);
+        close(handle).unwrap();
+        runtime.block_on(peer.close());
+    }
 
     type BindPause = (
         [u8; 32],

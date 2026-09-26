@@ -291,12 +291,15 @@ pub(crate) fn fetch_checkpoint(
     if let Some(peer) = args.peer {
         args.peers.insert(0, peer);
     }
-    session.runtime.block_on(request_invitation_checkpoint(
-        session.node.control_client(),
-        session.node.id(),
-        args.invitation,
-        args.peers,
-    ))
+    session.runtime.block_on(crate::deadline::wait(
+        session.op_deadline,
+        request_invitation_checkpoint(
+            session.node.control_client(),
+            session.node.id(),
+            args.invitation,
+            args.peers,
+        ),
+    ))?
 }
 
 /// Stage the Welcome and the history steps that lead to it. The prefix
@@ -386,7 +389,10 @@ pub(crate) fn request_admission(
     let packet = admission_request_packet(request, name)?;
     let outcome = session
         .runtime
-        .block_on(session.node.request_control(peer, &packet));
+        .block_on(crate::deadline::wait(
+            session.op_deadline,
+            session.node.request_control(peer, &packet),
+        ))?;
     let reply = match outcome {
         Ok(reply) => reply,
         Err(arachne_node::Error::ControlNotSent(_) | arachne_node::Error::MissingPeer) => {
@@ -434,7 +440,10 @@ pub(crate) fn request_admission(
             let page = admission_history_page_packet(request, offset)?;
             let page = session
                 .runtime
-                .block_on(session.node.request_control(peer, &page))
+                .block_on(crate::deadline::wait(
+                    session.op_deadline,
+                    session.node.request_control(peer, &page),
+                ))?
                 .map_err(errors::node)?;
             total_bytes = total_bytes.saturating_add(page.len());
             if total_bytes > arachne_security::MAX_JOIN_HISTORY_BYTES {

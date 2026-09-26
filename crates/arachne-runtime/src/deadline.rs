@@ -1,11 +1,31 @@
 //! Per-op deadlines (ADR step 4). A session has an optional deadline for
 //! each blocking op, set by `Client::set_deadline`, `TransportOptions::deadline`
-//! or the handle call `set_deadline`. `ops::run` arms it: at the deadline it
-//! stops the op's control exchanges, and every other bounded wait inside
+//! or the handle call `set_deadline`. `ops::run` gives it to foreground
+//! waits only. It never cancels background control exchanges. Other waits inside
 //! the op (policy install, gossip join during a send, the endpoint bind)
 //! takes the smaller of its own limit and the time left.
 
-use std::time::{Duration, Instant};
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
+
+/// Bound only the supplied foreground wait. Background tasks keep their own
+/// limits and the explicit node-wide cancel/close signal.
+pub(crate) async fn wait<T>(
+    deadline: Option<Instant>,
+    work: impl Future<Output = T>,
+) -> Result<T, arachne_api::ApiError> {
+    let Some(deadline) = deadline else {
+        return Ok(work.await);
+    };
+    if Instant::now() >= deadline {
+        return Err(arachne_api::ApiError::DeadlineExceeded);
+    }
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), work)
+        .await
+        .map_err(|_| arachne_api::ApiError::DeadlineExceeded)
+}
 
 /// The smaller of `limit` and the time left before `deadline`.
 pub(crate) fn cap(deadline: Option<Instant>, limit: Duration) -> Duration {
@@ -23,6 +43,18 @@ pub(crate) fn expired(deadline: Option<Instant>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_expired_wait_does_not_poll_ready_work() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let outcome: Result<(), _> = runtime.block_on(wait(Some(Instant::now()), async {
+            panic!("expired foreground work was polled")
+        }));
+        assert_eq!(outcome, Err(arachne_api::ApiError::DeadlineExceeded));
+    }
 
     #[test]
     fn a_wait_takes_the_smaller_of_its_limit_and_the_time_left() {
