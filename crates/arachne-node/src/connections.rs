@@ -190,6 +190,8 @@ fn unreachable_backoff(failures: u32) -> std::time::Duration {
 #[derive(Clone)]
 pub(super) struct Connections {
     endpoint: Endpoint,
+    #[cfg(test)]
+    pub(super) blocked_peer: super::gossip_forwarding_test::BlockedPeer,
     budget: ConnectionBudget,
     members: super::budget::Members,
     bound_address: SocketAddr,
@@ -268,6 +270,12 @@ impl Connections {
             members: members.clone(),
         })
         .hooks(observer.clone());
+        #[cfg(test)]
+        let blocked_peer = super::gossip_forwarding_test::BlockedPeer::default();
+        #[cfg(test)]
+        {
+            builder = builder.hooks(blocked_peer.clone());
+        }
         if !profile.uses_tor() {
             builder = builder.address_lookup(memory.clone());
         }
@@ -305,6 +313,8 @@ impl Connections {
         let bound_address = endpoint.bound_sockets().first().copied().unwrap_or(address);
         Ok(Self {
             endpoint,
+            #[cfg(test)]
+            blocked_peer,
             budget,
             members,
             bound_address,
