@@ -9,6 +9,7 @@ use std::{
 };
 
 use arachne_routing::RoutingTable;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use iroh::{EndpointAddr, PublicKey, endpoint::Connection};
 use iroh_moq::{Moq, MoqSession};
 use moq_net::{Timestamp, broadcast, group, track};
@@ -21,6 +22,9 @@ use crate::{
 };
 
 const SESSION_TIMEOUT: Duration = Duration::from_secs(10);
+// At most 1 MiB of validated-size envelopes per peer, independent of the
+// upstream MoQ cache. Each reader also ends at the existing live replay window.
+const MAX_GROUP_READS: usize = 8;
 
 /// Counters for the distinct MoQ data path. A queued packet is not a remote receipt.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -605,37 +609,33 @@ async fn receive_session(
     tracing::info!(target: "data_fabric_transport", peer = %session.remote_id(), workspace = %hex(&scope.workspace), revision = scope.revision, topic = topic.as_str(), route = "moq", "PTT_MOQ_SESSION_ESTABLISHED");
     let closed = session.closed();
     tokio::pin!(closed);
+    let mut pending = FuturesUnordered::new();
+    let mut ended = false;
     loop {
-        let next_group = tokio::select! {
-            group = subscriber.recv_group() => group.map_err(transport)?,
-            reason = &mut closed => return Err(transport(reason)),
-        };
-        let Some(mut group) = next_group else {
+        if ended && pending.is_empty() {
             return Ok(());
+        }
+        let (sequence, frame) = tokio::select! {
+            biased;
+            // This remains polled while any group waits for a header, payload
+            // or EOF. Dropping this function drops all its group readers.
+            reason = &mut closed => return Err(transport(reason)),
+            completed = pending.next(), if !pending.is_empty() => {
+                completed.expect("nonempty group readers")?
+            }
+            next = subscriber.recv_group(), if !ended && pending.len() < MAX_GROUP_READS => {
+                match next.map_err(transport)? {
+                    Some(group) => {
+                        if let Some(counters) = counters.upgrade() {
+                            counters.groups_received.fetch_add(1, Ordering::Relaxed);
+                        }
+                        pending.push(read_group(group, counters));
+                    }
+                    None => ended = true,
+                }
+                continue;
+            }
         };
-        if let Some(counters) = counters.upgrade() {
-            counters.groups_received.fetch_add(1, Ordering::Relaxed);
-        }
-        let sequence = group.sequence;
-        let Some(frame) = group.read_frame().await.map_err(transport)? else {
-            return Err(Error::InvalidFrame);
-        };
-        if let Some(counters) = counters.upgrade() {
-            counters.frames_received.fetch_add(1, Ordering::Relaxed);
-        }
-        if frame.payload.len() > super::MAX_FRAME
-            || group.read_frame().await.map_err(transport)?.is_some()
-        {
-            return Err(Error::TooLarge);
-        }
-        if let Some(counters) = counters.upgrade() {
-            counters.groups_completed.fetch_add(1, Ordering::Relaxed);
-        }
-        let envelope = wire::decode::<Envelope>(&frame.payload)?;
-        if envelope.sequence != sequence {
-            return Err(Error::InvalidFrame);
-        }
-        let frame = wire::decode::<Frame>(&envelope.frame)?;
         if frame.workspace != scope.workspace
             || frame.revision != scope.revision
             || frame.topic != topic.as_str()
@@ -652,6 +652,39 @@ async fn receive_session(
         }
         tracing::info!(target: "data_fabric_transport", peer = %session.remote_id(), sequence, route = "moq", "PTT_MOQ_PACKET_RECEIVED");
     }
+}
+
+/// Read one independent envelope. A peer cannot hold a reader forever, even
+/// when all slots are occupied. The deadline is the live replay window, not a
+/// reconnect timeout. Protocol errors still end the authenticated session.
+async fn read_group(mut group: group::Consumer, counters: &Weak<Counters>) -> Result<(u64, Frame)> {
+    tokio::time::timeout(track::DEFAULT_MAX_AGE, async {
+        let sequence = group.sequence;
+        let Some(mut frame) = group.next_frame().await.map_err(transport)? else {
+            return Err(Error::InvalidFrame);
+        };
+        if frame.size > super::MAX_FRAME as u64 {
+            return Err(Error::TooLarge);
+        }
+        let payload = frame.read_all().await.map_err(transport)?;
+        if let Some(counters) = counters.upgrade() {
+            counters.frames_received.fetch_add(1, Ordering::Relaxed);
+        }
+        // Inspect the next header, without assembling a forbidden second body.
+        if group.next_frame().await.map_err(transport)?.is_some() {
+            return Err(Error::TooLarge);
+        }
+        if let Some(counters) = counters.upgrade() {
+            counters.groups_completed.fetch_add(1, Ordering::Relaxed);
+        }
+        let envelope = wire::decode::<Envelope>(&payload)?;
+        if envelope.sequence != sequence {
+            return Err(Error::InvalidFrame);
+        }
+        Ok((sequence, wire::decode::<Frame>(&envelope.frame)?))
+    })
+    .await
+    .map_err(|_| Error::Timeout("read MoQ group"))?
 }
 
 fn path(workspace: WorkspaceId, author: PeerId, revision: u64) -> String {
