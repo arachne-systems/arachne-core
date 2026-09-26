@@ -14,6 +14,126 @@ fn access(topic: &Topic) -> Permissions {
 }
 
 #[tokio::test]
+async fn three_peers_deliver_a_critical_reply_after_a_stream_burst() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut nodes = Vec::new();
+        let mut messages = Vec::new();
+        for _ in 0..3 {
+            let (node, receiver) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            nodes.push(node);
+            messages.push(receiver);
+        }
+        let workspace = [48; 32];
+        let topic = Topic::new("shared/stream").unwrap();
+        let policy: BTreeMap<_, _> = nodes
+            .iter()
+            .map(|node| (node.id(), access(&topic)))
+            .collect();
+        for node in &nodes {
+            node.install_verified_policy(workspace, 1, policy.clone())
+                .await
+                .unwrap();
+            for peer in &nodes {
+                if node.id() != peer.id() {
+                    node.add_address_hint(peer.id(), peer.address())
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+        for node in &nodes {
+            node.subscribe(workspace, 1, topic.clone()).await.unwrap();
+        }
+        for left in 0..3 {
+            for right in left + 1..3 {
+                let (dialer, listener) = if nodes[left].id() < nodes[right].id() {
+                    (&nodes[left], &nodes[right])
+                } else {
+                    (&nodes[right], &nodes[left])
+                };
+                listener
+                    .enable_moq_delivery(workspace, 1, dialer.id(), topic.clone())
+                    .await
+                    .unwrap();
+                dialer
+                    .enable_moq_delivery(workspace, 1, listener.id(), topic.clone())
+                    .await
+                    .unwrap();
+            }
+        }
+        while nodes
+            .iter()
+            .any(|node| node.moq_metrics().sessions_active != 2)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for sequence in 1..=15 {
+            nodes[0]
+                .publish_protected_with_class(
+                    workspace,
+                    1,
+                    topic.clone(),
+                    sequence,
+                    DeliveryClass::Critical,
+                    vec![sequence as u8],
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // A follower requests a reply after the first publisher ends its burst.
+        nodes[1]
+            .publish_protected_with_class(
+                workspace,
+                1,
+                topic.clone(),
+                1,
+                DeliveryClass::Critical,
+                b"request".to_vec(),
+            )
+            .await
+            .unwrap();
+        loop {
+            if let Ok(message) = messages[0].try_recv()
+                && message.payload == b"request"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for sequence in [16, 17] {
+            nodes[0]
+                .publish_protected_with_class(
+                    workspace,
+                    1,
+                    topic.clone(),
+                    sequence,
+                    DeliveryClass::Critical,
+                    vec![sequence as u8],
+                )
+                .await
+                .unwrap();
+        }
+        for receiver in messages.iter_mut().skip(1) {
+            let mut replies = BTreeSet::new();
+            while replies.len() != 2 {
+                if let Ok(message) = receiver.try_recv() {
+                    if matches!(message.payload.as_slice(), [16] | [17]) {
+                        replies.insert(message.payload[0]);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        for node in nodes {
+            node.close().await;
+        }
+    })
+    .await
+    .expect("critical reply was lost after the stream burst");
+}
+
+#[tokio::test]
 async fn dialer_reconnects_after_the_listener_restarts_on_the_same_port() {
     tokio::time::timeout(Duration::from_secs(45), async {
         let dialer_secret = [71; 32];
