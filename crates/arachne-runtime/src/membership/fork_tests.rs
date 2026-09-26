@@ -61,6 +61,10 @@ fn a_competing_removal_switches_only_after_candidate_adoption() {
     adopt_staged(&mut session);
     assert_eq!(owner(&session).epoch_fingerprint(), expected);
     assert!(
+        receive_offer(&mut session, &packet).is_err(),
+        "an exact replay retains its generic rejection"
+    );
+    assert!(
         !owner(&session)
             .member_roster()
             .unwrap()
@@ -216,4 +220,194 @@ fn branch_rows_are_bounded_contiguous_and_only_hints() {
         })
         .collect();
     assert!(wire::encode_branch_reply(&reply).is_err());
+}
+
+fn active(workspace: PreparedManagementUpdate) -> Workspace {
+    match workspace {
+        PreparedManagementUpdate::Active(workspace) => *workspace,
+        PreparedManagementUpdate::Removed(_) => panic!("unexpected removal"),
+    }
+}
+
+fn two_admins(count: u16) -> (Workspace, Workspace, Vec<Workspace>) {
+    let (admin, mut members, _) = admit_members(6, "Member", count + 1);
+    for member in &mut members {
+        while member.epoch() < admin.epoch() {
+            let (authorization, commit) = admin.history_step(member.epoch()).unwrap().unwrap();
+            *member = match &authorization {
+                arachne_security::MembershipAuthorization::Admission(auth) => {
+                    member.prepare_admission_update(auth, &commit).unwrap()
+                }
+                arachne_security::MembershipAuthorization::AdmissionBatch(auths) => member
+                    .prepare_admission_batch_update(auths, &commit)
+                    .unwrap(),
+                _ => active(member.prepare_step_update(&authorization, &commit).unwrap()),
+            };
+        }
+    }
+    let promote = admin
+        .prepare_management(ManagementAction::Promote(members[0].member().unwrap().id()))
+        .unwrap();
+    for member in &mut members {
+        *member = active(
+            member
+                .prepare_step_update(&promote.authorization, &promote.commit)
+                .unwrap(),
+        );
+    }
+    (promote.workspace, members.remove(0), members)
+}
+
+#[test]
+fn competing_removes_are_carried_and_quarantine_sends_until_both_apply() {
+    let (first, second, mut members) = two_admins(3);
+    let targets = [
+        members[0].member().unwrap().id(),
+        members[1].member().unwrap().id(),
+    ];
+    let first_remove = first
+        .prepare_management(ManagementAction::Remove(targets[0]))
+        .unwrap();
+    let second_remove = second
+        .prepare_management(ManagementAction::Remove(targets[1]))
+        .unwrap();
+    let key = |change: &arachne_security::PreparedManagement| {
+        arachne_security::fork_key(&change.authorization, &change.commit)
+    };
+    let (winner, loser) = if key(&first_remove) < key(&second_remove) {
+        (first_remove, second_remove)
+    } else {
+        (second_remove, first_remove)
+    };
+    let mut session = bare_test_session(members.remove(2));
+    session.storage_key = Some(StorageKey::derive(&[85; 32]).unwrap());
+    let fork_epoch = owner(&session).epoch();
+    let losing = owner_wire_step(
+        owner(&session),
+        &loser.authorization,
+        &loser.commit,
+        usize::MAX,
+    )
+    .unwrap();
+    stage_update(&mut session, join_step_from_wire(&losing).unwrap()).unwrap();
+    adopt_staged(&mut session);
+    let packet = offer_packet(
+        &first,
+        fork_epoch,
+        &winner.authorization,
+        &winner.commit,
+        false,
+    )
+    .unwrap();
+    receive_offer(&mut session, &packet).unwrap();
+    adopt_staged(&mut session);
+    assert!(
+        fork::require_send(&session).is_err(),
+        "losing Remove must quarantine sends until it is carried"
+    );
+    // Branch records restore the quarantine before any new publication.
+    let records = fork::records(&session, false).unwrap();
+    let mut restored = bare_test_session(owner(&session).provisional_copy().unwrap());
+    restored.storage_key = Some(StorageKey::derive(&[85; 32]).unwrap());
+    fork::restore(&mut restored, &records).unwrap();
+    assert!(fork::require_send(&restored).is_err());
+    let (_, encoded) = records
+        .iter()
+        .find(|(name, _)| name.starts_with(b"runtime/branch/order/"))
+        .unwrap();
+    let mut receiver = bare_test_session(owner(&session).provisional_copy().unwrap());
+    receiver.storage_key = Some(StorageKey::derive(&[85; 32]).unwrap());
+    let mut forged = arachne_security::OrderStep::from_bytes(encoded).unwrap();
+    forged.order.signature[0] ^= 1;
+    assert!(
+        fork::receive_order(&mut receiver, &forged.to_bytes().unwrap())
+            .unwrap()
+            .is_none()
+    );
+    fork::require_send(&receiver).unwrap();
+    assert!(
+        fork::receive_order(&mut receiver, encoded)
+            .unwrap()
+            .is_some()
+    );
+    fork::require_send(&receiver).unwrap();
+    adopt_staged(&mut receiver);
+    assert!(fork::require_send(&receiver).is_err());
+    assert!(
+        fork::receive_order(&mut receiver, encoded)
+            .unwrap()
+            .is_none(),
+        "duplicate order must not stage another candidate"
+    );
+    // Quarantine stops encryption, but a received membership step still works.
+    let update = winner.workspace.prepare_self_update().unwrap();
+    let bytes = owner_wire_step(
+        &winner.workspace,
+        &arachne_security::MembershipAuthorization::SelfUpdate,
+        &update.commit,
+        usize::MAX,
+    )
+    .unwrap();
+    stage_update(&mut receiver, join_step_from_wire(&bytes).unwrap()).unwrap();
+    adopt_staged(&mut receiver);
+    assert!(fork::require_send(&receiver).is_err());
+    let staged = stage_gossiped_step(&mut session).unwrap();
+    assert!(staged.is_some(), "the driver must commit a carried order");
+    adopt_staged(&mut session);
+    fork::require_send(&session).unwrap();
+    let roster = owner(&session).member_roster().unwrap();
+    assert!(roster.iter().all(|member| !targets.contains(&member.id)));
+    let staged = stage_gossiped_step(&mut restored).unwrap();
+    assert!(staged.is_some());
+    adopt_staged(&mut restored);
+    fork::require_send(&restored).unwrap();
+}
+
+#[test]
+fn a_winner_carries_a_verified_losing_remove_without_switching() {
+    let (first, second, mut members) = two_admins(3);
+    let first_remove = first
+        .prepare_management(ManagementAction::Remove(members[0].member().unwrap().id()))
+        .unwrap();
+    let second_remove = second
+        .prepare_management(ManagementAction::Remove(members[1].member().unwrap().id()))
+        .unwrap();
+    let key = |change: &arachne_security::PreparedManagement| {
+        arachne_security::fork_key(&change.authorization, &change.commit)
+    };
+    let (winner, loser) = if key(&first_remove) < key(&second_remove) {
+        (first_remove, second_remove)
+    } else {
+        (second_remove, first_remove)
+    };
+    let mut session = bare_test_session(members.remove(2));
+    session.storage_key = Some(StorageKey::derive(&[86; 32]).unwrap());
+    let fork_epoch = owner(&session).epoch();
+    let winning = owner_wire_step(
+        owner(&session),
+        &winner.authorization,
+        &winner.commit,
+        usize::MAX,
+    )
+    .unwrap();
+    stage_update(&mut session, join_step_from_wire(&winning).unwrap()).unwrap();
+    adopt_staged(&mut session);
+    let fingerprint = owner(&session).epoch_fingerprint();
+    let losing = offer_packet(
+        &first,
+        fork_epoch,
+        &loser.authorization,
+        &loser.commit,
+        false,
+    )
+    .unwrap();
+    let value = receive_offer(&mut session, &losing).unwrap();
+    assert_eq!(value["branch_state"], "carried_revocation_received");
+    adopt_staged(&mut session);
+    assert_eq!(owner(&session).epoch_fingerprint(), fingerprint);
+    assert!(fork::require_send(&session).is_err());
+    assert!(stage_gossiped_step(&mut session).unwrap().is_some());
+    adopt_staged(&mut session);
+    fork::require_send(&session).unwrap();
+    assert_eq!(owner(&session).member_count(), 3);
 }

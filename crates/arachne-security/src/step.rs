@@ -9,8 +9,8 @@
 //! The class byte must equal the class of the decoded authorization, so a
 //! stored tag cannot relabel a step. Older versions are rejected; there is no
 //! migration (pre-release rule).
-use super::{AdmissionAuthorization, ForkClass, ManagementAction, MembershipAuthorization};
 use super::storage::{number, take};
+use super::{AdmissionAuthorization, ForkClass, ManagementAction, MembershipAuthorization};
 
 /// Error for any record written by an older format.
 pub const FORMAT_NOT_SUPPORTED: &str = "workspace format not supported; create the workspace again";
@@ -62,6 +62,15 @@ pub(super) fn write_step(
     authorization: &MembershipAuthorization,
     commit: &[u8],
 ) -> Result<(), &'static str> {
+    write_step_at_depth(out, authorization, commit, 0)
+}
+
+pub(super) fn write_step_at_depth(
+    out: &mut Vec<u8>,
+    authorization: &MembershipAuthorization,
+    commit: &[u8],
+    depth: u8,
+) -> Result<(), &'static str> {
     if commit.is_empty() || commit.len() > MAX_STEP_COMMIT {
         return Err("membership step commit exceeds bounds");
     }
@@ -84,7 +93,7 @@ pub(super) fn write_step(
         MembershipAuthorization::SelfUpdate => out.extend([12, class]),
         MembershipAuthorization::Revocation(step) => {
             out.extend([revocation_tag(step.order.kind), class]);
-            super::order::write_order_step(out, step)?;
+            super::order::write_order_step_at_depth(out, step, depth)?;
         }
         MembershipAuthorization::Management(action) => {
             let (tag, id) = match action {
@@ -126,6 +135,13 @@ pub(super) fn write_step(
 pub(super) fn read_step(
     rest: &mut &[u8],
 ) -> Result<(MembershipAuthorization, Vec<u8>), &'static str> {
+    read_step_at_depth(rest, 0)
+}
+
+pub(super) fn read_step_at_depth(
+    rest: &mut &[u8],
+    depth: u8,
+) -> Result<(MembershipAuthorization, Vec<u8>), &'static str> {
     let mut bytes = *rest;
     let tag = take(&mut bytes, 1)?[0];
     let class = ForkClass::from_u8(take(&mut bytes, 1)?[0])?;
@@ -144,7 +160,7 @@ pub(super) fn read_step(
         }
         12 => MembershipAuthorization::SelfUpdate,
         2 | 3 | 4 | 6 => {
-            let step = super::order::read_order_step(&mut bytes)?;
+            let step = super::order::read_order_step_at_depth(&mut bytes, depth)?;
             if revocation_tag(step.order.kind) != tag {
                 return Err("membership step class does not match its action");
             }
@@ -323,7 +339,10 @@ mod tests {
         assert!(decode_membership_step(&bytes).is_err());
         let mut old = encode_membership_step(&remove, b"c").unwrap();
         old[4] = 2;
-        assert_eq!(decode_membership_step(&old).err(), Some(FORMAT_NOT_SUPPORTED));
+        assert_eq!(
+            decode_membership_step(&old).err(),
+            Some(FORMAT_NOT_SUPPORTED)
+        );
         let mut unknown = encode_membership_step(&remove, b"c").unwrap();
         unknown[5] = 200;
         assert!(decode_membership_step(&unknown).is_err());

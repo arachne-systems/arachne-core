@@ -2356,6 +2356,7 @@ pub(super) fn note_head(session: &mut Session, head: u64, author: [u8; 32]) {
 /// many members, not all from the owner. Only the head travels by gossip: a
 /// lost announcement is replaced by the next one. Best effort; never blocks.
 pub(super) fn announce_head(session: &mut Session) {
+    fork::announce_orders(session);
     let Some(owner) = session.workspace.as_ref() else {
         return;
     };
@@ -2392,6 +2393,16 @@ pub(super) fn stage_gossiped_step(session: &mut Session) -> Result<Option<Value>
     while let Some((workspace, payload)) = session.node.poll_membership_gossip() {
         GossipCounts::add(&session.membership.gossip_counts.received);
         if workspace == id
+            && payload.len() > fork::GOSSIP_ORDER.len() + 32
+            && payload.starts_with(fork::GOSSIP_ORDER)
+            && payload[fork::GOSSIP_ORDER.len()..fork::GOSSIP_ORDER.len() + 32] == id
+        {
+            if let Some(staged) = fork::receive_order(session, &payload[fork::GOSSIP_ORDER.len() + 32..])? {
+                return Ok(Some(staged));
+            }
+            continue;
+        }
+        if workspace == id
             && payload.len() > GOSSIP_PROFILE.len() + 32
             && payload.starts_with(GOSSIP_PROFILE)
             && payload[GOSSIP_PROFILE.len()..GOSSIP_PROFILE.len() + 32] == id
@@ -2420,6 +2431,7 @@ pub(super) fn stage_gossiped_step(session: &mut Session) -> Result<Option<Value>
         }
     }
     if let Some(staged) = fork::poll(session)? { return Ok(Some(staged)) }
+    if let Some(staged) = fork::stage_carried(session)? { return Ok(Some(staged)) }
     finish_range_pull(session);
     finish_profile_pull(session);
     session
@@ -2874,6 +2886,12 @@ pub(super) fn receive_offer(session: &mut Session, packet: &[u8]) -> Result<Valu
     let step = join_step_from_wire(&packet[OFFER_HEADER..])
         .map_err(|_| ApiError::invalid_input("offer", "invalid offered transition"))?;
     if after < owner.epoch() {
+        let (authorization, commit) = step.parts()?;
+        if owner.branch_key(after).map_err(security(ErrorCode::StorageCorrupt))?
+            == Some(arachne_security::fork_key(&authorization, &commit))
+        {
+            return Err(ApiError::epoch_mismatch("membership offer was already adopted"));
+        }
         return fork::stage(session, after, step);
     }
     serde_json::to_value(stage_update(session, step)?).map_err(errors::encode)
