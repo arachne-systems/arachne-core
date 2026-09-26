@@ -1,10 +1,12 @@
 use arachne_node::Node;
-use arachne_runtime::{close, create, describe, execute, wait_for_work};
+use arachne_runtime::{MemoryProvider, close, describe, execute, wait_for_work};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+
+mod common;
 
 fn call(handle: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
@@ -22,7 +24,7 @@ fn bytes(value: &Value) -> Vec<u8> {
 
 #[test]
 fn a_parked_host_wakes_on_control_arrival_and_on_close() {
-    let owner = create(Some(&[41; 32])).unwrap();
+    let owner = common::stored(&[41; 32], &MemoryProvider::default());
     call(
         owner,
         json!({"op":"create_workspace","display_name":"Signal owner","workspace_name":"Signal"}),

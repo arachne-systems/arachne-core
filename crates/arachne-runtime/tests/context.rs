@@ -9,6 +9,7 @@ fn config() -> ClientConfig {
         network: Network::Direct,
         secret: None,
         transport: Default::default(),
+        storage: None,
     }
 }
 

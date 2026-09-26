@@ -46,6 +46,8 @@ pub(crate) struct StagePublicationArgs {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct StagedObject {
     pub workspace: [u8; 32],
+    /// The opaque candidate token; adopt it with the matching adopt op.
+    #[serde(rename = "candidate")]
     pub snapshot: Vec<u8>,
     pub state: &'static str,
     pub durable: bool,
@@ -108,17 +110,7 @@ pub(crate) fn stage_object(
     transition: WorkspaceTransition,
     state: &'static str,
 ) -> Result<StagedObject, ApiError> {
-    let key = session
-        .storage_key
-        .as_ref()
-        .ok_or_else(errors::no_root_key)?;
-    let snapshot = seal_state(
-        session.records.is_some(),
-        &candidate,
-        key,
-        Some(&publisher),
-        Some(&inbox),
-    )?;
+    let snapshot = seal_state(session.records.is_some())?;
     let missing_count = missed_since_commit(session, Some(&inbox));
     Ok(hold_object(
         session,
@@ -176,9 +168,9 @@ fn stage_publication(session: &mut Session, args: StagePublicationArgs, recoveri
         .as_ref()
         .ok_or_else(errors::no_workspace)?;
     session
-        .storage_key
+        .records
         .as_ref()
-        .ok_or_else(errors::no_root_key)?;
+        .ok_or_else(crate::persistence::storage_required)?;
     // Reject before anything is staged so the session stays usable.
     check_workspace(session, args.workspace)?;
     let StagePublicationArgs {

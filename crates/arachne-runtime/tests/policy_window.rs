@@ -1,7 +1,9 @@
 //! A publication sent one policy revision behind the receiver's still
 //! decrypts and lands. Routing accepts it only where both revisions grant,
 //! so this never widens what the sender may publish.
-use arachne_runtime::{close, create, describe, execute};
+use arachne_runtime::{MemoryProvider, close, describe, execute};
+
+mod common;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
@@ -22,8 +24,8 @@ fn hint(from: i64, to: i64) {
 
 #[test]
 fn publication_one_revision_behind_is_received() {
-    let sender = create(Some(&[91; 32])).unwrap();
-    let receiver = create(Some(&[92; 32])).unwrap();
+    let sender = common::stored(&[91; 32], &MemoryProvider::default());
+    let receiver = common::stored(&[92; 32], &MemoryProvider::default());
     let workspace = call(
         sender,
         json!({"op":"create_workspace","display_name":"Publisher"}),
@@ -34,7 +36,7 @@ fn publication_one_revision_behind_is_received() {
     );
     let invite = call(
         sender,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )["issued_invitation"]
         .clone();
     let pending = call(
@@ -49,7 +51,7 @@ fn publication_one_revision_behind_is_received() {
     );
     call(
         sender,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     );
     let reply = call(
         sender,
@@ -63,7 +65,7 @@ fn publication_one_revision_behind_is_received() {
     );
     call(
         receiver,
-        json!({"op":"adopt_join","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
     );
     let topics = json!(["streams/opaque"]);
     for handle in [sender, receiver] {
@@ -93,7 +95,7 @@ fn publication_one_revision_behind_is_received() {
     );
     let sent = call(
         sender,
-        json!({"op":"adopt_publication","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_publication","candidate":staged["candidate"]}),
     );
     let receiver_key =
         serde_json::from_str::<Value>(&describe(receiver).unwrap()).unwrap()["endpoint_key"]
@@ -110,7 +112,7 @@ fn publication_one_revision_behind_is_received() {
     };
     call(
         receiver,
-        json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_reception","candidate":staged["candidate"]}),
     );
     let item = call(receiver, json!({"op":"poll_pending_object"}));
     assert_eq!(item["payload"], json!([4, 5, 6]));
@@ -125,7 +127,7 @@ fn publication_one_revision_behind_is_received() {
     );
     let sent = call(
         sender,
-        json!({"op":"adopt_publication","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_publication","candidate":staged["candidate"]}),
     );
     assert_eq!(
         sent["admission"]["admitted"],
@@ -146,7 +148,7 @@ fn publication_one_revision_behind_is_received() {
     };
     call(
         receiver,
-        json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_reception","candidate":staged["candidate"]}),
     );
 
     // Two revisions behind is outside the window: nothing reaches the runtime.
@@ -161,7 +163,7 @@ fn publication_one_revision_behind_is_received() {
     );
     call(
         sender,
-        json!({"op":"adopt_publication","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_publication","candidate":staged["candidate"]}),
     );
     let deadline = Instant::now() + Duration::from_secs(1);
     while Instant::now() < deadline {

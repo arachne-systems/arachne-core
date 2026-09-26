@@ -21,9 +21,11 @@
 // real Iroh endpoints so the byte-bounded paging path is exercised.
 
 use arachne_node::MAX_CONTROL_REPLY;
-use arachne_runtime::{close, create, describe, enable_record_storage, execute, save_candidate};
+use arachne_runtime::{MemoryProvider, close, describe, execute};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
+
+mod common;
 
 /// 55 promote/demote cycles on top of the helper's own admission puts the
 /// workspace far past the 64-step ceiling without a network round trip each.
@@ -34,20 +36,11 @@ fn call(handle: i64, request: Value) -> Result<Value, String> {
         .map_err(|error| error.to_string())
 }
 
-fn bytes(value: &Value) -> Vec<u8> {
-    value
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|byte| byte.as_u64().unwrap() as u8)
-        .collect()
-}
-
-/// Honour the durable-save-before-ack contract on sessions that keep records;
-/// sessions without record storage simply have nothing to commit.
+/// Adoption saves the candidate, reads it back and adopts it in one step.
 fn adopt(handle: i64, op: &str, staged: &Value) -> Value {
-    let _ = save_candidate(handle, &bytes(&staged["snapshot"]));
-    call(handle, json!({"op":op,"snapshot":staged["snapshot"]})).unwrap()
+    let adopted = call(handle, json!({"op":op,"candidate":staged["candidate"]})).unwrap();
+    assert_eq!(adopted["durable"], true);
+    adopted
 }
 
 fn node(handle: i64) -> Value {
@@ -101,32 +94,25 @@ struct Ramp {
     /// Total membership transitions between the pinned epoch-0 checkpoint and
     /// the workspace's current epoch.
     steps: u64,
-    dirs: Vec<tempfile::TempDir>,
-    seed: u8,
 }
 
 /// Build a workspace whose history is far longer than the 64-step ceiling,
 /// with one ordinary member fully synchronised to the head epoch.
 fn ramp(seed: u8) -> Ramp {
-    let admin = create(Some(&[seed; 32])).unwrap();
-    let helper = create(Some(&[seed + 1; 32])).unwrap();
-    let late = create(Some(&[seed + 2; 32])).unwrap();
-    let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let admin = common::stored(&[seed; 32], &MemoryProvider::default());
+    let helper = common::stored(&[seed + 1; 32], &MemoryProvider::default());
+    let late = common::stored(&[seed + 2; 32], &MemoryProvider::default());
     call(
         admin,
         json!({"op":"create_workspace","display_name":"Coordinator"}),
     )
     .unwrap();
-    enable_record_storage(admin, &dirs[0].path().join("admin.db"), &[seed; 32]).unwrap();
     let staged = call(
         admin,
         json!({"op":"stage_invitation","personal":false,"expires_at":0}),
     )
     .unwrap();
-    save_candidate(admin, &bytes(&staged["snapshot"])).unwrap();
-    let invite = call(admin, json!({"op":"adopt_admission","snapshot":staged["snapshot"]}))
-        .unwrap()["issued_invitation"]
-        .clone();
+    let invite = adopt(admin, "adopt_admission", &staged)["issued_invitation"].clone();
 
     // The helper joins at the very beginning, so its own retained history is
     // anchored at the same epoch-0 checkpoint the late joiner pins.
@@ -156,7 +142,6 @@ fn ramp(seed: u8) -> Ramp {
     )
     .unwrap();
     adopt(helper, "adopt_join", &staged);
-    enable_record_storage(helper, &dirs[1].path().join("helper.db"), &[seed + 1; 32]).unwrap();
 
     let member = early["member"]["id"].clone();
     for _ in 0..RAMP_CYCLES {
@@ -206,8 +191,6 @@ fn ramp(seed: u8) -> Ramp {
         invite,
         late,
         steps,
-        dirs,
-        seed,
     }
 }
 
@@ -239,15 +222,6 @@ fn redeem(ramp: &Ramp, responder: i64, responder_peer: Value) -> Value {
         ramp.late,
         json!({"op":"begin_join","invitation":ramp.invite["invitation"],
             "checkpoint":ramp.invite["checkpoint"],"display_name":"Late arrival"}),
-    )
-    .unwrap();
-    // A 100+ epoch history is far past the 128 KiB sealed-snapshot budget, so
-    // the joiner keeps records like any real member would. That budget is a
-    // separate, unchanged byte bound (FUT-33), not the step ceiling under test.
-    enable_record_storage(
-        ramp.late,
-        &ramp.dirs[2].path().join("late.db"),
-        &[ramp.seed + 2; 32],
     )
     .unwrap();
 

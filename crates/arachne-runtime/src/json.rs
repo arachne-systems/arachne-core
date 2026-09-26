@@ -29,6 +29,7 @@ pub(crate) enum Request {
     WorkspaceState {},
     ResetWorkspace {},
     DiscardWorkspaceCandidate {},
+    DiscardCandidate(candidate::DiscardArgs),
     NetworkChange {},
     NearbyEndpoints {},
     SetNearbyIdentity(nearby::IdentityArgs),
@@ -105,10 +106,7 @@ pub(crate) enum Request {
     RetainedAdmission(admission::AdmissionArgs),
     BeginJoin(join::BeginJoinArgs),
     DriveJoin {},
-    SealPendingJoin {},
-    RestorePendingJoin(join::RestorePendingJoinArgs),
     CreateWorkspace(workspace::CreateArgs),
-    SealWorkspace {},
     RestoreWorkspace(workspace::RestoreArgs),
     AddAddressHint(policy::AddressHintArgs),
     // Explicit all-member topic default; endpoints come from verified membership.
@@ -135,6 +133,7 @@ pub(crate) fn op(request: &Request) -> Op {
         Request::WorkspaceState { .. } => Op::WorkspaceState,
         Request::ResetWorkspace { .. } => Op::ResetWorkspace,
         Request::DiscardWorkspaceCandidate { .. } => Op::DiscardWorkspaceCandidate,
+        Request::DiscardCandidate { .. } => Op::DiscardCandidate,
         Request::NetworkChange { .. } => Op::NetworkChange,
         Request::NearbyEndpoints { .. } => Op::NearbyEndpoints,
         Request::SetNearbyIdentity { .. } => Op::SetNearbyIdentity,
@@ -203,10 +202,7 @@ pub(crate) fn op(request: &Request) -> Op {
         Request::RetainedAdmission { .. } => Op::RetainedAdmission,
         Request::BeginJoin { .. } => Op::BeginJoin,
         Request::DriveJoin { .. } => Op::DriveJoin,
-        Request::SealPendingJoin { .. } => Op::SealPendingJoin,
-        Request::RestorePendingJoin { .. } => Op::RestorePendingJoin,
         Request::CreateWorkspace { .. } => Op::CreateWorkspace,
-        Request::SealWorkspace { .. } => Op::SealWorkspace,
         Request::RestoreWorkspace { .. } => Op::RestoreWorkspace,
         Request::AddAddressHint { .. } => Op::AddAddressHint,
         Request::InstallWorkspacePolicy { .. } => Op::InstallWorkspacePolicy,
@@ -243,8 +239,6 @@ pub(crate) fn dispatch(session: &mut crate::Session, request: Request) -> Result
         Request::RetainedAdmission(args) => reply(admission::retained(session, args)?),
         Request::BeginJoin(args) => reply(join::begin(session, args)?),
         Request::DriveJoin {} => join::drive(session),
-        Request::SealPendingJoin {} => reply(join::seal_pending(session)?),
-        Request::RestorePendingJoin(args) => reply(join::restore_pending(session, args)?),
         Request::FetchInvitationCheckpoint(args) => reply(join::fetch_checkpoint(session, args)?),
         Request::JoinViaPeer(args) => join::request_admission(session, args),
         Request::StageJoin(args) => reply(join::stage(session, args)?),
@@ -256,10 +250,10 @@ pub(crate) fn dispatch(session: &mut crate::Session, request: Request) -> Result
         Request::AdoptCurrentView(args) => reply(candidate::adopt_current_view(session, args)?),
         Request::ResetWorkspace {} => reply(workspace::reset(session)?),
         Request::DiscardWorkspaceCandidate {} => reply(workspace::discard_candidate(session)?),
+        Request::DiscardCandidate(args) => reply(candidate::discard_candidate(session, args)?),
         Request::WorkspaceState {} => reply(workspace::state(session)?),
         Request::WorkspaceMetrics {} => reply(workspace::metrics(session)?),
         Request::CreateWorkspace(args) => reply(workspace::create(session, args)?),
-        Request::SealWorkspace {} => reply(workspace::seal(session)?),
         Request::RestoreWorkspace(args) => reply(workspace::restore(session, args)?),
         Request::Resource(args) => debug::resource(session, args),
         Request::EndpointInfo {} => reply(debug::endpoint_info(session)?),
@@ -352,40 +346,23 @@ pub fn execute_with_code(handle: i64, bytes: &[u8]) -> Result<Vec<u8>, ApiError>
     serde_json::to_vec(&run(handle, request)?).map_err(errors::encode)
 }
 
-/// Largest binary snapshot `execute_stored` accepts or returns: a sealed
-/// workspace bundle, or a sealed pending join, which carries its invitation
-/// checkpoint (up to `MAX_CHECKPOINT`, B3a) and so can be the larger one.
-pub const MAX_STORED_SNAPSHOT: usize =
-    if arachne_security::MAX_SEALED_BUNDLE > arachne_security::MAX_SEALED_PENDING_JOIN {
-        arachne_security::MAX_SEALED_BUNDLE
-    } else {
-        arachne_security::MAX_SEALED_PENDING_JOIN
-    };
-// A pending join, with its checkpoint, is saved as one host record.
-const _: () = assert!(arachne_security::MAX_SEALED_PENDING_JOIN <= arachne_store::MAX_RECORD_BYTES);
-
-// Binary snapshots never pass through the JSON request size bound. Metadata is
-// independently bounded and cannot supply a second, ambiguous snapshot value.
-/// Execute metadata with a binary snapshot; return metadata and snapshot separately.
-/// The caller must durably save and read back staged snapshots before adopting them.
+/// Execute `stage_join` with its Welcome as a separate binary argument, so a
+/// large Welcome does not pass through the JSON request bound. No other op
+/// takes binary input: candidates are opaque tokens in the JSON reply.
 ///
 /// **Deprecated** (ADR step 9): use [`crate::Client`].
-pub fn execute_stored(
-    handle: i64,
-    metadata: &[u8],
-    snapshot: &[u8],
-) -> Result<[Vec<u8>; 2], String> {
-    execute_stored_with_code(handle, metadata, snapshot).map_err(errors::text)
+pub fn execute_stored(handle: i64, metadata: &[u8], welcome: &[u8]) -> Result<Vec<u8>, String> {
+    execute_stored_with_code(handle, metadata, welcome).map_err(errors::text)
 }
 
 /// [`execute_stored`] with the typed error.
 pub fn execute_stored_with_code(
     handle: i64,
     metadata: &[u8],
-    snapshot: &[u8],
-) -> Result<[Vec<u8>; 2], ApiError> {
+    welcome: &[u8],
+) -> Result<Vec<u8>, ApiError> {
     let invalid = |reason: &str| ApiError::invalid_input("request", reason);
-    if metadata.len() > MAX_REQUEST || snapshot.len() > MAX_STORED_SNAPSHOT {
+    if metadata.len() > MAX_REQUEST || welcome.len() > arachne_security::MAX_WELCOME {
         return Err(invalid("stored request exceeds limit"));
     }
     // Parse original bytes strictly before a generic map can hide duplicate fields.
@@ -395,69 +372,17 @@ pub fn execute_stored_with_code(
     let object = value
         .as_object()
         .ok_or_else(|| invalid("request must be an object"))?;
-    if object.contains_key("snapshot") {
-        return Err(invalid("snapshot must use the binary argument"));
+    if welcome.is_empty() {
+        return serde_json::to_vec(&run(handle, request)?).map_err(errors::encode);
     }
-    let stored = matches!(
-        object.get("op").and_then(Value::as_str),
-        Some(
-            "restore_workspace"
-                | "restore_pending_join"
-                | "adopt_admission"
-                | "adopt_join"
-                | "adopt_publication"
-                | "adopt_reception"
-                | "adopt_recovery"
-                | "adopt_current_view"
-        )
-    );
-    let binary_welcome = matches!(request, Request::StageJoin { .. }) && !snapshot.is_empty();
-    if binary_welcome {
-        if object.contains_key("welcome") {
-            return Err(invalid("Welcome must have exactly one representation"));
-        }
-        if snapshot.len() > arachne_security::MAX_WELCOME {
-            return Err(invalid("Welcome exceeds binary input bound"));
-        }
-        if let Request::StageJoin(join::StageJoinArgs { welcome, .. }) = &mut request {
-            *welcome = snapshot.to_vec();
-        }
+    let Request::StageJoin(join::StageJoinArgs { welcome: target, .. }) = &mut request else {
+        return Err(invalid("only stage_join takes a binary argument"));
+    };
+    if object.contains_key("welcome") {
+        return Err(invalid("Welcome must have exactly one representation"));
     }
-    if !stored && !binary_welcome && !snapshot.is_empty() {
-        return Err(invalid("operation does not accept a snapshot"));
-    }
-    if stored {
-        let target = match &mut request {
-            Request::RestoreWorkspace(workspace::RestoreArgs { snapshot, .. })
-            | Request::RestorePendingJoin(join::RestorePendingJoinArgs { snapshot, .. })
-            | Request::AdoptAdmission(AdoptArgs { snapshot })
-            | Request::AdoptJoin(AdoptArgs { snapshot })
-            | Request::AdoptPublication(AdoptArgs { snapshot })
-            | Request::AdoptReception(AdoptArgs { snapshot })
-            | Request::AdoptRecovery(AdoptArgs { snapshot })
-            | Request::AdoptCurrentView(AdoptArgs { snapshot }) => snapshot,
-            _ => unreachable!(),
-        };
-        *target = snapshot.to_vec();
-    }
-    let mut response = run(handle, request)?;
-    // ponytail: current dispatcher builds bounded JSON values internally; move
-    // snapshots into a typed result if measured allocation cost warrants it.
-    let snapshot = response
-        .as_object_mut()
-        .and_then(|v| v.remove("snapshot"))
-        .map(serde_json::from_value::<Vec<u8>>)
-        .transpose()
-        .map_err(errors::encode)?
-        .unwrap_or_default();
-    if snapshot.len() > MAX_STORED_SNAPSHOT {
-        return Err(ApiError::limit_reached(
-            "stored snapshot",
-            MAX_STORED_SNAPSHOT as u64,
-            "stored response exceeds limit; close and restore",
-        ));
-    }
-    Ok([serde_json::to_vec(&response).map_err(errors::encode)?, snapshot])
+    *target = welcome.to_vec();
+    serde_json::to_vec(&run(handle, request)?).map_err(errors::encode)
 }
 
 #[derive(Deserialize)]
@@ -486,6 +411,21 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use crate::*;
+
+    /// A session with in-memory record storage. Sessions made with the same
+    /// provider share stores, so a test can close and restore.
+    fn stored(secret: &[u8; 32], provider: &MemoryProvider) -> i64 {
+        let handle = create(Some(secret)).unwrap();
+        attach_storage(handle, StorageConfig::memory(provider)).unwrap();
+        handle
+    }
+
+    /// The same token with its last byte changed.
+    fn altered(token: &Value) -> Value {
+        let mut bytes: Vec<u8> = serde_json::from_value(token.clone()).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        json!(bytes)
+    }
 
     #[test]
     fn real_node_lifecycle_rejects_stale_handles_and_releases_capacity() {
@@ -531,7 +471,7 @@ mod tests {
             .unwrap();
             call(
                 handle,
-                json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+                json!({"op":"adopt_admission","candidate":staged["candidate"]}),
             )
             .unwrap()["issued_invitation"]
                 .clone()
@@ -548,7 +488,7 @@ mod tests {
             .unwrap();
             call(
                 handle,
-                json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
+                json!({"op":"adopt_reception","candidate":staged["candidate"]}),
             )
             .unwrap();
             pending
@@ -620,18 +560,22 @@ mod tests {
         close(b).unwrap();
         assert!(call(a, json!({"op":"poll"})).is_err());
 
-        let mut admin = create(Some(&[41; 32])).unwrap();
-        let joiner = create(Some(&[42; 32])).unwrap();
+        // Admin and joiner hold the same workspace id: one provider each.
+        let admin_store = MemoryProvider::default();
+        let joiner_store = MemoryProvider::default();
+        let service_store = MemoryProvider::default();
+        let mut admin = stored(&[41; 32], &admin_store);
+        let joiner = stored(&[42; 32], &joiner_store);
         let created = call(
             admin,
             json!({"op":"create_workspace","display_name":"Coordinator"}),
         )
         .unwrap();
-        // The invitation must be registered before it is sealed as the
-        // rollback target below, otherwise restoring to `old` would make the
-        // admission look up a key that was never committed to policy.
+        assert_eq!(created["durable"], true);
+        // The invitation must be adopted (and so stored) before the admission
+        // below, otherwise the restored state would look up a key that was
+        // never committed to policy.
         let invite = issue_invitation(admin);
-        let old = call(admin, json!({"op":"seal_workspace"})).unwrap();
         let pending = call(
             joiner,
             json!({"op":"begin_join","invitation":invite["invitation"],
@@ -640,26 +584,36 @@ mod tests {
         .unwrap();
         let stage = json!({"op":"stage_admission","authenticated_endpoint":pending["endpoint"],"request":pending["admission_request"]});
         let retry = json!({"op":"retained_admission","authenticated_endpoint":pending["endpoint"],"request":pending["admission_request"]});
+        assert_eq!(pending["durable"], true);
         let prepared = call(admin, stage.clone()).unwrap();
         assert!(prepared.get("welcome").is_none());
+        assert!(prepared.get("snapshot").is_none());
         assert!(call(admin, retry.clone()).is_err());
-        assert!(call(admin, json!({"op":"seal_workspace"})).is_err());
+        // An altered candidate token is not the staged candidate.
         assert!(
             call(
                 admin,
-                json!({"op":"adopt_admission","snapshot":old["snapshot"]})
+                json!({"op":"adopt_admission","candidate":altered(&prepared["candidate"])})
             )
             .is_err()
         );
-        close(admin).unwrap(); // No candidate saved: the old durable state wins.
-        admin = create(Some(&[41; 32])).unwrap();
-        let restored = call(admin, json!({"op":"restore_workspace","workspace":created["workspace"],"snapshot":old["snapshot"]})).unwrap();
+        close(admin).unwrap(); // Candidate not adopted: the old durable state wins.
+        admin = stored(&[41; 32], &admin_store);
+        let restore = json!({"op":"restore_workspace","workspace":created["workspace"]});
+        let restored = call(admin, restore.clone()).unwrap();
         assert_eq!(restored["members"], 1);
+        assert_eq!(restored["durable"], true);
         assert!(call(admin, retry.clone()).is_err());
         let saved = call(admin, stage).unwrap();
-        close(admin).unwrap(); // Candidate saved, adoption reply lost: restore it directly.
-        admin = create(Some(&[41; 32])).unwrap();
-        let restored = call(admin, json!({"op":"restore_workspace","workspace":created["workspace"],"snapshot":saved["snapshot"]})).unwrap();
+        let adopted = call(
+            admin,
+            json!({"op":"adopt_admission","candidate":saved["candidate"]}),
+        )
+        .unwrap();
+        assert_eq!(adopted["durable"], true);
+        close(admin).unwrap(); // Adopted, then the process ends: restore gives the new state.
+        admin = stored(&[41; 32], &admin_store);
+        let restored = call(admin, restore.clone()).unwrap();
         assert_eq!(restored["members"], 2);
         // +1: registering the invitation now costs an epoch before the
         // admission commit that seated the second member.
@@ -717,26 +671,35 @@ mod tests {
         let mut invalid = join.clone();
         invalid["commits"][0]["authorization"]["grant_signature"] = json!([1]);
         assert!(call(joiner, invalid).is_err());
-        assert!(call(joiner, json!({"op":"seal_pending_join"})).is_ok());
         let staged_join = call(joiner, join).unwrap();
+        assert!(staged_join.get("snapshot").is_none());
+        // A join candidate given to the wrong adopt op is rejected.
         assert!(
             call(
                 joiner,
-                json!({"op":"adopt_admission","snapshot":staged_join["snapshot"]})
+                json!({"op":"adopt_admission","candidate":staged_join["candidate"]})
+            )
+            .is_err()
+        );
+        assert!(
+            call(
+                joiner,
+                json!({"op":"adopt_join","candidate":altered(&staged_join["candidate"])})
             )
             .is_err()
         );
         let adopted = call(
             joiner,
-            json!({"op":"adopt_join","snapshot":staged_join["snapshot"]}),
+            json!({"op":"adopt_join","candidate":staged_join["candidate"]}),
         )
         .unwrap();
         assert_eq!(adopted["members"], 2);
-        assert!(call(joiner, json!({"op":"seal_pending_join"})).is_err());
+        assert_eq!(adopted["durable"], true);
         close(joiner).unwrap();
-        let joiner = create(Some(&[42; 32])).unwrap();
-        let restored = call(joiner,json!({"op":"restore_workspace","workspace":created["workspace"],"snapshot":staged_join["snapshot"]})).unwrap();
+        let joiner = stored(&[42; 32], &joiner_store);
+        let restored = call(joiner, restore.clone()).unwrap();
         assert_eq!(restored["member"], pending["member"]);
+        assert_eq!(restored["members"], 2);
         // Production routing obtains endpoints from the restored MLS roster.
         let member_policy =
             json!({"op":"install_member_policy","revision":17,"topics":["streams/sample"]});
@@ -769,59 +732,64 @@ mod tests {
         assert_eq!(subscribed["admitted"].as_array().unwrap().len(), 2);
         assert!(subscribed["failed"].as_array().unwrap().is_empty());
         assert!(call(joiner, json!({"op":"subscribe","workspace":created["workspace"],"revision":17,"topic":"streams/other"})).is_err());
-        let staged_binary = execute_stored(admin, &serde_json::to_vec(&json!({"op":"stage_network_publication","revision":17,"topic":"streams/sample","id":vec![10;16],"payload":[0,255,77]})).unwrap(), &[]).unwrap();
-        let mut staged_network: Value = serde_json::from_slice(&staged_binary[0]).unwrap();
+        let staged_network = call(admin, json!({"op":"stage_network_publication","revision":17,"topic":"streams/sample","id":vec![10;16],"payload":[0,255,77]})).unwrap();
         assert!(staged_network.get("snapshot").is_none());
-        assert!(!staged_binary[1].is_empty());
-        staged_network["snapshot"] = json!(staged_binary[1]);
+        let candidate: Vec<u8> =
+            serde_json::from_value(staged_network["candidate"].clone()).unwrap();
+        assert_eq!(candidate.len(), 37);
+        assert!(candidate.starts_with(b"DFRC\x01"));
         assert!(staged_network.get("ciphertext").is_none());
         assert_eq!(
             call(joiner, json!({"op":"poll_protected"})).unwrap(),
             Value::Null
         );
+        // An admission candidate that was already adopted is not this one.
         assert!(
             call(
                 admin,
-                json!({"op":"adopt_publication","snapshot":saved["snapshot"]})
+                json!({"op":"adopt_publication","candidate":saved["candidate"]})
             )
             .is_err()
         );
-        let snapshot: Vec<u8> = serde_json::from_value(staged_network["snapshot"].clone()).unwrap();
+        let duplicate = format!(
+            r#"{{"op":"adopt_publication","op":"adopt_publication","candidate":{}}}"#,
+            staged_network["candidate"]
+        );
+        assert!(execute(admin, duplicate.as_bytes()).is_err());
         assert!(
-            execute_stored(
+            call(
                 admin,
-                br#"{"op":"adopt_publication","op":"adopt_publication"}"#,
-                &snapshot
+                json!({"op":"adopt_publication","candidate":altered(&staged_network["candidate"])})
             )
             .is_err()
         );
-        let mut damaged = snapshot.clone();
-        *damaged.last_mut().unwrap() ^= 1;
-        assert!(execute_stored(admin, br#"{"op":"adopt_publication"}"#, &damaged).is_err());
         assert_eq!(
             call(joiner, json!({"op":"poll_protected"})).unwrap(),
             Value::Null
         );
+        assert!(call(admin, json!({"op":"adopt_publication","candidate":[]})).is_err());
+        assert!(call(admin, json!({"op":"adopt_publication"})).is_err());
+        // Only stage_join takes a binary argument.
+        assert!(execute_stored(admin, br#"{"op":"endpoint_info"}"#, &candidate).is_err());
+        let adopt_request = serde_json::to_vec(
+            &json!({"op":"adopt_publication","candidate":staged_network["candidate"]}),
+        )
+        .unwrap();
+        assert!(execute_stored(admin, &adopt_request, &candidate).is_err());
         assert!(
             execute_stored(
                 admin,
-                br#"{"op":"adopt_publication","snapshot":[]}"#,
-                &snapshot
+                br#"{"op":"stage_join","commits":[]}"#,
+                &vec![0; arachne_security::MAX_WELCOME + 1]
             )
             .is_err()
         );
-        assert!(execute_stored(admin, br#"{"op":"endpoint_info"}"#, &snapshot).is_err());
-        assert!(
-            execute_stored(
-                admin,
-                br#"{"op":"adopt_publication"}"#,
-                &vec![0; MAX_STORED_SNAPSHOT + 1]
-            )
-            .is_err()
-        );
-        let sent = execute_stored(admin, br#"{"op":"adopt_publication"}"#, &snapshot).unwrap();
-        assert!(sent[1].is_empty());
-        let sent: Value = serde_json::from_slice(&sent[0]).unwrap();
+        let sent = call(
+            admin,
+            json!({"op":"adopt_publication","candidate":staged_network["candidate"]}),
+        )
+        .unwrap();
+        assert_eq!(sent["durable"], true);
         assert!(sent["admission"]["admitted"].as_array().unwrap().is_empty());
         assert_eq!(sent["admission"]["queued"], true);
         assert!(sent["admission"]["failed"].as_array().unwrap().is_empty());
@@ -875,7 +843,7 @@ mod tests {
         assert_eq!(network_received["state"], "awaiting_reception_save");
         call(
             joiner,
-            json!({"op":"adopt_reception","snapshot":network_received["snapshot"]}),
+            json!({"op":"adopt_reception","candidate":network_received["candidate"]}),
         )
         .unwrap();
         let delivered_network = take_pending(joiner);
@@ -889,7 +857,7 @@ mod tests {
         let reverse = call(joiner, json!({"op":"stage_network_publication","revision":17,"topic":"streams/sample","id":vec![11;16],"payload":[9]})).unwrap();
         let sent = call(
             joiner,
-            json!({"op":"adopt_publication","snapshot":reverse["snapshot"]}),
+            json!({"op":"adopt_publication","candidate":reverse["candidate"]}),
         )
         .unwrap();
         assert_eq!(sent["admission"]["admitted"].as_array().unwrap().len(), 1);
@@ -910,7 +878,7 @@ mod tests {
         };
         call(
             admin,
-            json!({"op":"adopt_reception","snapshot":incoming["snapshot"]}),
+            json!({"op":"adopt_reception","candidate":incoming["candidate"]}),
         )
         .unwrap();
         let reverse_delivered = take_pending(admin);
@@ -921,30 +889,20 @@ mod tests {
         assert!(
             call(
                 joiner,
-                json!({"op":"adopt_reception","snapshot":staged_join["snapshot"]})
+                json!({"op":"adopt_reception","candidate":staged_join["candidate"]})
             )
             .is_err()
         );
-        let [_, received] = execute_stored(joiner, br#"{"op":"seal_workspace"}"#, &[]).unwrap();
         close(joiner).unwrap();
-        let joiner = create(Some(&[42; 32])).unwrap();
-        execute_stored(
-            joiner,
-            &serde_json::to_vec(
-                &json!({"op":"restore_workspace","workspace":created["workspace"]}),
-            )
-            .unwrap(),
-            &received,
-        )
-        .unwrap();
+        let joiner = stored(&[42; 32], &joiner_store);
+        call(joiner, restore.clone()).unwrap();
         // The acknowledged object stays acknowledged after restore.
         assert!(call(joiner, json!({"op":"poll_pending_object"})).unwrap().is_null());
-        // Simulate process ownership loss after candidate persistence but before
-        // adoption. No filesystem/power-loss claim: the record is held in RAM.
-        let request = serde_json::to_vec(&json!({"op":"stage_network_publication","revision":17,"topic":"streams/sample","id":vec![12;16],"payload":[7]})).unwrap();
-        let candidate = execute_stored(admin, &request, &[]).unwrap();
-        assert!(candidate[1].starts_with(b"DFWB\x01"));
-        let (head, retained) = {
+        // Simulate process ownership loss after staging but before adoption.
+        // No filesystem/power-loss claim: the records are held in RAM.
+        let publish_12 = json!({"op":"stage_network_publication","revision":17,"topic":"streams/sample","id":vec![12;16],"payload":[7]});
+        let lost = call(admin, publish_12.clone()).unwrap();
+        {
             let shared = session(admin).unwrap();
             let guard = shared.lock().unwrap();
             let session = guard.as_ref().unwrap();
@@ -957,6 +915,42 @@ mod tests {
                 .as_ref()
                 .unwrap();
             assert_eq!(log.head(), 2);
+        }
+        close(admin).unwrap();
+        // The candidate was not adopted, so it was never stored: the old state wins.
+        admin = stored(&[41; 32], &admin_store);
+        call(admin, restore.clone()).unwrap();
+        {
+            let shared = session(admin).unwrap();
+            let guard = shared.lock().unwrap();
+            let log = guard.as_ref().unwrap().delivery.publisher.as_ref().unwrap();
+            assert_eq!(log.head(), 1);
+        }
+        // The lost token belongs to the closed session only.
+        assert!(
+            call(admin, json!({"op":"adopt_publication","candidate":lost["candidate"]})).is_err()
+        );
+        // Stage it again and adopt; the adopted record survives the next restart.
+        // This session has no subscribers yet, so adoption sends nothing live.
+        let candidate = call(admin, publish_12).unwrap();
+        assert_ne!(candidate["candidate"], lost["candidate"]);
+        assert!(
+            call(
+                admin,
+                json!({"op":"adopt_publication","candidate":altered(&candidate["candidate"])})
+            )
+            .is_err()
+        );
+        call(
+            admin,
+            json!({"op":"adopt_publication","candidate":candidate["candidate"]}),
+        )
+        .unwrap();
+        let (head, retained) = {
+            let shared = session(admin).unwrap();
+            let guard = shared.lock().unwrap();
+            let log = guard.as_ref().unwrap().delivery.publisher.as_ref().unwrap();
+            assert_eq!(log.head(), 2);
             let range = log
                 .select(
                     1,
@@ -967,14 +961,8 @@ mod tests {
             (log.head(), range.records()[0].ciphertext.clone())
         };
         close(admin).unwrap();
-        admin = create(Some(&[41; 32])).unwrap();
-        let restore =
-            serde_json::to_vec(&json!({"op":"restore_workspace","workspace":created["workspace"]}))
-                .unwrap();
-        let mut corrupt = candidate[1].clone();
-        *corrupt.last_mut().unwrap() ^= 1;
-        assert!(execute_stored(admin, &restore, &corrupt).is_err());
-        execute_stored(admin, &restore, &candidate[1]).unwrap();
+        admin = stored(&[41; 32], &admin_store);
+        call(admin, restore.clone()).unwrap();
         {
             let shared = session(admin).unwrap();
             let guard = shared.lock().unwrap();
@@ -989,8 +977,8 @@ mod tests {
                 .unwrap();
             assert_eq!(range.records()[0].ciphertext, retained);
         }
-        let next = execute_stored(admin, &serde_json::to_vec(&json!({"op":"stage_network_publication","revision":17,"topic":"streams/sample","id":vec![13;16],"payload":[7]})).unwrap(), &[]).unwrap();
-        assert_ne!(candidate[1], next[1]);
+        let next = call(admin, json!({"op":"stage_network_publication","revision":17,"topic":"streams/sample","id":vec![13;16],"payload":[7]})).unwrap();
+        assert_ne!(candidate["candidate"], next["candidate"]);
         {
             let shared = session(admin).unwrap();
             let guard = shared.lock().unwrap();
@@ -1051,7 +1039,11 @@ mod tests {
         // Admission polling remains available while another candidate is
         // staged so a retry can retrieve an already accepted result.
         assert!(call(admin, json!({"op":"poll_admission"})).is_ok());
-        execute_stored(admin, br#"{"op":"adopt_publication"}"#, &next[1]).unwrap();
+        call(
+            admin,
+            json!({"op":"adopt_publication","candidate":next["candidate"]}),
+        )
+        .unwrap();
         call(
             admin,
             json!({"op":"install_member_policy","revision":17,"topics":["streams/sample"]}),
@@ -1471,7 +1463,7 @@ mod tests {
             .unwrap();
             call(
                 admin,
-                json!({"op":"adopt_publication", "snapshot":missed["snapshot"]}),
+                json!({"op":"adopt_publication", "candidate":missed["candidate"]}),
             )
             .unwrap();
         }
@@ -1499,7 +1491,7 @@ mod tests {
         .unwrap();
         call(
             admin,
-            json!({"op":"adopt_publication", "snapshot":live["snapshot"]}),
+            json!({"op":"adopt_publication", "candidate":live["candidate"]}),
         )
         .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -1516,24 +1508,33 @@ mod tests {
         }
         poll_recovery();
         assert_eq!(poll_range(joiner).unwrap()["packet_count"], 7);
-        let [metadata, recovery_snapshot] =
-            execute_stored(joiner, br#"{"op":"stage_recovery_range"}"#, &[]).unwrap();
-        let metadata: Value = serde_json::from_slice(&metadata).unwrap();
+        let metadata = call(joiner, json!({"op":"stage_recovery_range"})).unwrap();
         assert_eq!(metadata["state"], "awaiting_recovery_save");
         assert_eq!(metadata["publication_count"], 7);
         assert!(metadata.get("payload").is_none() && metadata.get("snapshot").is_none());
+        let recovery_candidate = metadata["candidate"].clone();
+        // A recovery candidate given to the wrong adopt op is rejected.
         assert!(
-            execute_stored(joiner, br#"{"op":"adopt_reception"}"#, &recovery_snapshot).is_err()
+            call(
+                joiner,
+                json!({"op":"adopt_reception","candidate":recovery_candidate})
+            )
+            .is_err()
         );
-        let mut corrupt = recovery_snapshot.clone();
-        *corrupt.last_mut().unwrap() ^= 1;
-        assert!(execute_stored(joiner, br#"{"op":"adopt_recovery"}"#, &corrupt).is_err());
-        let adopted =
-            execute_stored(joiner, br#"{"op":"adopt_recovery"}"#, &recovery_snapshot).unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&adopted[0]).unwrap()["publication_count"],
-            7
+        assert!(
+            call(
+                joiner,
+                json!({"op":"adopt_recovery","candidate":altered(&recovery_candidate)})
+            )
+            .is_err()
         );
+        let adopted = call(
+            joiner,
+            json!({"op":"adopt_recovery","candidate":recovery_candidate}),
+        )
+        .unwrap();
+        assert_eq!(adopted["publication_count"], 7);
+        assert_eq!(adopted["durable"], true);
         // Recovered objects wait in the durable inbox like live ones.
         for id in 90..97 {
             let recovered = take_pending(joiner);
@@ -1542,7 +1543,13 @@ mod tests {
             assert_eq!(recovered["topic"], "streams/other");
         }
         assert!(call(joiner, json!({"op":"poll_pending_object"})).unwrap().is_null());
-        assert!(execute_stored(joiner, br#"{"op":"adopt_recovery"}"#, &recovery_snapshot).is_err());
+        assert!(
+            call(
+                joiner,
+                json!({"op":"adopt_recovery","candidate":recovery_candidate})
+            )
+            .is_err()
+        );
         call(joiner, recover.clone()).unwrap();
         poll_recovery();
         poll_range(joiner).unwrap();
@@ -1559,14 +1566,14 @@ mod tests {
         .unwrap();
         call(
             joiner,
-            json!({"op":"adopt_publication", "snapshot":outgoing["snapshot"]}),
+            json!({"op":"adopt_publication", "candidate":outgoing["candidate"]}),
         )
         .unwrap();
         let live = poll_result(joiner, "poll_protected").unwrap();
         assert!(live.get("payload").is_none());
         call(
             joiner,
-            json!({"op":"adopt_reception", "snapshot":live["snapshot"]}),
+            json!({"op":"adopt_reception", "candidate":live["candidate"]}),
         )
         .unwrap();
         assert_eq!(take_pending(joiner)["payload"], json!([8]));
@@ -1581,7 +1588,6 @@ mod tests {
             call(joiner, json!({"op":"stage_recovery_range"})).unwrap()["state"],
             "recovery_no_new_objects"
         );
-        let [_, durable] = execute_stored(joiner, br#"{"op":"seal_workspace"}"#, &[]).unwrap();
         let mut pending_on_close = discover_request;
         pending_on_close["revision"] = json!(19);
         pending_on_close["topics"] = json!(["streams/other"]);
@@ -1600,15 +1606,8 @@ mod tests {
         };
         close(joiner).unwrap();
         assert!(task.is_finished());
-        let restored = create(Some(&[42; 32])).unwrap();
-        execute_stored(
-            restored,
-            &serde_json::to_vec(&json!({"op":"restore_workspace",
-            "workspace":created["workspace"]}))
-            .unwrap(),
-            &durable,
-        )
-        .unwrap();
+        let restored = stored(&[42; 32], &joiner_store);
+        call(restored, restore.clone()).unwrap();
         {
             let shared = session(restored).unwrap();
             let guard = shared.lock().unwrap();
@@ -1631,7 +1630,7 @@ mod tests {
             .unwrap();
             call(
                 admin,
-                json!({"op":"adopt_publication", "snapshot":staged["snapshot"]}),
+                json!({"op":"adopt_publication", "candidate":staged["candidate"]}),
             )
             .unwrap()
         };
@@ -1645,7 +1644,7 @@ mod tests {
         .unwrap();
         call(
             admin,
-            json!({"op":"adopt_publication", "snapshot":current["snapshot"]}),
+            json!({"op":"adopt_publication", "candidate":current["candidate"]}),
         )
         .unwrap();
         let missed = send_object(101);
@@ -1670,7 +1669,7 @@ mod tests {
         assert!(staged.get("payload").is_none());
         call(
             restored,
-            json!({"op":"adopt_reception", "snapshot":staged["snapshot"]}),
+            json!({"op":"adopt_reception", "candidate":staged["candidate"]}),
         )
         .unwrap();
         let pending = call(restored, json!({"op":"poll_pending_object"})).unwrap();
@@ -1679,19 +1678,9 @@ mod tests {
             call(restored, json!({"op":"poll_pending_object"})).unwrap(),
             pending
         );
-        let [_, pending_snapshot] =
-            execute_stored(restored, br#"{"op":"seal_workspace"}"#, &[]).unwrap();
         close(restored).unwrap();
-        let restored = create(Some(&[42; 32])).unwrap();
-        execute_stored(
-            restored,
-            &serde_json::to_vec(
-                &json!({"op":"restore_workspace","workspace":created["workspace"]}),
-            )
-            .unwrap(),
-            &pending_snapshot,
-        )
-        .unwrap();
+        let restored = stored(&[42; 32], &joiner_store);
+        call(restored, restore.clone()).unwrap();
         assert_eq!(
             call(restored, json!({"op":"poll_pending_object"})).unwrap(),
             pending
@@ -1703,12 +1692,19 @@ mod tests {
             wrong["id"] = json!(vec![0; 16]);
             assert!(call(handle, wrong).is_err());
             let staged = call(handle, request).unwrap();
-            let snapshot: Vec<u8> = serde_json::from_value(staged["snapshot"].clone()).unwrap();
             assert_eq!(
-                execute_stored(handle, br#"{"op":"adopt_publication"}"#, &snapshot).unwrap_err(),
-                "wrong adoption lifecycle phase"
+                call(
+                    handle,
+                    json!({"op":"adopt_publication","candidate":staged["candidate"]})
+                )
+                .unwrap_err(),
+                "candidate kind does not match this adopt operation"
             );
-            execute_stored(handle, br#"{"op":"adopt_reception"}"#, &snapshot).unwrap();
+            call(
+                handle,
+                json!({"op":"adopt_reception","candidate":staged["candidate"]}),
+            )
+            .unwrap();
         };
         ack(restored, &pending);
         assert_eq!(
@@ -1749,7 +1745,7 @@ mod tests {
         assert!(call(restored, json!({"op":"poll_pending_object"})).is_err());
         call(
             restored,
-            json!({"op":"adopt_current_view", "snapshot":staged["snapshot"]}),
+            json!({"op":"adopt_current_view", "candidate":staged["candidate"]}),
         )
         .unwrap();
         let current = call(restored, json!({"op":"poll_pending_object"})).unwrap();
@@ -1764,26 +1760,19 @@ mod tests {
         .unwrap();
         poll_recovery();
         poll_range(restored).unwrap();
-        let [metadata, snapshot] =
-            execute_stored(restored, br#"{"op":"stage_recovery_range"}"#, &[]).unwrap();
-        let metadata: Value = serde_json::from_slice(&metadata).unwrap();
+        let metadata = call(restored, json!({"op":"stage_recovery_range"})).unwrap();
         assert_eq!(metadata["publication_count"], 1); // live object already acknowledged
-        execute_stored(restored, br#"{"op":"adopt_recovery"}"#, &snapshot).unwrap();
+        call(
+            restored,
+            json!({"op":"adopt_recovery","candidate":metadata["candidate"]}),
+        )
+        .unwrap();
         let recovered = call(restored, json!({"op":"poll_pending_object"})).unwrap();
         assert_eq!(recovered["payload"], json!([101]));
         ack(restored, &recovered);
-        let [_, snapshot] = execute_stored(restored, br#"{"op":"seal_workspace"}"#, &[]).unwrap();
         close(restored).unwrap();
-        let restored = create(Some(&[42; 32])).unwrap();
-        execute_stored(
-            restored,
-            &serde_json::to_vec(
-                &json!({"op":"restore_workspace","workspace":created["workspace"]}),
-            )
-            .unwrap(),
-            &snapshot,
-        )
-        .unwrap();
+        let restored = stored(&[42; 32], &joiner_store);
+        call(restored, restore.clone()).unwrap();
         assert_eq!(
             call(restored, json!({"op":"poll_pending_object"})).unwrap(),
             Value::Null
@@ -1811,13 +1800,13 @@ mod tests {
         .unwrap();
         call(
             admin,
-            json!({"op":"adopt_publication", "snapshot":current_live["snapshot"]}),
+            json!({"op":"adopt_publication", "candidate":current_live["candidate"]}),
         )
         .unwrap();
         let staged = poll_result(restored, "poll_protected").unwrap();
         call(
             restored,
-            json!({"op":"adopt_reception", "snapshot":staged["snapshot"]}),
+            json!({"op":"adopt_reception", "candidate":staged["candidate"]}),
         )
         .unwrap();
         let current_pending = call(restored, json!({"op":"poll_pending_object"})).unwrap();
@@ -1840,14 +1829,14 @@ mod tests {
             "topics":["streams/objects"],"after":window["retained_after"],"through":window["head"]})).unwrap();
         poll_recovery();
         poll_range(restored).unwrap();
-        let [metadata, snapshot] =
-            execute_stored(restored, br#"{"op":"stage_recovery_range"}"#, &[]).unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&metadata).unwrap()["publication_count"],
-            32
-        );
-        execute_stored(restored, br#"{"op":"adopt_recovery"}"#, &snapshot).unwrap();
-        let service = create(Some(&[43; 32])).unwrap();
+        let metadata = call(restored, json!({"op":"stage_recovery_range"})).unwrap();
+        assert_eq!(metadata["publication_count"], 32);
+        call(
+            restored,
+            json!({"op":"adopt_recovery","candidate":metadata["candidate"]}),
+        )
+        .unwrap();
+        let service = stored(&[43; 32], &service_store);
         // Registering the link is itself a membership step the restored
         // member must accept before the service's Add.
         let staged_link = call(
@@ -1857,7 +1846,7 @@ mod tests {
         .unwrap();
         let registration = call(
             admin,
-            json!({"op":"adopt_admission","snapshot":staged_link["snapshot"]}),
+            json!({"op":"adopt_admission","candidate":staged_link["candidate"]}),
         )
         .unwrap();
         let invite = registration["issued_invitation"].clone();
@@ -1869,9 +1858,12 @@ mod tests {
         .unwrap();
         let admission = json!({"op":"stage_admission", "authenticated_endpoint":pending_service["endpoint"],
             "request":pending_service["admission_request"]});
-        let [_, saved] =
-            execute_stored(admin, &serde_json::to_vec(&admission).unwrap(), &[]).unwrap();
-        execute_stored(admin, br#"{"op":"adopt_admission"}"#, &saved).unwrap();
+        let saved = call(admin, admission.clone()).unwrap();
+        call(
+            admin,
+            json!({"op":"adopt_admission","candidate":saved["candidate"]}),
+        )
+        .unwrap();
         let response = call(
             admin,
             json!({"op":"retained_admission", "authenticated_endpoint":pending_service["endpoint"],
@@ -1920,9 +1912,12 @@ mod tests {
         // step nor the Add is delayed, and each candidate carries them (A3).
         assert_eq!(pending_count(), 32);
         let registered = json!({"op":"stage_admission_update", "step":fetched["step"]});
-        let [_, saved] =
-            execute_stored(restored, &serde_json::to_vec(&registered).unwrap(), &[]).unwrap();
-        execute_stored(restored, br#"{"op":"adopt_admission"}"#, &saved).unwrap();
+        let saved = call(restored, registered).unwrap();
+        call(
+            restored,
+            json!({"op":"adopt_admission","candidate":saved["candidate"]}),
+        )
+        .unwrap();
         assert_eq!(pending_count(), 32);
         let fetched = fetch();
         assert_eq!(fetched["state"], "membership_update_available");
@@ -1934,27 +1929,32 @@ mod tests {
         assert!(fetched.get("welcome").is_none());
         let update = json!({"op":"stage_admission_update", "step":fetched["step"]});
         assert_eq!(pending_count(), 32);
-        let [_, saved] =
-            execute_stored(restored, &serde_json::to_vec(&update).unwrap(), &[]).unwrap();
-        let mut altered = saved.clone();
-        *altered.last_mut().unwrap() ^= 1;
-        assert!(execute_stored(restored, br#"{"op":"adopt_admission"}"#, &altered).is_err());
-        assert!(execute_stored(restored, br#"{"op":"adopt_reception"}"#, &saved).is_err());
-        close(restored).unwrap(); // Saved candidate survives before explicit adoption.
-        let restored = create(Some(&[42; 32])).unwrap();
-        let [metadata, _] = execute_stored(
-            restored,
-            &serde_json::to_vec(
-                &json!({"op":"restore_workspace", "workspace":created["workspace"]}),
+        let saved = call(restored, update.clone()).unwrap();
+        assert!(
+            call(
+                restored,
+                json!({"op":"adopt_admission","candidate":altered(&saved["candidate"])})
             )
-            .unwrap(),
-            &saved,
+            .is_err()
+        );
+        assert!(
+            call(
+                restored,
+                json!({"op":"adopt_reception","candidate":saved["candidate"]})
+            )
+            .is_err()
+        );
+        let adopted = call(
+            restored,
+            json!({"op":"adopt_admission","candidate":saved["candidate"]}),
         )
         .unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&metadata).unwrap()["members"],
-            3
-        );
+        assert_eq!(adopted["members"], 3);
+        assert_eq!(adopted["durable"], true);
+        close(restored).unwrap(); // The adopted step survives a restart.
+        let restored = stored(&[42; 32], &joiner_store);
+        let metadata = call(restored, restore.clone()).unwrap();
+        assert_eq!(metadata["members"], 3);
         for number in 118..150 {
             let pending = call(restored, json!({"op":"poll_pending_object"})).unwrap();
             assert_eq!(pending["payload"], json!([number]));
@@ -1964,20 +1964,28 @@ mod tests {
             "NATIVE_OBJECT_INBOX live_pending_restart=true acknowledgement_restart=true missed_recovery=true pending_carried_across_epoch=true adapter_callback=not_exercised"
         );
         assert!(call(restored, update).is_err()); // replay
-        let [_, saved] = execute_stored(
-            service,
-            &serde_json::to_vec(
-                &json!({"op":"stage_join", "commits":[step], "welcome":response["welcome"]}),
-            )
-            .unwrap(),
-            &[],
+        // The Welcome goes as the separate binary argument, not in the JSON.
+        let welcome: Vec<u8> = serde_json::from_value(response["welcome"].clone()).unwrap();
+        let join_request = json!({"op":"stage_join", "commits":[step]});
+        let mut both = join_request.clone();
+        both["welcome"] = response["welcome"].clone();
+        assert!(
+            execute_stored(service, &serde_json::to_vec(&both).unwrap(), &welcome).is_err(),
+            "Welcome must have exactly one representation"
+        );
+        let saved: Value = serde_json::from_slice(
+            &execute_stored(service, &serde_json::to_vec(&join_request).unwrap(), &welcome)
+                .unwrap(),
         )
         .unwrap();
-        let [metadata, _] = execute_stored(service, br#"{"op":"adopt_join"}"#, &saved).unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&metadata).unwrap()["members"],
-            3
-        );
+        assert!(saved.get("snapshot").is_none());
+        let metadata = call(
+            service,
+            json!({"op":"adopt_join","candidate":saved["candidate"]}),
+        )
+        .unwrap();
+        assert_eq!(metadata["members"], 3);
+        assert_eq!(metadata["durable"], true);
         close(service).unwrap();
         close(restored).unwrap();
         close(admin).unwrap();

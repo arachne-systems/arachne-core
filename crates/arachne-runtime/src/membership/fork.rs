@@ -100,11 +100,8 @@ pub(crate) fn prepare_candidate(session: &mut Session) -> Result<(), ApiError> {
         && staged.workspace.epoch() > previous.epoch()
         && branch.snapshot(previous.epoch()).is_none()
     {
-        let key = session
-            .storage_key
-            .as_ref()
-            .ok_or_else(errors::no_root_key)?;
-        match previous.seal_branch_snapshot(key) {
+        let key = persistence::record_key(session)?;
+        match previous.seal_branch_snapshot(&key) {
             Ok(snapshot) => branch
                 .retain(previous.epoch(), snapshot)
                 .map_err(security(ErrorCode::StorageFailed))?,
@@ -491,12 +488,9 @@ pub(crate) fn stage(session: &mut Session, epoch: u64, step: JoinStep) -> Result
                 && let MembershipAuthorization::Revocation(order) = &authorization
                 && let Some(snapshot) = branch.snapshot(epoch)
             {
-                let key = session
-                    .storage_key
-                    .as_ref()
-                    .ok_or_else(errors::no_root_key)?;
+                let key = persistence::record_key(session)?;
                 let mut common =
-                    Workspace::restore_branch_snapshot(key, owner.endpoint(), owner.id(), snapshot)
+                    Workspace::restore_branch_snapshot(&key, owner.endpoint(), owner.id(), snapshot)
                         .map_err(security(ErrorCode::StorageCorrupt))?;
                 if common.epoch() != epoch {
                     return Err(ApiError::storage_corrupt(
@@ -529,12 +523,9 @@ pub(crate) fn stage(session: &mut Session, epoch: u64, step: JoinStep) -> Result
             session.membership.fork.carried.clone(),
         ),
         BranchDecision::Switch(prepared) => {
-            let key = session
-                .storage_key
-                .as_ref()
-                .ok_or_else(errors::no_root_key)?;
+            let key = persistence::record_key(session)?;
             let mut at_fork = Workspace::restore_branch_snapshot(
-                key,
+                &key,
                 owner.endpoint(),
                 owner.id(),
                 prepared.snapshot(),
@@ -626,16 +617,7 @@ pub(crate) fn stage(session: &mut Session, epoch: u64, step: JoinStep) -> Result
         }
     };
     let orphaned = branch.is_orphaned();
-    let snapshot = seal_state(
-        session.records.is_some(),
-        &next,
-        session
-            .storage_key
-            .as_ref()
-            .ok_or_else(errors::no_root_key)?,
-        publisher.as_ref(),
-        inbox.as_ref(),
-    )?;
+    let snapshot = seal_state(session.records.is_some())?;
     let mut value = serde_json::to_value(StagedCandidate::new(
         next.id(),
         next.workspace_name()
@@ -871,16 +853,7 @@ fn stage_orders(
         .map_err(security(ErrorCode::StorageCorrupt))?;
     let publisher = session.delivery.publisher.clone();
     let inbox = session.delivery.inbox.clone();
-    let snapshot = seal_state(
-        session.records.is_some(),
-        &next,
-        session
-            .storage_key
-            .as_ref()
-            .ok_or_else(errors::no_root_key)?,
-        publisher.as_ref(),
-        inbox.as_ref(),
-    )?;
+    let snapshot = seal_state(session.records.is_some())?;
     let branch = session
         .membership
         .fork

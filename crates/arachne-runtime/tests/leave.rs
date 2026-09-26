@@ -1,10 +1,13 @@
-use arachne_runtime::{
-    close, create, describe, enable_record_storage, execute, restore_record_storage, save_candidate,
-};
+use arachne_runtime::{MemoryProvider, close, describe, execute};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
 mod common;
+
+/// A node with its own in-memory record storage.
+fn node(secret: u8) -> i64 {
+    common::stored(&[secret; 32], &MemoryProvider::default())
+}
 
 fn call(h: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(h, &serde_json::to_vec(&request).unwrap())?)
@@ -48,7 +51,7 @@ fn join(owner: i64, joiner: i64, invite: &Value, display_name: &str) {
     .unwrap();
     call(
         owner,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap();
     let reply = call(
@@ -63,7 +66,7 @@ fn join(owner: i64, joiner: i64, invite: &Value, display_name: &str) {
     .unwrap();
     call(
         joiner,
-        json!({"op":"adopt_join","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
     )
     .unwrap();
 }
@@ -97,7 +100,8 @@ fn drive_until_work(handle: i64) -> Value {
     let until = Instant::now() + Duration::from_secs(10);
     loop {
         let value = call(handle, json!({"op":"drive_workspace"})).unwrap();
-        if value.get("state").is_some() {
+        // Presence replies can precede the membership exchange under test.
+        if value.get("state").is_some() && value["state"] != "presence_replied" {
             return value;
         }
         assert!(Instant::now() < until, "workspace driver did not observe work");
@@ -105,21 +109,23 @@ fn drive_until_work(handle: i64) -> Value {
     }
 }
 
-/// A new member's Rust driver first self-updates through its administrator
-/// (B3c policy). Serve that here, so each scenario starts settled.
+/// Let the member save its first self-update, then let the administrator
+/// catch up, so each handoff scenario starts with the same accepted epoch.
 fn settle_self_update(member: i64, admin: i64) {
     let until = Instant::now() + Duration::from_secs(10);
+    let mut committed = false;
     loop {
         let value = call(member, json!({"op":"drive_workspace"})).unwrap();
         if value["state"] == "self_update_committed" {
-            return;
+            committed = true;
+            call(member, json!({"op":"poll_workspace_presence","announce":true})).unwrap();
         }
-        let served = call(admin, json!({"op":"poll_admission"})).unwrap();
-        if served["state"] == "awaiting_save" {
-            let snapshot = serde_json::from_value::<Vec<u8>>(served["snapshot"].clone()).unwrap();
-            let _ = save_candidate(admin, &snapshot);
-            call(admin, json!({"op":"adopt_admission","snapshot":served["snapshot"]})).unwrap();
-            call(admin, json!({"op":"send_admission_reply"})).unwrap();
+        call(admin, json!({"op":"drive_workspace"})).unwrap();
+        if committed
+            && call(member, json!({"op":"member_roster"})).unwrap()["epoch"]
+                == call(admin, json!({"op":"member_roster"})).unwrap()["epoch"]
+        {
+            return;
         }
         assert!(Instant::now() < until, "no self-update: {value}");
         std::thread::sleep(Duration::from_millis(5));
@@ -163,22 +169,20 @@ fn issue_invitation(handle: i64) -> Value {
     .unwrap();
     call(
         handle,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap()["issued_invitation"]
         .clone()
 }
 
 fn adopt_candidate(handle: i64, staged: &Value) -> Value {
-    let snapshot = serde_json::from_value::<Vec<u8>>(staged["snapshot"].clone()).unwrap();
-    save_candidate(handle, &snapshot).unwrap();
-    call(handle, json!({"op":"adopt_admission","snapshot":staged["snapshot"]})).unwrap()
+    call(handle, json!({"op":"adopt_admission","candidate":staged["candidate"]})).unwrap()
 }
 
 #[test]
 fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave() {
-    let admin = create(Some(&[73; 32])).unwrap();
-    let successor = create(Some(&[74; 32])).unwrap();
+    let admin = node(73);
+    let successor = node(74);
     call(
         admin,
         json!({"op":"create_workspace","display_name":"Original admin"}),
@@ -186,13 +190,6 @@ fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave()
     .unwrap();
     let invite = issue_invitation(admin);
     join(admin, successor, &invite, "Successor");
-    let dir = common::directory();
-    enable_record_storage(
-        successor,
-        &dir.path().join("successor.db"),
-        &[74; 32],
-    )
-    .unwrap();
     route(admin, successor);
     route(successor, admin);
     settle_self_update(successor, admin);
@@ -252,7 +249,7 @@ fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave()
     );
     let promoted = call(
         admin,
-        json!({"op":"adopt_admission","snapshot":promotion["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":promotion["candidate"]}),
     )
     .unwrap();
     assert_eq!(promoted["epoch"], old_epoch + 1);
@@ -266,11 +263,9 @@ fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave()
     let staged = incoming(successor);
     assert_eq!(staged["state"], "awaiting_save");
     assert!(!leaving.is_finished(), "departure completed before the peer adopted it");
-    let snapshot = serde_json::from_value::<Vec<u8>>(staged["snapshot"].clone()).unwrap();
-    save_candidate(successor, &snapshot).unwrap();
     call(
         successor,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap();
     assert_eq!(
@@ -289,21 +284,20 @@ fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave()
     assert_eq!(
         call(
             admin,
-            json!({"op":"adopt_admission","snapshot":removed["snapshot"]}),
+            json!({"op":"adopt_admission","candidate":removed["candidate"]}),
         )
         .unwrap()["state"],
         "removed"
     );
 
     close(successor).unwrap();
-    dir.close().unwrap();
 }
 
 #[test]
 fn three_member_leave_converges_through_successive_administrator_handoffs() {
-    let admin = create(Some(&[101; 32])).unwrap();
-    let successor = create(Some(&[102; 32])).unwrap();
-    let third = create(Some(&[103; 32])).unwrap();
+    let admin = node(101);
+    let successor = node(102);
+    let third = node(103);
     call(
         admin,
         json!({"op":"create_workspace","display_name":"Alpha"}),
@@ -311,6 +305,9 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
     .unwrap();
     let invite = issue_invitation(admin);
     join(admin, successor, &invite, "Bravo");
+    route(admin, successor);
+    route(successor, admin);
+    settle_self_update(successor, admin);
     // Registering the second invitation costs admin an epoch that successor
     // (already a member) does not automatically have. Apply that management
     // step to successor directly so it doesn't fork before the third join.
@@ -321,7 +318,7 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
     .unwrap();
     let adopted = call(
         admin,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap();
     let invite = adopted["issued_invitation"].clone();
@@ -332,35 +329,21 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
     .unwrap();
     call(
         successor,
-        json!({"op":"adopt_admission","snapshot":synced["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":synced["candidate"]}),
     )
     .unwrap();
     join(admin, third, &invite, "Charlie");
 
-    let dir = common::directory();
-    enable_record_storage(admin, &dir.path().join("alpha.db"), &[101; 32]).unwrap();
-    enable_record_storage(successor, &dir.path().join("bravo.db"), &[102; 32]).unwrap();
-    enable_record_storage(third, &dir.path().join("charlie.db"), &[103; 32]).unwrap();
     route(admin, successor);
     route(successor, admin);
     route(admin, third);
     route(third, admin);
     route(successor, third);
     route(third, successor);
-    // B3c policy: the current third member self-updates through the admin
-    // (epoch 4 -> 5). The successor is stale on purpose; its own attempt is
-    // refused by the admin and then waits a minute, past this scenario.
+    // The current third member self-updates through the admin (epoch 5 -> 6).
+    // Keep the successor stale until the handoff offer below. Newer head
+    // announcements defer its self-update; no refusal handshake is required.
     settle_self_update(third, admin);
-    let until = Instant::now() + Duration::from_secs(10);
-    loop {
-        let value = call(successor, json!({"op":"drive_workspace"})).unwrap();
-        if value["state"] == "self_update_refused" {
-            break;
-        }
-        call(admin, json!({"op":"poll_admission"})).unwrap();
-        assert!(Instant::now() < until, "stale self-update not refused: {value}");
-        std::thread::sleep(Duration::from_millis(5));
-    }
 
     let successor_id = self_member_id(successor);
     let third_id = self_member_id(third);
@@ -384,19 +367,19 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
         true
     );
     assert_eq!(failed_promotion["state"], "awaiting_save");
+    let stale_roster = call(successor, json!({"op":"member_roster"})).unwrap();
+    assert_eq!(stale_roster["epoch"], 4);
+    assert_eq!(stale_roster["members"].as_array().unwrap().len(), 2);
 
     // The second join advances the creator while the first member still has
     // the previous accepted view. Reconcile that view before any management.
-    // +2 on both numbers below: registering each invitation now costs an
-    // epoch. Successor's own join lands at epoch 2 (not 1), and it is synced
-    // to epoch 3 directly above for the second invitation's registration, so
-    // only the third member's join (epoch 3 -> 4) remains to reconcile here.
-    // Admin's epoch after the second invite+join is 4 (not 2).
-    offer_and_drive(admin, successor, 3);
-    // And the third member's self-update (epoch 4 -> 5).
+    // Bravo already self-updated at epoch 3 and received the second
+    // invitation registration at epoch 4. It is missing Charlie's join
+    // (epoch 4 -> 5) and self-update (epoch 5 -> 6).
     offer_and_drive(admin, successor, 4);
+    offer_and_drive(admin, successor, 5);
     let before_promotion = call(admin, json!({"op":"member_roster"})).unwrap();
-    assert_eq!(before_promotion["epoch"], 5);
+    assert_eq!(before_promotion["epoch"], 6);
     let before_promotion_epoch = before_promotion["epoch"].as_u64().unwrap();
 
     let promotion = call(
@@ -468,13 +451,14 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
     assert_eq!(final_roster["members"][0]["administrator"], true);
 
     close(third).unwrap();
-    dir.close().unwrap();
 }
 
 #[test]
 fn leave_over_iroh_retries_saved_outcome_then_restores_only_terminal_state() {
-    let mut admin = create(Some(&[71; 32])).unwrap();
-    let member = create(Some(&[72; 32])).unwrap();
+    let admin_storage = MemoryProvider::default();
+    let member_storage = MemoryProvider::default();
+    let mut admin = common::stored(&[71; 32], &admin_storage);
+    let member = common::stored(&[72; 32], &member_storage);
     let created = call(
         admin,
         json!({"op":"create_workspace","display_name":"Admin"}),
@@ -490,21 +474,16 @@ fn leave_over_iroh_retries_saved_outcome_then_restores_only_terminal_state() {
     let admission = call(admin, json!({"op":"stage_admission","authenticated_endpoint":join["endpoint"],"request":join["admission_request"]})).unwrap();
     call(
         admin,
-        json!({"op":"adopt_admission","snapshot":admission["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":admission["candidate"]}),
     )
     .unwrap();
     let reply = call(admin, json!({"op":"retained_admission","authenticated_endpoint":join["endpoint"],"request":join["admission_request"]})).unwrap();
     let joined = call(member, json!({"op":"stage_join","welcome":reply["welcome"],"commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]})).unwrap();
     call(
         member,
-        json!({"op":"adopt_join","snapshot":joined["snapshot"]}),
+        json!({"op":"adopt_join","candidate":joined["candidate"]}),
     )
     .unwrap();
-    let dir = common::directory();
-    let a = dir.path().join("admin.db");
-    let b = dir.path().join("member.db");
-    enable_record_storage(admin, &a, &[71; 32]).unwrap();
-    enable_record_storage(member, &b, &[72; 32]).unwrap();
     assert!(call(admin, json!({"op":"stage_solo_leave"})).is_err());
     route(member, admin);
     let peer = info(admin)["endpoint_key"].clone();
@@ -513,25 +492,18 @@ fn leave_over_iroh_retries_saved_outcome_then_restores_only_terminal_state() {
     let staged = incoming(admin);
     assert_eq!(staged["leaving"], true);
     assert!(call(admin, json!({"op":"send_admission_reply"})).is_err());
-    save_candidate(
-        admin,
-        &serde_json::from_value::<Vec<u8>>(staged["snapshot"].clone()).unwrap(),
-    )
-    .unwrap();
     let adopted = call(
         admin,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap();
     assert_eq!(adopted["members"], 1);
     close(admin).unwrap(); // Saved departure, lost reply.
     assert!(first.join().unwrap().is_err());
-    admin = create(Some(&[71; 32])).unwrap();
-    let restored = restore_record_storage(
+    admin = common::stored(&[71; 32], &admin_storage);
+    let restored = call(
         admin,
-        &a,
-        &[71; 32],
-        serde_json::from_value(created["workspace"].clone()).unwrap(),
+        json!({"op":"restore_workspace","workspace":created["workspace"]}),
     )
     .unwrap();
     assert_eq!(restored["members"], 1);
@@ -543,35 +515,21 @@ fn leave_over_iroh_retries_saved_outcome_then_restores_only_terminal_state() {
     call(admin, json!({"op":"send_admission_reply"})).unwrap();
     let departed = retry.join().unwrap().unwrap();
     assert_eq!(departed["removed"], true);
-    assert!(
-        call(
-            member,
-            json!({"op":"adopt_admission","snapshot":departed["snapshot"]})
-        )
-        .is_err()
-    );
-    save_candidate(
-        member,
-        &serde_json::from_value::<Vec<u8>>(departed["snapshot"].clone()).unwrap(),
-    )
-    .unwrap();
     assert_eq!(
         call(
             member,
-            json!({"op":"adopt_admission","snapshot":departed["snapshot"]})
+            json!({"op":"adopt_admission","candidate":departed["candidate"]})
         )
         .unwrap()["state"],
         "removed"
     );
     assert!(call(member, json!({"op":"member_roster"})).is_err());
     close(member).unwrap();
-    let member = create(Some(&[72; 32])).unwrap();
+    let member = common::stored(&[72; 32], &member_storage);
     assert_eq!(
-        restore_record_storage(
+        call(
             member,
-            &b,
-            &[72; 32],
-            serde_json::from_value(created["workspace"].clone()).unwrap()
+            json!({"op":"restore_workspace","workspace":created["workspace"]}),
         )
         .unwrap()["state"],
         "removed"
@@ -585,5 +543,4 @@ fn leave_over_iroh_retries_saved_outcome_then_restores_only_terminal_state() {
     );
     close(member).unwrap();
     close(admin).unwrap();
-    dir.close().unwrap();
 }

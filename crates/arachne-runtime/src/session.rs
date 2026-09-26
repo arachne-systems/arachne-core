@@ -10,7 +10,7 @@ use arachne_node::{Node, Timeouts};
 use serde_json::Value;
 use tokio::runtime::Handle;
 
-use crate::errors::{self, delivery, security};
+use crate::errors::{self, delivery};
 use crate::ops::join::{JoinLifecycle, PendingCheckpointExchange, PendingJoinExchange};
 use crate::ops::recovery::{
     PendingCurrentView, PendingDirectRange, PendingRange, ReadyCurrentView, ReadyDirectRange,
@@ -130,7 +130,8 @@ pub(crate) struct Session {
     /// The same state, published for inquiries answered without the host.
     pub(crate) committed: committed_view::Published,
     pub(crate) activity: WorkspaceActivity,
-    pub(crate) storage_key: Option<arachne_security::StorageKey>,
+    /// Where this session keeps workspace records. Required to hold one.
+    pub(crate) storage: Option<persistence::StorageConfig>,
     pub(crate) records: Option<persistence::NativeStore>,
     // Subsystems.
     pub(crate) transition: TransitionState,
@@ -250,8 +251,6 @@ pub(crate) struct MembershipState {
     pub(crate) peer_profile_summaries: BTreeMap<[u8; 32], [u8; 32]>,
     /// When this member self-updates next (B3c).
     pub(crate) self_update: membership::self_update::SelfUpdatePolicy,
-    /// The administrator this member's pending self-update is offered to.
-    pub(crate) self_update_offered: Option<[u8; 32]>,
 }
 
 impl MembershipState {
@@ -273,7 +272,6 @@ impl MembershipState {
             profiles,
             peer_profile_summaries: BTreeMap::new(),
             self_update: membership::self_update::SelfUpdatePolicy::new(std::time::Instant::now()),
-            self_update_offered: None,
         }
     }
 }
@@ -305,7 +303,6 @@ impl Session {
         receiver: arachne_node::MessageReceiver,
         context: Arc<crate::context::Context>,
         committed: committed_view::Published,
-        storage_key: Option<arachne_security::StorageKey>,
         presence: presence::Presence,
     ) -> Self {
         let profiles = committed.profiles();
@@ -318,7 +315,7 @@ impl Session {
             workspace: None,
             committed,
             activity: WorkspaceActivity::default(),
-            storage_key,
+            storage: None,
             records: None,
             transition: TransitionState::default(),
             delivery: DeliveryState::default(),
@@ -385,29 +382,13 @@ pub(crate) fn activity_view(session: &Session) -> ActivityView {
     session.activity.view()
 }
 
-/// The candidate bytes the host saves: a random token with native storage,
-/// else the sealed state.
-pub(crate) fn seal_state(
-    native: bool,
-    workspace: &arachne_security::Workspace,
-    key: &arachne_security::StorageKey,
-    publisher: Option<&arachne_delivery::PublisherLog>,
-    inbox: Option<&arachne_delivery::inbox::ObjectInbox>,
-) -> Result<Vec<u8>, ApiError> {
-    if native {
-        return persistence::candidate_token();
+/// The opaque token of a new candidate. Staging needs record storage: the
+/// adopt step saves the candidate there before it becomes live.
+pub(crate) fn seal_state(native: bool) -> Result<Vec<u8>, ApiError> {
+    if !native {
+        return Err(persistence::storage_required());
     }
-    match (inbox, publisher) {
-        (Some(inbox), Some(publisher)) => inbox
-            .seal(workspace, key, publisher)
-            .map_err(delivery(ErrorCode::StorageFailed)),
-        (None, None) => workspace
-            .seal(key)
-            .map_err(security(ErrorCode::StorageFailed)),
-        _ => Err(ApiError::internal(
-            "object inbox and publisher state go together",
-        )),
-    }
+    persistence::candidate_token()
 }
 
 // Pending application objects never block a membership step: they are

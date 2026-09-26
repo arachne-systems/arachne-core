@@ -5,16 +5,19 @@
 //! can echo the caller's own request text back to that caller; that is not
 //! covered here.
 
-use arachne_runtime::{Client, ClientConfig, Error, Network};
+use arachne_runtime::{
+    Client, ClientConfig, Error, FreshnessAnchor, MemoryProvider, Network, StorageConfig,
+};
 use base64::Engine;
 
 const SECRET: [u8; 32] = [0xA7; 32];
 
-fn open(secret: [u8; 32]) -> Client {
+fn open(secret: [u8; 32], provider: &MemoryProvider) -> Client {
     Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some(secret),
         transport: Default::default(),
+        storage: Some(StorageConfig::memory(provider)),
     })
     .unwrap()
 }
@@ -67,24 +70,24 @@ fn assert_no_secret(error: &Error, secrets: &[(&str, &[u8])]) {
 
 #[test]
 fn errors_from_secret_inputs_do_not_show_the_secret() {
-    let mut owner = open(SECRET);
-    owner.create_workspace("Owner", None).unwrap();
-    let sealed = owner.seal_workspace().unwrap();
+    let provider = MemoryProvider::default();
+    let mut owner = open(SECRET, &provider);
+    let created = owner.create_workspace("Owner", None).unwrap();
+    let anchor = owner.record_freshness().unwrap();
     let candidate = owner.stage_invitation(0).unwrap();
-    let invitation = owner.adopt_invitation(&candidate.snapshot).unwrap();
+    let invitation = owner.adopt_invitation(&candidate).unwrap();
 
-    let mut other = open([0x3C; 32]);
+    let other_provider = MemoryProvider::default();
+    let mut other = open([0x3C; 32], &other_provider);
     let mut errors = Vec::new();
-    // A snapshot sealed under another endpoint's key.
+    // This session's storage never saved anything for this workspace.
+    errors.extend(other.restore_workspace(created.workspace, None).err());
+    // A damaged freshness anchor against the owner's own storage.
+    let mut owner_again = open(SECRET, &provider);
+    let damaged = FreshnessAnchor::from_bytes(&tampered(&anchor.to_bytes())).unwrap();
     errors.extend(
-        other
-            .restore_workspace(sealed.workspace, &sealed.snapshot)
-            .err(),
-    );
-    // A damaged snapshot.
-    errors.extend(
-        other
-            .restore_workspace(sealed.workspace, &tampered(&sealed.snapshot))
+        owner_again
+            .restore_workspace(created.workspace, Some(damaged))
             .err(),
     );
     // A damaged invitation, and a damaged checkpoint.
@@ -98,25 +101,23 @@ fn errors_from_secret_inputs_do_not_show_the_secret() {
             .inspect_invitation(&invitation.invitation, &tampered(&invitation.checkpoint))
             .err(),
     );
-    // A candidate that is no longer staged, and a damaged one.
-    errors.extend(owner.adopt_invitation(&candidate.snapshot).err());
-    errors.extend(owner.adopt_invitation(&tampered(&candidate.snapshot)).err());
+    // A candidate that was already used.
+    errors.extend(owner.adopt_invitation(&candidate).err());
     assert!(
         errors.len() >= 4,
         "expected most secret inputs to fail, got {} errors",
         errors.len()
     );
 
-    let secrets: [(&str, &[u8]); 5] = [
+    let secrets: [(&str, &[u8]); 3] = [
         ("endpoint secret", &SECRET),
-        ("sealed snapshot", &sealed.snapshot),
         ("invitation", &invitation.invitation),
         ("invitation key", &invitation.invitation_key),
-        ("invitation candidate", &candidate.snapshot),
     ];
     for error in &errors {
         assert_no_secret(error, &secrets);
     }
     other.close().unwrap();
+    owner_again.close().unwrap();
     owner.close().unwrap();
 }

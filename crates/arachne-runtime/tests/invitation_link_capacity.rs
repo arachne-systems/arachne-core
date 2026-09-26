@@ -357,7 +357,7 @@ async fn full_onboard(
     // in-memory equivalent of the runtime's adopt_join op; genuine
     // disk-durable adoption is proven separately at small scale in
     // `local_full_onboarding_state_machine_rejects_a_corrupted_joiner`
-    // via enable_record_storage + save_candidate + execute_stored.
+    // via attached record storage and adopt_admission (save, read back, adopt).
     let self_id = match workspace.member() {
         Some(member) => member.id(),
         None => {
@@ -877,23 +877,24 @@ fn local_full_onboarding_state_machine_rejects_a_corrupted_joiner() {
     let started = Instant::now();
 
     let owner = arachne_runtime::create(Some(&[211; 32])).unwrap();
+    arachne_runtime::attach_storage(
+        owner,
+        arachne_runtime::StorageConfig::memory(&arachne_runtime::MemoryProvider::default()),
+    )
+    .unwrap();
     call(
         owner,
         json!({"op":"create_workspace","display_name":"Ramp Owner"}),
     )
     .unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    arachne_runtime::enable_record_storage(owner, &dir.path().join("owner.db"), &[211; 32])
-        .unwrap();
     let staged = call(
         owner,
         json!({"op":"stage_invitation","personal":false,"expires_at":0}),
     )
     .unwrap();
-    arachne_runtime::save_candidate(owner, &bytes(&staged["snapshot"])).unwrap();
     let invite = call(
         owner,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap()["issued_invitation"]
         .clone();
@@ -922,12 +923,9 @@ fn local_full_onboarding_state_machine_rejects_a_corrupted_joiner() {
             if let Ok(value) = call(owner, json!({"op":"poll_admission"}))
                 && value["state"] == "awaiting_save"
             {
-                let snapshot = bytes(&value["snapshot"]);
-                arachne_runtime::save_candidate(owner, &snapshot).unwrap();
-                arachne_runtime::execute_stored(
+                call(
                     owner,
-                    br#"{"op":"adopt_admission"}"#,
-                    &snapshot,
+                    json!({"op":"adopt_admission","candidate":value["candidate"]}),
                 )
                 .unwrap();
             }

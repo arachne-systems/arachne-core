@@ -1,7 +1,7 @@
 //! ADR A2 runtime fork regression checks. In-process MLS; no network exchange.
 use super::*;
 use crate::ops::candidate::{AdoptKind, adopt};
-use arachne_security::{ManagementAction, PreparedManagementUpdate, StorageKey, Workspace};
+use arachne_security::{ManagementAction, PreparedManagementUpdate, Workspace};
 
 fn owner(session: &Session) -> &Workspace {
     session.workspace.as_deref().unwrap()
@@ -39,7 +39,6 @@ fn a_competing_removal_switches_only_after_candidate_adoption() {
     )
     .unwrap();
     let mut session = bare_test_session(*second_admin);
-    session.storage_key = Some(StorageKey::derive(&[81; 32]).unwrap());
     stage_management(
         &mut session,
         ManagementAction::CreateInvitation([9; 32], 0, false),
@@ -89,7 +88,6 @@ fn a_lower_key_below_the_snapshot_window_stages_orphaning_and_blocks_sends() {
     )
     .unwrap();
     let mut session = bare_test_session(admin);
-    session.storage_key = Some(StorageKey::derive(&[82; 32]).unwrap());
     stage_management(
         &mut session,
         ManagementAction::CreateInvitation([7; 32], 0, false),
@@ -128,7 +126,6 @@ fn a_higher_key_does_not_orphan_a_settled_winner() {
     )
     .unwrap();
     let mut session = bare_test_session(admin);
-    session.storage_key = Some(StorageKey::derive(&[83; 32]).unwrap());
     stage_prepared(&mut session, lower).unwrap();
     adopt_staged(&mut session);
     session
@@ -162,7 +159,6 @@ fn a_branch_snapshot_must_match_its_declared_epoch() {
     )
     .unwrap();
     let mut session = bare_test_session(admin);
-    session.storage_key = Some(StorageKey::derive(&[84; 32]).unwrap());
     stage_management(
         &mut session,
         ManagementAction::CreateInvitation([7; 32], 0, false),
@@ -170,7 +166,7 @@ fn a_branch_snapshot_must_match_its_declared_epoch() {
     .unwrap();
     adopt_staged(&mut session);
     let wrong = owner(&session)
-        .seal_branch_snapshot(session.storage_key.as_ref().unwrap())
+        .seal_branch_snapshot(&persistence::record_key(&session).unwrap())
         .unwrap();
     let mut branch = arachne_security::BranchState::new(epoch);
     branch.retain(epoch, wrong).unwrap();
@@ -280,7 +276,6 @@ fn competing_removes_are_carried_and_quarantine_sends_until_both_apply() {
         (second_remove, first_remove)
     };
     let mut session = bare_test_session(members.remove(2));
-    session.storage_key = Some(StorageKey::derive(&[85; 32]).unwrap());
     let fork_epoch = owner(&session).epoch();
     let losing = owner_wire_step(
         owner(&session),
@@ -308,7 +303,6 @@ fn competing_removes_are_carried_and_quarantine_sends_until_both_apply() {
     // Branch records restore the quarantine before any new publication.
     let records = fork::records(&session, false).unwrap();
     let mut restored = bare_test_session(owner(&session).provisional_copy().unwrap());
-    restored.storage_key = Some(StorageKey::derive(&[85; 32]).unwrap());
     fork::restore(&mut restored, &records).unwrap();
     assert!(fork::require_send(&restored).is_err());
     let (_, encoded) = records
@@ -316,7 +310,6 @@ fn competing_removes_are_carried_and_quarantine_sends_until_both_apply() {
         .find(|(name, _)| name.starts_with(b"runtime/branch/order/"))
         .unwrap();
     let mut receiver = bare_test_session(owner(&session).provisional_copy().unwrap());
-    receiver.storage_key = Some(StorageKey::derive(&[85; 32]).unwrap());
     let mut forged = arachne_security::OrderStep::from_bytes(encoded).unwrap();
     forged.order.signature[0] ^= 1;
     assert!(
@@ -381,7 +374,6 @@ fn a_winner_carries_a_verified_losing_remove_without_switching() {
         (second_remove, first_remove)
     };
     let mut session = bare_test_session(members.remove(2));
-    session.storage_key = Some(StorageKey::derive(&[86; 32]).unwrap());
     let fork_epoch = owner(&session).epoch();
     let winning = owner_wire_step(
         owner(&session),

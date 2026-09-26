@@ -1,7 +1,9 @@
 //! The gossip tag key is one members-only secret, carried to joiners and
 //! kept across a runtime save and restore.
-use arachne_runtime::{close, create, execute, harness::gossip_tag_key};
+use arachne_runtime::{MemoryProvider, close, execute, harness::gossip_tag_key};
 use serde_json::{Value, json};
+
+mod common;
 
 fn call(handle: i64, request: Value) -> Value {
     let reply = execute(handle, &serde_json::to_vec(&request).unwrap())
@@ -11,8 +13,10 @@ fn call(handle: i64, request: Value) -> Value {
 
 #[test]
 fn joiner_shares_the_key_and_keeps_it_across_restore() {
-    let admin = create(Some(&[71; 32])).unwrap();
-    let joiner = create(Some(&[72; 32])).unwrap();
+    let admin_provider = MemoryProvider::default();
+    let joiner_provider = MemoryProvider::default();
+    let admin = common::stored(&[71; 32], &admin_provider);
+    let joiner = common::stored(&[72; 32], &joiner_provider);
     let workspace = call(
         admin,
         json!({"op":"create_workspace","display_name":"Coordinator"}),
@@ -25,7 +29,7 @@ fn joiner_shares_the_key_and_keeps_it_across_restore() {
     );
     let invite = call(
         admin,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )["issued_invitation"]
         .clone();
     let pending = call(
@@ -40,7 +44,7 @@ fn joiner_shares_the_key_and_keeps_it_across_restore() {
     );
     call(
         admin,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     );
     let reply = call(
         admin,
@@ -59,18 +63,16 @@ fn joiner_shares_the_key_and_keeps_it_across_restore() {
     );
     call(
         joiner,
-        json!({"op":"adopt_join","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
     );
     assert_eq!(gossip_tag_key(joiner).unwrap(), key);
     assert_eq!(gossip_tag_key(admin).unwrap(), key);
 
-    let saved = call(joiner, json!({"op":"seal_workspace"}));
     close(joiner).unwrap();
-    let joiner = create(Some(&[72; 32])).unwrap();
+    let joiner = common::stored(&[72; 32], &joiner_provider);
     call(
         joiner,
-        json!({"op":"restore_workspace","workspace":workspace["workspace"],
-        "snapshot":saved["snapshot"]}),
+        json!({"op":"restore_workspace","workspace":workspace["workspace"]}),
     );
     assert_eq!(gossip_tag_key(joiner).unwrap(), key);
     call(

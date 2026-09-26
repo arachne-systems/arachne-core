@@ -1,6 +1,8 @@
-use arachne_runtime::{close, create, describe, execute};
+use arachne_runtime::{MemoryProvider, close, describe, execute};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
+
+mod common;
 
 fn call(handle: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
@@ -9,14 +11,15 @@ fn call(handle: i64, request: Value) -> Result<Value, String> {
 
 fn issue(h: i64) -> Value {
     let staged = call(h, json!({"op":"stage_invitation","personal":false,"expires_at":0})).unwrap();
-    call(h, json!({"op":"adopt_admission","snapshot":staged["snapshot"]})).unwrap()["issued_invitation"].clone()
+    call(h, json!({"op":"adopt_admission","candidate":staged["candidate"]})).unwrap()["issued_invitation"].clone()
 }
 
 #[test]
 fn management_save_adopt_old_invitation_and_removal_over_iroh() {
-    let admin = create(Some(&[81; 32])).unwrap();
-    let mut helper = create(Some(&[82; 32])).unwrap();
-    let late = create(Some(&[83; 32])).unwrap();
+    let admin = common::stored(&[81; 32], &MemoryProvider::default());
+    let helper_provider = MemoryProvider::default();
+    let mut helper = common::stored(&[82; 32], &helper_provider);
+    let late = common::stored(&[83; 32], &MemoryProvider::default());
     call(
         admin,
         json!({"op":"create_workspace","display_name":"Coordinator"}),
@@ -40,7 +43,7 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
     .unwrap();
     call(
         admin,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap();
     let reply = call(
@@ -57,12 +60,12 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
     .unwrap();
     call(
         helper,
-        json!({"op":"adopt_join","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
     )
     .unwrap();
     close(helper).unwrap();
-    helper = create(Some(&[82; 32])).unwrap();
-    call(helper, json!({"op":"restore_workspace","workspace":invite["workspace"],"snapshot":staged["snapshot"]})).unwrap();
+    helper = common::stored(&[82; 32], &helper_provider);
+    call(helper, json!({"op":"restore_workspace","workspace":invite["workspace"]})).unwrap();
     assert!(
         call(
             helper,
@@ -92,10 +95,10 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
         )
         .is_err()
     );
-    assert!(call(admin, json!({"op":"adopt_admission","snapshot":[]})).is_err());
+    assert!(call(admin, json!({"op":"adopt_admission","candidate":[]})).is_err());
     let adopted = call(
         admin,
-        json!({"op":"adopt_admission","snapshot":change["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":change["candidate"]}),
     )
     .unwrap();
     assert_eq!(adopted["step"]["kind"], "promote");
@@ -133,7 +136,7 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
     let change = call(helper, json!({"op":"stage_admission_update","step":step})).unwrap();
     call(
         helper,
-        json!({"op":"adopt_admission","snapshot":change["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":change["candidate"]}),
     )
     .unwrap();
     call(
@@ -155,8 +158,8 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
     }
     let saved_profiles = call(helper, json!({"op":"member_roster"})).unwrap()["profiles"].clone();
     close(helper).unwrap();
-    helper = create(Some(&[82; 32])).unwrap();
-    call(helper, json!({"op":"restore_workspace","workspace":invite["workspace"],"snapshot":change["snapshot"]})).unwrap();
+    helper = common::stored(&[82; 32], &helper_provider);
+    call(helper, json!({"op":"restore_workspace","workspace":invite["workspace"]})).unwrap();
     call(
         helper,
         json!({"op":"member_roster","profiles":saved_profiles}),
@@ -234,7 +237,7 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
         if staged["state"] == "awaiting_save" {
             call(
                 helper,
-                json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+                json!({"op":"adopt_admission","candidate":staged["candidate"]}),
             )
             .unwrap();
             break;
@@ -269,7 +272,6 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
         )
         .is_err()
     );
-    assert!(call(late, json!({"op":"seal_pending_join"})).is_ok());
     let staged = call(
         late,
         json!({"op":"stage_join","welcome":reply["welcome"],"commits":steps}),
@@ -277,7 +279,7 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
     .expect("reachable member must provide the missing authorized history from the old invitation");
     let joined = call(
         late,
-        json!({"op":"adopt_join","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
     )
     .unwrap();
     assert_eq!(joined["members"], 3);
@@ -321,7 +323,7 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
     let removal = call(helper, json!({"op":"stage_management","action":{"kind":"remove","member":late_identity["member"]["id"]}})).unwrap();
     call(
         helper,
-        json!({"op":"adopt_admission","snapshot":removal["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":removal["candidate"]}),
     )
     .unwrap();
     // Advance again before serving the former member; only its own removal,
@@ -333,7 +335,7 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
     .unwrap();
     call(
         helper,
-        json!({"op":"adopt_admission","snapshot":demotion["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":demotion["candidate"]}),
     )
     .unwrap();
     let removed_step = pull(helper, late, helper_peer);
@@ -351,10 +353,10 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
         )
         .is_err()
     );
-    assert!(call(late, json!({"op":"adopt_admission","snapshot":[]})).is_err());
+    assert!(call(late, json!({"op":"adopt_admission","candidate":[]})).is_err());
     let adopted = call(
         late,
-        json!({"op":"adopt_admission","snapshot":removed["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":removed["candidate"]}),
     )
     .unwrap();
     assert_eq!(adopted["state"], "removed");
@@ -396,9 +398,9 @@ fn pull(responder: i64, receiver: i64, peer: Value) -> Value {
 /// joiner uses to ask its next member.
 #[test]
 fn a_member_that_is_not_an_administrator_refuses_admissions() {
-    let admin = create(Some(&[84; 32])).unwrap();
-    let member = create(Some(&[85; 32])).unwrap();
-    let late = create(Some(&[86; 32])).unwrap();
+    let admin = common::stored(&[84; 32], &MemoryProvider::default());
+    let member = common::stored(&[85; 32], &MemoryProvider::default());
+    let late = common::stored(&[86; 32], &MemoryProvider::default());
     call(admin, json!({"op":"create_workspace","display_name":"Coordinator"})).unwrap();
     let invite = issue(admin);
     let begin = |handle, name| {
@@ -416,7 +418,7 @@ fn a_member_that_is_not_an_administrator_refuses_admissions() {
             "request":joined["admission_request"]}),
     )
     .unwrap();
-    call(admin, json!({"op":"adopt_admission","snapshot":staged["snapshot"]})).unwrap();
+    call(admin, json!({"op":"adopt_admission","candidate":staged["candidate"]})).unwrap();
     let reply = call(
         admin,
         json!({"op":"retained_admission","authenticated_endpoint":joined["endpoint"],
@@ -429,7 +431,7 @@ fn a_member_that_is_not_an_administrator_refuses_admissions() {
             "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}),
     )
     .unwrap();
-    call(member, json!({"op":"adopt_join","snapshot":staged["snapshot"]})).unwrap();
+    call(member, json!({"op":"adopt_join","candidate":staged["candidate"]})).unwrap();
 
     let asking = begin(late, "Late joiner");
     let refused = execute(

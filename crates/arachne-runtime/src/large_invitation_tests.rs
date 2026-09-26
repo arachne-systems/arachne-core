@@ -89,20 +89,21 @@ fn a_joiner_redeems_an_invitation_past_three_hundred_members_over_the_runtime() 
     assert_eq!(*secret.public().as_bytes(), owner_peer);
     let workspace = grown(&arachne_node::IrohEndpointSigner(&secret), 520);
     let members = workspace.member_count();
-    {
-        let shared = session(owner).unwrap();
-        let mut guard = shared.lock().unwrap();
-        commit_workspace(guard.as_mut().unwrap(), workspace);
-    }
-    // A roster this size is past the legacy sealed-snapshot budget, so the
-    // owner keeps records, saving each candidate before adopting it.
+    // The owner keeps records: its roster is seeded into storage and restored.
     let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
-    persistence::enable_record_storage(owner, &dirs[0].path().join("owner.db"), &[241; 32]).unwrap();
+    let owner_storage = StorageConfig::sqlite(dirs[0].path(), [241; 32]);
+    persistence::seed_workspace(
+        &arachne_store::SqliteProvider::new(dirs[0].path(), [241; 32]),
+        &workspace,
+        None,
+        None,
+    )
+    .unwrap();
+    attach_storage(owner, owner_storage).unwrap();
+    call(owner, json!({"op":"restore_workspace","workspace":workspace.id()})).unwrap();
     let staged =
         call(owner, json!({"op":"stage_invitation","personal":false,"expires_at":0})).unwrap();
-    let snapshot: Vec<u8> = serde_json::from_value(staged["snapshot"].clone()).unwrap();
-    persistence::save_candidate(owner, &snapshot).unwrap();
-    let adopted = call(owner, json!({"op":"adopt_admission","snapshot":staged["snapshot"]})).unwrap();
+    let adopted = call(owner, json!({"op":"adopt_admission","candidate":staged["candidate"]})).unwrap();
     let invitation = adopted["issued_invitation"].clone();
     let checkpoint: Vec<u8> = serde_json::from_value(invitation["checkpoint"].clone()).unwrap();
     // The regime under test: the old single 64 KiB checkpoint bound, and one
@@ -112,6 +113,7 @@ fn a_joiner_redeems_an_invitation_past_three_hundred_members_over_the_runtime() 
 
     let joiner = create(Some(&[242; 32])).unwrap();
     let _joiner = Closing(joiner);
+    attach_storage(joiner, StorageConfig::sqlite(dirs[1].path(), [242; 32])).unwrap();
     let pending = call(
         joiner,
         json!({
@@ -123,8 +125,6 @@ fn a_joiner_redeems_an_invitation_past_three_hundred_members_over_the_runtime() 
     )
     .unwrap();
     let workspace_id: [u8; 32] = serde_json::from_value(pending["workspace"].clone()).unwrap();
-    persistence::enable_record_storage(joiner, &dirs[1].path().join("joiner.db"), &[242; 32])
-        .unwrap();
     call(joiner, json!({"op":"add_address_hint","peer":owner_peer,"address":address})).unwrap();
 
     // The owner is driven on its own thread, so a joiner failure surfaces

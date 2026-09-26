@@ -1,9 +1,11 @@
 //! B7b: automatic recovery of large objects makes progress under the
 //! per-author pending quota. The application acknowledges only after each
 //! stage/adopt cycle, as a real host does.
-use arachne_runtime::{close, create, describe, execute, execute_stored};
+use arachne_runtime::{MemoryProvider, close, describe, execute};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
+
+mod common;
 
 const EVENT: &str = "atak/native/v1/chat";
 /// Full-size objects: 12 KiB payloads (zero-filled to keep the JSON request
@@ -22,17 +24,9 @@ fn try_call(handle: i64, request: Value) -> Result<Value, String> {
         .map(|bytes| serde_json::from_slice(&bytes).unwrap())
 }
 
-/// Adopt a staged candidate. The snapshot travels as stored bytes: large
-/// publisher and inbox state does not fit a JSON request.
+/// Adopt a staged candidate: save, read back and adopt in one step.
 fn adopt(handle: i64, op: &str, staged: &Value) -> Value {
-    let snapshot: Vec<u8> = serde_json::from_value(staged["snapshot"].clone()).unwrap();
-    let [metadata, _] = execute_stored(
-        handle,
-        &serde_json::to_vec(&json!({"op":op})).unwrap(),
-        &snapshot,
-    )
-    .unwrap();
-    serde_json::from_slice(&metadata).unwrap()
+    call(handle, json!({"op":op,"candidate":staged["candidate"]}))
 }
 
 fn step(reply: &Value) -> Value {
@@ -46,7 +40,7 @@ fn issue_invitation(handle: i64) -> Value {
     );
     call(
         handle,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )["issued_invitation"]
         .clone()
 }
@@ -64,7 +58,7 @@ fn add(owner: i64, joiner: i64, invite: &Value, name: &str) {
     );
     call(
         owner,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     );
     let reply = call(
         owner,
@@ -77,7 +71,7 @@ fn add(owner: i64, joiner: i64, invite: &Value, name: &str) {
     );
     call(
         joiner,
-        json!({"op":"adopt_join","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
     );
 }
 
@@ -141,8 +135,8 @@ fn acknowledge(handle: i64, pending: &Value) {
 
 #[test]
 fn automatic_recovery_of_large_objects_progresses_under_author_quota() {
-    let author = create(Some(&[131; 32])).unwrap();
-    let reader = create(Some(&[132; 32])).unwrap();
+    let author = common::stored(&[131; 32], &MemoryProvider::default());
+    let reader = common::stored(&[132; 32], &MemoryProvider::default());
     let created = call(
         author,
         json!({"op":"create_workspace","display_name":"Author"}),
@@ -233,8 +227,8 @@ fn automatic_recovery_of_large_objects_progresses_under_author_quota() {
 
 #[test]
 fn automatic_recovery_waits_for_the_application_when_the_quota_is_full() {
-    let author = create(Some(&[141; 32])).unwrap();
-    let reader = create(Some(&[142; 32])).unwrap();
+    let author = common::stored(&[141; 32], &MemoryProvider::default());
+    let reader = common::stored(&[142; 32], &MemoryProvider::default());
     let created = call(
         author,
         json!({"op":"create_workspace","display_name":"Author"}),
@@ -271,7 +265,7 @@ fn automatic_recovery_waits_for_the_application_when_the_quota_is_full() {
     let waiting = call(reader, json!({"op":"stage_recovery_range"}));
     assert_eq!(waiting["state"], "recovery_awaiting_application");
     assert_eq!(waiting["accepted_through"], 2);
-    assert!(waiting.get("snapshot").is_none());
+    assert!(waiting.get("candidate").is_none());
     // After the application drains, recovery continues from the same point.
     for expected in 1..=2 {
         let pending = call(reader, json!({"op":"poll_pending_object"}));

@@ -444,3 +444,29 @@ Resolution of the step 2 open points:
 - Export a free function `api_error_code()`. Go gets no methods on error types, and Python field
   names hide the method.
 - Generated code is 3,300–4,000 lines per language, all generated.
+
+### Step 5 and A5 (done: branch `feat/a5-storage`)
+
+- Native record storage is the only persistence mode. `arachne-store` has
+  `Storage` and `StorageProvider` traits: `SqliteProvider` (default, one file
+  per workspace) and `MemoryProvider` (tests, with fault switches). A session
+  gets a `StorageConfig` (`ClientConfig::storage` or `attach_storage`).
+- Every adopt saves the candidate, reads it back, then adopts it. A failed or
+  unconfirmed save stops the session until close and restore.
+  `create_workspace` and `begin_join` are durable. Host mode, `seal_*`,
+  `restore_pending_join`, `save_candidate`, `enable_record_storage`,
+  `restore_record_storage*` and `MAX_STORED_SNAPSHOT` are deleted.
+  `execute_stored` only carries a binary Welcome.
+- Typed candidates: one type per kind, bound to their client, one use,
+  `discard()`, discard on drop. Core checks the exact kind before anything
+  changes. The candidates are plain Rust types with a `Mutex<Option<_>>`
+  token; step 7 wraps them as `uniffi::Object`.
+- The storage root is the host's (`StorageConfig`), not the endpoint secret.
+  Each store records its endpoint key; another endpoint gets `WrongState`.
+- Formats: store format 1 (SQLite `user_version` and the authenticated head)
+  and runtime record format 1 (`runtime/format`). Unknown or newer formats
+  give `FormatNotSupported` (303). Store creation is atomic.
+- B9: `StorageConfig::with_anchors` (monotonic host storage) makes core save
+  a two-slot freshness anchor with every commit and require it on restore.
+- B5 was already fixed: `stage_protected_publication` passes the workspace,
+  and the op checks it before staging.

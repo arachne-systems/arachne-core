@@ -1,9 +1,11 @@
 //! B7e on the runtime path: when the receiver's direct record window
 //! overflows past a gap, the skipped sequence is reported as missed
 //! (`missing_count`), and the objects behind it are delivered in order.
-use arachne_runtime::{close, create, describe, execute};
+use arachne_runtime::{MemoryProvider, close, describe, execute};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
+
+mod common;
 
 const TOPIC: &str = "streams/opaque";
 /// One more than the per-scope record window (32).
@@ -32,14 +34,14 @@ fn publish(sender: i64, recipients: &Value, sequence: u64) -> Value {
     );
     call(
         sender,
-        json!({"op":"adopt_publication","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_publication","candidate":staged["candidate"]}),
     )
 }
 
 #[test]
 fn evicting_past_a_direct_gap_reports_the_miss_and_keeps_order() {
-    let sender = create(Some(&[151; 32])).unwrap();
-    let receiver = create(Some(&[152; 32])).unwrap();
+    let sender = common::stored(&[151; 32], &MemoryProvider::default());
+    let receiver = common::stored(&[152; 32], &MemoryProvider::default());
     let workspace = call(
         sender,
         json!({"op":"create_workspace","display_name":"Publisher"}),
@@ -50,7 +52,7 @@ fn evicting_past_a_direct_gap_reports_the_miss_and_keeps_order() {
     );
     let invite = call(
         sender,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )["issued_invitation"]
         .clone();
     let pending = call(
@@ -65,7 +67,7 @@ fn evicting_past_a_direct_gap_reports_the_miss_and_keeps_order() {
     );
     call(
         sender,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     );
     let reply = call(
         sender,
@@ -79,7 +81,7 @@ fn evicting_past_a_direct_gap_reports_the_miss_and_keeps_order() {
     );
     call(
         receiver,
-        json!({"op":"adopt_join","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
     );
     for handle in [sender, receiver] {
         call(
@@ -116,7 +118,7 @@ fn evicting_past_a_direct_gap_reports_the_miss_and_keeps_order() {
         missing += staged_missing;
         let adopted = call(
             receiver,
-            json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
+            json!({"op":"adopt_reception","candidate":staged["candidate"]}),
         );
         // B7f-1: the adoption reports the same miss as the staging reply.
         let adopted_here = adopted["missing_count"].as_u64().unwrap_or(0);
@@ -146,7 +148,7 @@ fn evicting_past_a_direct_gap_reports_the_miss_and_keeps_order() {
         );
         call(
             receiver,
-            json!({"op":"adopt_reception","snapshot":ack["snapshot"]}),
+            json!({"op":"adopt_reception","candidate":ack["candidate"]}),
         );
     }
     assert_eq!(delivered, (2..=LIVE_THROUGH).collect::<Vec<_>>());

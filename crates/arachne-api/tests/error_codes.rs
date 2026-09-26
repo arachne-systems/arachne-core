@@ -18,6 +18,7 @@ const GOLDEN: &[(ErrorCode, u32, &str, u32)] = &[
     (ErrorCode::StorageFailed, 300, "storage_failed", 300),
     (ErrorCode::StorageCorrupt, 301, "storage_corrupt", 300),
     (ErrorCode::CandidateStale, 302, "candidate_stale", 300),
+    (ErrorCode::FormatNotSupported, 303, "format_not_supported", 300),
     (ErrorCode::PeerUnreachable, 400, "peer_unreachable", 400),
     (ErrorCode::Timeout, 401, "timeout", 400),
     (ErrorCode::TransportFailed, 402, "transport_failed", 400),
@@ -69,7 +70,7 @@ fn every_code_is_inside_its_documented_range() {
 
 #[test]
 fn unknown_numbers_are_rejected() {
-    for number in [0, 4, 99, 104, 202, 303, 403, 504, 602, 899, 901, u32::MAX] {
+    for number in [0, 4, 99, 104, 202, 304, 403, 504, 602, 899, 901, u32::MAX] {
         assert_eq!(ErrorCode::from_u32(number), None, "{number}");
     }
 }
@@ -178,6 +179,7 @@ fn every_code_has_a_checked_constructor_with_its_right_variant() {
         (ApiError::storage_failed("d"), ErrorCode::StorageFailed),
         (ApiError::storage_corrupt("d"), ErrorCode::StorageCorrupt),
         (ApiError::candidate_stale("d"), ErrorCode::CandidateStale),
+        (ApiError::format_not_supported("d"), ErrorCode::FormatNotSupported),
         (ApiError::peer_unreachable(peer, "d"), ErrorCode::PeerUnreachable),
         (ApiError::timeout(peer, "d"), ErrorCode::Timeout),
         (ApiError::transport_failed(None, "d"), ErrorCode::TransportFailed),

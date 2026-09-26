@@ -64,6 +64,9 @@ and a different Core pin. Core work that each plan step depends on:
 - B7b: new recovery state `recovery_awaiting_application`, field `accepted_through`; `RecoveryStage::AwaitingApplication`.
 - B1: `issue_invitation` removed; use `stage_invitation` + `adopt_invitation`.
 - A7r: `ClientConfig` gains relay, public lookup and timeouts.
+- A5/H2: storage is supplied before create/join; adoption owns commit and read-back;
+  candidate objects replace snapshot tokens in the typed API. See
+  [SDK migration](h2-storage-sdk-migration.md). H4 must increment `API_VERSION`.
 
 ## Architecture work (needs design first)
 
@@ -73,14 +76,21 @@ and a different Core pin. Core work that each plan step depends on:
   Original: Commit-ordering authority. **Decision open:** sequencer admin vs deterministic tie-break (recommended).
 - [x] **A3** (`fix/a3-delivery-epochs`, merging)
   - [x] A3f (`8078d8e`): runtime recovery ops (`fetch_recovery_range`, `discover_recovery_cutoff`) still ask for the current epoch only; wire the 4-epoch window.
-  - [ ] A3g: check that a large workspace plus a full attachment fits the store's 1 MiB record limit.
+  - [x] A3g (H2): 2,049 members save as parts, then a name change and one admission
+    restore with 2,050 members. Fixed attachment bounds fit. A 3,208,876-byte H1
+    snapshot restores from seven parts. See [evidence](../evidence/h2-night-2026-09-26.md).
   - [ ] A3h: drop unused `serde_json` in `arachne-delivery`; run `cargo fmt` workspace-wide once branches settle.
   Original: Decouple delivery and routing from the exact epoch and policy revision.
 - [x] **A4** (`feat/a4-context` merged at `2205887`; full suite before merge 526 pass / 0 fail; ADR steps 3–4; default limits 64 sessions / 320 overlay paths accepted)
   - [x] A4c (`6b98b22`, `5db52d3`): 8 leftover test locks removed; `cargo test -p arachne-runtime` runs with default threads (39 binaries pass).
   - [x] A4b (`f0eb382`..`b419723`; suspend closes idle links + stops mDNS via wrapper; Low ×4 all timers; deadlines on bind/policy/send + C-ABI `set_deadline`; 5 event e2e tests). Was: mDNS has no pause API (iroh-mdns-address-lookup 0.5); suspend does not close idle connections; Low profile only slows presence; deadlines only on typed Client and only for outbound control exchanges; end-to-end event tests for MembershipChanged, ProtectedReceived, RecoveryReady, CurrentViewReady, Presence.
   Original: Owned `Context`, event stream, `wait_for_work(timeout)`, `close(&self)`, suspend/resume.
-- [ ] **A5** One persistence mode behind a `Storage` trait; schema versions and migrations.
+- [ ] **A5** Code and local proof complete on `codex/night-h2-storage`: native storage,
+  typed candidates, separate storage root, versions, anchors, and large-value parts.
+  H1 branch records share the atomic commit. Store/runtime suite: 243 pass, 0 fail;
+  workspace all-target/all-feature release check passes. The lead's final merge with
+  current `integrate/wave1` remains the completion gate.
+  See [evidence](../evidence/h2-night-2026-09-26.md) and [SDK migration](h2-storage-sdk-migration.md).
 - [x] **A6** (`fix/a3-delivery-epochs`; `docs/delivery.md`)
   Original: Delivery spec; per-author quotas; bitmap dedup; remove the legacy receive stack.
 - [x] **A7** (`fix/a7-network`, merged)

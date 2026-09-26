@@ -5,8 +5,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arachne_runtime::{
-    Client, ClientConfig, Context, ContextConfig, ErrorCode, Event, Network, PeerPolicy,
-    PowerProfile, TransportOptions, TransportTimeouts,
+    Client, ClientConfig, Context, ContextConfig, ErrorCode, Event, MemoryProvider, Network, PeerPolicy,
+    PowerProfile, StorageConfig, TransportOptions, TransportTimeouts,
 };
 
 fn context() -> Arc<Context> {
@@ -18,6 +18,7 @@ fn direct(secret: Option<[u8; 32]>) -> ClientConfig {
         network: Network::Direct,
         secret,
         transport: Default::default(),
+        storage: Some(StorageConfig::memory(&MemoryProvider::default())),
     }
 }
 
@@ -89,6 +90,7 @@ fn a_per_op_deadline_fails_the_op_and_keeps_the_session() {
                 }),
                 ..Default::default()
             },
+            storage: Some(StorageConfig::memory(&MemoryProvider::default())),
         })
         .unwrap()
         .with_deadline(Duration::from_millis(300));
@@ -341,6 +343,7 @@ fn close_while_another_thread_is_inside_an_op_is_bounded() {
                     }),
                     ..Default::default()
                 },
+                storage: Some(StorageConfig::memory(&MemoryProvider::default())),
             })
             .unwrap(),
     );
@@ -406,6 +409,7 @@ fn suspend_stops_mdns_announcements_and_resume_restarts_them() {
             network: Network::Lan,
             secret: Some([111; 32]),
             transport: Default::default(),
+            storage: Some(StorageConfig::memory(&MemoryProvider::default())),
         })
         .unwrap();
     // The mDNS service runs and has the endpoint's addresses to announce.
@@ -448,6 +452,7 @@ fn a_deadline_bounds_the_endpoint_bind() {
                 deadline: Some(Duration::from_millis(300)),
                 ..Default::default()
             },
+            storage: Some(StorageConfig::memory(&MemoryProvider::default())),
         })
         .err()
         .expect("the relay never comes online");

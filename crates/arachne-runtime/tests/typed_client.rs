@@ -1,6 +1,7 @@
 use arachne_runtime::{
-    Client, ClientConfig, ErrorKind, JoinAdmissionStep, MemberKind, Network, PeerPolicy, Presence,
-    ReceivedProtectedPublication, RecoveryRangeRequest, RecoveryRangeStatus, WorkspacePhase,
+    Client, ClientConfig, ErrorKind, JoinAdmissionStep, MemberKind, MemoryProvider, Network,
+    PeerPolicy, Presence, ReceivedProtectedPublication, RecoveryRangeRequest, RecoveryRangeStatus,
+    StorageConfig, WorkspacePhase,
 };
 use std::time::{Duration, Instant};
 
@@ -10,6 +11,7 @@ fn typed_client_reports_endpoint_and_workspace_state_then_closes() {
         network: Network::Direct,
         secret: Some([7; 32]),
         transport: Default::default(),
+        storage: None,
     })
     .unwrap();
 
@@ -35,10 +37,12 @@ fn typed_client_reports_endpoint_and_workspace_state_then_closes() {
 
 #[test]
 fn typed_client_creates_named_workspace_with_typed_state() {
+    let provider = MemoryProvider::default();
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([10; 32]),
         transport: Default::default(),
+        storage: Some(StorageConfig::memory(&provider)),
     })
     .unwrap();
 
@@ -48,7 +52,7 @@ fn typed_client_creates_named_workspace_with_typed_state() {
     assert_eq!(workspace.workspace_name.as_deref(), Some("Field Team"));
     assert_eq!(workspace.member_count, 1);
     assert_eq!(workspace.epoch, 0);
-    assert!(!workspace.durable);
+    assert!(workspace.durable);
     assert_eq!(
         client.workspace_state().unwrap().phase,
         WorkspacePhase::Active
@@ -59,10 +63,12 @@ fn typed_client_creates_named_workspace_with_typed_state() {
 
 #[test]
 fn typed_client_exposes_recovery_result_without_vendor_types() {
+    let provider = MemoryProvider::default();
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([11; 32]),
         transport: Default::default(),
+        storage: Some(StorageConfig::memory(&provider)),
     })
     .unwrap();
     client.create_workspace("Owner", None).unwrap();
@@ -74,10 +80,12 @@ fn typed_client_exposes_recovery_result_without_vendor_types() {
 
 #[test]
 fn typed_client_exposes_recovery_request_lifecycle() {
+    let provider = MemoryProvider::default();
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([15; 32]),
         transport: Default::default(),
+        storage: Some(StorageConfig::memory(&provider)),
     })
     .unwrap();
     let workspace = client.create_workspace("Owner", None).unwrap();
@@ -105,23 +113,27 @@ fn typed_client_exposes_recovery_request_lifecycle() {
 
 #[test]
 fn typed_clients_recover_an_opaque_publication() {
+    let owner_provider = MemoryProvider::default();
+    let reader_provider = MemoryProvider::default();
     let mut owner = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([16; 32]),
         transport: Default::default(),
+        storage: Some(StorageConfig::memory(&owner_provider)),
     })
     .unwrap();
     let mut reader = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([17; 32]),
         transport: Default::default(),
+        storage: Some(StorageConfig::memory(&reader_provider)),
     })
     .unwrap();
     let workspace = owner
         .create_workspace("Owner", Some("Recovery proof"))
         .unwrap();
     let candidate = owner.stage_invitation(0).unwrap();
-    let invitation = owner.adopt_invitation(&candidate.snapshot).unwrap();
+    let invitation = owner.adopt_invitation(&candidate).unwrap();
     let owner_address = invitation.address.replace("0.0.0.0:", "127.0.0.1:");
     reader
         .add_address_hint(invitation.peer, &owner_address)
@@ -133,7 +145,7 @@ fn typed_clients_recover_an_opaque_publication() {
     let staged = owner
         .stage_admission(join.endpoint, &join.admission_request)
         .unwrap();
-    let joined_owner = owner.adopt_admission(&staged.snapshot).unwrap();
+    let joined_owner = owner.adopt_admission(&staged).unwrap();
     let reply = owner
         .retained_admission(join.endpoint, &join.admission_request)
         .unwrap();
@@ -146,7 +158,7 @@ fn typed_clients_recover_an_opaque_publication() {
             }],
         )
         .unwrap();
-    let joined_reader = reader.adopt_join(&staged.snapshot).unwrap();
+    let joined_reader = reader.adopt_join(&staged).unwrap();
     assert_eq!(joined_owner.epoch, joined_reader.epoch);
     let revision = joined_owner.epoch + 1;
     owner.install_workspace_policy(revision).unwrap();
@@ -162,7 +174,7 @@ fn typed_clients_recover_an_opaque_publication() {
             payload.clone(),
         )
         .unwrap();
-    owner.adopt_protected_publication(&staged.snapshot).unwrap();
+    owner.adopt_protected_publication(&staged).unwrap();
 
     let owner_endpoint = owner.endpoint().unwrap();
     let owner_member = owner
@@ -206,8 +218,8 @@ fn typed_clients_recover_an_opaque_publication() {
         arachne_runtime::RecoveryStage::Candidate(candidate) => candidate,
         other => panic!("unexpected recovery stage: {other:?}"),
     };
-    assert_eq!(staged.publication_count, 1);
-    let adoption = reader.adopt_recovery(&staged.snapshot).unwrap();
+    assert_eq!(staged.publication_count(), 1);
+    let adoption = reader.adopt_recovery(&staged).unwrap();
     assert_eq!(adoption.recovered_publications, 1);
 
     // Recovered objects wait in the durable inbox until acknowledged.
@@ -218,7 +230,7 @@ fn typed_clients_recover_an_opaque_publication() {
     assert_eq!(reader.poll_pending_object().unwrap(), Some(recovered.clone()));
     let acknowledged = reader.stage_object_acknowledgement(&recovered).unwrap();
     reader
-        .adopt_protected_reception(&acknowledged.snapshot)
+        .adopt_protected_reception(&acknowledged)
         .unwrap();
     assert_eq!(reader.poll_pending_object().unwrap(), None);
 
@@ -228,10 +240,12 @@ fn typed_clients_recover_an_opaque_publication() {
 
 #[test]
 fn typed_client_rejects_wrong_publication_workspace_before_staging() {
+    let provider = MemoryProvider::default();
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([18; 32]),
         transport: Default::default(),
+        storage: Some(StorageConfig::memory(&provider)),
     })
     .unwrap();
     let workspace = client.create_workspace("Owner", None).unwrap();
@@ -256,25 +270,23 @@ fn typed_client_rejects_wrong_publication_workspace_before_staging() {
             vec![2],
         )
         .unwrap();
-    assert_eq!(staged.workspace, workspace.workspace);
-    client.adopt_protected_publication(&staged.snapshot).unwrap();
+    assert_eq!(staged.workspace(), workspace.workspace);
+    client.adopt_protected_publication(&staged).unwrap();
     client.close().unwrap();
 }
 
 #[test]
 fn typed_client_restores_only_with_matching_freshness_anchor() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("workspace.db");
     let root = [19; 32];
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some(root),
         transport: Default::default(),
+        storage: Some(StorageConfig::sqlite(directory.path(), root)),
     })
     .unwrap();
     let workspace = client.create_workspace("Owner", None).unwrap();
-    assert_eq!(client.record_freshness().unwrap_err().kind(), ErrorKind::Storage);
-    client.enable_record_storage(&path, &root).unwrap();
     let anchor = client.record_freshness().unwrap();
     client.close().unwrap();
 
@@ -284,14 +296,15 @@ fn typed_client_restores_only_with_matching_freshness_anchor() {
         network: Network::Direct,
         secret: Some(root),
         transport: Default::default(),
+        storage: Some(StorageConfig::sqlite(directory.path(), root)),
     })
     .unwrap();
     let rejected = client
-        .restore_record_storage_with_freshness(&path, &root, workspace.workspace, Some(stale))
+        .restore_workspace(workspace.workspace, Some(stale))
         .unwrap_err();
     assert_eq!(rejected.kind(), ErrorKind::Storage);
     client
-        .restore_record_storage_with_freshness(&path, &root, workspace.workspace, Some(anchor))
+        .restore_workspace(workspace.workspace, Some(anchor))
         .unwrap();
     assert_eq!(client.record_freshness().unwrap(), anchor);
     client.close().unwrap();
@@ -299,10 +312,12 @@ fn typed_client_restores_only_with_matching_freshness_anchor() {
 
 #[test]
 fn typed_client_exposes_workspace_roster_and_profile_projection() {
+    let provider = MemoryProvider::default();
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([12; 32]),
         transport: Default::default(),
+        storage: Some(StorageConfig::memory(&provider)),
     })
     .unwrap();
     let workspace = client.create_workspace("Owner", None).unwrap();
@@ -320,10 +335,12 @@ fn typed_client_exposes_workspace_roster_and_profile_projection() {
 
 #[test]
 fn typed_client_issues_an_invitation_with_bounded_route_hints() {
+    let provider = MemoryProvider::default();
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([13; 32]),
         transport: Default::default(),
+        storage: Some(StorageConfig::memory(&provider)),
     })
     .unwrap();
     let workspace = client
@@ -331,7 +348,7 @@ fn typed_client_issues_an_invitation_with_bounded_route_hints() {
         .unwrap();
 
     let candidate = client.stage_invitation(0).unwrap();
-    let invitation = client.adopt_invitation(&candidate.snapshot).unwrap();
+    let invitation = client.adopt_invitation(&candidate).unwrap();
     assert_eq!(invitation.workspace, workspace.workspace);
     assert_eq!(invitation.workspace_name.as_deref(), Some("Field Team"));
     assert!(!invitation.invitation.is_empty());
@@ -350,10 +367,12 @@ fn typed_client_issues_an_invitation_with_bounded_route_hints() {
 
 #[test]
 fn typed_client_reports_connectivity_without_exposing_transport_types() {
+    let provider = MemoryProvider::default();
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([14; 32]),
         transport: Default::default(),
+        storage: Some(StorageConfig::memory(&provider)),
     })
     .unwrap();
     let workspace = client.create_workspace("Owner", None).unwrap();
@@ -381,12 +400,14 @@ fn typed_client_routes_opaque_publication_and_reports_interest() {
         network: Network::Direct,
         secret: Some([8; 32]),
         transport: Default::default(),
+        storage: None,
     })
     .unwrap();
     let mut subscriber = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([9; 32]),
         transport: Default::default(),
+        storage: None,
     })
     .unwrap();
     let publisher_endpoint = publisher.endpoint().unwrap();
@@ -463,10 +484,12 @@ fn typed_client_routes_opaque_publication_and_reports_interest() {
 #[test]
 fn typed_admission_ops_report_codes_and_pages() {
     use arachne_runtime::ErrorCode;
+    let provider = MemoryProvider::default();
     let mut owner = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([21; 32]),
         transport: Default::default(),
+        storage: Some(StorageConfig::memory(&provider)),
     })
     .unwrap();
     owner.create_workspace("Owner", None).unwrap();
@@ -485,20 +508,13 @@ fn typed_admission_ops_report_codes_and_pages() {
         owner.send_admission_reply().unwrap_err().code(),
         ErrorCode::WrongState
     );
-    // A candidate that is not the staged one is stale.
+    // A candidate is an opaque object: the wrong adopt method does not
+    // compile, and a used candidate is stale.
     let staged = owner.stage_invitation(0).unwrap();
-    let mut other = staged.snapshot.clone();
-    *other.last_mut().unwrap() ^= 1;
-    let error = owner.adopt_invitation(&other).unwrap_err();
-    assert_eq!(error.code(), ErrorCode::CandidateStale, "{error}");
-    assert_eq!(error.message(), "workspace snapshot does not match candidate");
-    // The wrong adopt op for this kind of candidate.
-    assert_eq!(
-        owner.adopt_join(&staged.snapshot).unwrap_err().code(),
-        ErrorCode::WrongState
-    );
-    let invitation = owner.adopt_invitation(&staged.snapshot).unwrap();
+    let invitation = owner.adopt_invitation(&staged).unwrap();
     assert!(!invitation.invitation.is_empty());
+    let error = owner.adopt_invitation(&staged).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::CandidateStale, "{error}");
     assert!(!owner.poll_control().unwrap());
     owner.close().unwrap();
 }
@@ -507,23 +523,25 @@ fn typed_admission_ops_report_codes_and_pages() {
 #[test]
 fn typed_management_invitation_and_name_ops() {
     use arachne_runtime::{ErrorCode, InvitationKind, MemberAction};
+    let provider = MemoryProvider::default();
     let mut owner = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([22; 32]),
         transport: Default::default(),
+        storage: Some(StorageConfig::memory(&provider)),
     })
     .unwrap();
     let workspace = owner.create_workspace("Owner", Some("Team")).unwrap();
 
     let renamed = owner.stage_workspace_name("Field Team").unwrap();
-    assert_eq!(renamed.workspace, workspace.workspace);
-    let adopted = owner.adopt_admission(&renamed.snapshot).unwrap();
+    assert_eq!(renamed.workspace(), workspace.workspace);
+    let adopted = owner.adopt_admission(&renamed).unwrap();
     assert_eq!(adopted.workspace_name.as_deref(), Some("Field Team"));
 
     let personal = owner
         .stage_invitation_of(0, InvitationKind::Personal)
         .unwrap();
-    let link = owner.adopt_invitation(&personal.snapshot).unwrap();
+    let link = owner.adopt_invitation(&personal).unwrap();
     let controls = owner.invitation_controls().unwrap();
     assert_eq!(controls.len(), 1);
     assert!(controls[0].personal);
@@ -536,7 +554,7 @@ fn typed_management_invitation_and_name_ops() {
     let disabled = owner
         .stage_management(MemberAction::DisableInvitation(link.invitation_key))
         .unwrap();
-    owner.adopt_admission(&disabled.snapshot).unwrap();
+    owner.adopt_admission(&disabled).unwrap();
     assert!(!owner.invitation_controls().unwrap()[0].enabled);
 
     // A management action on a stranger is refused with a code.
@@ -545,7 +563,7 @@ fn typed_management_invitation_and_name_ops() {
 
     // The last member leaves alone; adopting the removal ends the session.
     let leave = owner.stage_solo_leave().unwrap();
-    let removed = owner.adopt_removal(&leave.snapshot).unwrap();
+    let removed = owner.adopt_removal(&leave).unwrap();
     assert_eq!(removed.workspace, workspace.workspace);
     assert_eq!(owner.member_roster().unwrap_err().code(), ErrorCode::Closed);
     let _ = owner.close();

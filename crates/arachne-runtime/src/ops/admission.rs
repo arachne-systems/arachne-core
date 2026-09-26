@@ -43,6 +43,8 @@ const ADMISSION_RESULT_OFFER: &[u8; 5] = b"DFAR\x01";
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct StagedAdmission {
     pub workspace: [u8; 32],
+    /// The opaque candidate token; adopt it with the matching adopt op.
+    #[serde(rename = "candidate")]
     pub snapshot: Vec<u8>,
     pub state: &'static str,
     pub durable: bool,
@@ -489,17 +491,7 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
             "workspace lifecycle requires native record storage",
         ));
     }
-    // This member's self-update offer: adopt once an administrator adopted
-    // it, or drop it when refused (B3c).
     let now = std::time::Instant::now();
-    match membership::finish_self_update_offer(live_mut(session)?, now) {
-        Some(true) => return commit_self_update(session, now),
-        Some(false) => {
-            return Ok(json!({"state":"self_update_refused",
-                "activity":activity_value(live(session)?)}));
-        }
-        None => {}
-    }
     let mut staged = ops::nested(session, Op::PollAdmission, |session| {
         poll(session, PollAdmissionArgs { profile: false })
     })?;
@@ -522,12 +514,6 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
         if staged_state.is_some() {
             staged["activity"] = activity_value(live(session)?);
             return Ok(staged);
-        }
-        // The staged self-update waits for its administrator; membership
-        // queries wait until it is adopted or dropped.
-        if membership::self_update_pending(live(session)?) {
-            return Ok(json!({"state":"self_update_pending",
-                "activity":activity_value(live(session)?)}));
         }
         let membership = ops::nested(live_mut(session)?, Op::PollMembershipUpdate, |session| {
             ops::membership::poll_update(session)
@@ -589,20 +575,13 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
             return Ok(membership);
         }
         // Nothing else to do this tick: a self-update, when one is due.
-        if !membership::self_update_pending(live(session)?)
-            && let Some(started) = membership::start_self_update(live_mut(session)?, now)?
-        {
-            if started["state"] == "awaiting_save" {
-                return commit_self_update(session, now);
-            }
-            let mut started = started;
-            started["activity"] = activity_value(live(session)?);
-            return Ok(started);
+        if membership::start_self_update(live_mut(session)?, now)? {
+            return commit_self_update(session, now);
         }
         staged["activity"] = activity_value(live(session)?);
         return Ok(staged);
     }
-    let snapshot: Vec<u8> = serde_json::from_value(staged["snapshot"].clone())
+    let snapshot: Vec<u8> = serde_json::from_value(staged["candidate"].clone())
         .map_err(|_| ApiError::internal("workspace candidate snapshot is invalid"))?;
     persistence::commit_candidate(live_mut(session)?, &snapshot)?;
     let mut committed = adopt_admission_value(session, snapshot)?;
@@ -635,7 +614,7 @@ fn commit_self_update(session: &mut Session, now: std::time::Instant) -> Result<
 fn adopt_admission_value(session: &mut Session, snapshot: Vec<u8>) -> Result<Value, ApiError> {
     let session = live_mut(session)?;
     let adopted = ops::nested(session, Op::AdoptAdmission, |session| {
-        candidate::adopt_admission(session, candidate::AdoptArgs { snapshot })
+        candidate::adopt_admission(session, candidate::AdoptArgs { candidate: snapshot })
     })?;
     serde_json::to_value(adopted).map_err(errors::encode)
 }
@@ -705,18 +684,8 @@ fn stage_admission_workspace(
     workspace: arachne_security::Workspace,
     admission_count: usize,
 ) -> Result<StagedAdmission, ApiError> {
-    let key = session
-        .storage_key
-        .as_ref()
-        .ok_or_else(errors::no_root_key)?;
     let (publisher, inbox) = carry_delivery(session, &workspace)?;
-    let snapshot = seal_state(
-        session.records.is_some(),
-        &workspace,
-        key,
-        publisher.as_ref(),
-        inbox.as_ref(),
-    )?;
+    let snapshot = seal_state(session.records.is_some())?;
     let value = StagedAdmission {
         workspace: workspace.id(),
         snapshot: snapshot.clone(),
