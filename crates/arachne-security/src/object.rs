@@ -179,7 +179,12 @@ fn objects_are_independent_authenticated_and_epoch_scoped() {
     let epoch = sender.epoch();
     sender.provider.storage().values.write().unwrap().insert(
         COUNTER.to_vec(),
-        [epoch.to_be_bytes(), u64::MAX.to_be_bytes()].concat(),
+        [epoch.to_be_bytes(), (u64::MAX - 1).to_be_bytes()].concat(),
+    );
+    let last = sender.protect_object(b"app", b"last-counter", b"last").unwrap();
+    assert_eq!(
+        sender.unprotect_object(b"app", b"last-counter", &last).unwrap().counter,
+        u64::MAX,
     );
     assert_eq!(
         sender.protect_object(b"app", b"", b"").unwrap_err(),
@@ -392,6 +397,20 @@ fn objects_are_bound_to_their_application_namespace() {
     );
 }
 
+#[cfg(test)]
+#[test]
+fn object_namespace_derivation_keeps_its_bytes_across_crypto_upgrades() {
+    // Independently calculated with Python hashlib/hmac and RFC 5869.
+    let base: [u8; 32] = std::array::from_fn(|i| i as u8);
+    let expected = [
+        0x84, 0xa6, 0x79, 0x56, 0xcc, 0x9f, 0x45, 0x50,
+        0x7f, 0xd5, 0xf7, 0x8e, 0x78, 0x70, 0x7c, 0xb3,
+        0x3b, 0x77, 0xcf, 0x44, 0x92, 0x08, 0x23, 0x00,
+        0x08, 0x24, 0x11, 0x46, 0x7e, 0x07, 0xc7, 0xb1,
+    ];
+    assert_eq!(*namespace_key(&base, b"chat").unwrap(), expected);
+}
+
 /// Authenticated data for both the signature and the SFrame tag. The
 /// application namespace is length-prefixed so namespace and context cannot
 /// trade bytes.
@@ -586,7 +605,8 @@ impl Workspace {
             .map_err(|_| "object key unavailable")?;
         let mut nonce = MonotonicCounter::with_start_value(counter, counter);
         let scope = scoped(namespace, context);
-        let frame = MediaFrameView::with_meta_data(&mut nonce, payload, &scope)
+        let frame = MediaFrameView::try_with_meta_data(&mut nonce, payload, &scope)
+            .map_err(|_| "object counter exhausted")?
             .encrypt(&key)
             .map_err(|_| "object encryption failed")?;
         let mut object = MAGIC.to_vec();

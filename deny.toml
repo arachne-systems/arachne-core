@@ -76,14 +76,22 @@ deny = [
 # Existing duplicates of the crates above. Each skip names one exact version,
 # so a new third copy still fails.
 skip = [
-    { crate = "sha2@0.11.0", reason = "iroh 1.2 (ed25519-dalek 3) and openmls_rust_crypto -> hpke-rs-rust-crypto; Arachne stays on 0.10 until an intentional bump" },
-    { crate = "hkdf@0.13.0", reason = "openmls_rust_crypto -> hpke-rs-rust-crypto; Arachne uses 0.12" },
-    { crate = "hmac@0.13.0", reason = "openmls_rust_crypto -> hpke-rs-rust-crypto (via hkdf 0.13)" },
+    { crate = "sha2@0.10.9", reason = "ed25519-dalek 2 and p256/p384 retain digest 0.10; all workspace uses select sha2 0.11" },
+    { crate = "hkdf@0.12.4", reason = "elliptic-curve 0.13 uses the prior crypto generation; workspace uses select hkdf 0.13" },
+    { crate = "hmac@0.12.1", reason = "hkdf 0.12 and rfc6979 0.4 retain it for elliptic-curve; the Tor fork selects hmac 0.13" },
 ]
 
 [sources]
-# Only crates.io. The vendored forks are path dependencies in this repository.
+# Crates.io and the two existing MoQ sources. Git sources must name a revision.
+# The Iroh restart fix and other vendored forks remain local path dependencies.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+required-git-spec = "rev"
+# Exact repository URLs only. Revision pins remain in Cargo.toml and Cargo.lock:
+# iroh-live bd5afc40822eca7e6b1db2432556460ddc345a6d;
+# moq 6ab7d1a223e1949a5c2e10b68e29db2e8ab9bdd1.
+allow-git = [
+    "https://github.com/n0-computer/iroh-live",
+    "https://github.com/moq-dev/moq",
+]

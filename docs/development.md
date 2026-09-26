@@ -159,10 +159,15 @@ That job takes the vendored Iroh forks out of `members`, because their upstream
 manifests have loose lower bounds that do not build at their minimums.
 
 `deny.toml` fails on any vulnerability advisory, on unmaintained crates, on a
-license outside the allowlist, on a non-crates.io source, and on a second
+license outside the allowlist, on an unlisted source, and on a second
 version of a directly used crypto crate (for example `aes-gcm`, `openmls`,
 `sha2`). Existing duplicates and accepted advisories are listed there with a
-reason; review them when you change dependencies.
+reason; review them when you change dependencies. The two existing MoQ Git sources are
+listed by exact repository URL and must use a `rev` pin. Their committed revisions remain
+in the manifests and lockfile. The Arachne crates and Tor fork use SHA-2 0.11 and
+HKDF/HMAC 0.13. Older copies remain only for upstream elliptic curve dependencies.
+AES-GCM stays at 0.10 with OpenMLS and Iroh. SFrame 2.0 uses `ring`; enabling its
+`rust-crypto` backend would add AES-GCM 0.11.
 
 For the simple transport example:
 

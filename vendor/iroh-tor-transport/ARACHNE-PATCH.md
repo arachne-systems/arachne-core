@@ -134,8 +134,10 @@ iroh `SecretKey`, and the Tor key blob is only a SHA-512 expansion.
   allows five), new `repository`, `homepage`, `documentation`,
   `publish = ["crates-io"]` and `exclude = ["Cargo.toml.orig"]` fields.
   Dependencies: `torut` removed, `sha3 = "0.11.0"` added, and for
-  `SAFECOOKIE` `hmac = "0.12"` and `getrandom = "0.4"` added (both already
-  in the workspace lock; no new crates). The `echo` test
+  `SAFECOOKIE` `hmac = "0.13.0"` and `getrandom = "0.4"` added. `sha2` now
+  uses 0.11.0. These versions are already in the workspace lock. The HMAC
+  constructor imports `KeyInit`, and SHA-2 and SHA-3 share the same `Digest`
+  trait. Existing RFC and independent SAFECOOKIE vectors check the wire bytes. The `echo` test
   target is removed. `Cargo.toml.orig` is the unchanged upstream original.
 - `README.md`: a fork banner at the top.
 - `ARACHNE-PATCH.md` (this file) is added.
