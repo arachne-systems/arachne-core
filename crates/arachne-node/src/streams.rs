@@ -231,6 +231,10 @@ impl Streams {
                 .fetch_add(1, Ordering::Relaxed);
             return Err(Error::Rejected);
         }
+        // Iroh authenticated this fresh connection and the route/topic checks
+        // above admitted it. An older data-ALPN failure no longer proves this
+        // peer unreachable, including when the path is a relay or Tor.
+        self.0.connections.remember_reachable(peer).await;
         use iroh::protocol::ProtocolHandler;
         route
             .moq

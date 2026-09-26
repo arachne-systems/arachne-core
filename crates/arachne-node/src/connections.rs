@@ -513,6 +513,13 @@ impl Connections {
         self.address_lookup
     }
 
+    /// A fresh authenticated transport reached us. Clear only that peer's
+    /// failed-dial schedule; retain its address and all authorization state.
+    #[cfg(feature = "moq")]
+    pub(super) async fn remember_reachable(&self, peer: PeerId) {
+        self.unreachable.lock().await.remove(&peer);
+    }
+
     pub(super) async fn remember_observed(&self, peer: PeerId, address: SocketAddr) {
         if self.tor {
             return;
@@ -1081,6 +1088,172 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[cfg(feature = "moq")]
+    #[tokio::test]
+    async fn authenticated_incoming_moq_ends_only_its_peers_backoff() {
+        use crate::{Node, Permissions, Topic};
+        use iroh_moq::{Moq, MoqSession};
+        use std::time::Duration;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (receiver, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let (sender, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let workspace = [56; 32];
+            let topic = Topic::new("shared/stream").unwrap();
+            let policy = BTreeMap::from([
+                (receiver.id(), Permissions::AllTopics),
+                (sender.id(), Permissions::AllTopics),
+            ]);
+            for node in [&receiver, &sender] {
+                node.install_verified_policy(workspace, 1, policy.clone())
+                    .await
+                    .unwrap();
+            }
+            receiver
+                .subscribe(workspace, 1, topic.clone())
+                .await
+                .unwrap();
+            receiver
+                .add_address_hint(sender.id(), sender.address())
+                .await
+                .unwrap();
+            receiver
+                .enable_moq_delivery(workspace, 1, sender.id(), topic)
+                .await
+                .unwrap();
+            let unrelated = *iroh::SecretKey::generate().public().as_bytes();
+            let until = Instant::now() + Duration::from_secs(120);
+            receiver
+                .connections
+                .unreachable
+                .lock()
+                .await
+                .extend([(sender.id(), (until, 6)), (unrelated, (until, 6))]);
+            let error = receiver
+                .connections
+                .connect(sender.id(), super::super::ALPN)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("recently unreachable"));
+
+            // A fresh incoming QUIC/MoQ handshake is authenticated by Iroh and
+            // admitted by the receiver's existing route/topic policy. It does
+            // not send a direct-frame message that could clear the backoff.
+            let moq = Moq::new(sender.connections.endpoint());
+            let (session, driver) = MoqSession::connect(
+                &sender.connections.endpoint(),
+                EndpointAddr::new(PublicKey::from_bytes(&receiver.id()).unwrap())
+                    .with_ip_addr(receiver.address()),
+                moq.origin(),
+            )
+            .await
+            .unwrap();
+            let driver = tokio::spawn(driver.run());
+            let observed = tokio::time::timeout(Duration::from_secs(1), async {
+                while receiver
+                    .connections
+                    .unreachable
+                    .lock()
+                    .await
+                    .contains_key(&sender.id())
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            let data = receiver
+                .connections
+                .connect(sender.id(), super::super::ALPN)
+                .await;
+            let unrelated_kept = receiver
+                .connections
+                .unreachable
+                .lock()
+                .await
+                .contains_key(&unrelated);
+            session.close(moq_net::Error::Cancel);
+            driver.abort();
+            let _ = driver.await;
+            sender.close().await;
+            receiver.close().await;
+            assert!(
+                observed.is_ok(),
+                "authenticated incoming MoQ left stale backoff: {data:?}"
+            );
+            assert!(
+                data.is_ok(),
+                "fresh reachable peer could not use the data ALPN: {data:?}"
+            );
+            assert!(
+                unrelated_kept,
+                "one peer cleared another peer's failure state"
+            );
+        })
+        .await
+        .expect("authenticated reachability fixture timed out");
+    }
+
+    #[cfg(feature = "moq")]
+    #[tokio::test]
+    async fn rejected_incoming_moq_does_not_clear_backoff() {
+        use crate::{Node, Permissions};
+        use iroh_moq::{Moq, MoqSession};
+        use std::time::Duration;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (receiver, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let (sender, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            receiver
+                .install_verified_policy(
+                    [57; 32],
+                    1,
+                    BTreeMap::from([
+                        (receiver.id(), Permissions::AllTopics),
+                        (sender.id(), Permissions::AllTopics),
+                    ]),
+                )
+                .await
+                .unwrap();
+            // Membership alone does not authorize an enabled streaming route.
+            receiver
+                .connections
+                .unreachable
+                .lock()
+                .await
+                .insert(sender.id(), (Instant::now() + Duration::from_secs(120), 6));
+            let moq = Moq::new(sender.connections.endpoint());
+            let attempt = MoqSession::connect(
+                &sender.connections.endpoint(),
+                EndpointAddr::new(PublicKey::from_bytes(&receiver.id()).unwrap())
+                    .with_ip_addr(receiver.address()),
+                moq.origin(),
+            )
+            .await;
+            let running = attempt
+                .ok()
+                .map(|(session, driver)| (session, tokio::spawn(driver.run())));
+            while receiver.moq_metrics().rejected_sessions == 0 {
+                tokio::task::yield_now().await;
+            }
+            let kept = receiver
+                .connections
+                .unreachable
+                .lock()
+                .await
+                .contains_key(&sender.id());
+            if let Some((session, driver)) = running {
+                session.close(moq_net::Error::Cancel);
+                driver.abort();
+                let _ = driver.await;
+            }
+            sender.close().await;
+            receiver.close().await;
+            assert!(kept, "rejected MoQ arrival cleared its peer's backoff");
+        })
+        .await
+        .expect("rejected reachability fixture timed out");
     }
 
     #[test]
