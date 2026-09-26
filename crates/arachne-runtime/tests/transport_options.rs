@@ -15,6 +15,7 @@ fn open(
         network,
         secret: Some([secret; 32]),
         transport,
+        storage: None,
     })
 }
 

@@ -1,8 +1,5 @@
 use arachne_node::Node;
-use arachne_runtime::{
-    close, create, describe, enable_record_storage, execute, execute_stored, restore_record_storage,
-    save_candidate, wait_for_work,
-};
+use arachne_runtime::{MemoryProvider, close, describe, execute, wait_for_work};
 use arachne_security::{Invitation, PendingJoin};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -10,9 +7,22 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod common;
+
 fn call(handle: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
         .map_err(|error| error.to_string())
+}
+
+/// Save, read back and adopt a staged candidate in one step.
+fn adopt(handle: i64, op: &str, staged: &Value) -> Value {
+    let adopted = call(handle, json!({"op":op,"candidate":staged["candidate"]})).unwrap();
+    assert_eq!(adopted["durable"], true);
+    adopted
+}
+
+fn restore(handle: i64, workspace: [u8; 32]) -> Result<Value, String> {
+    call(handle, json!({"op":"restore_workspace","workspace":workspace}))
 }
 
 fn bytes(value: &Value) -> Vec<u8> {
@@ -61,31 +71,24 @@ struct Owner {
     address: SocketAddr,
     invitation: Vec<u8>,
     checkpoint: Vec<u8>,
-    _dir: tempfile::TempDir,
+    provider: MemoryProvider,
 }
 
 fn owner(seed: u8) -> Owner {
-    let handle = create(Some(&[seed; 32])).unwrap();
+    let provider = MemoryProvider::default();
+    let handle = common::stored(&[seed; 32], &provider);
     let created = call(
         handle,
         json!({"op":"create_workspace","display_name":"Owner","workspace_name":"Event driven"}),
     )
     .unwrap();
     assert_eq!(created["activity"]["state"], "active");
-    let dir = tempfile::tempdir().unwrap();
-    enable_record_storage(handle, &dir.path().join("owner.db"), &[seed; 32]).unwrap();
     let staged = call(
         handle,
         json!({"op":"stage_invitation","personal":false,"expires_at":0}),
     )
     .unwrap();
-    save_candidate(handle, &bytes(&staged["snapshot"])).unwrap();
-    let invitation = call(
-        handle,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
-    )
-    .unwrap()["issued_invitation"]
-        .clone();
+    let invitation = adopt(handle, "adopt_admission", &staged)["issued_invitation"].clone();
     let info: Value = serde_json::from_str(&describe(handle).unwrap()).unwrap();
     let port: u16 = info["bound_address"]
         .as_str()
@@ -101,7 +104,7 @@ fn owner(seed: u8) -> Owner {
         address: SocketAddr::from(([127, 0, 0, 1], port)),
         invitation: bytes(&invitation["invitation"]),
         checkpoint: bytes(&invitation["checkpoint"]),
-        _dir: dir,
+        provider,
     }
 }
 
@@ -125,9 +128,7 @@ fn drive(owner: i64, deadline: Instant, mut done: impl FnMut(&Value) -> bool) ->
     while Instant::now() < deadline {
         let value = call(owner, json!({"op":"poll_admission","profile":true})).unwrap();
         if value["state"] == "awaiting_save" {
-            let snapshot = bytes(&value["snapshot"]);
-            save_candidate(owner, &snapshot).unwrap();
-            execute_stored(owner, br#"{"op":"adopt_admission"}"#, &snapshot).unwrap();
+            adopt(owner, "adopt_admission", &value);
         }
         if done(&value) {
             return true;
@@ -200,7 +201,6 @@ fn queued_admission_rearms_the_host_for_staging() {
 #[test]
 fn rust_driver_commits_and_replies_without_host_candidate_steps() {
     let owner = owner(84);
-    let path = owner._dir.path().join("owner.db");
     let (reply_tx, reply_rx) = mpsc::channel();
     let peer = owner.peer;
     let address = owner.address;
@@ -238,16 +238,16 @@ fn rust_driver_commits_and_replies_without_host_candidate_steps() {
     requester.join().unwrap();
 
     close(owner.handle).unwrap();
-    let reopened = create(Some(&[84; 32])).unwrap();
-    assert_eq!(restore_record_storage(reopened, &path, &[84; 32], bytes(&committed["workspace"]).try_into().unwrap()).unwrap()["members"], 2);
+    let reopened = common::stored(&[84; 32], &owner.provider);
+    assert_eq!(restore(reopened, bytes(&committed["workspace"]).try_into().unwrap()).unwrap()["members"], 2);
     close(reopened).unwrap();
 }
 
 #[test]
 fn rust_join_driver_persists_iroh_peer_and_adopts_the_welcome() {
     let owner = owner(86);
-    let joiner_dir = tempfile::tempdir().unwrap();
-    let joiner = create(Some(&[87; 32])).unwrap();
+    let joiner_storage = MemoryProvider::default();
+    let joiner = common::stored(&[87; 32], &joiner_storage);
     let pending = call(
         joiner,
         json!({"op":"begin_join","invitation":owner.invitation,"checkpoint":owner.checkpoint,
@@ -258,8 +258,7 @@ fn rust_join_driver_persists_iroh_peer_and_adopts_the_welcome() {
     assert!(call(joiner, json!({"op":"create_workspace","display_name":"stale"})).is_err());
     assert_eq!(call(joiner, json!({"op":"workspace_state"})).unwrap()["activity"]["state"], "joining");
     let workspace: [u8; 32] = bytes(&pending["workspace"]).try_into().unwrap();
-    let path = joiner_dir.path().join("joiner.db");
-    enable_record_storage(joiner, &path, &[87; 32]).unwrap();
+    assert_eq!(pending["durable"], true);
     assert_eq!(call(joiner, json!({"op":"workspace_state"})).unwrap()["activity"]["state"], "joining");
     call(joiner, json!({"op":"add_address_hint","peer":owner.peer,"address":owner.address.to_string()})).unwrap();
 
@@ -280,8 +279,8 @@ fn rust_join_driver_persists_iroh_peer_and_adopts_the_welcome() {
     assert_eq!(call(joiner, json!({"op":"workspace_state"})).unwrap()["activity"]["state"], "active");
 
     close(joiner).unwrap();
-    let reopened = create(Some(&[87; 32])).unwrap();
-    let restored = restore_record_storage(reopened, &path, &[87; 32], workspace).unwrap();
+    let reopened = common::stored(&[87; 32], &joiner_storage);
+    let restored = restore(reopened, workspace).unwrap();
     assert_eq!(restored["members"], 2);
     assert_eq!(restored["activity"]["state"], "active");
     assert_eq!(call(reopened, json!({"op":"workspace_state"})).unwrap()["activity"]["state"], "active");
@@ -292,9 +291,8 @@ fn rust_join_driver_persists_iroh_peer_and_adopts_the_welcome() {
 #[test]
 fn rust_join_driver_resumes_the_persisted_iroh_peer_after_restart() {
     let owner = owner(88);
-    let joiner_dir = tempfile::tempdir().unwrap();
-    let path = joiner_dir.path().join("joiner.db");
-    let joiner = create(Some(&[89; 32])).unwrap();
+    let joiner_storage = MemoryProvider::default();
+    let joiner = common::stored(&[89; 32], &joiner_storage);
     let pending = call(
         joiner,
         json!({"op":"begin_join","invitation":owner.invitation,"checkpoint":owner.checkpoint,
@@ -302,11 +300,10 @@ fn rust_join_driver_resumes_the_persisted_iroh_peer_after_restart() {
     )
     .unwrap();
     let workspace: [u8; 32] = bytes(&pending["workspace"]).try_into().unwrap();
-    enable_record_storage(joiner, &path, &[89; 32]).unwrap();
     close(joiner).unwrap();
 
-    let resumed = create(Some(&[89; 32])).unwrap();
-    let restored = restore_record_storage(resumed, &path, &[89; 32], workspace).unwrap();
+    let resumed = common::stored(&[89; 32], &joiner_storage);
+    let restored = restore(resumed, workspace).unwrap();
     assert_eq!(restored["state"], "pending");
     assert_eq!(restored["activity"]["state"], "joining");
     call(resumed, json!({"op":"add_address_hint","peer":owner.peer,"address":owner.address.to_string()})).unwrap();
@@ -327,7 +324,7 @@ fn rust_join_driver_resumes_the_persisted_iroh_peer_after_restart() {
 #[test]
 fn fresh_pending_join_reports_remove_and_reinvite_recovery() {
     let owner = owner(91);
-    let first = create(Some(&[92; 32])).unwrap();
+    let first = common::stored(&[92; 32], &MemoryProvider::default());
     let pending = call(
         first,
         json!({"op":"begin_join","invitation":owner.invitation,
@@ -340,14 +337,12 @@ fn fresh_pending_join_reports_remove_and_reinvite_recovery() {
             "request":pending["admission_request"]}),
     )
     .unwrap();
-    save_candidate(owner.handle, &bytes(&staged["snapshot"])).unwrap();
-    execute_stored(owner.handle, br#"{"op":"adopt_admission"}"#, &bytes(&staged["snapshot"]))
-        .unwrap();
+    adopt(owner.handle, "adopt_admission", &staged);
     close(first).unwrap();
 
     // Same endpoint, fresh pending credentials: the original local MLS state
     // is gone, so byte-exact retained-admission recovery is impossible.
-    let fresh = create(Some(&[92; 32])).unwrap();
+    let fresh = common::stored(&[92; 32], &MemoryProvider::default());
     let fresh_pending = call(
         fresh,
         json!({"op":"begin_join","invitation":owner.invitation,
@@ -386,16 +381,15 @@ fn fresh_pending_join_reports_remove_and_reinvite_recovery() {
 #[test]
 fn rust_reset_invalidates_native_state_and_clears_the_projection() {
     let secret = [90; 32];
-    let handle = create(Some(&secret)).unwrap();
+    let provider = MemoryProvider::default();
+    let handle = common::stored(&secret, &provider);
     let created = call(
         handle,
         json!({"op":"create_workspace","display_name":"Owner","workspace_name":"Reset me"}),
     )
     .unwrap();
     let workspace: [u8; 32] = bytes(&created["workspace"]).try_into().unwrap();
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("workspace.db");
-    enable_record_storage(handle, &path, &secret).unwrap();
+    assert_eq!(created["durable"], true);
     assert_eq!(
         call(handle, json!({"op":"workspace_state"})).unwrap()["activity"]["state"],
         "active"
@@ -418,8 +412,8 @@ fn rust_reset_invalidates_native_state_and_clears_the_projection() {
     assert_eq!(again["activity"]["state"], "empty");
     close(handle).unwrap();
 
-    let reopened = create(Some(&secret)).unwrap();
-    let error = restore_record_storage(reopened, &path, &secret, workspace).unwrap_err();
+    let reopened = common::stored(&secret, &provider);
+    let error = restore(reopened, workspace).unwrap_err();
     assert_eq!(error, "native record store was reset");
     close(reopened).unwrap();
 }
@@ -449,7 +443,7 @@ fn a_busy_inbox_cannot_delay_a_small_batch_until_it_drains() {
                 address,
                 invitation,
                 checkpoint,
-                _dir: tempfile::tempdir().unwrap(),
+                provider: MemoryProvider::default(),
             };
             let mut tasks = tokio::task::JoinSet::new();
             for index in 0..3u64 {
@@ -508,7 +502,7 @@ fn one_request_is_enough_the_result_arrives_on_the_same_exchange() {
                 address,
                 invitation,
                 checkpoint,
-                _dir: tempfile::tempdir().unwrap(),
+                provider: MemoryProvider::default(),
             };
             let (node, packet) = joiner(5200, &shadow).await;
             // Exactly one request. No retry loop.
@@ -602,10 +596,8 @@ fn expired_admission_exchange_receives_a_pushed_result_without_retry() {
         assert!(Instant::now() < deadline, "admission was not staged");
         thread::sleep(Duration::from_millis(5));
     };
-    let snapshot = bytes(&staged["snapshot"]);
-    save_candidate(owner.handle, &snapshot).unwrap();
-    let committed = execute_stored(owner.handle, br#"{"op":"adopt_admission"}"#, &snapshot).unwrap();
-    assert_eq!(serde_json::from_slice::<Value>(&committed[0]).unwrap()["members"], 2);
+    let committed = adopt(owner.handle, "adopt_admission", &staged);
+    assert_eq!(committed["members"], 2);
     commit_tx.send(()).unwrap();
     let pushed = client.join().unwrap();
     let reply: Value = arachne_runtime::harness::decode_admission_reply(&pushed[9..]).unwrap();
@@ -617,8 +609,7 @@ fn expired_admission_exchange_receives_a_pushed_result_without_retry() {
 #[test]
 fn tampered_and_replayed_admission_pushes_are_rejected() {
     let owner = owner(59);
-    let joiner = create(Some(&[60; 32])).unwrap();
-    let joiner_dir = tempfile::tempdir().unwrap();
+    let joiner = common::stored(&[60; 32], &MemoryProvider::default());
     let pending = call(
         joiner,
         json!({"op":"begin_join","invitation":owner.invitation,
@@ -626,12 +617,6 @@ fn tampered_and_replayed_admission_pushes_are_rejected() {
     )
     .unwrap();
     let workspace: [u8; 32] = bytes(&pending["workspace"]).try_into().unwrap();
-    enable_record_storage(
-        joiner,
-        &joiner_dir.path().join("joiner.db"),
-        &[60; 32],
-    )
-    .unwrap();
     call(
         joiner,
         json!({"op":"add_address_hint","peer":owner.peer,"address":owner.address.to_string()}),
@@ -649,9 +634,7 @@ fn tampered_and_replayed_admission_pushes_are_rejected() {
             "request":pending["admission_request"]}),
     )
     .unwrap();
-    save_candidate(owner.handle, &bytes(&staged["snapshot"])).unwrap();
-    execute_stored(owner.handle, br#"{"op":"adopt_admission"}"#, &bytes(&staged["snapshot"]))
-        .unwrap();
+    adopt(owner.handle, "adopt_admission", &staged);
     let reply = call(
         owner.handle,
         json!({"op":"retained_admission","authenticated_endpoint":pending["endpoint"],
@@ -684,14 +667,7 @@ fn tampered_and_replayed_admission_pushes_are_rejected() {
     assert!(wait_for_work(joiner).unwrap());
     let candidate = call(joiner, json!({"op":"drive_join"})).unwrap();
     assert_eq!(candidate["state"], "awaiting_join_save");
-    save_candidate(joiner, &bytes(&candidate["snapshot"])).unwrap();
-    let joined_bytes = execute_stored(
-        joiner,
-        br#"{"op":"adopt_join"}"#,
-        &bytes(&candidate["snapshot"]),
-    )
-    .unwrap();
-    let joined: Value = serde_json::from_slice(&joined_bytes[0]).unwrap();
+    let joined = adopt(joiner, "adopt_join", &candidate);
     assert_eq!(joined["members"], 2);
     assert_eq!(valid_exchange.join().unwrap().unwrap()["reply"], json!([1]));
 
@@ -711,7 +687,7 @@ fn tampered_and_replayed_admission_pushes_are_rejected() {
 #[test]
 fn a_sent_request_with_no_reply_reports_waiting_not_an_error() {
     let owner = owner(53);
-    let late = create(Some(&[54; 32])).unwrap();
+    let late = common::stored(&[54; 32], &MemoryProvider::default());
     let begun = call(
         late,
         json!({"op":"begin_join","invitation":owner.invitation,
@@ -751,7 +727,7 @@ fn a_request_set_aside_during_a_commit_wakes_the_host_when_the_commit_lands() {
             .build()
             .unwrap();
         runtime.block_on(async move {
-            let shadow = Owner { handle: 0, peer, address, invitation, checkpoint, _dir: tempfile::tempdir().unwrap() };
+            let shadow = Owner { handle: 0, peer, address, invitation, checkpoint, provider: MemoryProvider::default() };
             let (node, packet) = joiner(5500, &shadow).await;
             let admission = tokio::spawn({
                 let node = Arc::clone(&node);
@@ -793,9 +769,7 @@ fn a_request_set_aside_during_a_commit_wakes_the_host_when_the_commit_lands() {
         "a pending commit must set the recovery request aside");
     while wakes.try_recv().is_ok() {}
 
-    let snapshot = bytes(&staged["snapshot"]);
-    save_candidate(owner.handle, &snapshot).unwrap();
-    execute_stored(owner.handle, br#"{"op":"adopt_admission"}"#, &snapshot).unwrap();
+    adopt(owner.handle, "adopt_admission", &staged);
     let woken = wakes.recv_timeout(Duration::from_secs(1));
     let served = drive(owner.handle, Instant::now() + Duration::from_secs(5), |value| value["state"] == "recovery_replied");
     close(owner.handle).unwrap();
@@ -818,7 +792,7 @@ fn waiting_requests_are_one_group_commit() {
     let clients = thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         runtime.block_on(async move {
-            let shadow = Owner { handle: 0, peer, address, invitation, checkpoint, _dir: tempfile::tempdir().unwrap() };
+            let shadow = Owner { handle: 0, peer, address, invitation, checkpoint, provider: MemoryProvider::default() };
             let mut tasks = tokio::task::JoinSet::new();
             for index in 0..6u64 {
                 let (node, packet) = joiner(5600 + index, &shadow).await;

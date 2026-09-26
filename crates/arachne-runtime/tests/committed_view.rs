@@ -2,15 +2,15 @@
 // lock, no control queue. A request that asks for a membership change still
 // goes to the host.
 use arachne_node::Node;
-use arachne_runtime::{
-    close, create, describe, enable_record_storage, execute, execute_stored, save_candidate,
-};
+use arachne_runtime::{MemoryProvider, StorageConfig, attach_storage, close, create, describe, execute};
 use arachne_security::{Invitation, PendingJoin};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+mod common;
 
 fn call(handle: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
@@ -48,22 +48,21 @@ struct Owner {
 
 fn owner(seed: u8) -> Owner {
     let handle = create(Some(&[seed; 32])).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    attach_storage(handle, StorageConfig::sqlite(dir.path(), [seed; 32])).unwrap();
     call(
         handle,
         json!({"op":"create_workspace","display_name":"Owner","workspace_name":"Committed view"}),
     )
     .unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    enable_record_storage(handle, &dir.path().join("owner.db"), &[seed; 32]).unwrap();
     let staged = call(
         handle,
         json!({"op":"stage_invitation","personal":false,"expires_at":0}),
     )
     .unwrap();
-    save_candidate(handle, &bytes(&staged["snapshot"])).unwrap();
     let invitation = call(
         handle,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap()["issued_invitation"]
         .clone();
@@ -91,9 +90,11 @@ fn drive(owner: i64, deadline: Instant, mut done: impl FnMut(&Value) -> bool) ->
     while Instant::now() < deadline {
         let value = call(owner, json!({"op":"poll_admission","profile":true})).unwrap();
         if value["state"] == "awaiting_save" {
-            let snapshot = bytes(&value["snapshot"]);
-            save_candidate(owner, &snapshot).unwrap();
-            execute_stored(owner, br#"{"op":"adopt_admission"}"#, &snapshot).unwrap();
+            call(
+                owner,
+                json!({"op":"adopt_admission","candidate":value["candidate"]}),
+            )
+            .unwrap();
         }
         if done(&value) {
             return true;
@@ -279,7 +280,7 @@ fn add_member(admin: i64, joiner: i64, name: &str) {
         json!({"op":"stage_invitation","personal":false,"expires_at":0}),
     )
     .unwrap();
-    let invite = call(admin, json!({"op":"adopt_admission","snapshot":staged["snapshot"]}))
+    let invite = call(admin, json!({"op":"adopt_admission","candidate":staged["candidate"]}))
         .unwrap()["issued_invitation"]
         .clone();
     let begin = call(
@@ -292,7 +293,7 @@ fn add_member(admin: i64, joiner: i64, name: &str) {
         json!({"op":"stage_admission","authenticated_endpoint":begin["endpoint"],"request":begin["admission_request"]}),
     )
     .unwrap();
-    call(admin, json!({"op":"adopt_admission","snapshot":staged["snapshot"]})).unwrap();
+    call(admin, json!({"op":"adopt_admission","candidate":staged["candidate"]})).unwrap();
     let reply = call(
         admin,
         json!({"op":"retained_admission","authenticated_endpoint":begin["endpoint"],"request":begin["admission_request"]}),
@@ -300,14 +301,14 @@ fn add_member(admin: i64, joiner: i64, name: &str) {
     .unwrap();
     let steps = json!([{"commit":reply["commit"],"authorization":reply["authorization"]}]);
     let staged = call(joiner, json!({"op":"stage_join","welcome":reply["welcome"],"commits":steps})).unwrap();
-    call(joiner, json!({"op":"adopt_join","snapshot":staged["snapshot"]})).unwrap();
+    call(joiner, json!({"op":"adopt_join","candidate":staged["candidate"]})).unwrap();
 }
 
 #[test]
 fn a_membership_query_is_answered_while_the_host_never_polls() {
-    let admin = create(Some(&[66; 32])).unwrap();
+    let admin = common::stored(&[66; 32], &MemoryProvider::default());
     call(admin, json!({"op":"create_workspace","display_name":"Owner"})).unwrap();
-    let member = create(Some(&[67; 32])).unwrap();
+    let member = common::stored(&[67; 32], &MemoryProvider::default());
     add_member(admin, member, "Field member");
     let info: Value = serde_json::from_str(&describe(admin).unwrap()).unwrap();
     let address = info["bound_address"].as_str().unwrap().replace("0.0.0.0:", "127.0.0.1:");

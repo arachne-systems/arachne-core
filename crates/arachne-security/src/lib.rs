@@ -23,6 +23,7 @@ pub use profile::{MAX_MEMBER_PROFILE, MemberIdentity};
 mod fork;
 pub use fork::{FORK_KEY_BYTES, ForkClass, ForkKey, fork_key, winner};
 mod branch;
+mod branch_steps;
 pub use branch::{
     BranchDecision, BranchState, MAX_BRANCH_RECORD, MAX_BRANCH_SNAPSHOT, MAX_ROLLBACK_BYTES,
     PreparedBranchSwitch, ROLLBACK_EPOCHS,

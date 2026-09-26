@@ -1,6 +1,4 @@
-use arachne_runtime::{
-    close, create, describe, enable_record_storage, execute, restore_record_storage, save_candidate,
-};
+use arachne_runtime::{MemoryProvider, close, describe, execute};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
@@ -10,23 +8,20 @@ fn call(h: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(h, &serde_json::to_vec(&request).unwrap())?)
         .map_err(|e| e.to_string())
 }
-fn adopt(h: i64, staged: &Value, records: bool) -> Value {
-    if records {
-        save_candidate(
-            h,
-            &serde_json::from_value::<Vec<u8>>(staged["snapshot"].clone()).unwrap(),
-        )
-        .unwrap();
-    }
+/// A session with its own in-memory record storage.
+fn session(seed: u8) -> i64 {
+    common::stored(&[seed; 32], &MemoryProvider::default())
+}
+fn adopt(h: i64, staged: &Value) -> Value {
     call(
         h,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap()
 }
 fn apply(h: i64, step: &Value) {
     let staged = call(h, json!({"op":"stage_admission_update","step":step})).unwrap();
-    adopt(h, &staged, false);
+    adopt(h, &staged);
 }
 fn begin(h: i64, invite: &Value) -> Value {
     call(h, json!({"op":"begin_join","display_name":"Attendee","invitation":invite["invitation"],"checkpoint":invite["checkpoint"]})).unwrap()
@@ -34,9 +29,9 @@ fn begin(h: i64, invite: &Value) -> Value {
 
 #[test]
 fn overlapping_open_admissions_queue_while_membership_commit_is_pending() {
-    let admin = create(Some(&[121; 32])).unwrap();
+    let admin = session(121);
     let people: Vec<_> = (122..=124)
-        .map(|key| create(Some(&[key; 32])).unwrap())
+        .map(session)
         .collect();
     call(
         admin,
@@ -48,7 +43,7 @@ fn overlapping_open_admissions_queue_while_membership_commit_is_pending() {
         json!({"op":"stage_invitation","personal":false,"expires_at":0}),
     )
     .unwrap();
-    let invite = adopt(admin, &staged, false)["issued_invitation"].clone();
+    let invite = adopt(admin, &staged)["issued_invitation"].clone();
     let admin_info: Value = serde_json::from_str(&describe(admin).unwrap()).unwrap();
     let admin_address = admin_info["bound_address"]
         .as_str()
@@ -111,7 +106,7 @@ fn overlapping_open_admissions_queue_while_membership_commit_is_pending() {
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    adopt(admin, &first_staged, false);
+    adopt(admin, &first_staged);
     assert!(first.join().unwrap()["commits"].is_array());
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut held_batches = Vec::new();
@@ -119,7 +114,7 @@ fn overlapping_open_admissions_queue_while_membership_commit_is_pending() {
         let value = call(admin, json!({"op":"poll_admission"})).unwrap();
         if value["state"] == "awaiting_save" {
             held_batches.push(value["admissions"].as_u64().unwrap());
-            adopt(admin, &value, false);
+            adopt(admin, &value);
         }
         assert!(Instant::now() < deadline, "held admissions were not delivered");
         std::thread::sleep(Duration::from_millis(5));
@@ -151,7 +146,7 @@ fn overlapping_open_admissions_queue_while_membership_commit_is_pending() {
         let value = call(admin, json!({"op":"poll_admission"})).unwrap();
         if value["state"] == "awaiting_save" {
             staged_admissions.push(value["admissions"].as_u64().unwrap());
-            adopt(admin, &value, false);
+            adopt(admin, &value);
         } else {
             assert!(
                 value.is_null()
@@ -181,7 +176,7 @@ fn overlapping_open_admissions_queue_while_membership_commit_is_pending() {
         .unwrap();
         call(
             *person,
-            json!({"op":"adopt_join","snapshot":joined["snapshot"]}),
+            json!({"op":"adopt_join","candidate":joined["candidate"]}),
         )
         .unwrap();
     }
@@ -200,9 +195,9 @@ fn overlapping_open_admissions_queue_while_membership_commit_is_pending() {
 
 #[test]
 fn overlapping_manual_approval_is_queued_until_the_owner_is_ready() {
-    let admin = create(Some(&[131; 32])).unwrap();
-    let first = create(Some(&[132; 32])).unwrap();
-    let requester = create(Some(&[133; 32])).unwrap();
+    let admin = session(131);
+    let first = session(132);
+    let requester = session(133);
     call(
         admin,
         json!({"op":"create_workspace","display_name":"Incident lead","workspace_name":"Wildfire response"}),
@@ -213,13 +208,13 @@ fn overlapping_manual_approval_is_queued_until_the_owner_is_ready() {
         json!({"op":"stage_invitation","personal":false,"expires_at":0}),
     )
     .unwrap();
-    let open = adopt(admin, &staged, false)["issued_invitation"].clone();
+    let open = adopt(admin, &staged)["issued_invitation"].clone();
     let staged = call(
         admin,
         json!({"op":"stage_invitation","personal":true,"automatic":true,"expires_at":0}),
     )
     .unwrap();
-    let request_access = adopt(admin, &staged, false)["issued_invitation"].clone();
+    let request_access = adopt(admin, &staged)["issued_invitation"].clone();
     let info: Value = serde_json::from_str(&describe(admin).unwrap()).unwrap();
     let address = info["bound_address"]
         .as_str()
@@ -270,7 +265,7 @@ fn overlapping_manual_approval_is_queued_until_the_owner_is_ready() {
         waiting_call.join().unwrap(),
         json!({"state":"admission_queued"})
     );
-    adopt(admin, &first_staged, false);
+    adopt(admin, &first_staged);
     // The owner holds the request's exchange and writes the committed
     // result onto it after save and adopt (event-driven admission).
     assert!(first_call.join().unwrap()["commits"].is_array());
@@ -298,7 +293,7 @@ fn overlapping_manual_approval_is_queued_until_the_owner_is_ready() {
         json!({"op":"stage_invitation_approval","attempt_id":attempt_id,"request":waiting["admission_request"]}),
     )
     .unwrap();
-    adopt(admin, &staged, false);
+    adopt(admin, &staged);
 
     let retry_peer = info["endpoint_key"].clone();
     let retry = std::thread::spawn(move || {
@@ -313,7 +308,7 @@ fn overlapping_manual_approval_is_queued_until_the_owner_is_ready() {
         assert!(Instant::now() < deadline, "approved request was not admitted");
         std::thread::sleep(Duration::from_millis(5));
     };
-    adopt(admin, &staged, false);
+    adopt(admin, &staged);
     // A retry of an approved, queued attempt is held and receives its
     // committed result after save and adopt (event-driven admission).
     assert!(retry.join().unwrap()["commits"].is_array());
@@ -332,7 +327,7 @@ fn overlapping_manual_approval_is_queued_until_the_owner_is_ready() {
     .unwrap();
     call(
         requester,
-        json!({"op":"adopt_join","snapshot":joined["snapshot"]}),
+        json!({"op":"adopt_join","candidate":joined["candidate"]}),
     )
     .unwrap();
     assert_eq!(
@@ -349,40 +344,43 @@ fn overlapping_manual_approval_is_queued_until_the_owner_is_ready() {
 
 #[test]
 fn approved_personal_join_survives_restart_and_uses_peer_while_admin_is_closed() {
-    let admin = create(Some(&[91; 32])).unwrap();
-    let helper = create(Some(&[92; 32])).unwrap();
-    let mut person = create(Some(&[93; 32])).unwrap();
-    let copied = create(Some(&[94; 32])).unwrap();
+    let admin_storage = MemoryProvider::default();
+    let admin = common::stored(&[91; 32], &admin_storage);
+    let helper = session(92);
+    let person_storage = MemoryProvider::default();
+    let mut person = common::stored(&[93; 32], &person_storage);
+    let copied = session(94);
     let workspace = call(
         admin,
         json!({"op":"create_workspace","display_name":"Organizer","workspace_name":"Field team"}),
     )
     .unwrap()["workspace"]
         .clone();
-    let dir = common::directory();
-    enable_record_storage(admin, &dir.path().join("admin.db"), &[91; 32]).unwrap();
     let staged = call(
         admin,
         json!({"op":"stage_invitation","personal":false,"expires_at":0}),
     )
     .unwrap();
     assert!(staged.get("issued_invitation").is_none());
+    // Adoption saves the exact staged candidate: a changed token is refused.
+    let mut altered: Vec<u8> = serde_json::from_value(staged["candidate"].clone()).unwrap();
+    altered[36] ^= 1;
     assert!(
         call(
             admin,
-            json!({"op":"adopt_admission","snapshot":staged["snapshot"]})
+            json!({"op":"adopt_admission","candidate":altered})
         )
         .is_err()
     );
-    let open = adopt(admin, &staged, true)["issued_invitation"].clone();
+    let open = adopt(admin, &staged)["issued_invitation"].clone();
     let early = begin(helper, &open);
     let staged = call(admin, json!({"op":"stage_admission","authenticated_endpoint":early["endpoint"],"request":early["admission_request"]})).unwrap();
-    adopt(admin, &staged, true);
+    adopt(admin, &staged);
     let reply = call(admin, json!({"op":"retained_admission","authenticated_endpoint":early["endpoint"],"request":early["admission_request"]})).unwrap();
     let staged = call(helper, json!({"op":"stage_join","welcome":reply["welcome"],"commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]})).unwrap();
     call(
         helper,
-        json!({"op":"adopt_join","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
     )
     .unwrap();
     // Native history discovery runs in the background after reconnecting.
@@ -396,7 +394,7 @@ fn approved_personal_join_survives_restart_and_uses_peer_while_admin_is_closed()
         json!({"op":"stage_invitation","personal":true,"automatic":true,"expires_at":0}),
     )
     .unwrap();
-    let issued = adopt(admin, &staged, true);
+    let issued = adopt(admin, &staged);
     assert_eq!(
         call(admin, json!({"op":"poll_recovery_cutoff"})).unwrap(),
         Value::Null
@@ -432,7 +430,7 @@ fn approved_personal_join_survives_restart_and_uses_peer_while_admin_is_closed()
         json!({"op":"stage_management","action":{"kind":"promote","member":early["member"]["id"]}}),
     )
     .unwrap();
-    let promoted = adopt(admin, &promotion, true);
+    let promoted = adopt(admin, &promotion);
     apply(helper, &promoted["step"]);
     // A premature retry gets useful feedback without disrupting the member
     // accepting requests. It cannot become membership or consume the request.
@@ -470,15 +468,13 @@ fn approved_personal_join_survives_restart_and_uses_peer_while_admin_is_closed()
             .len(),
         2
     );
-    assert!(call(person, json!({"op":"seal_pending_join"})).is_ok());
-    enable_record_storage(person, &dir.path().join("person.db"), &[93; 32]).unwrap();
+    // begin_join saved the pending join; a restart restores it from storage.
+    assert_eq!(pending["durable"], true);
     close(person).unwrap();
-    person = create(Some(&[93; 32])).unwrap();
-    let restored = restore_record_storage(
+    person = common::stored(&[93; 32], &person_storage);
+    let restored = call(
         person,
-        &dir.path().join("person.db"),
-        &[93; 32],
-        serde_json::from_value(workspace.clone()).unwrap(),
+        json!({"op":"restore_workspace","workspace":workspace.clone()}),
     )
     .unwrap();
     assert_eq!(restored["admission_request"], pending["admission_request"]);
@@ -488,7 +484,7 @@ fn approved_personal_join_survives_restart_and_uses_peer_while_admin_is_closed()
         json!({"op":"stage_invitation_approval","request":pending["admission_request"]}),
     )
     .unwrap();
-    let approved = adopt(admin, &staged, true);
+    let approved = adopt(admin, &staged);
     apply(helper, &approved["step"]);
     assert!(call(helper, json!({"op":"stage_admission","authenticated_endpoint":wrong["endpoint"],"request":wrong["admission_request"]})).is_err());
     close(admin).unwrap();
@@ -505,7 +501,7 @@ fn approved_personal_join_survives_restart_and_uses_peer_while_admin_is_closed()
     loop {
         let staged = call(helper, json!({"op":"poll_admission"})).unwrap();
         if staged["state"] == "awaiting_save" {
-            adopt(helper, &staged, false);
+            adopt(helper, &staged);
             break;
         }
         assert!(Instant::now() < until, "No approved personal join request");
@@ -526,15 +522,10 @@ fn approved_personal_join_survives_restart_and_uses_peer_while_admin_is_closed()
         json!({"op":"stage_join","welcome":reply["welcome"],"commits":reply["commits"]}),
     )
     .unwrap();
-    save_candidate(
-        person,
-        &serde_json::from_value::<Vec<u8>>(staged["snapshot"].clone()).unwrap(),
-    )
-    .unwrap();
     assert_eq!(
         call(
             person,
-            json!({"op":"adopt_join","snapshot":staged["snapshot"]})
+            json!({"op":"adopt_join","candidate":staged["candidate"]})
         )
         .unwrap()["members"],
         3
@@ -542,26 +533,19 @@ fn approved_personal_join_survives_restart_and_uses_peer_while_admin_is_closed()
     close(person).unwrap();
     close(helper).unwrap();
     close(copied).unwrap();
-    let admin = create(Some(&[91; 32])).unwrap();
-    restore_record_storage(
-        admin,
-        &dir.path().join("admin.db"),
-        &[91; 32],
-        serde_json::from_value(workspace).unwrap(),
-    )
-    .unwrap();
+    let admin = common::stored(&[91; 32], &admin_storage);
+    call(admin, json!({"op":"restore_workspace","workspace":workspace})).unwrap();
     assert_eq!(
         call(admin, json!({"op":"invitation_controls"})).unwrap()["invitations"][1]["approved"],
         true
     );
     close(admin).unwrap();
-    dir.close().unwrap();
 }
 
 #[test]
 fn declining_a_personal_request_disables_its_invitation_without_admitting_it() {
-    let admin = create(Some(&[101; 32])).unwrap();
-    let person = create(Some(&[102; 32])).unwrap();
+    let admin = session(101);
+    let person = session(102);
     call(
         admin,
         json!({"op":"create_workspace","display_name":"Organizer","workspace_name":"Field team"}),
@@ -572,14 +556,14 @@ fn declining_a_personal_request_disables_its_invitation_without_admitting_it() {
         json!({"op":"stage_invitation","personal":true,"expires_at":0}),
     )
     .unwrap();
-    let invite = adopt(admin, &staged, false)["issued_invitation"].clone();
+    let invite = adopt(admin, &staged)["issued_invitation"].clone();
     let pending = begin(person, &invite);
     let declined = call(
         admin,
         json!({"op":"stage_invitation_decline","request":pending["admission_request"]}),
     )
     .unwrap();
-    adopt(admin, &declined, false);
+    adopt(admin, &declined);
     assert_eq!(
         call(admin, json!({"op":"invitation_controls"})).unwrap()["invitations"][0]["enabled"],
         false
@@ -605,9 +589,9 @@ fn declining_a_personal_request_disables_its_invitation_without_admitting_it() {
 
 #[test]
 fn reusable_request_access_keeps_native_commands_and_catalog_scoped() {
-    let admin = create(Some(&[151; 32])).unwrap();
+    let admin = session(151);
     let people: Vec<_> = (152..=154)
-        .map(|key| create(Some(&[key; 32])).unwrap())
+        .map(session)
         .collect();
     call(
         admin,
@@ -619,7 +603,7 @@ fn reusable_request_access_keeps_native_commands_and_catalog_scoped() {
         json!({"op":"stage_invitation","personal":true,"request_access":true,"expires_at":0}),
     )
     .unwrap();
-    let issued = adopt(admin, &staged, false);
+    let issued = adopt(admin, &staged);
     let pending: Vec<_> = people
         .iter()
         .map(|h| begin(*h, &issued["issued_invitation"]))
@@ -635,7 +619,7 @@ fn reusable_request_access_keeps_native_commands_and_catalog_scoped() {
             json!({"op":op,"request":request["admission_request"]}),
         )
         .unwrap();
-        adopt(admin, &decision, false);
+        adopt(admin, &decision);
     }
     let catalog = call(admin, json!({"op":"invitation_controls"})).unwrap();
     assert_eq!(catalog["invitations"].as_array().unwrap().len(), 1);
@@ -649,7 +633,7 @@ fn reusable_request_access_keeps_native_commands_and_catalog_scoped() {
         if index == 1 {
             assert_eq!(admission.unwrap_err(), arachne_security::INVITATION_DISABLED);
         } else {
-            adopt(admin, &admission.unwrap(), false);
+            adopt(admin, &admission.unwrap());
         }
     }
     assert_eq!(

@@ -1,6 +1,13 @@
-use arachne_runtime::{close, create, describe, execute};
+use arachne_runtime::{MemoryProvider, close, describe, execute};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+mod common;
+
+/// A node with its own in-memory record storage.
+fn node(secret: u8) -> i64 {
+    common::stored(&[secret; 32], &MemoryProvider::default())
+}
 
 const EVENT: &str = "atak/native/v1/chat";
 const CURRENT: &str = "atak/native/v1/pli";
@@ -23,7 +30,7 @@ fn issue_invitation(handle: i64) -> Value {
     );
     call(
         handle,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )["issued_invitation"]
         .clone()
 }
@@ -41,7 +48,7 @@ fn add(owner: i64, joiner: i64, invite: &Value, prior: Vec<Value>, name: &str) -
     );
     call(
         owner,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     );
     let reply = call(
         owner,
@@ -56,7 +63,7 @@ fn add(owner: i64, joiner: i64, invite: &Value, prior: Vec<Value>, name: &str) -
     );
     call(
         joiner,
-        json!({"op":"adopt_join","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
     );
     let mut reply = reply;
     reply["joined_member"] = begin["member"]["id"].clone();
@@ -115,7 +122,7 @@ fn receive_one(handle: i64) -> Value {
         if !staged.is_null() {
             call(
                 handle,
-                json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
+                json!({"op":"adopt_reception","candidate":staged["candidate"]}),
             );
             return staged;
         }
@@ -126,8 +133,8 @@ fn receive_one(handle: i64) -> Value {
 
 #[test]
 fn retained_replay_delivers_events_current_values_and_deletions() {
-    let author = create(Some(&[121; 32])).unwrap();
-    let reader = create(Some(&[122; 32])).unwrap();
+    let author = node(121);
+    let reader = node(122);
     call(
         author,
         json!({"op":"create_workspace","display_name":"Author"}),
@@ -158,7 +165,7 @@ fn retained_replay_delivers_events_current_values_and_deletions() {
         let staged = call(author, request);
         call(
             author,
-            json!({"op":"adopt_publication","snapshot":staged["snapshot"]}),
+            json!({"op":"adopt_publication","candidate":staged["candidate"]}),
         );
     }
     connect(reader, author);
@@ -174,7 +181,7 @@ fn retained_replay_delivers_events_current_values_and_deletions() {
     );
     call(
         reader,
-        json!({"op":"adopt_recovery","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_recovery","candidate":staged["candidate"]}),
     );
     for id in 1..=3 {
         let pending = call(reader, json!({"op":"poll_pending_object"}));
@@ -192,7 +199,7 @@ fn retained_replay_delivers_events_current_values_and_deletions() {
         );
         call(
             reader,
-            json!({"op":"adopt_reception","snapshot":ack["snapshot"]}),
+            json!({"op":"adopt_reception","candidate":ack["candidate"]}),
         );
     }
     assert!(call(reader, json!({"op":"poll_pending_object"})).is_null());
@@ -208,10 +215,11 @@ fn retained_replay_delivers_events_current_values_and_deletions() {
 
 #[test]
 fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
-    let author = create(Some(&[111; 32])).unwrap();
-    let stale_holder = create(Some(&[112; 32])).unwrap();
-    let fresh_holder = create(Some(&[113; 32])).unwrap();
-    let reader = create(Some(&[114; 32])).unwrap();
+    let author = node(111);
+    let stale_holder = node(112);
+    let fresh_holder = node(113);
+    let reader_storage = MemoryProvider::default();
+    let reader = common::stored(&[114; 32], &reader_storage);
     let created = call(
         author,
         json!({"op":"create_workspace","display_name":"Author"}),
@@ -240,7 +248,7 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
             let staged = call(handle, json!({"op":"stage_admission_update","step":update}));
             call(
                 handle,
-                json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+                json!({"op":"adopt_admission","candidate":staged["candidate"]}),
             );
         }
     }
@@ -268,7 +276,7 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
     );
     call(
         author,
-        json!({"op":"adopt_publication","snapshot":event["snapshot"]}),
+        json!({"op":"adopt_publication","candidate":event["candidate"]}),
     );
     let created_state = call(
         author,
@@ -279,7 +287,7 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
     );
     call(
         author,
-        json!({"op":"adopt_publication","snapshot":created_state["snapshot"]}),
+        json!({"op":"adopt_publication","candidate":created_state["candidate"]}),
     );
 
     call(
@@ -294,7 +302,7 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
     );
     call(
         stale_holder,
-        json!({"op":"adopt_recovery","snapshot":retained["snapshot"]}),
+        json!({"op":"adopt_recovery","candidate":retained["candidate"]}),
     );
     call(
         stale_holder,
@@ -306,7 +314,7 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
     let retained = call(stale_holder, json!({"op":"stage_current_view"}));
     call(
         stale_holder,
-        json!({"op":"adopt_current_view","snapshot":retained["snapshot"]}),
+        json!({"op":"adopt_current_view","candidate":retained["candidate"]}),
     );
 
     for (id, payload, tombstone) in [([3; 16], vec![2], false), ([4; 16], vec![0], true)] {
@@ -319,7 +327,7 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
         );
         call(
             author,
-            json!({"op":"adopt_publication","snapshot":staged["snapshot"]}),
+            json!({"op":"adopt_publication","candidate":staged["candidate"]}),
         );
     }
     call(
@@ -332,7 +340,7 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
     let retained = call(fresh_holder, json!({"op":"stage_current_view"}));
     call(
         fresh_holder,
-        json!({"op":"adopt_current_view","snapshot":retained["snapshot"]}),
+        json!({"op":"adopt_current_view","candidate":retained["candidate"]}),
     );
     close(author).unwrap();
 
@@ -369,7 +377,7 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
     let staged = call(reader, json!({"op":"stage_current_view"}));
     call(
         reader,
-        json!({"op":"adopt_current_view","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_current_view","candidate":staged["candidate"]}),
     );
     let deleted = call(reader, json!({"op":"poll_pending_object"}));
     assert_eq!(deleted["payload"], json!([0]));
@@ -381,16 +389,14 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
     );
     call(
         reader,
-        json!({"op":"adopt_reception","snapshot":acknowledged["snapshot"]}),
+        json!({"op":"adopt_reception","candidate":acknowledged["candidate"]}),
     );
-    let saved_reader = call(reader, json!({"op":"seal_workspace"}));
     close(reader).unwrap();
 
-    let reader = create(Some(&[114; 32])).unwrap();
+    let reader = common::stored(&[114; 32], &reader_storage);
     call(
         reader,
-        json!({"op":"restore_workspace","workspace":created["workspace"],
-            "snapshot":saved_reader["snapshot"]}),
+        json!({"op":"restore_workspace","workspace":created["workspace"]}),
     );
     call(
         reader,
@@ -424,7 +430,7 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
     let recovered = call(reader, json!({"op":"stage_recovery_range"}));
     call(
         reader,
-        json!({"op":"adopt_recovery","snapshot":recovered["snapshot"]}),
+        json!({"op":"adopt_recovery","candidate":recovered["candidate"]}),
     );
     assert_eq!(
         call(reader, json!({"op":"poll_pending_object"}))["payload"],
@@ -438,10 +444,12 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
 
 #[test]
 fn intended_recipient_recovers_private_tail_from_restarted_holder() {
-    let author = create(Some(&[101; 32])).unwrap();
-    let holder = create(Some(&[102; 32])).unwrap();
-    let reader = create(Some(&[103; 32])).unwrap();
-    let observer = create(Some(&[104; 32])).unwrap();
+    let author = node(101);
+    let holder_storage = MemoryProvider::default();
+    let reader_storage = MemoryProvider::default();
+    let holder = common::stored(&[102; 32], &holder_storage);
+    let reader = common::stored(&[103; 32], &reader_storage);
+    let observer = node(104);
     let created = call(
         author,
         json!({"op":"create_workspace","display_name":"Author"}),
@@ -462,7 +470,7 @@ fn intended_recipient_recovers_private_tail_from_restarted_holder() {
     );
     call(
         holder,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     );
     for handle in [holder, reader] {
         let staged = call(
@@ -471,7 +479,7 @@ fn intended_recipient_recovers_private_tail_from_restarted_holder() {
         );
         call(
             handle,
-            json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
         );
     }
     for handle in [author, holder, reader, observer] {
@@ -495,7 +503,6 @@ fn intended_recipient_recovers_private_tail_from_restarted_holder() {
                 "revision":5,"topic":EVENT}),
         );
     }
-    let saved_reader = call(reader, json!({"op":"seal_workspace"}));
     close(reader).unwrap();
     let mut recipients = [
         serde_json::from_value::<[u8; 32]>(first["joined_member"].clone()).unwrap(),
@@ -510,16 +517,15 @@ fn intended_recipient_recovers_private_tail_from_restarted_holder() {
     );
     let sent = call(
         author,
-        json!({"op":"adopt_publication","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_publication","candidate":staged["candidate"]}),
     );
     assert_eq!(sent["sequence"], 1);
     receive_one(holder);
 
-    let reader = create(Some(&[103; 32])).unwrap();
+    let reader = common::stored(&[103; 32], &reader_storage);
     call(
         reader,
-        json!({"op":"restore_workspace","workspace":created["workspace"],
-            "snapshot":saved_reader["snapshot"]}),
+        json!({"op":"restore_workspace","workspace":created["workspace"]}),
     );
     call(
         reader,
@@ -530,14 +536,12 @@ fn intended_recipient_recovers_private_tail_from_restarted_holder() {
         json!({"op":"subscribe","workspace":created["workspace"],
             "revision":5,"topic":EVENT}),
     );
-    let saved_holder = call(holder, json!({"op":"seal_workspace"}));
     close(holder).unwrap();
     close(author).unwrap();
-    let holder = create(Some(&[102; 32])).unwrap();
+    let holder = common::stored(&[102; 32], &holder_storage);
     call(
         holder,
-        json!({"op":"restore_workspace","workspace":created["workspace"],
-            "snapshot":saved_holder["snapshot"]}),
+        json!({"op":"restore_workspace","workspace":created["workspace"]}),
     );
     call(
         holder,
@@ -616,7 +620,7 @@ fn intended_recipient_recovers_private_tail_from_restarted_holder() {
     assert_eq!(staged["publication_count"], 1);
     call(
         reader,
-        json!({"op":"adopt_recovery","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_recovery","candidate":staged["candidate"]}),
     );
     assert!(call(reader, json!({"op":"next_direct_gap"})).is_null());
     assert_eq!(
@@ -630,10 +634,13 @@ fn intended_recipient_recovers_private_tail_from_restarted_holder() {
 
 #[test]
 fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
-    let author = create(Some(&[91; 32])).unwrap();
-    let holder = create(Some(&[92; 32])).unwrap();
-    let reader = create(Some(&[93; 32])).unwrap();
-    let empty_holder = create(Some(&[94; 32])).unwrap();
+    let author_storage = MemoryProvider::default();
+    let holder_storage = MemoryProvider::default();
+    let reader_storage = MemoryProvider::default();
+    let author = common::stored(&[91; 32], &author_storage);
+    let holder = common::stored(&[92; 32], &holder_storage);
+    let reader = common::stored(&[93; 32], &reader_storage);
+    let empty_holder = node(94);
     let created = call(
         author,
         json!({"op":"create_workspace","display_name":"Author"}),
@@ -654,7 +661,7 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     );
     call(
         holder,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     );
     for handle in [holder, reader] {
         let staged = call(
@@ -663,7 +670,7 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
         );
         call(
             handle,
-            json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
         );
     }
     for handle in [author, holder, reader, empty_holder] {
@@ -680,7 +687,7 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     );
     let publication = call(
         author,
-        json!({"op":"adopt_publication","snapshot":publication["snapshot"]}),
+        json!({"op":"adopt_publication","candidate":publication["candidate"]}),
     );
     assert_eq!(publication["sequence"], 1);
     let expires_at = SystemTime::now()
@@ -698,12 +705,13 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     );
     let current = call(
         author,
-        json!({"op":"adopt_publication","snapshot":current["snapshot"]}),
+        json!({"op":"adopt_publication","candidate":current["candidate"]}),
     );
     assert_eq!(current["sequence"], 2);
     let holder_member = first["joined_member"].clone();
     let reader_member = second["joined_member"].clone();
-    let saved_author = call(author, json!({"op":"seal_workspace"}));
+    // Storage keeps the author's state from here; serving recovery below
+    // does not change it.
 
     connect(holder, author);
     let author_info: Value = serde_json::from_str(&describe(author).unwrap()).unwrap();
@@ -724,7 +732,7 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     );
     call(
         holder,
-        json!({"op":"adopt_recovery","snapshot":retained["snapshot"]}),
+        json!({"op":"adopt_recovery","candidate":retained["candidate"]}),
     );
     call(
         holder,
@@ -739,17 +747,15 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     let retained = call(holder, json!({"op":"stage_current_view"}));
     call(
         holder,
-        json!({"op":"adopt_current_view","snapshot":retained["snapshot"]}),
+        json!({"op":"adopt_current_view","candidate":retained["candidate"]}),
     );
-    let saved = call(holder, json!({"op":"seal_workspace"}));
     close(holder).unwrap();
     close(author).unwrap();
 
-    let holder = create(Some(&[92; 32])).unwrap();
+    let holder = common::stored(&[92; 32], &holder_storage);
     call(
         holder,
-        json!({"op":"restore_workspace","workspace":created["workspace"],
-            "snapshot":saved["snapshot"]}),
+        json!({"op":"restore_workspace","workspace":created["workspace"]}),
     );
     call(
         holder,
@@ -817,7 +823,7 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     assert_eq!(recovered["publication_count"], 1);
     call(
         reader,
-        json!({"op":"adopt_recovery","snapshot":recovered["snapshot"]}),
+        json!({"op":"adopt_recovery","candidate":recovered["candidate"]}),
     );
     let pending = call(reader, json!({"op":"poll_pending_object"}));
     assert_eq!(pending["payload"], json!([42]));
@@ -836,14 +842,12 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
         call(reader, json!({"op":"stage_recovery_range"}))["state"],
         "recovery_already_covered"
     );
-    let saved_reader = call(reader, json!({"op":"seal_workspace"}));
     close(reader).unwrap();
 
-    let reader = create(Some(&[93; 32])).unwrap();
+    let reader = common::stored(&[93; 32], &reader_storage);
     call(
         reader,
-        json!({"op":"restore_workspace","workspace":created["workspace"],
-            "snapshot":saved_reader["snapshot"]}),
+        json!({"op":"restore_workspace","workspace":created["workspace"]}),
     );
     call(
         reader,
@@ -881,7 +885,7 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     );
     call(
         reader,
-        json!({"op":"adopt_reception","snapshot":acknowledged["snapshot"]}),
+        json!({"op":"adopt_reception","candidate":acknowledged["candidate"]}),
     );
 
     let started = call(
@@ -898,7 +902,7 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     assert_eq!(staged["pending"], 1);
     call(
         reader,
-        json!({"op":"adopt_current_view","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_current_view","candidate":staged["candidate"]}),
     );
     let current = call(reader, json!({"op":"poll_pending_object"}));
     assert_eq!(current["payload"], json!([43]));
@@ -910,14 +914,13 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     );
     call(
         reader,
-        json!({"op":"adopt_reception","snapshot":acknowledged["snapshot"]}),
+        json!({"op":"adopt_reception","candidate":acknowledged["candidate"]}),
     );
 
-    let author = create(Some(&[91; 32])).unwrap();
+    let author = common::stored(&[91; 32], &author_storage);
     call(
         author,
-        json!({"op":"restore_workspace","workspace":created["workspace"],
-            "snapshot":saved_author["snapshot"]}),
+        json!({"op":"restore_workspace","workspace":created["workspace"]}),
     );
     let removal = call(
         author,
@@ -925,7 +928,7 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     );
     let removal = call(
         author,
-        json!({"op":"adopt_admission","snapshot":removal["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":removal["candidate"]}),
     );
     let accepted = call(
         reader,
@@ -933,7 +936,7 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     );
     call(
         reader,
-        json!({"op":"adopt_admission","snapshot":accepted["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":accepted["candidate"]}),
     );
     call(
         reader,
@@ -963,13 +966,11 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
         .unwrap_err(),
         "recovery peer is not a current member"
     );
-    let saved_reader = call(reader, json!({"op":"seal_workspace"}));
     close(reader).unwrap();
-    let reader = create(Some(&[93; 32])).unwrap();
+    let reader = common::stored(&[93; 32], &reader_storage);
     call(
         reader,
-        json!({"op":"restore_workspace","workspace":created["workspace"],
-            "snapshot":saved_reader["snapshot"]}),
+        json!({"op":"restore_workspace","workspace":created["workspace"]}),
     );
     call(
         reader,

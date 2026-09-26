@@ -1,7 +1,9 @@
 //! ADR step 4: `next_event` end to end for the workspace events. A member
 //! waits only on `next_event` while its peer serves requests; each event
 //! kind must arrive for the work that makes it.
-use arachne_runtime::{close, create, describe, execute, next_event};
+use arachne_runtime::{close, describe, execute, next_event};
+
+mod common;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,7 +37,7 @@ fn admit(author: i64, joiner: i64, invite: &Value, name: &str) -> Value {
         json!({"op":"stage_admission","authenticated_endpoint":begin["endpoint"],
             "request":begin["admission_request"]}),
     );
-    call(author, json!({"op":"adopt_admission","snapshot":staged["snapshot"]}));
+    call(author, json!({"op":"adopt_admission","candidate":staged["candidate"]}));
     call(
         author,
         json!({"op":"retained_admission","authenticated_endpoint":begin["endpoint"],
@@ -47,7 +49,7 @@ fn admit(author: i64, joiner: i64, invite: &Value, name: &str) -> Value {
 fn drain_protected(handle: i64) {
     let staged = call(handle, json!({"op":"poll_protected"}));
     if !staged.is_null() {
-        call(handle, json!({"op":"adopt_reception","snapshot":staged["snapshot"]}));
+        call(handle, json!({"op":"adopt_reception","candidate":staged["candidate"]}));
     }
 }
 
@@ -81,12 +83,12 @@ fn wait_for(handle: i64, wanted: &str, seen: &mut Vec<String>) {
 
 #[test]
 fn next_event_reports_every_workspace_event_kind() {
-    let author = create(Some(&[141; 32])).unwrap();
-    let holder = create(Some(&[142; 32])).unwrap();
-    let late = create(Some(&[143; 32])).unwrap();
+    let author = common::stored(&[141; 32], &arachne_runtime::MemoryProvider::default());
+    let holder = common::stored(&[142; 32], &arachne_runtime::MemoryProvider::default());
+    let late = common::stored(&[143; 32], &arachne_runtime::MemoryProvider::default());
     let created = call(author, json!({"op":"create_workspace","display_name":"Author"}));
     let staged = call(author, json!({"op":"stage_invitation","personal":false,"expires_at":0}));
-    let invite = call(author, json!({"op":"adopt_admission","snapshot":staged["snapshot"]}))
+    let invite = call(author, json!({"op":"adopt_admission","candidate":staged["candidate"]}))
         ["issued_invitation"]
         .clone();
     let reply = admit(author, holder, &invite, "Holder");
@@ -95,7 +97,7 @@ fn next_event_reports_every_workspace_event_kind() {
         json!({"op":"stage_join","welcome":reply["welcome"],
             "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}),
     );
-    call(holder, json!({"op":"adopt_join","snapshot":staged["snapshot"]}));
+    call(holder, json!({"op":"adopt_join","candidate":staged["candidate"]}));
     connect(author, holder);
     connect(holder, author);
     let epoch = call(author, json!({"op":"member_roster"}))["epoch"].as_u64().unwrap();
@@ -134,7 +136,7 @@ fn next_event_reports_every_workspace_event_kind() {
         json!({"op":"stage_network_publication","revision":revision,
             "topic":EVENT,"id":vec![1;16],"payload":[42]}),
     );
-    call(author, json!({"op":"adopt_publication","snapshot":event["snapshot"]}));
+    call(author, json!({"op":"adopt_publication","candidate":event["candidate"]}));
     wait_for(holder, "protected_received", &mut seen);
     drain_protected(holder);
 
@@ -148,8 +150,8 @@ fn next_event_reports_every_workspace_event_kind() {
     assert!(!call(holder, json!({"op":"poll_recovery_range"})).is_null());
     let expires_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600;
     let retained = call(holder, json!({"op":"stage_recovery_range","retain_until":expires_at}));
-    if !retained["snapshot"].is_null() {
-        call(holder, json!({"op":"adopt_recovery","snapshot":retained["snapshot"]}));
+    if !retained["candidate"].is_null() {
+        call(holder, json!({"op":"adopt_recovery","candidate":retained["candidate"]}));
     }
 
     // A current-view repair ends.
@@ -161,7 +163,7 @@ fn next_event_reports_every_workspace_event_kind() {
             "current":{"selector":selector.clone(),"replacement_key":vec![9; 32],
                 "expires_at":expires_at}}),
     );
-    call(author, json!({"op":"adopt_publication","snapshot":current["snapshot"]}));
+    call(author, json!({"op":"adopt_publication","candidate":current["candidate"]}));
     call(
         holder,
         json!({"op":"fetch_current_view","peer":author_info["endpoint_key"],

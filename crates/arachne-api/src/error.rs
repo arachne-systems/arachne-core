@@ -50,6 +50,9 @@ pub enum ErrorCode {
     /// candidate is a staged storage record, and "stale" means its stored
     /// basis moved. Numbers never move, so this is also the stable place.
     CandidateStale = 302,
+    /// Stored data has a format this build does not read: newer than it
+    /// supports, or older than the first supported format (no legacy readers).
+    FormatNotSupported = 303,
     PeerUnreachable = 400,
     Timeout = 401,
     TransportFailed = 402,
@@ -77,6 +80,7 @@ impl ErrorCode {
         Self::StorageFailed,
         Self::StorageCorrupt,
         Self::CandidateStale,
+        Self::FormatNotSupported,
         Self::PeerUnreachable,
         Self::Timeout,
         Self::TransportFailed,
@@ -109,6 +113,7 @@ impl ErrorCode {
             300 => Self::StorageFailed,
             301 => Self::StorageCorrupt,
             302 => Self::CandidateStale,
+            303 => Self::FormatNotSupported,
             400 => Self::PeerUnreachable,
             401 => Self::Timeout,
             402 => Self::TransportFailed,
@@ -138,6 +143,7 @@ impl ErrorCode {
             Self::StorageFailed => "storage_failed",
             Self::StorageCorrupt => "storage_corrupt",
             Self::CandidateStale => "candidate_stale",
+            Self::FormatNotSupported => "format_not_supported",
             Self::PeerUnreachable => "peer_unreachable",
             Self::Timeout => "timeout",
             Self::TransportFailed => "transport_failed",
@@ -182,7 +188,7 @@ impl<'de> Deserialize<'de> for ErrorCode {
 ///
 /// | Variant         | Codes                                              |
 /// | --------------- | -------------------------------------------------- |
-/// | `Storage`       | 300-399 (`StorageFailed`, `StorageCorrupt`, `CandidateStale`) |
+/// | `Storage`       | 300-399 (`StorageFailed`, `StorageCorrupt`, `CandidateStale`, `FormatNotSupported`) |
 /// | `Transport`     | 400-499                                            |
 /// | `Authorization` | 500-599                                            |
 /// | `State`         | `WrongState`, `Unsupported`, 600-699               |
@@ -374,7 +380,10 @@ impl ApiError {
         use ErrorCode as C;
         match self {
             Self::Storage { code, .. } => {
-                matches!(code, C::StorageFailed | C::StorageCorrupt | C::CandidateStale)
+                matches!(
+                    code,
+                    C::StorageFailed | C::StorageCorrupt | C::CandidateStale | C::FormatNotSupported
+                )
             }
             Self::Transport { code, .. } => {
                 matches!(code, C::PeerUnreachable | C::Timeout | C::TransportFailed)
@@ -437,7 +446,7 @@ impl ApiError {
                 limit: 0,
                 detail,
             },
-            C::StorageFailed | C::StorageCorrupt | C::CandidateStale => {
+            C::StorageFailed | C::StorageCorrupt | C::CandidateStale | C::FormatNotSupported => {
                 Self::Storage { code, detail }
             }
             C::PeerUnreachable | C::Timeout | C::TransportFailed => Self::Transport {
@@ -513,6 +522,10 @@ impl ApiError {
         Self::new(ErrorCode::CandidateStale, detail)
     }
 
+    pub fn format_not_supported(detail: impl Into<String>) -> Self {
+        Self::new(ErrorCode::FormatNotSupported, detail)
+    }
+
     pub fn peer_unreachable(peer: Option<EndpointId>, detail: impl Into<String>) -> Self {
         Self::transport(ErrorCode::PeerUnreachable, peer, detail)
     }
@@ -576,7 +589,7 @@ mod tests {
         match code {
             Closed | Cancelled | DeadlineExceeded | InvalidInput | InvalidId | WrongState
             | Unsupported | CapacityExceeded | LimitReached | StorageFailed | StorageCorrupt
-            | CandidateStale | PeerUnreachable | Timeout | TransportFailed | NotAuthorized
+            | CandidateStale | FormatNotSupported | PeerUnreachable | Timeout | TransportFailed | NotAuthorized
             | InvitationInvalid | InvitationExpired | NotMember | EpochMismatch
             | PolicyMismatch | Internal => ErrorCode::ALL.contains(&code),
         }
@@ -591,6 +604,6 @@ mod tests {
             }
         }
         assert!(ErrorCode::ALL.windows(2).all(|w| w[0] < w[1]));
-        assert_eq!(ErrorCode::ALL.len(), 22);
+        assert_eq!(ErrorCode::ALL.len(), 23);
     }
 }

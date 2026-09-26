@@ -71,7 +71,13 @@ fn probe(session: &Session) -> Probe {
         busy: crate::ops::admission_busy(session),
         controls: session.node.has_queued_controls() || session.node.has_deferred_controls(),
         admissions: !session.admission.queue.is_empty(),
-        membership: session.node.has_membership_gossip(),
+        membership: session.node.has_membership_gossip()
+            || crate::membership::fork::has_carried_work(session)
+            || session.membership.fork.has_result()
+            || session.membership.update.as_ref().is_some_and(|job| job.task.is_finished())
+            || session.membership.offer.as_ref().is_some_and(|job| job.task.is_finished())
+            || session.membership.range_pull.as_ref().is_some_and(|job| job.task.is_finished())
+            || session.membership.profile_pull.as_ref().is_some_and(|job| job.task.is_finished()),
         deliveries: !session.receiver.is_empty(),
         workspace: session.workspace.is_some(),
         recovery: recovery.ready_range.is_some()
@@ -92,7 +98,12 @@ fn probe(session: &Session) -> Probe {
             || recovery.direct_range.is_some()
             || recovery.current_view.is_some()
             || session.interests.is_running()
-            || session.presence.in_flight_count() != 0,
+            || session.presence.in_flight_count() != 0
+            || session.membership.fork.is_running()
+            || session.membership.update.is_some()
+            || session.membership.offer.is_some()
+            || session.membership.range_pull.is_some()
+            || session.membership.profile_pull.is_some(),
     }
 }
 

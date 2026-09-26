@@ -149,14 +149,6 @@ pub(crate) struct StageJoinArgs {
     pub welcome: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RestorePendingJoinArgs {
-    pub workspace: [u8; 32],
-    #[serde(default)]
-    pub snapshot: Vec<u8>,
-}
-
 /// A pending join: the joiner's identity and its admission request.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct PendingJoinInfo {
@@ -181,18 +173,13 @@ pub(crate) struct CheckpointFound {
     pub peer: [u8; 32],
 }
 
-/// Sealed state for a host that does not use native storage.
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct Sealed {
-    pub workspace: [u8; 32],
-    pub snapshot: Vec<u8>,
-}
-
 /// A join candidate that awaits the host's save.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct StagedJoin {
     pub workspace: [u8; 32],
     pub workspace_name: Option<String>,
+    /// The opaque candidate token; adopt it with the matching adopt op.
+    #[serde(rename = "candidate")]
     pub snapshot: Vec<u8>,
     pub state: &'static str,
     pub durable: bool,
@@ -227,58 +214,21 @@ pub(crate) fn begin(session: &mut Session, args: BeginJoinArgs) -> Result<Pendin
     transition_activity(session, WorkspacePhase::Joining, None)?;
     let mut value = pending_metadata(&pending, session.node.id())?;
     value.activity = Some(activity_view(session));
-    session.join.pending = Some(pending);
-    session.join.lifecycle = if args.peers.is_empty() {
+    let lifecycle = if args.peers.is_empty() {
         None
     } else {
         Some(JoinLifecycle::new(args.peers)?)
     };
-    session.join.history_prefix.clear();
-    Ok(value)
-}
-
-pub(crate) fn seal_pending(session: &mut Session) -> Result<Sealed, ApiError> {
-    let pending = session
-        .join
-        .pending
-        .as_ref()
-        .ok_or_else(errors::no_pending_join)?;
-    let key = session
-        .storage_key
-        .as_ref()
-        .ok_or_else(errors::no_root_key)?;
-    Ok(Sealed {
-        workspace: pending.workspace_id(),
-        snapshot: pending
-            .seal(key)
-            .map_err(security(ErrorCode::StorageFailed))?,
-    })
-}
-
-pub(crate) fn restore_pending(
-    session: &mut Session,
-    args: RestorePendingJoinArgs,
-) -> Result<PendingJoinInfo, ApiError> {
-    if session.workspace.is_some() || session.join.pending.is_some() {
-        return Err(ApiError::wrong_state("session already owns workspace state"));
-    }
-    let key = session
-        .storage_key
-        .as_ref()
-        .ok_or_else(errors::no_root_key)?;
-    let pending = arachne_security::PendingJoin::restore(
-        key,
-        session.node.id(),
-        args.workspace,
-        &args.snapshot,
-    )
-    .map_err(security(ErrorCode::StorageCorrupt))?;
-    let mut value = pending_metadata(&pending, session.node.id())?;
-    transition_activity(session, WorkspacePhase::Joining, None)?;
-    value.activity = Some(activity_view(session));
     session.join.pending = Some(pending);
-    session.join.lifecycle = None;
+    session.join.lifecycle = lifecycle;
     session.join.history_prefix.clear();
+    // The pending join is durable before any request leaves.
+    if let Err(error) = persistence::commit_begun_join(session) {
+        session.join = Default::default();
+        session.activity = crate::WorkspaceActivity::default();
+        return Err(error);
+    }
+    value.durable = true;
     Ok(value)
 }
 
@@ -314,10 +264,6 @@ pub(crate) fn stage(session: &mut Session, args: StageJoinArgs) -> Result<Staged
         .pending
         .as_ref()
         .ok_or_else(errors::no_pending_join)?;
-    let key = session
-        .storage_key
-        .as_ref()
-        .ok_or_else(errors::no_root_key)?;
     let mut proof = pending
         .join_proof()
         .map_err(security(ErrorCode::InvitationInvalid))?;
@@ -342,7 +288,7 @@ pub(crate) fn stage(session: &mut Session, args: StageJoinArgs) -> Result<Staged
     let workspace = pending
         .prepare_workspace(&proof, &welcome)
         .map_err(security(ErrorCode::InvalidInput))?;
-    let snapshot = seal_state(session.records.is_some(), &workspace, key, None, None)?;
+    let snapshot = seal_state(session.records.is_some())?;
     let workspace_id = workspace.id();
     let workspace_name = workspace
         .workspace_name()
@@ -768,7 +714,7 @@ pub(crate) fn drive(session: &mut Session) -> Result<Value, ApiError> {
         let joined = {
             let session = live_mut(session)?;
             ops::nested(session, Op::AdoptJoin, |session| {
-                candidate::adopt_join(session, AdoptArgs { snapshot })
+                candidate::adopt_join(session, AdoptArgs { candidate: snapshot })
             })?
         };
         let mut joined = serde_json::to_value(joined).map_err(errors::encode)?;

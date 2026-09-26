@@ -1,6 +1,6 @@
 use arachne_runtime::{
-    Client, ClientConfig, ErrorKind, JoinAdmissionStep, MemberKind, Network, PeerPolicy, Presence,
-    ReceivedProtectedPublication, RecoveryRangeRequest, RecoveryRangeStatus, WorkspacePhase,
+    Client, ClientConfig, ErrorCode, ErrorKind, JoinAdmissionStep, MemoryProvider, Network,
+    ReceivedProtectedPublication, StorageConfig,
 };
 use std::{
     fs,
@@ -14,32 +14,28 @@ fn typed_clients_persist_authenticated_inbox_objects_before_acknowledging() {
     let reader_secret = [32; 32];
     let owner_root = [131; 32];
     let reader_root = [132; 32];
+    let owner_store = common::directory();
+    let reader_store = common::directory();
     let owner_config = ClientConfig {
         network: Network::Direct,
         secret: Some(owner_secret),
         transport: Default::default(),
+        storage: Some(StorageConfig::sqlite(owner_store.path(), owner_root)),
     };
     let reader_config = ClientConfig {
         network: Network::Direct,
         secret: Some(reader_secret),
         transport: Default::default(),
+        storage: Some(StorageConfig::sqlite(reader_store.path(), reader_root)),
     };
-    let mut owner = Client::open(owner_config.clone()).unwrap();
+    let owner = Client::open(owner_config.clone()).unwrap();
     let mut reader = Client::open(reader_config.clone()).unwrap();
-    let owner_store = common::directory();
-    let reader_store = common::directory();
-    let owner_database = owner_store.path().join("workspace.db");
-    let reader_database = reader_store.path().join("workspace.db");
 
     let workspace = owner
         .create_workspace("Owner", Some("Object inbox proof"))
         .unwrap();
-    owner
-        .enable_record_storage(&owner_database, &owner_root)
-        .unwrap();
     let invitation = owner.stage_invitation(0).unwrap();
-    owner.save_candidate(&invitation.snapshot).unwrap();
-    let invitation = owner.adopt_invitation(&invitation.snapshot).unwrap();
+    let invitation = owner.adopt_invitation(&invitation).unwrap();
     reader
         .add_address_hint(
             invitation.peer,
@@ -49,14 +45,10 @@ fn typed_clients_persist_authenticated_inbox_objects_before_acknowledging() {
     let join = reader
         .begin_join(&invitation.invitation, &invitation.checkpoint, "Reader")
         .unwrap();
-    reader
-        .enable_record_storage(&reader_database, &reader_root)
-        .unwrap();
     let candidate = owner
         .stage_admission(join.endpoint, &join.admission_request)
         .unwrap();
-    owner.save_candidate(&candidate.snapshot).unwrap();
-    let joined_owner = owner.adopt_admission(&candidate.snapshot).unwrap();
+    let joined_owner = owner.adopt_admission(&candidate).unwrap();
     let reply = owner
         .retained_admission(join.endpoint, &join.admission_request)
         .unwrap();
@@ -69,8 +61,7 @@ fn typed_clients_persist_authenticated_inbox_objects_before_acknowledging() {
             }],
         )
         .unwrap();
-    reader.save_candidate(&candidate.snapshot).unwrap();
-    let joined_reader = reader.adopt_join(&candidate.snapshot).unwrap();
+    let joined_reader = reader.adopt_join(&candidate).unwrap();
     assert_eq!(joined_owner.epoch, joined_reader.epoch);
 
     let reader_endpoint = reader.endpoint().unwrap();
@@ -104,7 +95,7 @@ fn typed_clients_persist_authenticated_inbox_objects_before_acknowledging() {
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    // The legacy MLS publication path remains available before inbox cutover.
+    // Protected objects also use the normal Iroh data path before MoQ is enabled.
     let ordinary_payload = b"ordinary protected publication".to_vec();
     let candidate = owner
         .stage_protected_publication(
@@ -115,10 +106,7 @@ fn typed_clients_persist_authenticated_inbox_objects_before_acknowledging() {
             ordinary_payload.clone(),
         )
         .unwrap();
-    owner.save_candidate(&candidate.snapshot).unwrap();
-    let delivered = owner
-        .adopt_protected_publication(&candidate.snapshot)
-        .unwrap();
+    let delivered = owner.adopt_protected_publication(&candidate).unwrap();
     assert!(
         delivered.failed.is_empty(),
         "ordinary protected delivery: {delivered:?}"
@@ -135,15 +123,11 @@ fn typed_clients_persist_authenticated_inbox_objects_before_acknowledging() {
         );
         std::thread::sleep(Duration::from_millis(5));
     };
-    reader.save_candidate(&candidate.snapshot).unwrap();
-    reader
-        .adopt_protected_reception(&candidate.snapshot)
-        .unwrap();
+    reader.adopt_protected_reception(&candidate).unwrap();
     let ordinary = reader.poll_pending_object().unwrap().unwrap();
     assert_eq!(ordinary.payload, ordinary_payload);
     let ack = reader.stage_object_acknowledgement(&ordinary).unwrap();
-    reader.save_candidate(&ack.snapshot).unwrap();
-    reader.adopt_protected_reception(&ack.snapshot).unwrap();
+    reader.adopt_protected_reception(&ack).unwrap();
 
     #[cfg(feature = "moq")]
     {
@@ -192,10 +176,7 @@ fn typed_clients_persist_authenticated_inbox_objects_before_acknowledging() {
             payload.clone(),
         )
         .unwrap();
-    owner.save_candidate(&candidate.snapshot).unwrap();
-    let delivered = owner
-        .adopt_protected_publication(&candidate.snapshot)
-        .unwrap();
+    let delivered = owner.adopt_protected_publication(&candidate).unwrap();
     assert!(
         delivered.failed.is_empty(),
         "object protected delivery: {delivered:?}"
@@ -212,10 +193,7 @@ fn typed_clients_persist_authenticated_inbox_objects_before_acknowledging() {
         );
         std::thread::sleep(Duration::from_millis(5));
     };
-    reader.save_candidate(&candidate.snapshot).unwrap();
-    reader
-        .adopt_protected_reception(&candidate.snapshot)
-        .unwrap();
+    reader.adopt_protected_reception(&candidate).unwrap();
     let pending = reader.poll_pending_object().unwrap().unwrap();
     assert_eq!(pending.workspace, workspace.workspace);
     assert_eq!(pending.revision, revision);
@@ -233,23 +211,16 @@ fn typed_clients_persist_authenticated_inbox_objects_before_acknowledging() {
 
     reader.close().unwrap();
     reader = Client::open(reader_config.clone()).unwrap();
-    reader
-        .restore_record_storage(&reader_database, &reader_root, workspace.workspace)
-        .unwrap();
+    reader.restore_workspace(workspace.workspace, None).unwrap();
     let restored: ReceivedProtectedPublication = reader.poll_pending_object().unwrap().unwrap();
     assert_eq!(restored, pending);
     assert_eq!(fs::read(&recording).unwrap(), payload);
 
     let candidate = reader.stage_object_acknowledgement(&restored).unwrap();
-    reader.save_candidate(&candidate.snapshot).unwrap();
-    reader
-        .adopt_protected_reception(&candidate.snapshot)
-        .unwrap();
+    reader.adopt_protected_reception(&candidate).unwrap();
     reader.close().unwrap();
     reader = Client::open(reader_config).unwrap();
-    reader
-        .restore_record_storage(&reader_database, &reader_root, workspace.workspace)
-        .unwrap();
+    reader.restore_workspace(workspace.workspace, None).unwrap();
     assert!(reader.poll_pending_object().unwrap().is_none());
 
     reader.close().unwrap();
@@ -257,39 +228,37 @@ fn typed_clients_persist_authenticated_inbox_objects_before_acknowledging() {
 }
 
 #[test]
-fn typed_inbox_is_available_for_durable_and_ephemeral_clients() {
-    let mut ephemeral = Client::open(ClientConfig {
+fn typed_inbox_requires_native_storage_and_survives_restart() {
+    let ephemeral = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([33; 32]),
         transport: Default::default(),
+        storage: None,
     })
     .unwrap();
-    ephemeral.create_workspace("Ephemeral", None).unwrap();
-    assert!(ephemeral.poll_pending_object().unwrap().is_none());
+    assert_eq!(
+        ephemeral
+            .create_workspace("Ephemeral", None)
+            .unwrap_err()
+            .code(),
+        ErrorCode::WrongState
+    );
     ephemeral.close().unwrap();
 
-    let secret = [34; 32];
-    let root = [134; 32];
-    let mut durable = Client::open(ClientConfig {
-        network: Network::Direct,
-        secret: Some(secret),
-        transport: Default::default(),
-    })
-    .unwrap();
-    let workspace = durable.create_workspace("Durable", None).unwrap();
     let store = common::directory();
-    let database = store.path().join("workspace.db");
-    durable.enable_record_storage(&database, &root).unwrap();
+    let config = ClientConfig {
+        network: Network::Direct,
+        secret: Some([34; 32]),
+        transport: Default::default(),
+        storage: Some(StorageConfig::sqlite(store.path(), [134; 32])),
+    };
+    let durable = Client::open(config.clone()).unwrap();
+    let workspace = durable.create_workspace("Durable", None).unwrap();
     durable.close().unwrap();
 
-    let mut durable = Client::open(ClientConfig {
-        network: Network::Direct,
-        secret: Some(secret),
-        transport: Default::default(),
-    })
-    .unwrap();
+    let durable = Client::open(config).unwrap();
     durable
-        .restore_record_storage(&database, &root, workspace.workspace)
+        .restore_workspace(workspace.workspace, None)
         .unwrap();
     assert!(durable.poll_pending_object().unwrap().is_none());
     durable.close().unwrap();
@@ -297,33 +266,27 @@ fn typed_inbox_is_available_for_durable_and_ephemeral_clients() {
 
 #[test]
 fn failed_object_save_prevents_adoption_and_further_publication() {
-    let secret = [35; 32];
-    let root = [135; 32];
-    let mut client = Client::open(ClientConfig {
+    let provider = MemoryProvider::default();
+    let client = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some(secret),
+        secret: Some([35; 32]),
         transport: Default::default(),
+        storage: Some(StorageConfig::memory(&provider)),
     })
     .unwrap();
     let workspace = client.create_workspace("Owner", None).unwrap();
-    let store = common::directory();
-    client
-        .enable_record_storage(&store.path().join("workspace.db"), &root)
-        .unwrap();
     let candidate = client
         .stage_protected_publication(workspace.workspace, 1, "streams/example", [2; 16], vec![1])
         .unwrap();
-    let mut invalid = candidate.snapshot.clone();
-    *invalid.last_mut().unwrap() ^= 1;
+    provider.fail_next_commit();
     assert_eq!(
-        client.save_candidate(&invalid).unwrap_err().kind(),
+        client
+            .adopt_protected_publication(&candidate)
+            .unwrap_err()
+            .kind(),
         ErrorKind::Storage
     );
-    assert!(
-        client
-            .adopt_protected_publication(&candidate.snapshot)
-            .is_err()
-    );
+    assert!(client.adopt_protected_publication(&candidate).is_err());
     assert!(
         client
             .stage_protected_publication(

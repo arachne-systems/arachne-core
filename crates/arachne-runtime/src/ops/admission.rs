@@ -43,6 +43,8 @@ const ADMISSION_RESULT_OFFER: &[u8; 5] = b"DFAR\x01";
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct StagedAdmission {
     pub workspace: [u8; 32],
+    /// The opaque candidate token; adopt it with the matching adopt op.
+    #[serde(rename = "candidate")]
     pub snapshot: Vec<u8>,
     pub state: &'static str,
     pub durable: bool,
@@ -331,7 +333,11 @@ pub(crate) fn poll(session: &mut Session, args: PollAdmissionArgs) -> Result<Val
         let offered = membership::receive_offer(session, incoming.payload());
         return match offered {
             Ok(value) => {
-                session.transition.inbound = Some(incoming);
+                if session.transition.staged.is_some() || session.transition.removal.is_some() {
+                    session.transition.inbound = Some(incoming);
+                } else {
+                    let _ = incoming.respond(vec![1]);
+                }
                 Ok(value)
             }
             Err(_) => {
@@ -348,6 +354,18 @@ pub(crate) fn poll(session: &mut Session, args: PollAdmissionArgs) -> Result<Val
         let accepted = reply.is_ok();
         let _ = incoming.respond(reply.unwrap_or_default());
         return Ok(json!({"state":"invitation_checkpoint_replied","accepted":accepted}));
+    }
+    if incoming
+        .payload()
+        .starts_with(membership::wire::BRANCH_QUERY)
+    {
+        let reply = membership::fork::reply(
+            session.workspace.as_deref(),
+            incoming.peer(),
+            incoming.payload(),
+        );
+        let _ = incoming.respond(reply);
+        return Ok(json!({"state":"membership_replied", "remote_receipt":false}));
     }
     if incoming
         .payload()
@@ -498,15 +516,21 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
         && session.transition.inbound.is_none()
         && session.transition.removal.is_none()
     {
-        Some(ops::nested(session, Op::PollWorkspacePresence, |session| {
-            ops::membership::poll_presence(session, ops::membership::PresenceArgs { announce: false })
-        })?)
+        Some(ops::nested(
+            session,
+            Op::PollWorkspacePresence,
+            |session| {
+                ops::membership::poll_presence(
+                    session,
+                    ops::membership::PresenceArgs { announce: false },
+                )
+            },
+        )?)
     } else {
         None
     };
     let mut result = drive_workspace_step(session)?;
-    result["presence"] =
-        serde_json::to_value(presence).map_err(|error| ApiError::internal(error.to_string()))?;
+    result["presence"] = serde_json::to_value(presence).map_err(errors::encode)?;
     Ok(result)
 }
 
@@ -516,17 +540,7 @@ fn drive_workspace_step(session: &mut Session) -> Result<Value, ApiError> {
             "workspace lifecycle requires native record storage",
         ));
     }
-    // This member's self-update offer: adopt once an administrator adopted
-    // it, or drop it when refused (B3c).
     let now = std::time::Instant::now();
-    match membership::finish_self_update_offer(live_mut(session)?, now) {
-        Some(true) => return commit_self_update(session, now),
-        Some(false) => {
-            return Ok(json!({"state":"self_update_refused",
-                "activity":activity_value(live(session)?)}));
-        }
-        None => {}
-    }
     let mut staged = ops::nested(session, Op::PollAdmission, |session| {
         poll(session, PollAdmissionArgs { profile: false })
     })?;
@@ -551,12 +565,6 @@ fn drive_workspace_step(session: &mut Session) -> Result<Value, ApiError> {
             staged["activity"] = activity_value(live(session)?);
             return Ok(staged);
         }
-        // The staged self-update waits for its administrator; membership
-        // queries wait until it is adopted or dropped.
-        if membership::self_update_pending(live(session)?) {
-            return Ok(json!({"state":"self_update_pending",
-                "activity":activity_value(live(session)?)}));
-        }
         let membership = ops::nested(live_mut(session)?, Op::PollMembershipUpdate, |session| {
             ops::membership::poll_update(session)
         })?;
@@ -569,7 +577,10 @@ fn drive_workspace_step(session: &mut Session) -> Result<Value, ApiError> {
                 let step = serde_json::from_value(membership["step"].clone())
                     .map_err(|_| ApiError::transport_failed(None, "invalid membership step"))?;
                 let change = ops::nested(session, Op::StageAdmissionUpdate, |session| {
-                    management::stage_admission_update(session, management::AdmissionUpdateArgs { step })
+                    management::stage_admission_update(
+                        session,
+                        management::AdmissionUpdateArgs { step },
+                    )
                 })?;
                 let snapshot = match change {
                     management::StagedChange::Candidate(candidate) => candidate.snapshot,
@@ -637,20 +648,13 @@ fn drive_workspace_step(session: &mut Session) -> Result<Value, ApiError> {
             return Ok(membership);
         }
         // Nothing else to do this tick: a self-update, when one is due.
-        if !membership::self_update_pending(live(session)?)
-            && let Some(started) = membership::start_self_update(live_mut(session)?, now)?
-        {
-            if started["state"] == "awaiting_save" {
-                return commit_self_update(session, now);
-            }
-            let mut started = started;
-            started["activity"] = activity_value(live(session)?);
-            return Ok(started);
+        if membership::start_self_update(live_mut(session)?, now)? {
+            return commit_self_update(session, now);
         }
         staged["activity"] = activity_value(live(session)?);
         return Ok(staged);
     }
-    let snapshot: Vec<u8> = serde_json::from_value(staged["snapshot"].clone())
+    let snapshot: Vec<u8> = serde_json::from_value(staged["candidate"].clone())
         .map_err(|_| ApiError::internal("workspace candidate snapshot is invalid"))?;
     persistence::commit_candidate(live_mut(session)?, &snapshot)?;
     let mut committed = adopt_admission_value(session, snapshot)?;
@@ -683,7 +687,12 @@ fn commit_self_update(session: &mut Session, now: std::time::Instant) -> Result<
 fn adopt_admission_value(session: &mut Session, snapshot: Vec<u8>) -> Result<Value, ApiError> {
     let session = live_mut(session)?;
     let adopted = ops::nested(session, Op::AdoptAdmission, |session| {
-        candidate::adopt_admission(session, candidate::AdoptArgs { snapshot })
+        candidate::adopt_admission(
+            session,
+            candidate::AdoptArgs {
+                candidate: snapshot,
+            },
+        )
     })?;
     serde_json::to_value(adopted).map_err(errors::encode)
 }
@@ -753,18 +762,8 @@ fn stage_admission_workspace(
     workspace: arachne_security::Workspace,
     admission_count: usize,
 ) -> Result<StagedAdmission, ApiError> {
-    let key = session
-        .storage_key
-        .as_ref()
-        .ok_or_else(errors::no_root_key)?;
     let (publisher, inbox) = carry_delivery(session, &workspace)?;
-    let snapshot = seal_state(
-        session.records.is_some(),
-        &workspace,
-        key,
-        publisher.as_ref(),
-        inbox.as_ref(),
-    )?;
+    let snapshot = seal_state(session.records.is_some())?;
     let value = StagedAdmission {
         workspace: workspace.id(),
         snapshot: snapshot.clone(),
@@ -958,7 +957,11 @@ fn admission_history_page(
             break;
         }
         // The last step goes with the Welcome when both fit, else alone.
-        let candidates: &[bool] = if next == total { &[true, false] } else { &[false] };
+        let candidates: &[bool] = if next == total {
+            &[true, false]
+        } else {
+            &[false]
+        };
         let mut fits = false;
         for welcome in candidates {
             let encoded = encode_admission_page(reply, steps, offset, next, total, *welcome)?;
@@ -1039,8 +1042,7 @@ pub(crate) fn send_inbound_admission_reply(session: &mut Session) -> Result<Repl
         .as_ref()
         .ok_or_else(errors::no_workspace)?;
     let reply = if incoming.payload().starts_with(b"DFLV") {
-        membership::leave_reply(workspace, incoming.peer(), incoming.payload())
-            ?
+        membership::leave_reply(workspace, incoming.peer(), incoming.payload())?
     } else if incoming.payload().starts_with(b"DFMO")
         || incoming.payload().starts_with(ADMISSION_RESULT_OFFER)
     {
@@ -1184,8 +1186,7 @@ pub(crate) fn admission_offer_candidate(bytes: &[u8]) -> bool {
 
 fn admission_offer_packet(reply: &[u8]) -> Result<Vec<u8>, ApiError> {
     let bound = |detail: &str| ApiError::limit_reached("control request", 32 * 1024, detail);
-    let length =
-        u32::try_from(reply.len()).map_err(|_| bound("admission result is too large"))?;
+    let length = u32::try_from(reply.len()).map_err(|_| bound("admission result is too large"))?;
     if reply.len() > 32 * 1024 - 9 {
         return Err(bound("admission result offer exceeds control bound"));
     }
@@ -1203,7 +1204,8 @@ pub(crate) fn parse_admission_offer(packet: &[u8]) -> Result<(Vec<JoinStep>, Vec
     if length == 0 || packet.len() != 9 + length || packet.len() > 32 * 1024 {
         return Err(bad_packet("invalid admission result offer bounds"));
     }
-    let reply = decode_admission_reply(&packet[9..]).map_err(|_| bad_packet("invalid admission result"))?;
+    let reply =
+        decode_admission_reply(&packet[9..]).map_err(|_| bad_packet("invalid admission result"))?;
     if reply.get("history_page").is_some() {
         return Err(bad_packet("paged admission result requires the retry path"));
     }
@@ -1347,7 +1349,11 @@ fn hold_admission_exchange(
     incoming: arachne_node::ControlRequest,
     checkpoint: Option<Vec<u8>>,
 ) {
-    if let Some(overflow) = session.admission.waiters.hold(attempt, incoming, checkpoint) {
+    if let Some(overflow) = session
+        .admission
+        .waiters
+        .hold(attempt, incoming, checkpoint)
+    {
         let _ = overflow.respond(b"{\"state\":\"admission_queued\"}".to_vec());
     }
 }
@@ -1614,16 +1620,17 @@ fn stage_queued_admission(session: &mut Session) -> Result<Option<Value>, ApiErr
             requeue_admission(session, attempt, queued)?;
         }
         let id = attempt.id();
-        let pending = session
-            .admission
-            .pending_approvals
-            .entry(id)
-            .or_insert(PendingAdmissionApproval {
-                attempt,
-                queued,
-                delivered: false,
-                acknowledged: false,
-            });
+        let pending =
+            session
+                .admission
+                .pending_approvals
+                .entry(id)
+                .or_insert(PendingAdmissionApproval {
+                    attempt,
+                    queued,
+                    delivered: false,
+                    acknowledged: false,
+                });
         pending.delivered = true;
         return Ok(Some(
             json!({"state":admission_state::APPROVAL_REQUESTED,"attempt_id":id,
@@ -1864,7 +1871,8 @@ mod tests {
         let as_json: Vec<Value> = steps
             .iter()
             .map(|step| {
-                let (authorization, commit) = arachne_security::decode_membership_step(step).unwrap();
+                let (authorization, commit) =
+                    arachne_security::decode_membership_step(step).unwrap();
                 membership::step_json(&authorization, &commit)
             })
             .collect();
@@ -1898,7 +1906,10 @@ mod tests {
                     let next = page["history_next"].as_u64().unwrap() as usize;
                     assert_eq!(next, offset + carried.len());
                     let complete = page["history_complete"].as_bool().unwrap();
-                    assert!(next > offset || complete, "offset={offset} limit={limit}: no progress");
+                    assert!(
+                        next > offset || complete,
+                        "offset={offset} limit={limit}: no progress"
+                    );
                     assert_eq!(complete, page.get("welcome").is_some());
                     if complete {
                         assert_eq!(next, steps.len());
@@ -1919,7 +1930,9 @@ mod tests {
             ErrorCode::InvalidInput
         );
         assert_eq!(
-            parse_admission_offer(b"DFAR\x01").err().map(|error| error.code()),
+            parse_admission_offer(b"DFAR\x01")
+                .err()
+                .map(|error| error.code()),
             Some(ErrorCode::InvalidInput)
         );
     }
@@ -1934,7 +1947,8 @@ mod tests {
             let endpoint = |index: usize| crate::test_endpoint(index as u64);
             let key = |index: usize| crate::test_key(index as u64);
             let mut owner = Workspace::create(key(10_000), "Wire-size owner").unwrap();
-            let (registered, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+            let (registered, invitation, checkpoint) =
+                owner.prepare_invitation(0, false, false).unwrap();
             owner = registered.workspace;
             let mut joins = Vec::with_capacity(count);
             let mut requests = Vec::with_capacity(count);

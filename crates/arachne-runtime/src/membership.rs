@@ -4,6 +4,9 @@ use super::*;
 use crate::errors::{self, security};
 use crate::ops::management::{StagedCandidate, StagedChange, StagedRemoval};
 use arachne_api::{ApiError, ErrorCode};
+#[cfg(test)]
+mod fork_tests;
+pub(crate) mod fork;
 pub(crate) mod self_update;
 pub(crate) mod wire;
 pub(super) use wire::encode_reply;
@@ -1281,10 +1284,9 @@ fn poll_with_budget(
             if value["state"] == "membership_current" {
                 let state = agreement(owner, &value)?;
                 if state != "membership_current" {
-                    // A peer disagreement is not authority to replace local state.
-                    return Ok(
-                        json!({"state":state,"workspace":owner.id(),"epoch":owner.epoch(),"peer":pending.peer}),
-                    );
+                    let result = json!({"state":state,"workspace":owner.id(),"epoch":owner.epoch(),"peer":pending.peer});
+                    if state == "membership_branch_mismatch" { fork::start(session, pending.peer); }
+                    return Ok(result);
                 }
             }
             if let Some(profiles) = value.get("profiles") {
@@ -1508,14 +1510,17 @@ pub(super) fn bare_test_session(workspace: impl Into<Arc<arachne_security::Works
         receiver,
         context,
         committed,
-        None,
         presence::Presence::new().unwrap(),
     );
     session.activity = super::WorkspaceActivity {
         phase: super::WorkspacePhase::Active,
         reason: None,
     };
-    session.workspace = Some(workspace.into());
+    // Staging needs record storage; each bare session has its own.
+    let workspace: Arc<arachne_security::Workspace> = workspace.into();
+    session.storage = Some(super::StorageConfig::memory(&arachne_store::MemoryProvider::default()));
+    super::persistence::commit_created(&mut session, &workspace, None, None).unwrap();
+    session.workspace = Some(workspace);
     session
 }
 
@@ -2129,10 +2134,6 @@ pub(super) fn stage_update(
             prepared
         }
     };
-    let key = session
-        .storage_key
-        .as_ref()
-        .ok_or_else(errors::no_root_key)?;
     let prepared = match prepared {
         arachne_security::PreparedManagementUpdate::Active(workspace) => *workspace,
         arachne_security::PreparedManagementUpdate::Removed(removed) => {
@@ -2140,13 +2141,7 @@ pub(super) fn stage_update(
         }
     };
     let (publisher, inbox) = super::carry_delivery(session, &prepared)?;
-    let snapshot = seal_state(
-        session.records.is_some(),
-        &prepared,
-        key,
-        publisher.as_ref(),
-        inbox.as_ref(),
-    )?;
+    let snapshot = seal_state(session.records.is_some())?;
     let value = StagedCandidate::new(
         prepared.id(),
         prepared
@@ -2166,7 +2161,7 @@ pub(super) fn stage_update(
 }
 
 /// Head announcement: workspace, epoch, committing member's endpoint.
-const GOSSIP_HEAD: &[u8] = b"DFMH\x01";
+const GOSSIP_HEAD: &[u8] = b"DFMH\x02";
 /// A range pull that gets no reply gives up after this; pull still recovers.
 /// Longer than the 5 s connect limit, so the logs tell the two apart.
 const RANGE_PULL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2354,6 +2349,7 @@ pub(super) fn note_head(session: &mut Session, head: u64, author: [u8; 32]) {
 /// many members, not all from the owner. Only the head travels by gossip: a
 /// lost announcement is replaced by the next one. Best effort; never blocks.
 pub(super) fn announce_head(session: &mut Session) {
+    fork::announce_orders(session);
     let Some(owner) = session.workspace.as_ref() else {
         return;
     };
@@ -2361,6 +2357,11 @@ pub(super) fn announce_head(session: &mut Session) {
     payload.extend(owner.id());
     payload.extend(owner.epoch().to_be_bytes());
     payload.extend(session.node.id());
+    payload.extend(owner.epoch_fingerprint());
+    let key = owner.epoch().checked_sub(1).and_then(|epoch| owner.branch_key(epoch).ok().flatten());
+    payload.extend(key.map_or([255; arachne_security::FORK_KEY_BYTES], |key| key.to_bytes()));
+    let Ok(signature) = owner.sign_announcement(&payload) else { return };
+    payload.extend(signature);
     let send = session.node.broadcast_membership(owner.id(), payload);
     // A failed broadcast is not an error for the commit: members pull. The
     // outcome is counted (sent / no overlay or no member / failed).
@@ -2385,6 +2386,16 @@ pub(super) fn stage_gossiped_step(session: &mut Session) -> Result<Option<Value>
     while let Some((workspace, payload)) = session.node.poll_membership_gossip() {
         GossipCounts::add(&session.membership.gossip_counts.received);
         if workspace == id
+            && payload.len() > fork::GOSSIP_ORDER.len() + 32
+            && payload.starts_with(fork::GOSSIP_ORDER)
+            && payload[fork::GOSSIP_ORDER.len()..fork::GOSSIP_ORDER.len() + 32] == id
+        {
+            if let Some(staged) = fork::receive_order(session, &payload[fork::GOSSIP_ORDER.len() + 32..])? {
+                return Ok(Some(staged));
+            }
+            continue;
+        }
+        if workspace == id
             && payload.len() > GOSSIP_PROFILE.len() + 32
             && payload.starts_with(GOSSIP_PROFILE)
             && payload[GOSSIP_PROFILE.len()..GOSSIP_PROFILE.len() + 32] == id
@@ -2393,17 +2404,27 @@ pub(super) fn stage_gossiped_step(session: &mut Session) -> Result<Option<Value>
             continue;
         }
         if workspace == id
-            && payload.len() == GOSSIP_HEAD.len() + 72
+            && payload.len() == GOSSIP_HEAD.len() + 72 + 32 + arachne_security::FORK_KEY_BYTES + 64
             && payload.starts_with(GOSSIP_HEAD)
             && payload[GOSSIP_HEAD.len()..GOSSIP_HEAD.len() + 32] == id
         {
             let at = GOSSIP_HEAD.len() + 32;
             let head = u64::from_be_bytes(payload[at..at + 8].try_into().unwrap());
             let author: [u8; 32] = payload[at + 8..at + 40].try_into().unwrap();
+            let signed = payload.len() - 64;
+            let signature = payload[signed..].try_into().unwrap();
+            let owner = session.workspace.as_ref().unwrap();
+            if owner.verify_announcement(author, &payload[..signed], &signature).is_err() { continue }
+            let fingerprint = &payload[at + 40..at + 72];
+            if head == owner.epoch() && fingerprint != owner.epoch_fingerprint() {
+                fork::start(session, author);
+            }
             note_head(session, head, author);
             continue;
         }
     }
+    if let Some(staged) = fork::poll(session)? { return Ok(Some(staged)) }
+    if let Some(staged) = fork::stage_carried(session)? { return Ok(Some(staged)) }
     finish_range_pull(session);
     finish_profile_pull(session);
     session
@@ -2432,8 +2453,12 @@ pub(super) fn stage_gossiped_step(session: &mut Session) -> Result<Option<Value>
             GossipCounts::add(&session.membership.gossip_counts.staged);
             Ok(Some(value))
         }
-        // A step that does not verify is dropped; pull recovers.
+        // A step may name a parent on a competing branch. Ask the peer
+        // for the first divergence before applying any fork choice.
         Err(_) => {
+            if let Some(peer) = session.membership.head.as_ref().and_then(|(_, peers)| peers.first()).copied() {
+                fork::start(session, peer);
+            }
             GossipCounts::add(&session.membership.gossip_counts.rejected);
             Ok(None)
         }
@@ -2847,11 +2872,21 @@ pub(super) fn receive_offer(session: &mut Session, packet: &[u8]) -> Result<Valu
         return Err(ApiError::invalid_input("offer", "invalid membership offer"));
     }
     let owner = session.workspace.as_ref().ok_or_else(|| ApiError::wrong_state("no workspace"))?;
-    if packet[5..37] != owner.id() || packet[37..45] != owner.epoch().to_be_bytes() {
+    let after = u64::from_be_bytes(packet[37..45].try_into().unwrap());
+    if packet[5..37] != owner.id() || after > owner.epoch() {
         return Err(ApiError::epoch_mismatch("membership offer does not extend current epoch"));
     }
     let step = join_step_from_wire(&packet[OFFER_HEADER..])
         .map_err(|_| ApiError::invalid_input("offer", "invalid offered transition"))?;
+    if after < owner.epoch() {
+        let (authorization, commit) = step.parts()?;
+        if owner.branch_key(after).map_err(security(ErrorCode::StorageCorrupt))?
+            == Some(arachne_security::fork_key(&authorization, &commit))
+        {
+            return Err(ApiError::epoch_mismatch("membership offer was already adopted"));
+        }
+        return fork::stage(session, after, step);
+    }
     serde_json::to_value(stage_update(session, step)?).map_err(errors::encode)
 }
 
@@ -2877,16 +2912,7 @@ pub(super) fn stage_prepared(
     // could receive: receivers refuse steps above the transport bound.
     encode_step(&prepared.authorization, &prepared.commit)?;
     let (publisher, inbox) = super::carry_delivery(session, &prepared.workspace)?;
-    let snapshot = seal_state(
-        session.records.is_some(),
-        &prepared.workspace,
-        session
-            .storage_key
-            .as_ref()
-            .ok_or_else(errors::no_root_key)?,
-        publisher.as_ref(),
-        inbox.as_ref(),
-    )?;
+    let snapshot = seal_state(session.records.is_some())?;
     let value = StagedCandidate::new(
         prepared.workspace.id(),
         prepared
@@ -2909,29 +2935,22 @@ pub(super) fn stage_prepared(
     Ok(value)
 }
 
-/// Start this member's self-update when the policy says it is due (B3c,
-/// ADR A2 section 7). Returns `None` when nothing starts.
-///
-/// The member stages its update path commit and offers it to an
-/// administrator, who must adopt it before the member does (the staged
-/// offer handshake). Until fork resolution exists (ADR A2 steps 8-13), a
-/// local self-update that raced an administrator's commit at the same epoch
-/// would strand this member on a losing branch. The only administrator
-/// stages its own and adopts it directly. Only a node that has reached the
-/// newest head it heard starts one.
+/// Stage this member's self-update when it is due (B3c, ADR A2 section 7).
+/// The driver saves and adopts it in the same call before it announces the
+/// committed history. Fork choice resolves a concurrent authorized commit.
+/// A node first catches up to the newest head it has heard.
 pub(crate) fn start_self_update(
     session: &mut Session,
     now: std::time::Instant,
-) -> Result<Option<Value>, ApiError> {
+) -> Result<bool, ApiError> {
     if crate::ops::admission_busy(session)
-        || session.membership.offer.is_some()
         || !session.membership.steps_ahead.is_empty()
         || session.membership.range_pull.is_some()
     {
-        return Ok(None);
+        return Ok(false);
     }
     let Some(owner) = session.workspace.as_ref() else {
-        return Ok(None);
+        return Ok(false);
     };
     if session
         .membership
@@ -2943,69 +2962,14 @@ pub(crate) fn start_self_update(
             .self_update
             .due(now, owner.needs_self_update())
     {
-        return Ok(None);
+        return Ok(false);
     }
-    let own = owner.member().map(|member| member.id());
-    let roster = owner.member_roster().map_err(security(ErrorCode::WrongState))?;
-    let administrator = roster
-        .iter()
-        .any(|member| Some(member.id) == own && member.administrator);
-    let mut admins: Vec<PeerChoice> = roster
-        .iter()
-        .filter(|member| member.administrator && Some(member.id) != own)
-        .map(|member| PeerChoice {
-            endpoint: member.endpoint,
-            preferred: presence::contact_age(&session.presence, member.endpoint, now)
-                .is_some_and(|age| age < MEMBERSHIP_PEER_RECENT),
-            cooling: session
-                .membership
-                .peer_failures
-                .get(&member.endpoint)
-                .is_some_and(|failed| {
-                    now.saturating_duration_since(*failed) < MEMBERSHIP_PEER_COOLDOWN
-                }),
-        })
-        .collect();
-    admins.sort_unstable_by_key(|peer| peer.endpoint);
-    let peer = choose_membership_peer(&admins, None);
-    // Every administrator failed recently (for example all are offline):
-    // defer without staging, so gossip and range steps keep landing.
-    let reachable = peer.is_some_and(|peer| {
-        admins
-            .iter()
-            .any(|admin| admin.endpoint == peer && !admin.cooling)
-    });
-    if !reachable && (peer.is_some() || !administrator) {
-        session.membership.self_update.refused(now);
-        return Ok(None);
-    }
-    let epoch = owner.epoch();
     let prepared = owner
         .prepare_self_update()
         .map_err(security(ErrorCode::WrongState))?;
     encode_step(&arachne_security::MembershipAuthorization::SelfUpdate, &prepared.commit)?;
     let (publisher, inbox) = super::carry_delivery(session, &prepared.workspace)?;
-    let snapshot = seal_state(
-        session.records.is_some(),
-        &prepared.workspace,
-        session
-            .storage_key
-            .as_ref()
-            .ok_or_else(errors::no_root_key)?,
-        publisher.as_ref(),
-        inbox.as_ref(),
-    )?;
-    let mut value = serde_json::to_value(StagedCandidate::new(
-        prepared.workspace.id(),
-        prepared
-            .workspace
-            .workspace_name()
-            .map_err(security(ErrorCode::WrongState))?,
-        snapshot.clone(),
-    ))
-    .map_err(errors::encode)?;
-    value["self_update"] = json!(true);
-    let commit = prepared.commit.clone();
+    let snapshot = seal_state(session.records.is_some())?;
     session.transition.staged = Some(StagedWorkspace {
         publisher,
         inbox,
@@ -3013,63 +2977,7 @@ pub(crate) fn start_self_update(
         workspace: prepared.workspace,
         snapshot,
     });
-    let Some(peer) = peer else {
-        // The only administrator: no one else commits at this epoch.
-        return Ok(Some(value));
-    };
-    if let Err(error) = queue_membership_offer(
-        session,
-        peer,
-        epoch,
-        arachne_security::MembershipAuthorization::SelfUpdate,
-        commit,
-        true,
-    ) {
-        session.transition.staged = None;
-        session.membership.self_update.refused(now);
-        return Err(error);
-    }
-    session.membership.self_update_offered = Some(peer);
-    Ok(Some(json!({"state":"self_update_offered","peer":peer})))
-}
-
-/// This member's self-update offer is still out.
-pub(crate) fn self_update_pending(session: &Session) -> bool {
-    session.membership.self_update_offered.is_some()
-}
-
-/// The outcome of this member's self-update offer, once it finished:
-/// `Some(true)` when the administrator adopted it (the staged candidate may
-/// now be saved and adopted), `Some(false)` when it was refused or failed
-/// (the candidate is discarded). `None` while it is pending.
-pub(crate) fn finish_self_update_offer(
-    session: &mut Session,
-    now: std::time::Instant,
-) -> Option<bool> {
-    let peer = session.membership.self_update_offered?;
-    let outcome = poll_with_budget(session, Reconcile::PollOffer, MAX_PROFILE_SET_BYTES);
-    if matches!(outcome, Ok(Value::Null)) {
-        return None;
-    }
-    session.membership.self_update_offered = None;
-    let accepted = outcome.is_ok();
-    if !accepted {
-        // Unreachable (not a refusal): try another administrator next time.
-        if outcome
-            .as_ref()
-            .is_err_and(|error| error.code() != ErrorCode::NotAuthorized)
-        {
-            session.membership.peer_failures.insert(peer, now);
-        }
-        if matches!(
-            session.transition.staged.as_ref().map(|staged| &staged.transition),
-            Some(WorkspaceTransition::SelfUpdate(_))
-        ) {
-            session.transition.staged = None;
-        }
-        session.membership.self_update.refused(now);
-    }
-    Some(accepted)
+    Ok(true)
 }
 
 /// `DFLV\x02 | u64 epoch | revocation order`: a signed departure that the
@@ -3189,18 +3097,7 @@ pub(super) fn stage_removal(
     removed: arachne_security::RemovedMembership,
 ) -> Result<StagedRemoval, ApiError> {
     super::transition_activity(session, super::WorkspacePhase::Leaving, None)?;
-    let snapshot = if session.records.is_some() {
-        persistence::candidate_token()?
-    } else {
-        removed
-            .seal(
-                session
-                    .storage_key
-                    .as_ref()
-                    .ok_or_else(errors::no_root_key)?,
-            )
-            .map_err(security(ErrorCode::InvalidInput))?
-    };
+    let snapshot = super::seal_state(session.records.is_some())?;
     let value = StagedRemoval {
         workspace: removed.workspace_id(),
         snapshot: snapshot.clone(),
@@ -3519,23 +3416,18 @@ fn a_registration_and_remove_past_785_members_succeed_after_self_updates() {
     eprintln!("B3c runtime: commit sizes {sizes:?}, total {:?}", started.elapsed());
 }
 
-/// A member whose administrators all failed recently defers its
-/// self-update without staging, so steps keep landing while the
-/// administrators are offline (B3c policy).
+/// A member stages its own update even when all administrators are offline.
+/// No peer can see the commit before the driver saves and adopts it.
 #[test]
-fn a_self_update_waits_while_every_administrator_is_unreachable() {
+fn a_self_update_stages_locally_without_an_administrator_handshake() {
     let (owner, members, _) = admit_members(41, "Waiting member", 1);
     let admin = owner.endpoint();
     let mut session = bare_test_session(members.into_iter().next().unwrap());
     let now = std::time::Instant::now();
     session.membership.peer_failures.insert(admin, now);
-    assert!(start_self_update(&mut session, now).unwrap().is_none());
-    assert!(session.transition.staged.is_none());
-    // Deferred, not retried at once.
-    session.membership.peer_failures.clear();
-    assert!(start_self_update(&mut session, now).unwrap().is_none());
-    // Due again after the wait: it goes on to stage (this bare session has
-    // no storage key, so staging reports that).
-    let later = now + self_update::SELF_UPDATE_RETRY;
-    assert!(start_self_update(&mut session, later).is_err());
+    let epoch = session.workspace.as_ref().unwrap().epoch();
+    assert!(start_self_update(&mut session, now).unwrap());
+    assert!(session.transition.staged.is_some());
+    assert!(session.membership.offer.is_none());
+    assert_eq!(session.workspace.as_ref().unwrap().epoch(), epoch);
 }

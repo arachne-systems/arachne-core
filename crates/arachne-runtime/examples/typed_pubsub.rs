@@ -15,11 +15,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         network: Network::Direct,
         secret: Some([41; 32]),
         transport: Default::default(),
+        storage: None,
     })?;
     let mut subscriber = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([42; 32]),
         transport: Default::default(),
+        storage: None,
     })?;
 
     let publisher_endpoint = publisher.endpoint()?;

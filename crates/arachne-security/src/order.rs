@@ -115,6 +115,151 @@ impl OrderStep {
             proof: Some(proof),
         }
     }
+
+    /// Bounded public authorization, independent of a membership commit.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, &'static str> {
+        let mut bytes = b"DFRO\x01".to_vec();
+        write_order_step(&mut bytes, self)?;
+        Ok(bytes)
+    }
+
+    /// Decode structure only. The receiving workspace must verify the order.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
+        if bytes.len() > MAX_ANCHOR_PROOF + ORDER_BYTES + 6 {
+            return Err("revocation order exceeds bounds");
+        }
+        let mut rest = bytes
+            .strip_prefix(b"DFRO\x01")
+            .ok_or("invalid revocation order")?;
+        let step = read_order_step(&mut rest)?;
+        if !rest.is_empty() {
+            return Err("trailing revocation order bytes");
+        }
+        Ok(step)
+    }
+}
+
+impl super::Workspace {
+    /// Verify a carried order against this exact parent. This changes no
+    /// state and grants no authority from the peer that supplied it.
+    pub fn verify_revocation(&self, step: &OrderStep) -> Result<(), &'static str> {
+        verify(&super::MembershipVerifier::from_workspace(self)?, step)?;
+        if step.order.kind != RevocationKind::DisableInvitation {
+            let roster = self.member_roster()?;
+            let target = roster
+                .iter()
+                .find(|member| member.id == step.order.target)
+                .ok_or("management target is not a current member")?;
+            if step.order.kind == RevocationKind::Demote && !target.administrator {
+                return Err("member is not an administrator");
+            }
+            if target.administrator
+                && roster.iter().filter(|member| member.administrator).count() == 1
+            {
+                return Err("cannot remove the last administrator");
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebase an order from a losing chain onto this chain. `common` is a
+    /// local snapshot at their common ancestor. A prior anchor proof keeps
+    /// its anchor path; only the path to the winning parent changes.
+    pub fn rebase_revocation(
+        &self,
+        step: &OrderStep,
+        losing: &Self,
+        common: &Self,
+    ) -> Result<OrderStep, &'static str> {
+        if self.id() != losing.id() || self.id() != common.id() {
+            return Err("revocation branches have different workspaces");
+        }
+        let path = |owner: &Self, from: u64, until: u64| {
+            if from > until || until - from > ORDER_WINDOW {
+                return Err("anchor proof exceeds bounds");
+            }
+            (from..until)
+                .map(|epoch| {
+                    owner
+                        .history_step(epoch)?
+                        .ok_or("anchor proof history is missing")
+                })
+                .collect::<Result<Vec<_>, &'static str>>()
+        };
+        let fork = common.epoch();
+        let mut proof = match &step.proof {
+            None => AnchorProof {
+                checkpoint: common.public_checkpoint()?,
+                winning: Vec::new(),
+                losing: path(losing, fork, step.order.anchor_epoch)?,
+            },
+            Some(old) => {
+                let start = super::bootstrap::checkpoint_info(&old.checkpoint)?
+                    .epoch()
+                    .as_u64();
+                if start <= fork {
+                    let prefix =
+                        usize::try_from(fork - start).map_err(|_| "anchor proof exceeds bounds")?;
+                    AnchorProof {
+                        checkpoint: old.checkpoint.clone(),
+                        winning: old
+                            .winning
+                            .get(..prefix)
+                            .ok_or("anchor proof common prefix is missing")?
+                            .to_vec(),
+                        losing: old.losing.clone(),
+                    }
+                } else {
+                    let mut anchor = path(losing, fork, start)?;
+                    anchor.extend(old.losing.clone());
+                    AnchorProof {
+                        checkpoint: common.public_checkpoint()?,
+                        winning: Vec::new(),
+                        losing: anchor,
+                    }
+                }
+            }
+        };
+        proof.winning.extend(path(self, fork, self.epoch())?);
+        let carried = OrderStep::with_proof(step.order.clone(), proof);
+        carried.to_bytes()?;
+        self.verify_revocation(&carried)?;
+        Ok(carried)
+    }
+
+    /// Advance a pending order through locally accepted steps on one chain.
+    pub fn advance_revocation(
+        &self,
+        step: &OrderStep,
+        previous: &Self,
+    ) -> Result<OrderStep, &'static str> {
+        self.rebase_revocation(step, previous, previous)
+    }
+
+    /// Extend a peer's proof along accepted local history. A proof on a
+    /// different branch fails the final context check.
+    pub fn extend_revocation(&self, step: &OrderStep) -> Result<OrderStep, &'static str> {
+        let mut next = step.clone();
+        if let Some(proof) = &mut next.proof {
+            let start = super::bootstrap::checkpoint_info(&proof.checkpoint)?
+                .epoch()
+                .as_u64();
+            let parent = start
+                .checked_add(proof.winning.len() as u64)
+                .ok_or("anchor proof exceeds bounds")?;
+            if parent > self.epoch() || self.epoch().saturating_sub(start) > ORDER_WINDOW {
+                return Err("anchor proof exceeds bounds");
+            }
+            for epoch in parent..self.epoch() {
+                proof.winning.push(
+                    self.history_step(epoch)?
+                        .ok_or("anchor proof history is missing")?,
+                );
+            }
+        }
+        self.verify_revocation(&next)?;
+        Ok(next)
+    }
 }
 
 /// SHA-256 of the TLS-encoded public GroupContext.
@@ -226,10 +371,21 @@ pub(super) fn commit_aad(order: &RevocationOrder) -> Vec<u8> {
 }
 
 pub(super) fn write_order_step(out: &mut Vec<u8>, step: &OrderStep) -> Result<(), &'static str> {
+    write_order_step_at_depth(out, step, 0)
+}
+
+pub(super) fn write_order_step_at_depth(
+    out: &mut Vec<u8>,
+    step: &OrderStep,
+    depth: u8,
+) -> Result<(), &'static str> {
     out.extend(step.order.to_bytes());
     match &step.proof {
         None => out.push(0),
         Some(proof) => {
+            if depth >= MAX_PROOF_DEPTH {
+                return Err("anchor proof nested too deep");
+            }
             out.push(1);
             let start = out.len();
             out.extend((proof.checkpoint.len() as u32).to_be_bytes());
@@ -240,7 +396,7 @@ pub(super) fn write_order_step(out: &mut Vec<u8>, step: &OrderStep) -> Result<()
                 }
                 out.extend((steps.len() as u16).to_be_bytes());
                 for (authorization, commit) in steps {
-                    super::step::write_step(out, authorization, commit)?;
+                    super::step::write_step_at_depth(out, authorization, commit, depth + 1)?;
                 }
             }
             if out.len() - start > MAX_ANCHOR_PROOF {
@@ -252,10 +408,20 @@ pub(super) fn write_order_step(out: &mut Vec<u8>, step: &OrderStep) -> Result<()
 }
 
 pub(super) fn read_order_step(bytes: &mut &[u8]) -> Result<OrderStep, &'static str> {
+    read_order_step_at_depth(bytes, 0)
+}
+
+pub(super) fn read_order_step_at_depth(
+    bytes: &mut &[u8],
+    depth: u8,
+) -> Result<OrderStep, &'static str> {
     let order = RevocationOrder::read(bytes)?;
     let proof = match take(bytes, 1)?[0] {
         0 => None,
         1 => {
+            if depth >= MAX_PROOF_DEPTH {
+                return Err("anchor proof nested too deep");
+            }
             let before = bytes.len();
             let length = number(bytes)?;
             if length > MAX_ANCHOR_PROOF {
@@ -270,7 +436,7 @@ pub(super) fn read_order_step(bytes: &mut &[u8]) -> Result<OrderStep, &'static s
                 }
                 let mut steps = Vec::with_capacity(count);
                 for _ in 0..count {
-                    steps.push(super::step::read_step(bytes)?);
+                    steps.push(super::step::read_step_at_depth(bytes, depth + 1)?);
                 }
                 lists.push(steps);
             }
@@ -357,7 +523,8 @@ pub(super) fn verify(
                     &proof.checkpoint,
                     parent.proof_depth + 1,
                 )?;
-                if epoch < verifier.epoch() || epoch - verifier.epoch() != proof.winning.len() as u64
+                if epoch < verifier.epoch()
+                    || epoch - verifier.epoch() != proof.winning.len() as u64
                 {
                     return Err("anchor proof does not reach this state");
                 }
@@ -409,6 +576,51 @@ pub(crate) mod tests {
         ManagementAction, PendingJoin, PreparedManagement, PreparedManagementUpdate, Workspace,
     };
 
+    #[test]
+    fn order_codec_rejects_proof_nesting_before_verification() {
+        let mut step = OrderStep::new(RevocationOrder {
+            kind: RevocationKind::Remove,
+            target: [0; 32],
+            issuer: [0; 32],
+            anchor_epoch: 0,
+            anchor_context: [0; 32],
+            signature: [0; 64],
+        });
+        for _ in 0..MAX_PROOF_DEPTH {
+            step = OrderStep::with_proof(
+                step.order.clone(),
+                AnchorProof {
+                    checkpoint: vec![1],
+                    losing: Vec::new(),
+                    winning: vec![(MembershipAuthorization::Revocation(step), vec![1])],
+                },
+            );
+        }
+        let bytes = step.to_bytes().unwrap();
+        OrderStep::from_bytes(&bytes).unwrap();
+        let mut hostile = b"DFRO\x01".to_vec();
+        hostile.extend(step.order.to_bytes());
+        hostile.extend([1, 0, 0, 0, 1, 1, 0, 1, 3, 0]);
+        hostile.extend(&bytes[5..]);
+        hostile.extend([0, 0, 0, 1, 1, 0, 0]);
+        assert!(
+            OrderStep::from_bytes(&hostile).is_err(),
+            "the parser must reject excessive depth before public verification"
+        );
+        let nested = OrderStep::with_proof(
+            step.order.clone(),
+            AnchorProof {
+                checkpoint: vec![1],
+                losing: Vec::new(),
+                winning: vec![(MembershipAuthorization::Revocation(step), vec![1])],
+            },
+        );
+        assert!(
+            nested.to_bytes().is_err(),
+            "the encoder must refuse an undecodable proof depth"
+        );
+    }
+
     /// Apply a prepared management or revocation step as a receiver.
     pub(crate) fn follow(owner: &Workspace, change: &PreparedManagement) -> Workspace {
         match owner
@@ -428,8 +640,13 @@ pub(crate) mod tests {
         let mut members: Vec<Workspace> = Vec::new();
         for n in 0..count {
             let endpoint = crate::test_endpoint(u64::from(n) + 2);
-            let pending =
-                PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key_for(endpoint), "Member").unwrap();
+            let pending = PendingJoin::from_invitation(
+                &invite,
+                &checkpoint,
+                crate::test_key_for(endpoint),
+                "Member",
+            )
+            .unwrap();
             let request = pending.admission_request().unwrap();
             let admitted = admin.prepare_admission(endpoint, request).unwrap();
             let mut proof = pending.join_proof().unwrap();
@@ -447,7 +664,11 @@ pub(crate) mod tests {
                         .unwrap()
                 })
                 .collect();
-            members.push(pending.prepare_workspace(&proof, &admitted.welcome).unwrap());
+            members.push(
+                pending
+                    .prepare_workspace(&proof, &admitted.welcome)
+                    .unwrap(),
+            );
             admin = admitted.workspace;
         }
         (admin, members)
@@ -483,7 +704,10 @@ pub(crate) mod tests {
         let observer = follow(&observer, &change);
         assert!(removed(&target, &change));
         assert_eq!(admin.member_count(), 3);
-        assert_eq!(observer.epoch_fingerprint(), change.workspace.epoch_fingerprint());
+        assert_eq!(
+            observer.epoch_fingerprint(),
+            change.workspace.epoch_fingerprint()
+        );
         // An ordinary member cannot issue one.
         assert_eq!(
             carrier
@@ -506,7 +730,9 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(
-            forger.prepare_revocation(&OrderStep::new(forged.clone())).err(),
+            forger
+                .prepare_revocation(&OrderStep::new(forged.clone()))
+                .err(),
             Some("order issuer was not an administrator at the anchor")
         );
         // A tampered administrator order fails its signature.
@@ -556,7 +782,9 @@ pub(crate) mod tests {
                 .err(),
             Some("revocation commit does not carry its order")
         );
-        second.verify_step(&change.authorization, &change.commit).unwrap();
+        second
+            .verify_step(&change.authorization, &change.commit)
+            .unwrap();
     }
 
     /// ADR A2 T6 (security part): a Remove issued before its issuer was
@@ -568,8 +796,7 @@ pub(crate) mod tests {
         let promotion = admin
             .prepare_management(ManagementAction::Promote(id(&second)))
             .unwrap();
-        let [second, target, carrier] =
-            [&second, &target, &carrier].map(|m| follow(m, &promotion));
+        let [second, target, carrier] = [&second, &target, &carrier].map(|m| follow(m, &promotion));
         let admin = promotion.workspace;
         let order = admin
             .issue_revocation(RevocationKind::Remove, id(&target))
@@ -582,7 +809,9 @@ pub(crate) mod tests {
         let second = demotion.workspace;
         // Without a proof the anchor is not this state.
         assert_eq!(
-            carrier.prepare_revocation(&OrderStep::new(order.clone())).err(),
+            carrier
+                .prepare_revocation(&OrderStep::new(order.clone()))
+                .err(),
             Some("revocation order needs an anchor proof")
         );
         let step = OrderStep::with_proof(
@@ -596,7 +825,13 @@ pub(crate) mod tests {
         let change = carrier.prepare_revocation(&step).unwrap();
         for verifier in [&second, &admin] {
             let after = follow(verifier, &change);
-            assert!(after.member_roster().unwrap().iter().all(|m| m.id != id(&target)));
+            assert!(
+                after
+                    .member_roster()
+                    .unwrap()
+                    .iter()
+                    .all(|m| m.id != id(&target))
+            );
         }
         assert!(removed(&target, &change));
         // The step round-trips through history and restore.
@@ -642,13 +877,19 @@ pub(crate) mod tests {
         // A proof must reach this state and the order anchor.
         assert_eq!(
             carrier
-                .prepare_revocation(&OrderStep::with_proof(order.clone(), proof(&loser, vec![&loser])))
+                .prepare_revocation(&OrderStep::with_proof(
+                    order.clone(),
+                    proof(&loser, vec![&loser])
+                ))
                 .err(),
             Some("anchor proof does not reach this state")
         );
         assert_eq!(
             carrier
-                .prepare_revocation(&OrderStep::with_proof(order.clone(), proof(&winner, vec![])))
+                .prepare_revocation(&OrderStep::with_proof(
+                    order.clone(),
+                    proof(&winner, vec![])
+                ))
                 .err(),
             Some("anchor proof does not reach the order anchor")
         );

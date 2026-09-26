@@ -1,6 +1,8 @@
-use arachne_runtime::{close, create, describe, execute};
+use arachne_runtime::{MemoryProvider, close, describe, execute};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
+
+mod common;
 
 fn call(handle: i64, request: Value) -> Value {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap()).unwrap())
@@ -14,7 +16,7 @@ fn issue_invitation(handle: i64) -> Value {
     );
     call(
         handle,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )["issued_invitation"]
         .clone()
 }
@@ -35,8 +37,10 @@ fn synchronize(server: i64, client: i64, peer: &Value) -> Value {
 
 #[test]
 fn unchanged_state_does_not_repeat_profiles_but_restart_recovers_them() {
-    let admin = create(Some(&[151; 32])).unwrap();
-    let member = create(Some(&[152; 32])).unwrap();
+    let admin_provider = MemoryProvider::default();
+    let member_provider = MemoryProvider::default();
+    let admin = common::stored(&[151; 32], &admin_provider);
+    let member = common::stored(&[152; 32], &member_provider);
     call(
         admin,
         json!({"op":"create_workspace","display_name":"Coordinator"}),
@@ -54,7 +58,7 @@ fn unchanged_state_does_not_repeat_profiles_but_restart_recovers_them() {
     );
     call(
         admin,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     );
     let reply = call(
         admin,
@@ -68,7 +72,7 @@ fn unchanged_state_does_not_repeat_profiles_but_restart_recovers_them() {
     );
     call(
         member,
-        json!({"op":"adopt_join","snapshot":joined["snapshot"]}),
+        json!({"op":"adopt_join","candidate":joined["candidate"]}),
     );
     let info: Value = serde_json::from_str(&describe(admin).unwrap()).unwrap();
     let peer = &info["endpoint_key"];
@@ -110,10 +114,10 @@ fn unchanged_state_does_not_repeat_profiles_but_restart_recovers_them() {
     // The requester still remembers agreement, but the responder has lost its
     // transient profile cache. Comparing the actual set must repair both sides.
     close(admin).unwrap();
-    let admin = create(Some(&[151; 32])).unwrap();
+    let admin = common::stored(&[151; 32], &admin_provider);
     call(
         admin,
-        json!({"op":"restore_workspace","workspace":invite["workspace"],"snapshot":staged["snapshot"]}),
+        json!({"op":"restore_workspace","workspace":invite["workspace"]}),
     );
     let restarted_info: Value = serde_json::from_str(&describe(admin).unwrap()).unwrap();
     let address = restarted_info["bound_address"]
@@ -139,10 +143,10 @@ fn unchanged_state_does_not_repeat_profiles_but_restart_recovers_them() {
             .all(|m| m["display_name"].is_string())
     );
     close(member).unwrap();
-    let restarted = create(Some(&[152; 32])).unwrap();
+    let restarted = common::stored(&[152; 32], &member_provider);
     call(
         restarted,
-        json!({"op":"restore_workspace","workspace":invite["workspace"],"snapshot":joined["snapshot"]}),
+        json!({"op":"restore_workspace","workspace":invite["workspace"]}),
     );
     call(
         restarted,

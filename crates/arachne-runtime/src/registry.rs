@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use arachne_api::{ApiError, ErrorCode};
+use arachne_api::ApiError;
 use arachne_node::{NetworkProfile, Node, NodeOptions, RelayOptions};
 use serde_json::{Value, json};
 use tokio::sync::watch;
@@ -261,16 +261,11 @@ pub(crate) fn open(
     });
     let cancellation = node.control_cancellation();
     let presence = presence::Presence::new()?;
-    let storage_key = secret
-        .map(arachne_security::StorageKey::derive)
-        .transpose()
-        .map_err(errors::security(ErrorCode::InvalidInput))?;
     let mut session = Session::new(
         node,
         receiver,
         Arc::clone(context),
         committed,
-        storage_key,
         presence,
     );
     session.tasks.push(forwarder.abort_handle());

@@ -168,6 +168,49 @@ impl PublisherLog {
         Ok(advanced)
     }
 
+    /// Move the logs to a winning branch (ADR A2 steps 8 and 10). `current`
+    /// is the owner on the losing branch, `fork` the owner at the fork epoch
+    /// F (from the retained snapshot), `next` the owner after the winning
+    /// steps. Epochs at and below F are on both branches and stay. The logs
+    /// of the losing epochs above F are returned: they hold this author's
+    /// publications that no member of the winning branch can open, for
+    /// re-publication. The winning epoch starts empty.
+    pub fn rebase(
+        &self,
+        current: &arachne_security::Workspace,
+        fork: &arachne_security::Workspace,
+        next: &arachne_security::Workspace,
+    ) -> Result<(Self, Vec<EpochLog>), &'static str> {
+        self.validate_owner(current)?;
+        if fork.id() != self.workspace
+            || fork.member().map(|m| m.id()) != Some(self.author)
+            || fork.epoch() >= current.epoch()
+        {
+            return Err("publisher log cannot rebase to this fork");
+        }
+        let (mut kept, losing): (Vec<_>, Vec<_>) = self
+            .epochs
+            .iter()
+            .cloned()
+            .partition(|retained| retained.log.epoch <= fork.epoch());
+        if kept.last().is_none_or(|last| last.log.epoch != fork.epoch()) {
+            // The fork epoch's log was evicted: start an empty one. Its
+            // eviction watermark is unknown, so it serves nothing old.
+            kept.push(Retained {
+                fingerprint: fork.epoch_fingerprint(),
+                joined_after: BTreeSet::new(),
+                log: EpochLog::new(self.workspace, self.author, fork.epoch()),
+            });
+        }
+        let at_fork = Self {
+            workspace: self.workspace,
+            author: self.author,
+            epochs: kept,
+        };
+        let rebased = at_fork.advance(fork, next)?;
+        Ok((rebased, losing.into_iter().map(|retained| retained.log).collect()))
+    }
+
     /// Current-epoch selection. See `EpochLog::select`.
     pub fn select(
         &self,

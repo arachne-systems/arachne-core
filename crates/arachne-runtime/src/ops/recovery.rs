@@ -313,6 +313,8 @@ pub(crate) enum CutoffStatus {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct StagedRecovery {
     pub workspace: [u8; 32],
+    /// The opaque candidate token; adopt it with the matching adopt op.
+    #[serde(rename = "candidate")]
     pub snapshot: Vec<u8>,
     pub state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1230,10 +1232,6 @@ pub(crate) fn stage_current_view(session: &mut Session) -> Result<StagedRecovery
         .workspace
         .as_ref()
         .ok_or_else(errors::no_workspace)?;
-    let key = session
-        .storage_key
-        .as_ref()
-        .ok_or_else(errors::no_root_key)?;
     let now = arachne_delivery::UnixSeconds::now().map_err(delivery(ErrorCode::Internal))?;
     let (mut inbox, pending, stale) = session
         .delivery
@@ -1258,13 +1256,7 @@ pub(crate) fn stage_current_view(session: &mut Session) -> Result<StagedRecovery
         Some(publisher) => publisher.clone(),
         None => arachne_delivery::PublisherLog::new(owner).map_err(delivery(ErrorCode::Internal))?,
     };
-    let snapshot = seal_state(
-        session.records.is_some(),
-        owner,
-        key,
-        Some(&publisher),
-        Some(&inbox),
-    )?;
+    let snapshot = seal_state(session.records.is_some())?;
     let candidate = owner
         .provisional_copy()
         .map_err(security(ErrorCode::Internal))?;
@@ -1467,10 +1459,6 @@ pub(crate) fn stage_range(session: &mut Session, args: StageRangeArgs) -> Result
         .workspace
         .as_ref()
         .ok_or_else(errors::no_workspace)?;
-    let key = session
-        .storage_key
-        .as_ref()
-        .ok_or_else(errors::no_root_key)?;
     let publisher = publisher_or_new(session, owner)?;
     let fresh;
     let inbox = match session.delivery.inbox.as_ref() {
@@ -1605,7 +1593,7 @@ pub(crate) fn stage_range(session: &mut Session, args: StageRangeArgs) -> Result
         }));
     }
     let automatic = ready.automatic;
-    let snapshot = seal_state(session.records.is_some(), owner, key, Some(&publisher), Some(&next))?;
+    let snapshot = seal_state(session.records.is_some())?;
     let candidate = owner
         .provisional_copy()
         .map_err(security(ErrorCode::Internal))?;
@@ -1651,10 +1639,6 @@ pub(crate) fn stage_direct(session: &mut Session) -> Result<RecoveryStaged, ApiE
         .workspace
         .as_ref()
         .ok_or_else(errors::no_workspace)?;
-    let key = session
-        .storage_key
-        .as_ref()
-        .ok_or_else(errors::no_root_key)?;
     // B7c: a partial range is admitted as its in-order prefix; the stream
     // keeps its gap for the rest. When nothing fits, nothing is staged.
     let (next, count) = match session
@@ -1679,7 +1663,7 @@ pub(crate) fn stage_direct(session: &mut Session) -> Result<RecoveryStaged, ApiE
         return Ok(nothing("direct_recovery_already_covered"));
     }
     let publisher = publisher_or_new(session, owner)?;
-    let snapshot = seal_state(session.records.is_some(), owner, key, Some(&publisher), Some(&next))?;
+    let snapshot = seal_state(session.records.is_some())?;
     let candidate = owner
         .provisional_copy()
         .map_err(security(ErrorCode::Internal))?;
@@ -1716,10 +1700,6 @@ pub(crate) fn stage_direct_miss(session: &mut Session) -> Result<StagedRecovery,
         .workspace
         .as_ref()
         .ok_or_else(errors::no_workspace)?;
-    let key = session
-        .storage_key
-        .as_ref()
-        .ok_or_else(errors::no_root_key)?;
     let (next, missing) = session
         .delivery
         .inbox
@@ -1728,7 +1708,7 @@ pub(crate) fn stage_direct_miss(session: &mut Session) -> Result<StagedRecovery,
         .skip_direct_gap(owner, query)
         .map_err(delivery(ErrorCode::InvalidInput))?;
     let publisher = publisher_or_new(session, owner)?;
-    let snapshot = seal_state(session.records.is_some(), owner, key, Some(&publisher), Some(&next))?;
+    let snapshot = seal_state(session.records.is_some())?;
     let candidate = owner
         .provisional_copy()
         .map_err(security(ErrorCode::Internal))?;

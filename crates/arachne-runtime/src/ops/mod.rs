@@ -36,6 +36,7 @@ pub(crate) enum Op {
     WorkspaceState,
     ResetWorkspace,
     DiscardWorkspaceCandidate,
+    DiscardCandidate,
     NetworkChange,
     NearbyEndpoints,
     SetNearbyIdentity,
@@ -104,10 +105,7 @@ pub(crate) enum Op {
     RetainedAdmission,
     BeginJoin,
     DriveJoin,
-    SealPendingJoin,
-    RestorePendingJoin,
     CreateWorkspace,
-    SealWorkspace,
     RestoreWorkspace,
     AddAddressHint,
     InstallWorkspacePolicy,
@@ -128,6 +126,7 @@ impl Op {
             self,
             Op::ResetWorkspace
                 | Op::DiscardWorkspaceCandidate
+                | Op::DiscardCandidate
                 | Op::DriveWorkspace
                 | Op::DriveJoin
                 | Op::WorkspaceState
@@ -170,6 +169,17 @@ impl Op {
 
 /// The guards that hold before an op runs, in their fixed order.
 pub(crate) fn admit(session: &Session, op: Op) -> Result<(), ApiError> {
+    // A save with an unknown outcome: live state must not move on.
+    if session.records.as_ref().is_some_and(|store| store.uncertain)
+        && !matches!(
+            op,
+            Op::ResetWorkspace | Op::WorkspaceState | Op::WorkspaceMetrics | Op::EndpointInfo
+        )
+    {
+        return Err(ApiError::storage_failed(
+            "record storage outcome is uncertain; close and restore",
+        ));
+    }
     if op.always_allowed() {
         return Ok(());
     }

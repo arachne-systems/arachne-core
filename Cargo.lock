@@ -331,6 +331,7 @@ dependencies = [
  "getrandom 0.4.3",
  "iroh",
  "postcard",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",

@@ -1,5 +1,5 @@
-//! The workspace itself: create, seal and restore (hosts without native
-//! storage), reset, discard a candidate, and its state and metrics.
+//! The workspace itself: create and restore (from record storage), reset,
+//! discard a candidate, and its state and metrics.
 
 use std::sync::Arc;
 
@@ -10,8 +10,8 @@ use crate::client::{
     ConnectionCapacityMetrics, ControlTimingMetrics, DurationSummary, MembershipGossipMetrics,
 };
 use crate::errors::{self, delivery, security};
-use crate::ops::candidate::{MemberView, Removed};
-use crate::session::{activity_view, commit_workspace, seal_state, transition_activity};
+use crate::ops::candidate::MemberView;
+use crate::session::{activity_view, commit_workspace, transition_activity};
 use crate::workspace_activity::ActivityView;
 use crate::{
     MembershipState, Session, WorkspaceActivity, WorkspacePhase, persistence, presence,
@@ -29,8 +29,9 @@ pub(crate) struct CreateArgs {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RestoreArgs {
     pub workspace: [u8; 32],
+    /// The anchor the host saved from `record_freshness` (40 bytes).
     #[serde(default)]
-    pub snapshot: Vec<u8>,
+    pub freshness: Option<Vec<u8>>,
 }
 
 /// A workspace this session now owns (created or restored).
@@ -73,19 +74,6 @@ impl WorkspaceOpened {
             },
         })
     }
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(untagged)]
-pub(crate) enum RestoreReply {
-    Opened(WorkspaceOpened),
-    Removed(Removed),
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct SealedWorkspace {
-    pub workspace: [u8; 32],
-    pub snapshot: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -162,99 +150,39 @@ pub(crate) fn create(session: &mut Session, args: CreateArgs) -> Result<Workspac
         let _ = transition_activity(session, WorkspacePhase::Failed, Some("create_failed"));
         security(ErrorCode::InvalidInput)(error)
     })?;
+    // Saved before it becomes the committed workspace.
+    let publisher = arachne_delivery::PublisherLog::new(&workspace)
+        .map_err(delivery(ErrorCode::Internal))?;
+    let inbox = arachne_delivery::inbox::ObjectInbox::new(workspace.id(), workspace.epoch());
+    if let Err(error) =
+        persistence::commit_created(session, &workspace, Some(&publisher), Some(&inbox))
+    {
+        let _ = transition_activity(session, WorkspacePhase::Failed, Some("create_failed"));
+        return Err(error);
+    }
     transition_activity(session, WorkspacePhase::Active, None)?;
-    let mut value = WorkspaceOpened::of(&workspace, None, false)?;
+    let mut value = WorkspaceOpened::of(&workspace, None, true)?;
+    session.delivery.publisher = Some(publisher);
+    session.delivery.inbox = Some(inbox);
     commit_workspace(session, workspace);
     value.activity = activity_view(session);
     Ok(value)
 }
 
-/// Seal the workspace for a host without native storage.
-pub(crate) fn seal(session: &mut Session) -> Result<SealedWorkspace, ApiError> {
-    if session.records.is_some() {
-        return Err(ApiError::wrong_state(
-            "native records already own persistence; save staged candidates directly",
-        ));
-    }
-    if session.transition.staged.is_some()
-        || session.transition.inbound.is_some()
-        || !session.admission.in_flight.is_empty()
-    {
-        return Err(ApiError::wrong_state(
-            "admission candidate awaits durable adoption or reply",
-        ));
-    }
-    let workspace = session
-        .workspace
-        .as_ref()
-        .ok_or_else(errors::no_workspace)?;
-    let key = session
-        .storage_key
-        .as_ref()
-        .ok_or_else(errors::no_root_key)?;
-    let snapshot = seal_state(
-        session.records.is_some(),
-        workspace,
-        key,
-        session.delivery.publisher.as_ref(),
-        session.delivery.inbox.as_ref(),
-    )?;
-    Ok(SealedWorkspace {
-        workspace: workspace.id(),
-        snapshot,
-    })
-}
-
-/// Restore sealed state. A sealed removal ends the session.
-pub(crate) fn restore(session: &mut Session, args: RestoreArgs) -> Result<RestoreReply, ApiError> {
-    let RestoreArgs {
-        workspace,
-        snapshot,
-    } = args;
-    if session.workspace.is_some() || session.join.pending.is_some() {
-        return Err(already_owned());
-    }
-    let key = session
-        .storage_key
-        .as_ref()
-        .ok_or_else(errors::no_root_key)?;
-    if snapshot.starts_with(b"DFRM") {
-        let removed =
-            arachne_security::RemovedMembership::restore(key, session.node.id(), workspace, &snapshot)
-                .map_err(security(ErrorCode::StorageCorrupt))?;
-        // Consume the owner before releasing the lock. Even a caller which
-        // ignores the removed state cannot install fixture policy or reload
-        // an older active snapshot on this session. Close transport/tasks too.
-        session.ending = true;
-        return Ok(RestoreReply::Removed(Removed::of(&removed)));
-    }
-    let (restored, publisher, inbox) = if snapshot.starts_with(b"DFWB\x01") {
-        let (owner, log, inbox) = arachne_delivery::inbox::ObjectInbox::restore(
-            key,
-            session.node.id(),
-            workspace,
-            &snapshot,
-        )
-        .map_err(delivery(ErrorCode::StorageCorrupt))?;
-        (owner, Some(log), Some(inbox))
-    } else {
-        (
-            arachne_security::Workspace::restore(key, session.node.id(), workspace, &snapshot)
-                .map_err(security(ErrorCode::StorageCorrupt))?,
-            None,
-            None,
-        )
-    };
-    transition_activity(session, WorkspacePhase::Active, None)?;
-    let missing = restored
-        .workspace_name_missing_history()
-        .map_err(security(ErrorCode::Internal))?;
-    let mut value = WorkspaceOpened::of(&restored, Some(missing), false)?;
-    session.delivery.publisher = publisher;
-    session.delivery.inbox = inbox;
-    commit_workspace(session, restored);
-    value.activity = activity_view(session);
-    Ok(RestoreReply::Opened(value))
+/// Restore the stored workspace, pending join or removal. A stored
+/// removal ends the session.
+pub(crate) fn restore(
+    session: &mut Session,
+    args: RestoreArgs,
+) -> Result<persistence::Restored, ApiError> {
+    let expected = args
+        .freshness
+        .map(|bytes| {
+            arachne_store::FreshnessAnchor::from_bytes(&bytes)
+                .map_err(|_| ApiError::invalid_input("freshness", "invalid freshness anchor"))
+        })
+        .transpose()?;
+    persistence::restore(session, args.workspace, expected)
 }
 
 /// Forget all workspace state; with native storage, first write the reset
@@ -311,10 +239,24 @@ pub(crate) fn discard_candidate(session: &mut Session) -> Result<Discarded, ApiE
             "received admission awaits adoption or reply",
         ));
     }
+    if let Some(staged) = &session.transition.staged
+        && persistence::candidate_saved(session, &staged.snapshot)
+    {
+        // Storage already holds it: live state would fork from storage.
+        return Err(ApiError::wrong_state(
+            "candidate is already in storage; adopt it, or close and restore",
+        ));
+    }
     let discarded = session.transition.staged.take().is_some();
+    if discarded {
+        // The batch goes back to intake: a retried request is assessed again
+        // instead of waiting for an adoption that will never come. A pending
+        // approval stays pending.
+        session.admission.in_flight.clear();
+        session.admission.staged_approval_id = None;
+    }
     let offer_cancelled = session.membership.offer.take().is_some();
     session.membership.offer_requires_adoption = false;
-    session.membership.self_update_offered = None;
     session.membership.staged_step_received = false;
     Ok(Discarded {
         state: "workspace_candidate_discarded",
