@@ -681,3 +681,128 @@ pub(super) fn is_moq_alpn(alpn: &[u8]) -> bool {
         .into_iter()
         .any(|candidate| candidate == alpn)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Node, Permissions};
+
+    #[tokio::test]
+    async fn incomplete_group_payload_does_not_block_a_later_group() {
+        unfinished_group_does_not_block(true).await;
+    }
+
+    #[tokio::test]
+    async fn incomplete_group_end_does_not_block_a_later_group() {
+        unfinished_group_does_not_block(false).await;
+    }
+
+    async fn unfinished_group_does_not_block(partial_payload: bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (sender, _sender_messages) =
+                Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let (receiver, mut messages) =
+                Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let workspace = [54; 32];
+            let topic = Topic::new("shared/stream").unwrap();
+            let policy = BTreeMap::from([
+                (sender.id(), Permissions::AllTopics),
+                (receiver.id(), Permissions::AllTopics),
+            ]);
+            for (node, peer) in [(&sender, &receiver), (&receiver, &sender)] {
+                node.install_verified_policy(workspace, 1, policy.clone())
+                    .await
+                    .unwrap();
+                node.subscribe(workspace, 1, topic.clone()).await.unwrap();
+                node.add_address_hint(peer.id(), peer.address())
+                    .await
+                    .unwrap();
+                node.enable_moq_delivery(workspace, 1, peer.id(), topic.clone())
+                    .await
+                    .unwrap();
+            }
+            while sender.moq_metrics().sessions_active != 1
+                || receiver.moq_metrics().sessions_active != 1
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            // The public publisher always finishes its group. Inject the
+            // interrupted wire producer at the real authorized route instead
+            // of changing the public API to expose malformed publications.
+            let route = sender
+                .streams
+                .0
+                .routes
+                .lock()
+                .await
+                .get(&receiver.id())
+                .cloned()
+                .unwrap();
+            let envelope = wire::encode(&Envelope {
+                sequence: 1,
+                frame: wire::encode(&Frame {
+                    workspace,
+                    revision: 1,
+                    topic: topic.as_str().into(),
+                    delivery: DeliveryClass::Critical,
+                    operation: Operation::Publish(b"unfinished".to_vec()),
+                })
+                .unwrap(),
+            })
+            .unwrap();
+            let mut blocked = route.track.create_group(group::Info::from(1u64)).unwrap();
+            let partial = if partial_payload {
+                let mut frame = blocked
+                    .create_frame(moq_net::frame::Info {
+                        size: envelope.len() as u64,
+                        timestamp: Timestamp::now(),
+                    })
+                    .unwrap();
+                frame
+                    .write(envelope[..envelope.len() / 2].to_vec())
+                    .unwrap();
+                Some(frame)
+            } else {
+                blocked.write_frame(Timestamp::now(), envelope).unwrap();
+                None
+            };
+            while receiver.moq_metrics().groups_received != 1
+                || (!partial_payload && receiver.moq_metrics().frames_received != 1)
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert_eq!(receiver.moq_metrics().groups_completed, 0);
+            sender
+                .publish_protected_with_class(
+                    workspace,
+                    1,
+                    topic,
+                    2,
+                    DeliveryClass::Critical,
+                    b"later complete group".to_vec(),
+                )
+                .await
+                .unwrap();
+            let delivered = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let message = messages.recv().await.unwrap();
+                    if message.sender == sender.id() && message.payload == b"later complete group" {
+                        break;
+                    }
+                }
+            })
+            .await;
+            let metrics = receiver.moq_metrics();
+            drop(partial);
+            drop(blocked);
+            sender.close().await;
+            receiver.close().await;
+            assert!(
+                delivered.is_ok(),
+                "an unfinished group blocked an independent complete group: {metrics:?}"
+            );
+        })
+        .await
+        .expect("unfinished group fixture timed out");
+    }
+}
