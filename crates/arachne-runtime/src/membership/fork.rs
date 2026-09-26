@@ -1130,7 +1130,8 @@ pub(crate) fn reply(owner: Option<&Workspace>, peer: [u8; 32], bytes: &[u8]) -> 
             return Err(ApiError::not_authorized("wrong workspace"));
         }
         let mut rows = Vec::new();
-        for epoch in query.from..query.until.min(owner.epoch()) {
+        let from = query.from.max(owner.history_start().map_err(security(ErrorCode::StorageCorrupt))?);
+        for epoch in from..query.until.min(owner.epoch()) {
             let Some((auth, commit)) = owner
                 .membership_update_for(peer, epoch)
                 .map_err(security(ErrorCode::NotMember))?
@@ -1153,11 +1154,11 @@ pub(crate) fn reply(owner: Option<&Workspace>, peer: [u8; 32], bytes: &[u8]) -> 
         let current = owner.member_id_for_endpoint(peer).is_ok();
         wire::encode_branch_reply(&wire::BranchReply {
             workspace: owner.id(),
-            from: query.from,
+            from,
             head: if current {
                 owner.epoch()
             } else {
-                query.from.saturating_add(rows.len() as u64)
+                from.saturating_add(rows.len() as u64)
             },
             fingerprint: if current {
                 owner.epoch_fingerprint()
@@ -1235,7 +1236,9 @@ pub(crate) fn poll(session: &mut Session) -> Result<Option<Value>, ApiError> {
         if let Some(bytes) = bytes
             && let Ok(reply) = wire::decode_branch_reply(&bytes)
             && reply.workspace == pending.query.workspace
-            && reply.from == pending.query.from
+            && reply.from >= pending.query.from
+            && reply.from <= pending.query.until
+            && reply.rows.last().is_none_or(|row| row.epoch < pending.query.until)
             && let Some(owner) = &session.workspace
         {
             let mut distinct = None;

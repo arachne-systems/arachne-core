@@ -226,6 +226,22 @@ fn branch_rows_are_bounded_contiguous_and_only_hints() {
     assert!(wire::encode_branch_reply(&reply).is_err());
 }
 
+#[test]
+fn a_branch_reply_starts_at_the_responders_available_history() {
+    let (first, second, _) = two_admins(1);
+    let from = first.history_start().unwrap();
+    let available = second.history_start().unwrap();
+    assert!(available > from, "the joiner starts from a later checkpoint");
+    let query = wire::encode_branch_query(&wire::BranchQuery {
+        workspace: first.id(), from, until: first.epoch(),
+    }).unwrap();
+    let reply = fork::reply(Some(&second), first.endpoint(), &query);
+    let reply = wire::decode_branch_reply(&reply).unwrap();
+    assert_eq!(reply.rows.first().map(|row| row.epoch), Some(available),
+        "an old caller cursor must not hide the responder's available branch");
+    assert_eq!(reply.from, available);
+}
+
 fn active(workspace: PreparedManagementUpdate) -> Workspace {
     match workspace {
         PreparedManagementUpdate::Active(workspace) => *workspace,
