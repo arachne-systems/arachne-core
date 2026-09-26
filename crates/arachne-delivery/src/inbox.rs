@@ -3,50 +3,161 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 
-const MAGIC: &[u8] = b"DFOI\x01";
-const LEGACY_CACHE_MAGIC: &[u8] = b"DFIC\x01";
-const CURRENT_CACHE_MAGIC: &[u8] = b"DFIC\x02";
-const CACHE_MAGIC: &[u8] = b"DFIC\x03";
-const MAX_STREAMS: usize = 4096;
-const WINDOW: usize = MAX_PACKETS_PER_TOPIC;
+const MAGIC: &[u8] = b"DFOI\x02";
+/// Binary inbox state (A6f). Earlier versions are rejected.
+const CACHE_MAGIC: &[u8] = b"DFIC\x05";
+/// Replay windows: one per (author, epoch) that sent to this member.
+const MAX_REPLAY_WINDOWS: usize = 4096;
+/// Accepted counters tracked above one replay floor. An author's counter is
+/// shared by all its topics and audiences, so a receiver sees a sparse subset;
+/// the window is bounded by accepted entries, not by counter span. When it is
+/// full, the floor moves up to the oldest entry and older unseen counters are
+/// given up as lost.
+pub const REPLAY_ENTRIES: usize = 1024;
+const MAX_PENDING_OBJECTS: usize = 512;
+/// Pending objects one author may hold in this inbox.
+pub const MAX_PENDING_OBJECTS_PER_AUTHOR: usize = 128;
+/// Pending payload bytes one author may hold in this inbox.
+pub const MAX_PENDING_BYTES_PER_AUTHOR: usize = 32 * 1024;
+/// Pending payload bytes of all authors together.
+pub const MAX_PENDING_BYTES: usize = 96 * 1024;
+/// Refusal when one author's pending objects fill its quota.
+pub const AUTHOR_QUOTA_EXHAUSTED: &str = "author pending quota exhausted";
+/// Refusal when all authors' pending objects fill the inbox.
+pub const PENDING_INBOX_FULL: &str = "pending inbox full";
+
+/// True when a refused object can be accepted after the application
+/// acknowledges or rejects pending objects. Recovery stops at such a refusal
+/// and continues later; it does not skip the object.
+pub fn drains_with_application(error: &str) -> bool {
+    error == AUTHOR_QUOTA_EXHAUSTED || error == PENDING_INBOX_FULL
+}
+/// Encoded bound of the inbox. With `PUBLISHER_BUDGET` it fits one workspace
+/// attachment: saving never evicts publisher history to make room, and the
+/// operation that would grow the inbox past it fails instead.
+pub const INBOX_BUDGET: usize =
+    arachne_security::MAX_WORKSPACE_ATTACHMENT - 9 - crate::PUBLISHER_BUDGET;
+/// Retained third-party proofs (ranges and current views) together. The one
+/// that expires first gives way.
+const MAX_RETAINED_PROOF_BYTES: usize = wire::MAX_REPLY_BYTES + 4 * 1024;
+/// Recently accepted publication ids kept for cross-epoch dedup.
+pub const RECENT_IDS: usize = 256;
 const MAX_RETAINED_RANGES: usize = 4;
 const MAX_RETAINED_CURRENT_VIEWS: usize = 4;
 const MAX_RECOVERY_SELECTIONS: usize = 64;
 const MAX_DIRECT_STREAMS: usize = 256;
+/// Retained direct records per recipient scope.
+const DIRECT_WINDOW: usize = MAX_PACKETS_PER_TOPIC;
 // Recovery copies are optional; pending application objects and replay floors
 // are not. Bound encoded copies across all audiences, not just packet counts.
-const MAX_DIRECT_RETAINED_BYTES: usize = 128 * 1024;
+const MAX_DIRECT_RETAINED_BYTES: usize = 32 * 1024;
 
-fn is_false(value: &bool) -> bool {
-    !*value
+/// Dedup for one author's sender counters in one epoch. Separate from pending
+/// storage: acknowledging an object never reopens its counter.
+#[derive(Clone)]
+struct Replay {
+    author: [u8; 32],
+    epoch: u64,
+    /// Counters at or below this were given up as lost (window moved past).
+    lost_through: u64,
+    /// Every counter at or below `floor` is closed: accepted or lost.
+    floor: u64,
+    /// Accepted counters above `floor`: at most `REPLAY_ENTRIES`.
+    seen: BTreeSet<u64>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Receipt {
+/// Stable publication identity, independent of epoch and counter.
+fn publication_identity(author: [u8; 32], id: [u8; 16]) -> [u8; 16] {
+    let mut hash = Sha256::new();
+    hash.update(b"arachne/publication-identity/v1\0");
+    hash.update(author);
+    hash.update(id);
+    hash.finalize()[..16].try_into().unwrap()
+}
+
+enum ReplayState {
+    New,
+    Duplicate,
+    Lost,
+}
+
+impl Replay {
+    fn state(&self, counter: u64) -> ReplayState {
+        if counter <= self.lost_through {
+            ReplayState::Lost
+        } else if counter <= self.floor || self.seen.contains(&counter) {
+            ReplayState::Duplicate
+        } else {
+            ReplayState::New
+        }
+    }
+
+    fn accept(&mut self, counter: u64) {
+        self.seen.insert(counter);
+        while self.seen.remove(&(self.floor + 1)) {
+            self.floor += 1;
+        }
+        // Bound the window: a gap below many accepted objects is given up, so
+        // it cannot pin state forever. Late objects inside the window still
+        // fill their gap.
+        while self.seen.len() > REPLAY_ENTRIES {
+            let oldest = self.seen.pop_first().expect("nonempty seen set");
+            self.lost_through = oldest - 1;
+            self.floor = oldest;
+            while self.seen.remove(&(self.floor + 1)) {
+                self.floor += 1;
+            }
+        }
+    }
+
+    fn valid(&self) -> bool {
+        self.lost_through <= self.floor
+            && self.seen.first().is_none_or(|first| *first > self.floor + 1)
+            && self.seen.len() <= REPLAY_ENTRIES
+    }
+}
+
+/// Authenticated plaintext waiting for the application. It no longer needs
+/// the epoch key, so it survives epoch changes and key eviction.
+#[derive(Clone)]
+struct Pending {
+    author: [u8; 32],
+    endpoint: [u8; 32],
+    epoch: u64,
     counter: u64,
     revision: u64,
+    topic: String,
     id: [u8; 16],
     sequence: u64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     recipients: Vec<[u8; 32]>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     current: Option<CurrentReceipt>,
-    digest: [u8; 32],
-    /// None means durably resolved; `rejected` distinguishes application refusal.
-    pending: Option<Vec<u8>>,
-    /// The application permanently rejected this authenticated object.
-    #[serde(default, skip_serializing_if = "is_false")]
-    rejected: bool,
+    payload: Vec<u8>,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+impl Pending {
+    /// Encoded size in the inbox snapshot (see `Snapshot::encode`).
+    fn weight(topic: usize, recipients: usize, current: bool, payload: usize) -> usize {
+        32 + 32 + 8 * 3 + 1 + topic + 16 + 8 + 1 + 32 * recipients + 1
+            + if current { 72 } else { 0 }
+            + 4
+            + payload
+    }
+
+    fn encoded_len(&self) -> usize {
+        Self::weight(
+            self.topic.len(),
+            self.recipients.len(),
+            self.current.is_some(),
+            self.payload.len(),
+        )
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 struct CurrentReceipt {
     selector: [u8; 32],
     replacement_key: [u8; 32],
     expires_at: u64,
-    #[serde(default)]
     tombstone: bool,
 }
 
@@ -72,16 +183,6 @@ impl From<&CurrentReceipt> for current::CurrentMetadata {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Stream {
-    author: [u8; 32],
-    topic: String,
-    /// Counters at/below this boundary remain rejected after receipts expire.
-    floor: u64,
-    receipts: Vec<Receipt>,
-}
-
 #[derive(Clone)]
 struct RetainedRange {
     query: Vec<u8>,
@@ -96,16 +197,15 @@ struct RetainedCurrentView {
     expires_at: u64,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone)]
 struct SelectionProgress {
     author: [u8; 32],
+    epoch: u64,
     selection: [u8; 32],
     through: u64,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone)]
 struct CurrentProgress {
     authority: [u8; 32],
     revision: u64,
@@ -115,8 +215,7 @@ struct CurrentProgress {
     digest: [u8; 32],
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone)]
 struct DirectRecord {
     revision: u64,
     id: [u8; 16],
@@ -124,22 +223,35 @@ struct DirectRecord {
     object: Vec<u8>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone)]
 struct DirectStream {
     author: [u8; 32],
     revision: u64,
     topic: String,
     recipients: Vec<[u8; 32]>,
     floor: u64,
-    #[serde(default)]
     recovery_floor: u64,
-    #[serde(default)]
     known_head: u64,
     records: Vec<DirectRecord>,
 }
 
 impl DirectStream {
+    /// Evict the oldest recovery copy and move the floor to it. Sequences
+    /// between the old floor and that copy were never received: they are
+    /// given up as missed (B7e). Returns how many.
+    fn evict_first(&mut self) -> u64 {
+        let expected = self.floor.max(self.recovery_floor).saturating_add(1);
+        let sequence = self.records.remove(0).sequence;
+        self.floor = self.floor.max(sequence);
+        sequence.saturating_sub(expected)
+    }
+
+    /// True when `sequence` is at or below the floor: accepted, evicted, or
+    /// given up as missed. A late copy of such a sequence is dropped.
+    fn closed(&self, sequence: u64) -> bool {
+        sequence <= self.floor.max(self.recovery_floor)
+    }
+
     fn effective_head(&self) -> u64 {
         self.known_head.max(
             self.records
@@ -151,42 +263,376 @@ impl DirectStream {
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone)]
 pub struct ObjectInbox {
     workspace: [u8; 32],
+    /// The local accepted epoch. Replay state and pending objects from the
+    /// receive window are kept across epoch changes (`advance`).
     epoch: u64,
-    // ponytail: linear lookup up to 4,096 streams; index if measured load requires it.
-    streams: Vec<Stream>,
-    #[serde(skip)]
+    // ponytail: linear lookup up to 4,096 windows; index if measured load requires it.
+    replay: Vec<Replay>,
+    /// Arrival order.
+    pending: Vec<Pending>,
+    /// Recently accepted (author, publication id) digests, across epochs. A
+    /// copy that the author re-publishes under a new epoch or counter is a
+    /// duplicate.
+    recent: VecDeque<[u8; 16]>,
+    /// Round-robin service: acknowledgement tick of each delivery scope that
+    /// has pending work.
+    clock: u64,
+    served: Vec<([u8; 32], u64)>,
     retained_ranges: Vec<RetainedRange>,
-    #[serde(skip)]
     retained_current_views: Vec<RetainedCurrentView>,
-    #[serde(skip)]
     current: Option<Box<current::CurrentViewIndex>>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     progress: Vec<SelectionProgress>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     current_progress: Vec<CurrentProgress>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    legacy_receive_snapshot: Option<Vec<u8>>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     direct: Vec<DirectStream>,
+    /// Direct sequences given up as missed since this inbox was created or
+    /// restored (B7e). Not persisted: a staging step reports the difference
+    /// between its candidate and the adopted state.
+    missed: u64,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Decoded state part of an inbox snapshot. Binary, canonical, bounded:
+/// payloads and objects are raw bytes, not JSON number arrays.
 struct Snapshot {
     workspace: [u8; 32],
     epoch: u64,
-    streams: Vec<Stream>,
-    #[serde(default)]
+    replay: Vec<Replay>,
+    pending: Vec<Pending>,
+    recent: VecDeque<[u8; 16]>,
+    clock: u64,
+    served: Vec<([u8; 32], u64)>,
     progress: Vec<SelectionProgress>,
-    #[serde(default)]
     current_progress: Vec<CurrentProgress>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    legacy_receive_snapshot: Option<Vec<u8>>,
-    #[serde(default)]
     direct: Vec<DirectStream>,
+}
+
+mod codec {
+    //! Byte helpers for the inbox snapshot. Lengths are checked on read.
+    use super::super::{number64, take};
+
+    pub(super) fn u64(bytes: &mut Vec<u8>, value: u64) {
+        bytes.extend(value.to_be_bytes());
+    }
+    pub(super) fn count(bytes: &mut Vec<u8>, value: usize) {
+        bytes.extend((value as u32).to_be_bytes());
+    }
+    pub(super) fn blob(bytes: &mut Vec<u8>, value: &[u8]) {
+        count(bytes, value.len());
+        bytes.extend(value);
+    }
+    pub(super) fn text(bytes: &mut Vec<u8>, value: &str) {
+        bytes.push(value.len() as u8);
+        bytes.extend(value.as_bytes());
+    }
+    /// LEB128: sparse replay counters as small deltas.
+    pub(super) fn varint(bytes: &mut Vec<u8>, mut value: u64) {
+        while value >= 0x80 {
+            bytes.push(value as u8 | 0x80);
+            value >>= 7;
+        }
+        bytes.push(value as u8);
+    }
+
+    pub(super) fn read_u64(input: &mut &[u8]) -> Result<u64, &'static str> {
+        number64(input)
+    }
+    pub(super) fn read_count(input: &mut &[u8], limit: usize) -> Result<usize, &'static str> {
+        let value = u32::from_be_bytes(take(input, 4)?.try_into().unwrap()) as usize;
+        if value > limit {
+            return Err("inbox snapshot count exceeds bound");
+        }
+        Ok(value)
+    }
+    pub(super) fn read_blob(input: &mut &[u8], limit: usize) -> Result<Vec<u8>, &'static str> {
+        let length = read_count(input, limit)?;
+        Ok(take(input, length)?.to_vec())
+    }
+    pub(super) fn read_text(input: &mut &[u8]) -> Result<String, &'static str> {
+        let length = take(input, 1)?[0] as usize;
+        String::from_utf8(take(input, length)?.to_vec()).map_err(|_| "invalid inbox text")
+    }
+    pub(super) fn read_array<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], &'static str> {
+        Ok(take(input, N)?.try_into().unwrap())
+    }
+    pub(super) fn read_varint(input: &mut &[u8]) -> Result<u64, &'static str> {
+        let mut value = 0u64;
+        for shift in (0..64).step_by(7) {
+            let byte = take(input, 1)?[0];
+            value |= u64::from(byte & 0x7f)
+                .checked_shl(shift)
+                .filter(|part| part >> shift == u64::from(byte & 0x7f))
+                .ok_or("invalid varint")?;
+            if byte & 0x80 == 0 {
+                if byte == 0 && shift != 0 {
+                    return Err("noncanonical varint");
+                }
+                return Ok(value);
+            }
+        }
+        Err("invalid varint")
+    }
+}
+
+fn encode_recipients(bytes: &mut Vec<u8>, recipients: &[[u8; 32]]) {
+    bytes.push(recipients.len() as u8);
+    for recipient in recipients {
+        bytes.extend(recipient);
+    }
+}
+
+fn decode_recipients(input: &mut &[u8]) -> Result<Vec<[u8; 32]>, &'static str> {
+    let count = take(input, 1)?[0] as usize;
+    if count > 64 {
+        return Err("too many inbox recipients");
+    }
+    (0..count).map(|_| codec::read_array(input)).collect()
+}
+
+impl DirectStream {
+    fn encode(&self, bytes: &mut Vec<u8>) {
+        bytes.extend(self.author);
+        codec::u64(bytes, self.revision);
+        codec::text(bytes, &self.topic);
+        encode_recipients(bytes, &self.recipients);
+        codec::u64(bytes, self.floor);
+        codec::u64(bytes, self.recovery_floor);
+        codec::u64(bytes, self.known_head);
+        codec::count(bytes, self.records.len());
+        for record in &self.records {
+            codec::u64(bytes, record.revision);
+            bytes.extend(record.id);
+            codec::u64(bytes, record.sequence);
+            codec::blob(bytes, &record.object);
+        }
+    }
+
+    fn decode(input: &mut &[u8]) -> Result<Self, &'static str> {
+        let author = codec::read_array(input)?;
+        let revision = codec::read_u64(input)?;
+        let topic = codec::read_text(input)?;
+        let recipients = decode_recipients(input)?;
+        let floor = codec::read_u64(input)?;
+        let recovery_floor = codec::read_u64(input)?;
+        let known_head = codec::read_u64(input)?;
+        let count = codec::read_count(input, DIRECT_WINDOW)?;
+        let mut records = Vec::with_capacity(count);
+        for _ in 0..count {
+            records.push(DirectRecord {
+                revision: codec::read_u64(input)?,
+                id: codec::read_array(input)?,
+                sequence: codec::read_u64(input)?,
+                object: codec::read_blob(input, arachne_security::MAX_APPLICATION_CIPHERTEXT)?,
+            });
+        }
+        Ok(Self {
+            author,
+            revision,
+            topic,
+            recipients,
+            floor,
+            recovery_floor,
+            known_head,
+            records,
+        })
+    }
+
+    fn encoded_len(&self) -> usize {
+        32 + 8 + 1 + self.topic.len() + 1 + 32 * self.recipients.len() + 24 + 4
+            + self
+                .records
+                .iter()
+                .map(|record| 8 + 16 + 8 + 4 + record.object.len())
+                .sum::<usize>()
+    }
+}
+
+impl Snapshot {
+    fn encode(inbox: &ObjectInbox, bytes: &mut Vec<u8>) {
+        bytes.extend(inbox.workspace);
+        codec::u64(bytes, inbox.epoch);
+        codec::count(bytes, inbox.replay.len());
+        for replay in &inbox.replay {
+            bytes.extend(replay.author);
+            codec::u64(bytes, replay.epoch);
+            codec::u64(bytes, replay.lost_through);
+            codec::u64(bytes, replay.floor);
+            codec::count(bytes, replay.seen.len());
+            let mut previous = replay.floor;
+            for counter in &replay.seen {
+                codec::varint(bytes, counter - previous);
+                previous = *counter;
+            }
+        }
+        codec::count(bytes, inbox.pending.len());
+        for pending in &inbox.pending {
+            bytes.extend(pending.author);
+            bytes.extend(pending.endpoint);
+            codec::u64(bytes, pending.epoch);
+            codec::u64(bytes, pending.counter);
+            codec::u64(bytes, pending.revision);
+            codec::text(bytes, &pending.topic);
+            bytes.extend(pending.id);
+            codec::u64(bytes, pending.sequence);
+            encode_recipients(bytes, &pending.recipients);
+            match &pending.current {
+                None => bytes.push(0),
+                Some(current) => {
+                    bytes.push(1 + u8::from(current.tombstone));
+                    bytes.extend(current.selector);
+                    bytes.extend(current.replacement_key);
+                    codec::u64(bytes, current.expires_at);
+                }
+            }
+            codec::blob(bytes, &pending.payload);
+        }
+        codec::count(bytes, inbox.recent.len());
+        for identity in &inbox.recent {
+            bytes.extend(identity);
+        }
+        codec::u64(bytes, inbox.clock);
+        codec::count(bytes, inbox.served.len());
+        for (scope, tick) in &inbox.served {
+            bytes.extend(scope);
+            codec::u64(bytes, *tick);
+        }
+        codec::count(bytes, inbox.progress.len());
+        for progress in &inbox.progress {
+            bytes.extend(progress.author);
+            codec::u64(bytes, progress.epoch);
+            bytes.extend(progress.selection);
+            codec::u64(bytes, progress.through);
+        }
+        codec::count(bytes, inbox.current_progress.len());
+        for progress in &inbox.current_progress {
+            bytes.extend(progress.authority);
+            codec::u64(bytes, progress.revision);
+            codec::text(bytes, &progress.topic);
+            bytes.extend(progress.selector);
+            codec::u64(bytes, progress.cut);
+            bytes.extend(progress.digest);
+        }
+        codec::count(bytes, inbox.direct.len());
+        for stream in &inbox.direct {
+            stream.encode(bytes);
+        }
+    }
+
+    fn decode(input: &mut &[u8]) -> Result<Self, &'static str> {
+        let workspace = codec::read_array(input)?;
+        let epoch = codec::read_u64(input)?;
+        let count = codec::read_count(input, MAX_REPLAY_WINDOWS)?;
+        let mut replay = Vec::with_capacity(count);
+        for _ in 0..count {
+            let author = codec::read_array(input)?;
+            let epoch = codec::read_u64(input)?;
+            let lost_through = codec::read_u64(input)?;
+            let floor = codec::read_u64(input)?;
+            let seen_count = codec::read_count(input, REPLAY_ENTRIES)?;
+            let mut seen = BTreeSet::new();
+            let mut previous = floor;
+            for _ in 0..seen_count {
+                let delta = codec::read_varint(input)?;
+                previous = previous
+                    .checked_add(delta)
+                    .filter(|_| delta != 0)
+                    .ok_or("invalid replay counter")?;
+                seen.insert(previous);
+            }
+            replay.push(Replay {
+                author,
+                epoch,
+                lost_through,
+                floor,
+                seen,
+            });
+        }
+        let count = codec::read_count(input, MAX_PENDING_OBJECTS)?;
+        let mut pending = Vec::with_capacity(count);
+        for _ in 0..count {
+            let author = codec::read_array(input)?;
+            let endpoint = codec::read_array(input)?;
+            let epoch = codec::read_u64(input)?;
+            let counter = codec::read_u64(input)?;
+            let revision = codec::read_u64(input)?;
+            let topic = codec::read_text(input)?;
+            let id = codec::read_array(input)?;
+            let sequence = codec::read_u64(input)?;
+            let recipients = decode_recipients(input)?;
+            let current = match take(input, 1)?[0] {
+                0 => None,
+                flag @ (1 | 2) => Some(CurrentReceipt {
+                    selector: codec::read_array(input)?,
+                    replacement_key: codec::read_array(input)?,
+                    expires_at: codec::read_u64(input)?,
+                    tombstone: flag == 2,
+                }),
+                _ => return Err("invalid pending current marker"),
+            };
+            let payload = codec::read_blob(input, arachne_security::MAX_APPLICATION_PAYLOAD)?;
+            pending.push(Pending {
+                author,
+                endpoint,
+                epoch,
+                counter,
+                revision,
+                topic,
+                id,
+                sequence,
+                recipients,
+                current,
+                payload,
+            });
+        }
+        let count = codec::read_count(input, RECENT_IDS)?;
+        let recent = (0..count)
+            .map(|_| codec::read_array(input))
+            .collect::<Result<_, _>>()?;
+        let clock = codec::read_u64(input)?;
+        let count = codec::read_count(input, MAX_PENDING_OBJECTS)?;
+        let served = (0..count)
+            .map(|_| Ok((codec::read_array(input)?, codec::read_u64(input)?)))
+            .collect::<Result<_, &'static str>>()?;
+        let count = codec::read_count(input, MAX_RECOVERY_SELECTIONS)?;
+        let mut progress = Vec::with_capacity(count);
+        for _ in 0..count {
+            progress.push(SelectionProgress {
+                author: codec::read_array(input)?,
+                epoch: codec::read_u64(input)?,
+                selection: codec::read_array(input)?,
+                through: codec::read_u64(input)?,
+            });
+        }
+        let count = codec::read_count(input, current::MAX_CURRENT_SELECTIONS)?;
+        let mut current_progress = Vec::with_capacity(count);
+        for _ in 0..count {
+            current_progress.push(CurrentProgress {
+                authority: codec::read_array(input)?,
+                revision: codec::read_u64(input)?,
+                topic: codec::read_text(input)?,
+                selector: codec::read_array(input)?,
+                cut: codec::read_u64(input)?,
+                digest: codec::read_array(input)?,
+            });
+        }
+        let count = codec::read_count(input, MAX_DIRECT_STREAMS)?;
+        let direct = (0..count)
+            .map(|_| DirectStream::decode(input))
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            workspace,
+            epoch,
+            replay,
+            pending,
+            recent,
+            clock,
+            served,
+            progress,
+            current_progress,
+            direct,
+        })
+    }
 }
 
 pub enum InboxStage {
@@ -198,6 +644,8 @@ pub enum InboxStage {
 pub struct PendingObject {
     pub context: PublicationContext,
     pub message: arachne_security::ApplicationMessage,
+    /// The author's epoch for this object; with `counter` it is unique.
+    pub epoch: u64,
     pub counter: u64,
     pub recipients: Vec<[u8; 32]>,
     pub current: Option<current::CurrentMetadata>,
@@ -274,42 +722,111 @@ impl ObjectInbox {
         Self {
             workspace,
             epoch,
-            streams: Vec::new(),
+            replay: Vec::new(),
+            pending: Vec::new(),
+            recent: VecDeque::new(),
+            clock: 0,
+            served: Vec::new(),
             retained_ranges: Vec::new(),
             retained_current_views: Vec::new(),
             current: None,
             progress: Vec::new(),
             current_progress: Vec::new(),
-            legacy_receive_snapshot: None,
             direct: Vec::new(),
+            missed: 0,
         }
     }
 
-    /// Preserve pre-object receive evidence during an explicit host cutover.
-    /// This does not make legacy MLS ciphertext independently recoverable.
-    pub fn with_legacy_receipts(&self, received: Option<&crate::receive::ReceiveJournal>) -> Self {
-        let mut next = self.clone();
-        next.legacy_receive_snapshot = received.map(|r| r.snapshot());
-        next
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
-    pub fn legacy_receipts(&self) -> Result<Option<crate::receive::ReceiveJournal>, &'static str> {
-        self.legacy_receive_snapshot
-            .as_ref()
-            .map(|bytes| crate::receive::ReceiveJournal::restore(self.workspace, self.epoch, bytes))
-            .transpose()
+    /// Carry delivery state across an accepted membership step from
+    /// `previous` to `next`. Pending objects are kept: they are already
+    /// authenticated plaintext. Replay windows, recovery progress, retained
+    /// ranges and direct recovery copies are kept for epochs inside `next`'s
+    /// receive window. Current views are per epoch and start empty. Save the
+    /// result with `next` before adoption.
+    pub fn advance(
+        &self,
+        previous: &arachne_security::Workspace,
+        next: &arachne_security::Workspace,
+    ) -> Result<Self, &'static str> {
+        self.validate_owner(previous)?;
+        if next.id() != self.workspace || next.epoch() <= self.epoch {
+            return Err("inbox cannot advance to this owner");
+        }
+        let oldest = next.oldest_receive_epoch();
+        let member = |id: &[u8; 32]| next.endpoints_for_members(&[*id]).is_ok();
+        let before: BTreeSet<_> = previous.member_endpoints()?.into_iter().collect();
+        let admits = next
+            .member_endpoints()?
+            .iter()
+            .any(|endpoint| !before.contains(endpoint));
+        let mut advanced = self.clone();
+        advanced.epoch = next.epoch();
+        advanced.replay.retain(|replay| replay.epoch >= oldest);
+        advanced.progress.retain(|progress| progress.epoch >= oldest);
+        // Retained third-party ranges: only from current members, and none
+        // from before a join (a holder never serves pre-join history).
+        advanced.retained_ranges.retain(|range| {
+            RangeQuery::from_wire(&range.query).is_ok_and(|query| {
+                query.epoch >= oldest
+                    && member(&query.author)
+                    && (!admits || query.epoch >= next.epoch())
+            })
+        });
+        advanced.current = None;
+        advanced.retained_current_views.clear();
+        advanced.current_progress.clear();
+        let mut missed = 0;
+        for stream in &mut advanced.direct {
+            while let Some(record) = stream.records.first() {
+                if arachne_security::object_epoch(&record.object).is_some_and(|epoch| epoch >= oldest)
+                {
+                    break;
+                }
+                // B7f-2: copies that left the receive window move the floor
+                // past any gap before them; those sequences are missed, as
+                // on an eviction (B7e).
+                missed += stream.evict_first();
+            }
+        }
+        advanced.missed = advanced.missed.saturating_add(missed);
+        // A direct scope that names a removed member ends: its copies can no
+        // longer be authenticated or served to that audience.
+        advanced.direct.retain(|stream| {
+            (!stream.records.is_empty() || stream.known_head != 0)
+                && member(&stream.author)
+                && stream.recipients.iter().all(member)
+        });
+        advanced.snapshot()?;
+        Ok(advanced)
     }
 
-    pub fn recovery_progress(&self, author: [u8; 32], topics: &BTreeSet<Topic>) -> u64 {
+    /// Direct sequences given up as missed since this inbox was created or
+    /// restored: a record window overflow moved a scope floor past a gap
+    /// (B7e). The difference between a staged candidate and the current state
+    /// is the misses of that step.
+    pub fn missed_direct(&self) -> u64 {
+        self.missed
+    }
+
+    pub fn recovery_progress(&self, author: [u8; 32], epoch: u64, topics: &BTreeSet<Topic>) -> u64 {
         let selection = selection_digest(topics);
         self.progress
             .iter()
-            .find(|progress| progress.author == author && progress.selection == selection)
+            .find(|progress| {
+                progress.author == author
+                    && progress.epoch == epoch
+                    && progress.selection == selection
+            })
             .map_or(0, |progress| progress.through)
     }
 
     /// Add or replace one publisher-owned latest value. The returned inbox must
     /// be saved atomically with the already protected publication and owner.
+    /// `expires_at` is in `UnixSeconds`.
     #[allow(clippy::too_many_arguments)]
     pub fn stage_current(
         &self,
@@ -320,6 +837,7 @@ impl ObjectInbox {
         expires_at: u64,
         tombstone: bool,
         packet: Vec<u8>,
+        now: UnixSeconds,
     ) -> Result<Self, &'static str> {
         self.validate_owner(owner)?;
         let authority = owner.member().ok_or("member required")?.id();
@@ -339,6 +857,7 @@ impl ObjectInbox {
                 expires_at,
                 tombstone,
                 packet,
+                now,
             )?;
         next.snapshot()?;
         Ok(next)
@@ -350,7 +869,7 @@ impl ObjectInbox {
         policy: &arachne_routing::RoutingTable,
         requester: [u8; 32],
         query: &current::CurrentViewQuery,
-        now: u64,
+        now: UnixSeconds,
     ) -> Result<Vec<u8>, &'static str> {
         self.validate_owner(owner)?;
         if let Some(index) = &self.current {
@@ -378,7 +897,7 @@ impl ObjectInbox {
         let Some(view) = self
             .retained_current_views
             .iter()
-            .find(|view| view.query == encoded && view.expires_at > now)
+            .find(|view| view.query == encoded && now.before_remote_expiry(view.expires_at))
         else {
             return Ok(current::CurrentView::denied_wire());
         };
@@ -394,7 +913,7 @@ impl ObjectInbox {
         owner: &arachne_security::Workspace,
         query: &current::CurrentViewQuery,
         reply: &[u8],
-        now: u64,
+        now: UnixSeconds,
     ) -> Result<(Self, usize, usize), &'static str> {
         self.validate_owner(owner)?;
         let view =
@@ -433,7 +952,8 @@ impl ObjectInbox {
         let mut pending = 0;
         let mut stale = 0;
         for value in &view.values {
-            if value.expires_at <= now {
+            // The authority's clock set the expiry: allow clock skew.
+            if !now.before_remote_expiry(value.expires_at) {
                 stale += 1;
                 continue;
             }
@@ -449,8 +969,11 @@ impl ObjectInbox {
                 expires_at: value.expires_at,
                 tombstone: value.tombstone,
             };
-            let authenticated =
-                owner.unprotect_object(&metadata.authenticated_context(&context), ciphertext)?;
+            let authenticated = owner.unprotect_object(
+                context.topic.namespace().as_bytes(),
+                &metadata.authenticated_context(&context),
+                ciphertext,
+            )?;
             if authenticated.message.member != query.authority
                 || authenticated.message.endpoint != expected_endpoint
             {
@@ -498,8 +1021,26 @@ impl ObjectInbox {
         query: &RangeQuery,
         reply: &[u8],
     ) -> Result<Self, &'static str> {
+        self.accept_recovery_prefix(owner, query, reply, query.through)
+    }
+
+    /// Accept progress through `through` inside one verified publisher-signed
+    /// range (B7b). The signature covers the whole range, so every record with
+    /// a sequence at or below `through` is the complete prefix. The caller
+    /// passes the last sequence it admitted or found duplicate; records above
+    /// it were not recorded and come again by a later request.
+    pub fn accept_recovery_prefix(
+        &self,
+        owner: &arachne_security::Workspace,
+        query: &RangeQuery,
+        reply: &[u8],
+        through: u64,
+    ) -> Result<Self, &'static str> {
         self.validate_owner(owner)?;
-        if query.workspace != self.workspace || query.epoch != self.epoch {
+        if through <= query.after || through > query.through {
+            return Err("recovery progress outside the signed range");
+        }
+        if query.workspace != self.workspace || !owner.in_receive_window(query.epoch) {
             return Err("recovery coverage has wrong workspace or epoch");
         }
         if !matches!(
@@ -510,10 +1051,12 @@ impl ObjectInbox {
         }
         let selection = selection_digest(&query.topics);
         let position = self.progress.iter().position(|progress| {
-            progress.author == query.author && progress.selection == selection
+            progress.author == query.author
+                && progress.epoch == query.epoch
+                && progress.selection == selection
         });
         let current = position.map_or(0, |index| self.progress[index].through);
-        if query.through <= current {
+        if through <= current {
             return Ok(self.clone());
         }
         if query.after != current {
@@ -524,15 +1067,16 @@ impl ObjectInbox {
         }
         let mut next = self.clone();
         if let Some(index) = position {
-            next.progress[index].through = query.through;
+            next.progress[index].through = through;
         } else {
             next.progress.push(SelectionProgress {
                 author: query.author,
+                epoch: query.epoch,
                 selection,
-                through: query.through,
+                through,
             });
             next.progress
-                .sort_by_key(|progress| (progress.author, progress.selection));
+                .sort_by_key(|progress| (progress.author, progress.epoch, progress.selection));
         }
         next.snapshot()?;
         Ok(next)
@@ -545,17 +1089,13 @@ impl ObjectInbox {
         Ok(())
     }
 
-    fn context(
-        &self,
-        stream: &Stream,
-        receipt: &Receipt,
-    ) -> Result<PublicationContext, &'static str> {
+    fn context(&self, pending: &Pending) -> Result<PublicationContext, &'static str> {
         Ok(PublicationContext {
             workspace: self.workspace,
-            revision: receipt.revision,
-            topic: Topic::new(stream.topic.clone()).map_err(|_| "invalid inbox topic")?,
-            id: receipt.id,
-            sequence: std::num::NonZeroU64::new(receipt.sequence),
+            revision: pending.revision,
+            topic: Topic::new(pending.topic.clone()).map_err(|_| "invalid inbox topic")?,
+            id: pending.id,
+            sequence: std::num::NonZeroU64::new(pending.sequence),
         })
     }
 
@@ -606,69 +1146,99 @@ impl ObjectInbox {
         }
         let sequence = context.sequence.map_or(0, |n| n.get());
         let aad = receipt_aad(owner, context, recipients, current.as_ref())?;
-        let authenticated = owner.unprotect_object(&aad, object)?;
+        let authenticated =
+            owner.unprotect_object(context.topic.namespace().as_bytes(), &aad, object)?;
         let author = authenticated.message.member;
         let counter = authenticated.counter;
-        let digest: [u8; 32] = Sha256::digest(object).into();
+        let epoch = authenticated.epoch;
         let position = self
-            .streams
+            .replay
             .iter()
-            .position(|s| s.author == author && s.topic == context.topic.as_str());
+            .position(|replay| replay.author == author && replay.epoch == epoch);
         if let Some(index) = position {
-            let stream = &self.streams[index];
-            if counter <= stream.floor {
-                return Ok(InboxStage::OutsideWindow);
+            match self.replay[index].state(counter) {
+                ReplayState::Duplicate => return Ok(InboxStage::Duplicate),
+                ReplayState::Lost => return Ok(InboxStage::OutsideWindow),
+                ReplayState::New => {}
             }
-            if let Some(known) = stream.receipts.iter().find(|r| r.counter == counter) {
-                if known.digest != digest
-                    || self.context(stream, known)? != *context
-                    || known.recipients != recipients
-                    || known.current != current
-                {
-                    return Err("conflicting object identity");
-                }
-                return Ok(InboxStage::Duplicate);
-            }
-            if stream.receipts.iter().any(|r| r.id == context.id) {
-                return Err("publication identity reused");
-            }
-            if stream.receipts.len() == WINDOW && counter < stream.receipts[0].counter {
-                return Ok(InboxStage::OutsideWindow);
-            }
-        } else if self.streams.len() == MAX_STREAMS {
-            return Err("inbox stream capacity exhausted");
+        } else if self.replay.len() == MAX_REPLAY_WINDOWS {
+            return Err("inbox replay capacity exhausted");
+        }
+        let identity = publication_identity(author, context.id);
+        if self.recent.contains(&identity) {
+            return Ok(InboxStage::Duplicate);
+        }
+        // B7e: a direct sequence at or below its scope floor was accepted or
+        // given up as missed. A late copy is dropped, never delivered after
+        // newer objects of the scope.
+        if !recipients.is_empty()
+            && sequence != 0
+            && self.direct.iter().any(|stream| {
+                stream.author == author
+                    && stream.revision == context.revision
+                    && stream.topic == context.topic.as_str()
+                    && stream.recipients == recipients
+                    && stream.closed(sequence)
+            })
+        {
+            return Ok(InboxStage::Duplicate);
+        }
+        // Never discard an undelivered object to make room. The object is not
+        // recorded, so it can come again (live or by recovery) after the
+        // application drains work. One author cannot use up everyone's space.
+        // The author is charged the encoded size, metadata included.
+        let size = Pending::weight(
+            context.topic.as_str().len(),
+            recipients.len(),
+            current.is_some(),
+            authenticated.message.payload.len(),
+        );
+        let (author_objects, author_bytes) = self
+            .pending
+            .iter()
+            .filter(|pending| pending.author == author)
+            .fold((0, 0), |(count, bytes), pending| {
+                (count + 1, bytes + pending.encoded_len())
+            });
+        if (author_objects >= MAX_PENDING_OBJECTS_PER_AUTHOR
+            || author_bytes + size > MAX_PENDING_BYTES_PER_AUTHOR)
+            && !self.fills_blocking_gap(author, context, recipients)
+        {
+            return Err(AUTHOR_QUOTA_EXHAUSTED);
+        }
+        let total: usize = self.pending.iter().map(Pending::encoded_len).sum();
+        if self.pending.len() == MAX_PENDING_OBJECTS || total + size > MAX_PENDING_BYTES {
+            return Err(PENDING_INBOX_FULL);
         }
         let mut next = self.clone();
         let index = position.unwrap_or_else(|| {
-            next.streams.push(Stream {
+            next.replay.push(Replay {
                 author,
-                topic: context.topic.as_str().into(),
+                epoch,
+                lost_through: 0,
                 floor: 0,
-                receipts: Vec::new(),
+                seen: BTreeSet::new(),
             });
-            next.streams.len() - 1
+            next.replay.len() - 1
         });
-        let stream = &mut next.streams[index];
-        stream.receipts.push(Receipt {
+        next.replay[index].accept(counter);
+        next.recent.push_back(identity);
+        if next.recent.len() > RECENT_IDS {
+            next.recent.pop_front();
+        }
+        next.pending.push(Pending {
+            author,
+            endpoint: authenticated.message.endpoint,
+            epoch,
             counter,
             revision: context.revision,
+            topic: context.topic.as_str().into(),
             id: context.id,
             sequence,
             recipients: recipients.to_vec(),
             current,
-            digest,
-            pending: Some(object.to_vec()),
-            rejected: false,
+            payload: authenticated.message.payload,
         });
-        stream.receipts.sort_by_key(|r| r.counter);
-        if stream.receipts.len() > WINDOW {
-            // Never discard an undelivered object to make room. Caller drains
-            // pending application work and retries the SAME incoming object.
-            if stream.receipts[0].pending.is_some() {
-                return Err("pending inbox window full");
-            }
-            stream.floor = stream.receipts.remove(0).counter;
-        }
         if !recipients.is_empty() && context.sequence.is_some() {
             next.retain_direct(author, context, recipients, object)?;
         }
@@ -717,8 +1287,11 @@ impl ObjectInbox {
             return Err("direct sender cannot be a recipient");
         }
         owner.endpoints_for_members(recipients)?;
-        let authenticated =
-            owner.unprotect_object(&context.direct_authenticated_bytes(recipients)?, object)?;
+        let authenticated = owner.unprotect_object(
+            context.topic.namespace().as_bytes(),
+            &context.direct_authenticated_bytes(recipients)?,
+            object,
+        )?;
         if authenticated.message.member != owner.member().unwrap().id()
             || authenticated.message.endpoint != owner.endpoint()
         {
@@ -826,7 +1399,7 @@ impl ObjectInbox {
         let announcer = owner.member_id_for_endpoint(announcer)?;
         head.to_wire()?;
         if head.workspace != self.workspace
-            || head.epoch != self.epoch
+            || !owner.in_receive_window(head.epoch)
             || !head.recipients.contains(&local)
             || (announcer != head.author && !head.recipients.contains(&announcer))
         {
@@ -926,14 +1499,11 @@ impl ObjectInbox {
         });
         stream.records.sort_by_key(|record| record.sequence);
         stream.known_head = stream.known_head.max(sequence);
-        if stream.records.len() > WINDOW {
-            stream.floor = stream.records.remove(0).sequence;
+        if stream.records.len() > DIRECT_WINDOW {
+            self.missed += stream.evict_first();
         }
-        // ponytail: bounded JSON measurement matches the persisted byte budget;
-        // maintain incremental encoded weights if profiling warrants it.
-        while serde_json::to_vec(&self.direct)
-            .map_err(|_| "direct recovery encoding failed")?
-            .len()
+        // The encoded size is the persisted byte budget.
+        while self.direct.iter().map(DirectStream::encoded_len).sum::<usize>()
             > MAX_DIRECT_RETAINED_BYTES
         {
             let stream = self
@@ -948,7 +1518,7 @@ impl ObjectInbox {
                         .sum::<usize>()
                 })
                 .ok_or("direct recovery metadata capacity exhausted")?;
-            stream.floor = stream.floor.max(stream.records.remove(0).sequence);
+            self.missed += stream.evict_first();
         }
         Ok(())
     }
@@ -965,7 +1535,7 @@ impl ObjectInbox {
         let holder = owner.member().ok_or("member required")?.id();
         let topics = BTreeSet::from([query.topic.clone()]);
         if query.workspace != self.workspace
-            || query.epoch != self.epoch
+            || !owner.in_receive_window(query.epoch)
             || !query
                 .recipients
                 .contains(&requester_member.unwrap_or([0; 32]))
@@ -1021,13 +1591,27 @@ impl ObjectInbox {
         };
         let mut next = self.clone();
         let mut count = 0;
+        // B7c: the reply is verified whole and holds every sequence in
+        // (after, through] in order. Admit the in-order prefix that fits the
+        // pending bounds. The first refused record and all after it are not
+        // recorded, so the stream keeps its gap from there and
+        // `next_direct_gap` asks for the rest after the application drains.
         for packet in packets {
-            match next.stage_with_recipients(
+            let staged = next.stage_with_recipients(
                 owner,
                 &packet.context,
                 &query.recipients,
                 &packet.ciphertext,
-            )? {
+            );
+            let staged = match staged {
+                // Nothing fits yet: report the refusal, claim nothing.
+                Err(error) if drains_with_application(error) && count == 0 => {
+                    return Err(error);
+                }
+                Err(error) if drains_with_application(error) => break,
+                staged => staged?,
+            };
+            match staged {
                 InboxStage::Prepared(candidate) => {
                     next = *candidate;
                     count += 1;
@@ -1091,11 +1675,92 @@ impl ObjectInbox {
     /// Committed incoming objects still awaiting application acknowledgement,
     /// including objects waiting behind an ordered-delivery gap.
     pub fn pending_count(&self) -> usize {
-        self.streams
+        self.pending.len()
+    }
+
+    /// A direct object waits while an earlier sequence of its scope is missing.
+    fn behind_direct_gap(&self, pending: &Pending) -> bool {
+        if pending.recipients.is_empty() || pending.sequence == 0 {
+            return false;
+        }
+        self.direct.iter().any(|direct| {
+            if direct.author != pending.author
+                || direct.revision != pending.revision
+                || direct.topic != pending.topic
+                || direct.recipients != pending.recipients
+            {
+                return false;
+            }
+            let mut expected = direct.floor.max(direct.recovery_floor).saturating_add(1);
+            for record in &direct.records {
+                if record.sequence > expected {
+                    return pending.sequence >= record.sequence;
+                }
+                if record.sequence == expected {
+                    expected = expected.saturating_add(1);
+                }
+            }
+            false
+        })
+    }
+
+    /// B7c: true when a direct object is the next missing sequence of its
+    /// scope and every pending object of its author waits behind a direct gap.
+    /// The application can then acknowledge nothing of this author, so the
+    /// quota alone would block the gap for good. Such an object may go over the
+    /// author quota. Once admitted it is deliverable, so the author has
+    /// deliverable work again and the next object meets the quota: the author
+    /// is over its quota by one object at most.
+    fn fills_blocking_gap(
+        &self,
+        author: [u8; 32],
+        context: &PublicationContext,
+        recipients: &[[u8; 32]],
+    ) -> bool {
+        let Some(sequence) = context.sequence.map(|sequence| sequence.get()) else {
+            return false;
+        };
+        if recipients.is_empty() {
+            return false;
+        }
+        let mut author_pending = self
+            .pending
             .iter()
-            .flat_map(|stream| &stream.receipts)
-            .filter(|receipt| receipt.pending.is_some())
-            .count()
+            .filter(|pending| pending.author == author)
+            .peekable();
+        if author_pending.peek().is_none()
+            || !author_pending.all(|pending| self.behind_direct_gap(pending))
+        {
+            return false;
+        }
+        let expected = self
+            .direct
+            .iter()
+            .find(|stream| {
+                stream.author == author
+                    && stream.revision == context.revision
+                    && stream.topic == context.topic.as_str()
+                    && stream.recipients == recipients
+            })
+            .map_or(1, |stream| {
+                let mut expected = stream.floor.max(stream.recovery_floor).saturating_add(1);
+                for record in &stream.records {
+                    if record.sequence == expected {
+                        expected = expected.saturating_add(1);
+                    } else if record.sequence > expected {
+                        break;
+                    }
+                }
+                expected
+            });
+        sequence == expected
+    }
+
+    fn same_scope(a: &Pending, b: &Pending) -> bool {
+        a.author == b.author
+            && a.revision == b.revision
+            && a.topic == b.topic
+            && a.recipients == b.recipients
     }
 
     /// Returns authenticated pending work without consuming it. Call repeatedly
@@ -1127,67 +1792,100 @@ impl ObjectInbox {
                 return Err("invalid deferred delivery stream");
             }
         }
-        for stream in &self.streams {
-            for receipt in &stream.receipts {
-                if let Some(object) = &receipt.pending {
-                    if deferred.iter().any(|scope| {
-                        scope.member == stream.author
-                            && scope.revision == receipt.revision
-                            && scope.topic == stream.topic
-                            && scope.recipients == receipt.recipients
-                    }) {
-                        continue;
-                    }
-                    let context = self.context(stream, receipt)?;
-                    if !receipt.recipients.is_empty()
-                        && context.sequence.is_some()
-                        && self.direct.iter().any(|direct| {
-                            if direct.author != stream.author
-                                || direct.revision != context.revision
-                                || direct.topic != context.topic.as_str()
-                                || direct.recipients != receipt.recipients
-                            {
-                                return false;
-                            }
-                            let mut expected =
-                                direct.floor.max(direct.recovery_floor).saturating_add(1);
-                            for record in &direct.records {
-                                if record.sequence > expected {
-                                    return context.sequence.unwrap().get() >= record.sequence;
-                                }
-                                if record.sequence == expected {
-                                    expected = expected.saturating_add(1);
-                                }
-                            }
-                            false
-                        })
-                    {
-                        continue;
-                    }
-                    let aad = receipt_aad(
-                        owner,
-                        &context,
-                        &receipt.recipients,
-                        receipt.current.as_ref(),
-                    )?;
-                    let authenticated = owner.unprotect_object(&aad, object)?;
-                    if authenticated.counter != receipt.counter
-                        || authenticated.message.member != stream.author
-                        || <[u8; 32]>::from(Sha256::digest(object)) != receipt.digest
-                    {
-                        return Err("pending object identity mismatch");
-                    }
-                    return Ok(Some(PendingObject {
-                        context,
-                        message: authenticated.message,
-                        counter: receipt.counter,
-                        recipients: receipt.recipients.clone(),
-                        current: receipt.current.as_ref().map(Into::into),
-                    }));
-                }
-            }
+        let deferred_scope = |pending: &Pending| {
+            deferred.iter().any(|scope| {
+                scope.member == pending.author
+                    && scope.revision == pending.revision
+                    && scope.topic == pending.topic
+                    && scope.recipients == pending.recipients
+            })
+        };
+        // Round robin: the eligible scope served longest ago goes first (ties:
+        // earliest arrival), so one busy author cannot starve the others.
+        let Some((_, first)) = self
+            .pending
+            .iter()
+            .enumerate()
+            .filter(|(_, pending)| !deferred_scope(pending) && !self.behind_direct_gap(pending))
+            .min_by_key(|(arrival, pending)| (self.last_served(pending), *arrival))
+        else {
+            return Ok(None);
+        };
+        // Inside one scope, the author's order goes first.
+        let chosen = self
+            .pending
+            .iter()
+            .filter(|pending| Self::same_scope(pending, first) && !self.behind_direct_gap(pending))
+            .min_by_key(|pending| (pending.epoch, pending.counter))
+            .unwrap_or(first);
+        Ok(Some(self.pending_object(chosen)?))
+    }
+
+    fn scope_key(pending: &Pending) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"arachne/delivery-scope/v1\0");
+        hash.update(pending.author);
+        hash.update(pending.revision.to_be_bytes());
+        hash.update([pending.topic.len() as u8]);
+        hash.update(pending.topic.as_bytes());
+        for recipient in &pending.recipients {
+            hash.update(recipient);
         }
-        Ok(None)
+        hash.finalize().into()
+    }
+
+    fn last_served(&self, pending: &Pending) -> u64 {
+        let key = Self::scope_key(pending);
+        self.served
+            .iter()
+            .find(|(scope, _)| *scope == key)
+            .map_or(0, |(_, tick)| *tick)
+    }
+
+    fn pending_object(&self, pending: &Pending) -> Result<PendingObject, &'static str> {
+        Ok(PendingObject {
+            context: self.context(pending)?,
+            message: arachne_security::ApplicationMessage {
+                member: pending.author,
+                endpoint: pending.endpoint,
+                payload: pending.payload.clone(),
+            },
+            epoch: pending.epoch,
+            counter: pending.counter,
+            recipients: pending.recipients.clone(),
+            current: pending.current.as_ref().map(Into::into),
+        })
+    }
+
+    fn resolve(
+        &self,
+        author: [u8; 32],
+        topic: &Topic,
+        counter: u64,
+        id: [u8; 16],
+    ) -> Result<Self, &'static str> {
+        let position = self
+            .pending
+            .iter()
+            .position(|pending| {
+                pending.author == author
+                    && pending.topic == topic.as_str()
+                    && pending.counter == counter
+                    && pending.id == id
+            })
+            .ok_or("unknown pending object")?;
+        let mut next = self.clone();
+        // The replay window still records the counter: resolved objects are
+        // never delivered again.
+        let resolved = next.pending.remove(position);
+        let key = Self::scope_key(&resolved);
+        next.clock = next.clock.checked_add(1).ok_or("service clock exhausted")?;
+        next.served.retain(|(scope, _)| *scope != key);
+        next.served.push((key, next.clock));
+        // Keep ticks only for scopes that still have work.
+        let live: BTreeSet<_> = next.pending.iter().map(Self::scope_key).collect();
+        next.served.retain(|(scope, _)| live.contains(scope));
+        Ok(next)
     }
 
     /// Stage acknowledgement; save this inbox with the owner/publisher before
@@ -1199,20 +1897,7 @@ impl ObjectInbox {
         counter: u64,
         id: [u8; 16],
     ) -> Result<Self, &'static str> {
-        let mut next = self.clone();
-        let stream = next
-            .streams
-            .iter_mut()
-            .find(|s| s.author == author && s.topic == topic.as_str())
-            .ok_or("unknown pending stream")?;
-        let receipt = stream
-            .receipts
-            .iter_mut()
-            .find(|r| r.counter == counter && r.id == id)
-            .ok_or("unknown pending object")?;
-        receipt.pending = None;
-        receipt.rejected = false;
-        Ok(next)
+        self.resolve(author, topic, counter, id)
     }
 
     /// Persist permanent application rejection while retaining replay identity.
@@ -1223,24 +1908,7 @@ impl ObjectInbox {
         counter: u64,
         id: [u8; 16],
     ) -> Result<Self, &'static str> {
-        let mut next = self.clone();
-        let receipt = next
-            .streams
-            .iter_mut()
-            .find(|stream| stream.author == author && stream.topic == topic.as_str())
-            .and_then(|stream| {
-                stream
-                    .receipts
-                    .iter_mut()
-                    .find(|receipt| receipt.counter == counter && receipt.id == id)
-            })
-            .ok_or("unknown pending object")?;
-        if receipt.pending.is_none() {
-            return Err("object is not pending");
-        }
-        receipt.pending = None;
-        receipt.rejected = true;
-        Ok(next)
+        self.resolve(author, topic, counter, id)
     }
 
     /// Retain an exact publisher-signed range after local verification. A holder
@@ -1252,10 +1920,11 @@ impl ObjectInbox {
         query: &RangeQuery,
         reply: &[u8],
         expires_at: u64,
-        now: u64,
+        now: UnixSeconds,
     ) -> Result<Self, &'static str> {
         self.validate_owner(owner)?;
-        if expires_at <= now {
+        // `expires_at` is this holder's own retention limit: no skew.
+        if !now.before_local_expiry(expires_at) {
             return Err("retained range expiry must be in the future");
         }
         if !matches!(
@@ -1266,7 +1935,8 @@ impl ObjectInbox {
         }
         let encoded = query.to_wire()?;
         let mut next = self.clone();
-        next.retained_ranges.retain(|range| range.expires_at > now);
+        next.retained_ranges
+            .retain(|range| now.before_local_expiry(range.expires_at));
         if let Some(range) = next
             .retained_ranges
             .iter_mut()
@@ -1292,6 +1962,7 @@ impl ObjectInbox {
             });
         }
         next.retained_ranges.sort_by(|a, b| a.query.cmp(&b.query));
+        next.trim_proofs()?;
         next.snapshot()?;
         Ok(next)
     }
@@ -1304,21 +1975,22 @@ impl ObjectInbox {
         owner: &arachne_security::Workspace,
         query: &current::CurrentViewQuery,
         reply: &[u8],
-        now: u64,
+        now: UnixSeconds,
     ) -> Result<Self, &'static str> {
         self.validate_owner(owner)?;
+        // The authority's clock set these expiries: allow clock skew.
         let expires_at = current::verify_wire_reply(owner, query, reply)?
             .ok_or("only an authenticated current view can be retained")?
             .values
             .iter()
             .map(|value| value.expires_at)
             .max()
-            .filter(|expires_at| *expires_at > now)
+            .filter(|expires_at| now.before_remote_expiry(*expires_at))
             .ok_or("current view has no fresh value")?;
         let encoded = query.to_wire()?;
         let mut next = self.clone();
         next.retained_current_views
-            .retain(|view| view.expires_at > now);
+            .retain(|view| now.before_remote_expiry(view.expires_at));
         if let Some(view) = next
             .retained_current_views
             .iter_mut()
@@ -1327,8 +1999,17 @@ impl ObjectInbox {
             view.reply = reply.to_vec();
             view.expires_at = expires_at;
         } else {
+            // Same rule as retained ranges: the view that expires first
+            // gives way.
             if next.retained_current_views.len() == MAX_RETAINED_CURRENT_VIEWS {
-                return Err("retained current-view capacity exhausted");
+                let oldest = next
+                    .retained_current_views
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, view)| view.expires_at)
+                    .map(|(index, _)| index)
+                    .unwrap();
+                next.retained_current_views.remove(oldest);
             }
             next.retained_current_views.push(RetainedCurrentView {
                 query: encoded,
@@ -1338,8 +2019,53 @@ impl ObjectInbox {
         }
         next.retained_current_views
             .sort_by(|a, b| a.query.cmp(&b.query));
+        next.trim_proofs()?;
         next.snapshot()?;
         Ok(next)
+    }
+
+    /// Keep retained proofs inside their byte budget: the proof (range or
+    /// current view) that expires first is evicted.
+    fn trim_proofs(&mut self) -> Result<(), &'static str> {
+        loop {
+            let bytes: usize = self
+                .retained_ranges
+                .iter()
+                .map(|range| range.query.len() + range.reply.len() + 16)
+                .chain(
+                    self.retained_current_views
+                        .iter()
+                        .map(|view| view.query.len() + view.reply.len() + 16),
+                )
+                .sum();
+            if bytes <= MAX_RETAINED_PROOF_BYTES {
+                return Ok(());
+            }
+            let range = self
+                .retained_ranges
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, range)| range.expires_at)
+                .map(|(index, range)| (range.expires_at, index));
+            let view = self
+                .retained_current_views
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, view)| view.expires_at)
+                .map(|(index, view)| (view.expires_at, index));
+            match (range, view) {
+                (Some(range), Some(view)) if view.0 < range.0 => {
+                    self.retained_current_views.remove(view.1);
+                }
+                (Some(range), _) => {
+                    self.retained_ranges.remove(range.1);
+                }
+                (None, Some(view)) => {
+                    self.retained_current_views.remove(view.1);
+                }
+                (None, None) => return Err("retained proof exceeds budget"),
+            }
+        }
     }
 
     /// Serve only a still-current exact proof to a currently authorized reader.
@@ -1350,10 +2076,10 @@ impl ObjectInbox {
         policy: &arachne_routing::RoutingTable,
         requester: [u8; 32],
         query: &RangeQuery,
-        now: u64,
+        now: UnixSeconds,
     ) -> Result<Vec<u8>, &'static str> {
         self.validate_owner(owner)?;
-        if query.workspace != self.workspace || query.epoch != self.epoch {
+        if query.workspace != self.workspace || !owner.in_receive_window(query.epoch) {
             return Ok(wire::denied_reply());
         }
         if super::authorize_history(
@@ -1372,7 +2098,7 @@ impl ObjectInbox {
         let Some(range) = self
             .retained_ranges
             .iter()
-            .find(|range| range.query == encoded && range.expires_at > now)
+            .find(|range| range.query == encoded && now.before_local_expiry(range.expires_at))
         else {
             return Ok(wire::unavailable_reply());
         };
@@ -1393,10 +2119,10 @@ impl ObjectInbox {
         policy: &arachne_routing::RoutingTable,
         requester: [u8; 32],
         request: &wire::AvailableRangeQuery,
-        now: u64,
+        now: UnixSeconds,
     ) -> Result<Vec<u8>, &'static str> {
         self.validate_owner(owner)?;
-        if request.workspace != self.workspace || request.epoch != self.epoch {
+        if request.workspace != self.workspace || !owner.in_receive_window(request.epoch) {
             return Ok(wire::unavailable_available_reply());
         }
         if super::authorize_history(
@@ -1414,7 +2140,7 @@ impl ObjectInbox {
         let candidate = self
             .retained_ranges
             .iter()
-            .filter(|range| range.expires_at > now)
+            .filter(|range| now.before_local_expiry(range.expires_at))
             .filter_map(|range| {
                 RangeQuery::from_wire(&range.query)
                     .ok()
@@ -1435,10 +2161,8 @@ impl ObjectInbox {
     }
 
     fn snapshot(&self) -> Result<Vec<u8>, &'static str> {
-        let json = serde_json::to_vec(self).map_err(|_| "inbox encoding failed")?;
         let mut bytes = CACHE_MAGIC.to_vec();
-        bytes.extend((json.len() as u32).to_be_bytes());
-        bytes.extend(json);
+        Snapshot::encode(self, &mut bytes);
         bytes.push(self.retained_ranges.len() as u8);
         for range in &self.retained_ranges {
             bytes.extend(range.expires_at.to_be_bytes());
@@ -1463,7 +2187,7 @@ impl ObjectInbox {
             .unwrap_or_default();
         bytes.extend((current.len() as u32).to_be_bytes());
         bytes.extend(current);
-        if bytes.len() > arachne_security::MAX_WORKSPACE_ATTACHMENT {
+        if bytes.len() > INBOX_BUDGET {
             return Err("inbox byte capacity exhausted");
         }
         Ok(bytes)
@@ -1490,19 +2214,14 @@ impl ObjectInbox {
         self.validate_owner(owner)?;
         publisher.validate_owner(owner)?;
         let inbox = self.snapshot()?;
-        // Inbox receipts and pending objects take precedence over optional
-        // publisher history. Snapshot eviction keeps the signed head and each
-        // topic's unavailable-history watermark, never claiming empty coverage.
-        let mut retained = publisher.clone();
-        let log = loop {
-            let log = retained.snapshot();
-            if 9 + log.len() + inbox.len() <= arachne_security::MAX_WORKSPACE_ATTACHMENT {
-                break log;
-            }
-            if !retained.evict_oldest() {
-                return Err("combined object delivery state exceeds bound");
-            }
-        };
+        // Each part has its own budget, and the budgets fit the attachment:
+        // saving never evicts publisher history to make room for the inbox.
+        let log = publisher.snapshot();
+        if log.len() > crate::PUBLISHER_BUDGET
+            || 9 + log.len() + inbox.len() > arachne_security::MAX_WORKSPACE_ATTACHMENT
+        {
+            return Err("combined object delivery state exceeds bound");
+        }
         let mut bytes = MAGIC.to_vec();
         bytes.extend((log.len() as u32).to_be_bytes());
         bytes.extend(log);
@@ -1535,22 +2254,12 @@ impl ObjectInbox {
             return Err("unsupported object delivery bundle");
         }
         let length = u32::from_be_bytes(take(&mut bytes, 4)?.try_into().unwrap()) as usize;
-        let publisher = PublisherLog::restore(
-            owner.id(),
-            owner.member().ok_or("member required")?.id(),
-            owner.epoch(),
-            take(&mut bytes, length)?,
-        )?;
-        let (json, ranges, retained_current_views, current) = if bytes.starts_with(CACHE_MAGIC)
-            || bytes.starts_with(CURRENT_CACHE_MAGIC)
-            || bytes.starts_with(LEGACY_CACHE_MAGIC)
-        {
-            let has_current =
-                bytes.starts_with(CACHE_MAGIC) || bytes.starts_with(CURRENT_CACHE_MAGIC);
-            let has_retained_current = bytes.starts_with(CACHE_MAGIC);
+        let publisher = PublisherLog::restore(owner, take(&mut bytes, length)?)?;
+        let (parsed, ranges, retained_current_views, current) = if bytes.starts_with(CACHE_MAGIC) {
+            let has_current = true;
+            let has_retained_current = true;
             let mut input = &bytes[5..];
-            let length = u32::from_be_bytes(take(&mut input, 4)?.try_into().unwrap()) as usize;
-            let json = take(&mut input, length)?;
+            let parsed = Snapshot::decode(&mut input)?;
             let count = take(&mut input, 1)?[0] as usize;
             if count > MAX_RETAINED_RANGES {
                 return Err("retained range capacity exceeded");
@@ -1632,30 +2341,31 @@ impl ObjectInbox {
             if !input.is_empty() {
                 return Err("trailing retained range bytes");
             }
-            (json, ranges, retained_current_views, current)
+            (parsed, ranges, retained_current_views, current)
         } else {
-            (bytes, Vec::new(), Vec::new(), None)
+            return Err("unsupported object inbox snapshot");
         };
-        let parsed: Snapshot =
-            serde_json::from_slice(json).map_err(|_| "invalid inbox snapshot")?;
         let inbox = Self {
             workspace: parsed.workspace,
             epoch: parsed.epoch,
-            streams: parsed.streams,
+            replay: parsed.replay,
+            pending: parsed.pending,
+            recent: parsed.recent,
+            clock: parsed.clock,
+            served: parsed.served,
             retained_ranges: ranges,
             retained_current_views,
             current,
             progress: parsed.progress,
             current_progress: parsed.current_progress,
-            legacy_receive_snapshot: parsed.legacy_receive_snapshot,
             direct: parsed.direct,
+            missed: 0,
         };
         inbox.validate_owner(owner)?;
-        inbox.legacy_receipts()?;
         for range in &inbox.retained_ranges {
             let query = RangeQuery::from_wire(&range.query)?;
             if query.workspace != owner.id()
-                || query.epoch != owner.epoch()
+                || !owner.in_receive_window(query.epoch)
                 || !matches!(
                     wire::verify_reply(owner, &query, &range.reply)?,
                     wire::RangeReply::Offered(_)
@@ -1676,13 +2386,61 @@ impl ObjectInbox {
                 return Err("invalid retained current-view proof");
             }
         }
-        if inbox.streams.len() > MAX_STREAMS {
-            return Err("inbox stream capacity exceeded");
+        let oldest = owner.oldest_receive_epoch();
+        let mut windows = BTreeSet::new();
+        if inbox.replay.len() > MAX_REPLAY_WINDOWS
+            || inbox.replay.iter().any(|replay| {
+                !replay.valid()
+                    || replay.epoch < oldest
+                    || replay.epoch > owner.epoch()
+                    || !windows.insert((replay.author, replay.epoch))
+            })
+        {
+            return Err("invalid inbox replay window");
+        }
+        if inbox.pending.len() > MAX_PENDING_OBJECTS {
+            return Err("pending inbox capacity exceeded");
+        }
+        let live: BTreeSet<_> = inbox.pending.iter().map(Self::scope_key).collect();
+        let mut scopes = BTreeSet::new();
+        if inbox.recent.len() > RECENT_IDS
+            || inbox.served.iter().any(|(scope, tick)| {
+                *tick == 0 || *tick > inbox.clock || !live.contains(scope) || !scopes.insert(*scope)
+            })
+        {
+            return Err("invalid inbox service state");
+        }
+        let mut identities = BTreeSet::new();
+        for pending in &inbox.pending {
+            let context = inbox.context(pending)?;
+            // Pending objects were authenticated at receipt; the replay window
+            // of a still-retained epoch must record them.
+            let recorded = inbox
+                .replay
+                .iter()
+                .find(|replay| replay.author == pending.author && replay.epoch == pending.epoch)
+                .is_none_or(|replay| {
+                    matches!(replay.state(pending.counter), ReplayState::Duplicate)
+                });
+            if !identities.insert((pending.author, pending.epoch, pending.counter))
+                || !recorded
+                || pending.epoch > owner.epoch()
+                || pending.payload.len() > arachne_security::MAX_APPLICATION_PAYLOAD
+                || (pending.current.is_some() && !pending.recipients.is_empty())
+                || (pending.recipients.is_empty() && context.sequence.is_none())
+                || pending.recipients.len() > 64
+                || pending.recipients.windows(2).any(|pair| pair[0] >= pair[1])
+            {
+                return Err("invalid pending object");
+            }
         }
         if inbox.progress.len() > MAX_RECOVERY_SELECTIONS
-            || inbox.progress.iter().any(|progress| progress.through == 0)
+            || inbox.progress.iter().any(|progress| {
+                progress.through == 0 || !owner.in_receive_window(progress.epoch)
+            })
             || inbox.progress.windows(2).any(|pair| {
-                (pair[0].author, pair[0].selection) >= (pair[1].author, pair[1].selection)
+                (pair[0].author, pair[0].epoch, pair[0].selection)
+                    >= (pair[1].author, pair[1].epoch, pair[1].selection)
             })
         {
             return Err("invalid recovery selection progress");
@@ -1716,7 +2474,7 @@ impl ObjectInbox {
         for stream in &inbox.direct {
             let effective_head = stream.effective_head();
             if (stream.records.is_empty() && stream.known_head == 0)
-                || stream.records.len() > WINDOW
+                || stream.records.len() > DIRECT_WINDOW
                 || stream.floor > effective_head
                 || stream.recovery_floor > effective_head
                 || (stream.known_head != 0
@@ -1751,6 +2509,7 @@ impl ObjectInbox {
                     sequence: std::num::NonZeroU64::new(record.sequence),
                 };
                 let authenticated = owner.unprotect_object(
+                    topic.namespace().as_bytes(),
                     &context.direct_authenticated_bytes(&stream.recipients)?,
                     &record.object,
                 )?;
@@ -1764,44 +2523,23 @@ impl ObjectInbox {
                 previous = record.sequence;
             }
         }
-        let mut streams = BTreeSet::new();
-        for stream in &inbox.streams {
-            if !streams.insert((stream.author, &stream.topic))
-                || stream.receipts.is_empty()
-                || stream.receipts.len() > WINDOW
-            {
-                return Err("invalid inbox stream");
-            }
-            let mut previous = stream.floor;
-            let mut ids = BTreeSet::new();
-            for receipt in &stream.receipts {
-                let context = inbox.context(stream, receipt)?;
-                let aad = receipt_aad(
-                    owner,
-                    &context,
-                    &receipt.recipients,
-                    receipt.current.as_ref(),
-                )?;
-                if receipt.counter <= previous || !ids.insert(receipt.id) {
-                    return Err("invalid inbox receipt order");
-                }
-                previous = receipt.counter;
-                if receipt.rejected && receipt.pending.is_some() {
-                    return Err("rejected inbox object is still pending");
-                }
-                if let Some(object) = &receipt.pending {
-                    let message = owner.unprotect_object(&aad, object)?;
-                    if message.counter != receipt.counter
-                        || message.message.member != stream.author
-                        || <[u8; 32]>::from(Sha256::digest(object)) != receipt.digest
-                    {
-                        return Err("invalid pending object");
-                    }
-                }
-            }
-        }
         Ok((publisher, inbox))
     }
+}
+
+/// Register an unregistered invitation and fold the registration commit into
+/// `admin`. Callers with other already-joined members must additionally apply
+/// `registered.action`/`registered.commit` via `prepare_management_update`.
+#[cfg(test)]
+fn issue_registered_invitation(
+    admin: arachne_security::Workspace,
+) -> (
+    arachne_security::Workspace,
+    arachne_security::Invitation,
+    Vec<u8>,
+) {
+    let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    (registered.workspace, invite, checkpoint)
 }
 
 #[test]
@@ -1809,11 +2547,11 @@ fn current_value_survives_authenticated_delivery_bundle() {
     use arachne_routing::{Permissions, RoutingTable};
     use arachne_security::{PendingJoin, StorageKey, Workspace};
 
-    let admin = Workspace::create([1; 32], "Publisher").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
-    let join = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
+    let (admin, invite, checkpoint) = issue_registered_invitation(admin);
+    let join = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], join.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(2), join.admission_request().unwrap())
         .unwrap();
     let mut proof = join.join_proof().unwrap();
     proof
@@ -1836,10 +2574,14 @@ fn current_value_survives_authenticated_delivery_bundle() {
         tombstone: false,
     };
     let object = owner
-        .protect_object(&metadata.authenticated_context(&context), b"latest")
+        .protect_object(
+            context.topic.namespace().as_bytes(),
+            &metadata.authenticated_context(&context),
+            b"latest",
+        )
         .unwrap();
     let packet = context.packet(&object).unwrap();
-    let mut publisher = PublisherLog::new(owner.id(), owner.member().unwrap().id(), owner.epoch());
+    let mut publisher = PublisherLog::new(&owner).unwrap();
     publisher.append(context.clone(), object).unwrap();
     let inbox = ObjectInbox::new(owner.id(), owner.epoch())
         .stage_current(
@@ -1850,12 +2592,13 @@ fn current_value_survives_authenticated_delivery_bundle() {
             metadata.expires_at,
             metadata.tombstone,
             packet,
+            UnixSeconds(0),
         )
         .unwrap();
     let key = StorageKey::derive(&[3; 32]).unwrap();
     let sealed = inbox.seal(&owner, &key, &publisher).unwrap();
     let (restored_owner, _, restored) =
-        ObjectInbox::restore(&key, [1; 32], owner.id(), &sealed).unwrap();
+        ObjectInbox::restore(&key, crate::test_endpoint(1), owner.id(), &sealed).unwrap();
     let query = current::CurrentViewQuery {
         workspace: owner.id(),
         authority: owner.member().unwrap().id(),
@@ -1870,13 +2613,13 @@ fn current_value_survives_authenticated_delivery_bundle() {
             owner.id(),
             7,
             BTreeMap::from([
-                ([1; 32], Permissions::AllTopics),
-                ([2; 32], Permissions::AllTopics),
+                (crate::test_endpoint(1), Permissions::AllTopics),
+                (crate::test_endpoint(2), Permissions::AllTopics),
             ]),
         )
         .unwrap();
     let reply = restored
-        .serve_current(&restored_owner, &policy, [2; 32], &query, 50)
+        .serve_current(&restored_owner, &policy, crate::test_endpoint(2), &query, UnixSeconds(50))
         .unwrap();
     let verified = current::verify_wire_reply(&reader, &query, &reply)
         .unwrap()
@@ -1884,7 +2627,7 @@ fn current_value_survives_authenticated_delivery_bundle() {
     assert_eq!(verified.cut, 1);
     assert_eq!(verified.values[0].replacement_key, [8; 32]);
     let (accepted, pending_count, stale_count) = ObjectInbox::new(reader.id(), reader.epoch())
-        .accept_current_view(&reader, &query, &reply, 50)
+        .accept_current_view(&reader, &query, &reply, UnixSeconds(50))
         .unwrap();
     assert_eq!((pending_count, stale_count), (1, 0));
     assert_eq!(
@@ -1893,25 +2636,36 @@ fn current_value_survives_authenticated_delivery_bundle() {
     );
     assert_eq!(
         accepted
-            .accept_current_view(&reader, &query, &reply, 50)
+            .accept_current_view(&reader, &query, &reply, UnixSeconds(50))
             .unwrap()
             .1,
         0
     );
     let reader_publisher =
-        PublisherLog::new(reader.id(), reader.member().unwrap().id(), reader.epoch());
+        PublisherLog::new(&reader).unwrap();
     let accepted_sealed = accepted.seal(&reader, &key, &reader_publisher).unwrap();
     let (restored_reader, _, restored_accepted) =
-        ObjectInbox::restore(&key, [2; 32], reader.id(), &accepted_sealed).unwrap();
+        ObjectInbox::restore(&key, crate::test_endpoint(2), reader.id(), &accepted_sealed).unwrap();
     assert_eq!(
         restored_accepted
-            .accept_current_view(&restored_reader, &query, &reply, 50)
+            .accept_current_view(&restored_reader, &query, &reply, UnixSeconds(50))
             .unwrap()
             .1,
         0
     );
+    // Expiry 100 was set by the authority's clock. A reader whose clock is
+    // ahead by less than the skew allowance still accepts the value.
     let (_, pending_count, stale_count) = ObjectInbox::new(reader.id(), reader.epoch())
-        .accept_current_view(&reader, &query, &reply, 100)
+        .accept_current_view(
+            &reader,
+            &query,
+            &reply,
+            UnixSeconds(100 + EXPIRY_SKEW_SECONDS - 1),
+        )
+        .unwrap();
+    assert_eq!((pending_count, stale_count), (1, 0));
+    let (_, pending_count, stale_count) = ObjectInbox::new(reader.id(), reader.epoch())
+        .accept_current_view(&reader, &query, &reply, UnixSeconds(100 + EXPIRY_SKEW_SECONDS))
         .unwrap();
     assert_eq!((pending_count, stale_count), (0, 1));
     let (received_context, ciphertext) = PublicationContext::unpack(
@@ -1943,11 +2697,11 @@ fn current_value_survives_authenticated_delivery_bundle() {
 fn repeated_direct_transfers_fit_storage_without_losing_pending_or_sequence() {
     use arachne_security::{PendingJoin, StorageKey, Workspace};
 
-    let admin = Workspace::create([1; 32], "Publisher").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
-    let join = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
+    let (admin, invite, checkpoint) = issue_registered_invitation(admin);
+    let join = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], join.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(2), join.admission_request().unwrap())
         .unwrap();
     let mut proof = join.join_proof().unwrap();
     proof
@@ -1955,7 +2709,7 @@ fn repeated_direct_transfers_fit_storage_without_losing_pending_or_sequence() {
         .unwrap();
     let mut reader = join.prepare_workspace(&proof, &prepared.welcome).unwrap();
     let mut sender = prepared.workspace;
-    let mut log = PublisherLog::new(sender.id(), sender.member().unwrap().id(), sender.epoch());
+    let mut log = PublisherLog::new(&sender).unwrap();
     let context = |workspace, topic: Topic, sequence: u64, id: u128| PublicationContext {
         workspace,
         revision: 7,
@@ -1973,7 +2727,7 @@ fn repeated_direct_transfers_fit_storage_without_losing_pending_or_sequence() {
             sequence.into(),
         );
         let object = sender
-            .protect_object(&ctx.authenticated_bytes(), &vec![5; 12 * 1024])
+            .protect_object(ctx.topic.namespace().as_bytes(), &ctx.authenticated_bytes(), &vec![5; 12 * 1024])
             .unwrap();
         log.append(ctx, object).unwrap();
     }
@@ -1981,6 +2735,7 @@ fn repeated_direct_transfers_fit_storage_without_losing_pending_or_sequence() {
     let audience = [sender.member().unwrap().id()];
     let pending_object = reader
         .protect_object(
+            pending_context.topic.namespace().as_bytes(),
             &pending_context
                 .direct_authenticated_bytes(&audience)
                 .unwrap(),
@@ -2013,6 +2768,7 @@ fn repeated_direct_transfers_fit_storage_without_losing_pending_or_sequence() {
         );
         let object = sender
             .protect_object(
+                ctx.topic.namespace().as_bytes(),
                 &ctx.direct_authenticated_bytes(&recipients).unwrap(),
                 &vec![7; 6 * 1024],
             )
@@ -2021,13 +2777,16 @@ fn repeated_direct_transfers_fit_storage_without_losing_pending_or_sequence() {
             .stage_sent_direct(&sender, &ctx, &recipients, &object)
             .unwrap();
         let saved = inbox.seal(&sender, &key, &log).unwrap();
-        (sender, log, inbox) = ObjectInbox::restore(&key, [1; 32], sender.id(), &saved).unwrap();
+        (sender, log, inbox) = ObjectInbox::restore(&key, crate::test_endpoint(1), sender.id(), &saved).unwrap();
         assert_eq!(log.head(), 64);
         assert_eq!(
             inbox.pending(&sender).unwrap().unwrap().message.payload,
             b"keep pending"
         );
-        assert!(serde_json::to_vec(&inbox.direct).unwrap().len() <= MAX_DIRECT_RETAINED_BYTES);
+        assert!(
+            inbox.direct.iter().map(DirectStream::encoded_len).sum::<usize>()
+                <= MAX_DIRECT_RETAINED_BYTES
+        );
     }
     assert!(matches!(
         inbox
@@ -2059,11 +2818,11 @@ fn repeated_direct_transfers_fit_storage_without_losing_pending_or_sequence() {
 fn deferred_streams_preserve_order_identity_and_restart() {
     use arachne_security::{PendingJoin, StorageKey, Workspace};
 
-    let admin = Workspace::create([1; 32], "Publisher").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
-    let join = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
+    let (admin, invite, checkpoint) = issue_registered_invitation(admin);
+    let join = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], join.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(2), join.admission_request().unwrap())
         .unwrap();
     let mut proof = join.join_proof().unwrap();
     proof
@@ -2091,7 +2850,9 @@ fn deferred_streams_preserve_order_identity_and_restart() {
             vec![]
         };
         let aad = audience_aad(&reader, &context, &recipients).unwrap();
-        let object = sender.protect_object(&aad, &[number as u8]).unwrap();
+        let object = sender
+            .protect_object(context.topic.namespace().as_bytes(), &aad, &[number as u8])
+            .unwrap();
         let InboxStage::Prepared(next) = inbox
             .stage_with_recipients(&reader, &context, &recipients, &object)
             .unwrap()
@@ -2104,7 +2865,7 @@ fn deferred_streams_preserve_order_identity_and_restart() {
     let mut deferred = Vec::new();
     // A later object in the deferred scope (ID 2) must never overtake ID 1.
     // A different revision, audience, or topic can still make progress.
-    for number in [1u128, 3, 5, 4] {
+    for number in [1u128, 3, 4, 5] {
         let pending = inbox
             .pending_excluding(&reader, &deferred)
             .unwrap()
@@ -2137,10 +2898,10 @@ fn deferred_streams_preserve_order_identity_and_restart() {
     assert_eq!(again.message.payload, first.message.payload);
 
     let key = StorageKey::derive(&[3; 32]).unwrap();
-    let publisher = PublisherLog::new(reader.id(), reader.member().unwrap().id(), reader.epoch());
+    let publisher = PublisherLog::new(&reader).unwrap();
     let sealed = inbox.seal(&reader, &key, &publisher).unwrap();
     let (restored_reader, _, restored) =
-        ObjectInbox::restore(&key, [2; 32], reader.id(), &sealed).unwrap();
+        ObjectInbox::restore(&key, crate::test_endpoint(2), reader.id(), &sealed).unwrap();
     assert_eq!(restored.pending_count(), 5);
     let restored_first = restored.pending(&restored_reader).unwrap().unwrap();
     assert_eq!(restored_first.context, first.context);
@@ -2161,7 +2922,8 @@ fn deferred_streams_preserve_order_identity_and_restart() {
             .unwrap()
             .context
             .id,
-        2u128.to_be_bytes()
+        // Round robin: another scope goes before the served one continues.
+        3u128.to_be_bytes()
     );
     assert_eq!(acknowledged.pending_count(), 4);
     assert!(
@@ -2180,11 +2942,11 @@ fn deferred_streams_preserve_order_identity_and_restart() {
 fn permanent_rejection_is_durable_and_unblocks_the_next_object() {
     use arachne_security::{PendingJoin, StorageKey, Workspace};
 
-    let admin = Workspace::create([1; 32], "Publisher").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
-    let join = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
+    let (admin, invite, checkpoint) = issue_registered_invitation(admin);
+    let join = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], join.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(2), join.admission_request().unwrap())
         .unwrap();
     let mut proof = join.join_proof().unwrap();
     proof
@@ -2203,10 +2965,18 @@ fn permanent_rejection_is_durable_and_unblocks_the_next_object() {
     let first = context(1);
     let second = context(2);
     let first_object = sender
-        .protect_object(&first.authenticated_bytes(), b"invalid native bytes")
+        .protect_object(
+            first.topic.namespace().as_bytes(),
+            &first.authenticated_bytes(),
+            b"invalid native bytes",
+        )
         .unwrap();
     let second_object = sender
-        .protect_object(&second.authenticated_bytes(), b"valid later object")
+        .protect_object(
+            second.topic.namespace().as_bytes(),
+            &second.authenticated_bytes(),
+            b"valid later object",
+        )
         .unwrap();
     let InboxStage::Prepared(inbox) = ObjectInbox::new(reader.id(), reader.epoch())
         .stage(&reader, &first, &first_object)
@@ -2230,18 +3000,18 @@ fn permanent_rejection_is_durable_and_unblocks_the_next_object() {
         rejected.pending(&reader).unwrap().unwrap().message.payload,
         b"valid later object"
     );
-    assert!(rejected.streams[0].receipts[0].rejected);
+    assert_eq!(rejected.pending_count(), 1);
     assert!(matches!(
         rejected.stage(&reader, &first, &first_object).unwrap(),
         InboxStage::Duplicate
     ));
 
     let key = StorageKey::derive(&[3; 32]).unwrap();
-    let publisher = PublisherLog::new(reader.id(), reader.member().unwrap().id(), reader.epoch());
+    let publisher = PublisherLog::new(&reader).unwrap();
     let sealed = rejected.seal(&reader, &key, &publisher).unwrap();
     let (restored_reader, _, restored) =
-        ObjectInbox::restore(&key, [2; 32], reader.id(), &sealed).unwrap();
-    assert!(restored.streams[0].receipts[0].rejected);
+        ObjectInbox::restore(&key, crate::test_endpoint(2), reader.id(), &sealed).unwrap();
+    assert_eq!(restored.pending_count(), 1);
     assert_eq!(
         restored
             .pending(&restored_reader)
@@ -2260,11 +3030,11 @@ fn durable_pending_objects_and_bounded_topic_replay() {
         fs::{self, File, OpenOptions},
         io::Write,
     };
-    let admin = Workspace::create([1; 32], "Publisher").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
-    let join = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
+    let (admin, invite, checkpoint) = issue_registered_invitation(admin);
+    let join = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], join.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(2), join.admission_request().unwrap())
         .unwrap();
     let mut proof = join.join_proof().unwrap();
     proof
@@ -2273,7 +3043,7 @@ fn durable_pending_objects_and_bounded_topic_replay() {
     let reader = join.prepare_workspace(&proof, &prepared.welcome).unwrap();
     let mut sender = prepared.workspace;
     let key = StorageKey::derive(&[11; 32]).unwrap();
-    let publisher = PublisherLog::new(reader.id(), reader.member().unwrap().id(), reader.epoch());
+    let publisher = PublisherLog::new(&reader).unwrap();
     let mut inbox = ObjectInbox::new(reader.id(), reader.epoch());
     let chat = Topic::new("chat/messages/v1").unwrap();
     let context = |number: u64, topic: Topic| PublicationContext {
@@ -2289,6 +3059,7 @@ fn durable_pending_objects_and_bounded_topic_replay() {
     let recipients = [reader.member().unwrap().id()];
     let object = sender
         .protect_object(
+            direct.topic.namespace().as_bytes(),
             &direct.direct_authenticated_bytes(&recipients).unwrap(),
             b"recipient only",
         )
@@ -2319,6 +3090,7 @@ fn durable_pending_objects_and_bounded_topic_replay() {
     let missing_tail = context(2, Topic::new("streams/private").unwrap());
     let missing_tail_object = sender
         .protect_object(
+            missing_tail.topic.namespace().as_bytes(),
             &missing_tail
                 .direct_authenticated_bytes(&recipients)
                 .unwrap(),
@@ -2350,21 +3122,21 @@ fn durable_pending_objects_and_bounded_topic_replay() {
     );
     let snapshot = scoped.seal(&reader, &key, &publisher).unwrap();
     let (restored_reader, _, restored) =
-        ObjectInbox::restore(&key, [2; 32], reader.id(), &snapshot).unwrap();
+        ObjectInbox::restore(&key, crate::test_endpoint(2), reader.id(), &snapshot).unwrap();
     let pending = restored.pending(&restored_reader).unwrap().unwrap();
     assert_eq!(pending.recipients, recipients);
     assert_eq!(pending.message.payload, b"recipient only");
     let older_object = sender
-        .protect_object(&older.authenticated_bytes(), b"missed chat")
+        .protect_object(b"chat", &older.authenticated_bytes(), b"missed chat")
         .unwrap();
     for _ in 0..10_000 {
         sender
-            .protect_object(b"unsubscribed/feed", b"opaque")
+            .protect_object(b"unsubscribed", b"unsubscribed/feed", b"opaque")
             .unwrap();
     }
     let newer = context(10_002, chat.clone());
     let newer_object = sender
-        .protect_object(&newer.authenticated_bytes(), b"live chat")
+        .protect_object(b"chat", &newer.authenticated_bytes(), b"live chat")
         .unwrap();
     let prepared = |inbox: &ObjectInbox, context: &PublicationContext, bytes: &[u8]| match inbox
         .stage(&reader, context, bytes)
@@ -2455,7 +3227,7 @@ fn durable_pending_objects_and_bounded_topic_replay() {
     for number in 10_003..11_027 {
         let ctx = context(number, chat.clone());
         let object = sender
-            .protect_object(&ctx.authenticated_bytes(), b"chat")
+            .protect_object(ctx.topic.namespace().as_bytes(), &ctx.authenticated_bytes(), b"chat")
             .unwrap();
         inbox = prepared(&inbox, &ctx, &object);
         let pending = inbox.pending(&reader).unwrap().unwrap();
@@ -2472,41 +3244,45 @@ fn durable_pending_objects_and_bounded_topic_replay() {
         }
     }
     inbox = save_restore(&inbox);
-    assert_eq!(inbox.streams[0].receipts.len(), WINDOW);
-    assert!(inbox.streams[0].floor > 0);
+    // 1,024 later accepted counters close the window below them.
+    assert_eq!(inbox.replay.len(), 1);
+    assert!(inbox.replay[0].seen.len() <= REPLAY_ENTRIES);
+    assert!(inbox.replay[0].lost_through >= 1);
     assert!(matches!(
         inbox.stage(&reader, &older, &older_object).unwrap(),
         InboxStage::OutsideWindow
     ));
     assert!(matches!(
         inbox.stage(&reader, &newer, &newer_object).unwrap(),
-        InboxStage::OutsideWindow
+        InboxStage::Duplicate
     ));
-    assert!(inbox.snapshot().unwrap().len() < 12 * 1024);
+    // Replay state stays small after 1,025 acknowledged objects.
+    assert!(inbox.snapshot().unwrap().len() < 6 * 1024);
     // Topic floors are independent; a feed does not retire chat receipts.
     let feed = Topic::new("feeds/opaque").unwrap();
     let first_feed = context(20_000, feed.clone());
     let first_feed_object = sender
-        .protect_object(&first_feed.authenticated_bytes(), b"pending")
+        .protect_object(
+            first_feed.topic.namespace().as_bytes(),
+            &first_feed.authenticated_bytes(),
+            b"pending",
+        )
         .unwrap();
     inbox = prepared(&inbox, &first_feed, &first_feed_object);
     for number in 20_001..20_032 {
         let ctx = context(number, feed.clone());
         let object = sender
-            .protect_object(&ctx.authenticated_bytes(), b"pending")
+            .protect_object(ctx.topic.namespace().as_bytes(), &ctx.authenticated_bytes(), b"pending")
             .unwrap();
         inbox = prepared(&inbox, &ctx, &object);
     }
-    let full = inbox.snapshot().unwrap();
+    // No per-topic receipt window: pending objects never displace each other.
     let ctx = context(20_032, feed.clone());
     let object = sender
-        .protect_object(&ctx.authenticated_bytes(), b"would evict pending")
+        .protect_object(ctx.topic.namespace().as_bytes(), &ctx.authenticated_bytes(), b"33rd")
         .unwrap();
-    assert!(matches!(
-        inbox.stage(&reader, &ctx, &object),
-        Err("pending inbox window full")
-    ));
-    assert_eq!(inbox.snapshot().unwrap(), full);
+    inbox = prepared(&inbox, &ctx, &object);
+    assert_eq!(inbox.pending_count(), 33);
     let restored = save_restore(&inbox);
     assert_eq!(
         restored.pending(&reader).unwrap().unwrap().context,
@@ -2541,12 +3317,12 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
     use arachne_routing::{Permissions, RoutingTable};
     use arachne_security::{PendingJoin, StorageKey, Workspace};
 
-    let admin = Workspace::create([1; 32], "Publisher").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
+    let (admin, invite, checkpoint) = issue_registered_invitation(admin);
     let holder_join =
-        PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Holder").unwrap();
+        PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Holder").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], holder_join.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(2), holder_join.admission_request().unwrap())
         .unwrap();
     let mut holder_proof = holder_join.join_proof().unwrap();
     holder_proof
@@ -2557,11 +3333,21 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         .unwrap();
     let admin = prepared.workspace;
 
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    // `holder` is already a member, so the invitation registration commit
+    // must be applied to it too or it forks from `admin`.
+    let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let admin = registered.workspace;
+    let holder = match holder
+        .prepare_management_update(registered.action, &registered.commit)
+        .unwrap()
+    {
+        arachne_security::PreparedManagementUpdate::Active(workspace) => *workspace,
+        _ => panic!("member stays active"),
+    };
     let reader_join =
-        PendingJoin::from_invitation(&invite, &checkpoint, [3; 32], "Reader").unwrap();
+        PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(3), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission([3; 32], reader_join.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(3), reader_join.admission_request().unwrap())
         .unwrap();
     let mut reader_proof = reader_join.join_proof().unwrap();
     reader_proof
@@ -2594,9 +3380,9 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
             author.id(),
             1,
             BTreeMap::from([
-                ([1; 32], permissions(false)),
-                ([2; 32], permissions(true)),
-                ([3; 32], permissions(true)),
+                (crate::test_endpoint(1), permissions(false)),
+                (crate::test_endpoint(2), permissions(true)),
+                (crate::test_endpoint(3), permissions(true)),
             ]),
         )
         .unwrap();
@@ -2608,10 +3394,14 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         sequence: std::num::NonZeroU64::new(1),
     };
     let ciphertext = author
-        .protect_object(&context.authenticated_bytes(), b"retained")
+        .protect_object(
+            context.topic.namespace().as_bytes(),
+            &context.authenticated_bytes(),
+            b"retained",
+        )
         .unwrap();
     let mut author_log =
-        PublisherLog::new(author.id(), author.member().unwrap().id(), author.epoch());
+        PublisherLog::new(&author).unwrap();
     author_log.append(context, ciphertext).unwrap();
     let query = RangeQuery {
         workspace: author.id(),
@@ -2622,18 +3412,18 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         through: 1,
         topics: BTreeSet::from([topic.clone()]),
     };
-    let reply = wire::serve_range(&author_log, &author, &policy, [2; 32], &query).unwrap();
+    let reply = wire::serve_range(&author_log, &author, &policy, crate::test_endpoint(2), &query).unwrap();
     let inbox = ObjectInbox::new(holder.id(), holder.epoch())
-        .retain_range(&holder, &query, &reply, 200, 100)
+        .retain_range(&holder, &query, &reply, 200, UnixSeconds(100))
         .unwrap();
     let key = StorageKey::derive(&[9; 32]).unwrap();
-    let holder_log = PublisherLog::new(holder.id(), holder.member().unwrap().id(), holder.epoch());
+    let holder_log = PublisherLog::new(&holder).unwrap();
     let saved = inbox.seal(&holder, &key, &holder_log).unwrap();
     let (holder, _, inbox) =
         ObjectInbox::restore(&key, holder.endpoint(), holder.id(), &saved).unwrap();
 
     let relayed = inbox
-        .serve_range(&holder, &policy, [3; 32], &query, 150)
+        .serve_range(&holder, &policy, crate::test_endpoint(3), &query, UnixSeconds(150))
         .unwrap();
     assert_eq!(relayed, reply);
     assert!(matches!(
@@ -2644,18 +3434,18 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         .accept_recovery_coverage(&reader, &query, &relayed)
         .unwrap();
     assert_eq!(
-        reader_inbox.recovery_progress(query.author, &query.topics),
+        reader_inbox.recovery_progress(query.author, query.epoch, &query.topics),
         1
     );
     let reader_key = StorageKey::derive(&[10; 32]).unwrap();
-    let reader_log = PublisherLog::new(reader.id(), reader.member().unwrap().id(), reader.epoch());
+    let reader_log = PublisherLog::new(&reader).unwrap();
     let saved = reader_inbox
         .seal(&reader, &reader_key, &reader_log)
         .unwrap();
     let (_, _, restored_reader_inbox) =
         ObjectInbox::restore(&reader_key, reader.endpoint(), reader.id(), &saved).unwrap();
     assert_eq!(
-        restored_reader_inbox.recovery_progress(query.author, &query.topics),
+        restored_reader_inbox.recovery_progress(query.author, query.epoch, &query.topics),
         1
     );
 
@@ -2673,7 +3463,11 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         tombstone: false,
     };
     let object = author
-        .protect_object(&metadata.authenticated_context(&current_context), b"latest")
+        .protect_object(
+            current_context.topic.namespace().as_bytes(),
+            &metadata.authenticated_context(&current_context),
+            b"latest",
+        )
         .unwrap();
     let packet = current_context.packet(&object).unwrap();
     let author_inbox = ObjectInbox::new(author.id(), author.epoch())
@@ -2685,6 +3479,7 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
             metadata.expires_at,
             metadata.tombstone,
             packet,
+            UnixSeconds(0),
         )
         .unwrap();
     let current_query = current::CurrentViewQuery {
@@ -2696,31 +3491,39 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         selector: metadata.selector,
     };
     let current_reply = author_inbox
-        .serve_current(&author, &policy, [2; 32], &current_query, 100)
+        .serve_current(&author, &policy, crate::test_endpoint(2), &current_query, UnixSeconds(100))
         .unwrap();
     let inbox = inbox
-        .retain_current_view(&holder, &current_query, &current_reply, 100)
+        .retain_current_view(&holder, &current_query, &current_reply, UnixSeconds(100))
         .unwrap();
     let saved = inbox.seal(&holder, &key, &holder_log).unwrap();
     let (holder, _, inbox) =
         ObjectInbox::restore(&key, holder.endpoint(), holder.id(), &saved).unwrap();
     let relayed = inbox
-        .serve_current(&holder, &policy, [3; 32], &current_query, 150)
+        .serve_current(&holder, &policy, crate::test_endpoint(3), &current_query, UnixSeconds(150))
         .unwrap();
     assert_eq!(relayed, current_reply);
     let (_, pending, stale) = ObjectInbox::new(reader.id(), reader.epoch())
-        .accept_current_view(&reader, &current_query, &relayed, 150)
+        .accept_current_view(&reader, &current_query, &relayed, UnixSeconds(150))
         .unwrap();
     assert_eq!((pending, stale), (1, 0));
     assert_eq!(
         inbox
-            .serve_current(&holder, &policy, [3; 32], &current_query, 200)
+            // The authority's expiry (200) plus the skew allowance has passed.
+            .serve_current(
+                &holder,
+                &policy,
+                crate::test_endpoint(3),
+                &current_query,
+                UnixSeconds(200 + EXPIRY_SKEW_SECONDS),
+            )
             .unwrap(),
         current::CurrentView::denied_wire()
     );
     assert_eq!(
         inbox
-            .serve_range(&holder, &policy, [3; 32], &query, 200)
+            // The holder's own retention limit (200): no skew.
+            .serve_range(&holder, &policy, crate::test_endpoint(3), &query, UnixSeconds(200))
             .unwrap(),
         wire::unavailable_reply()
     );
@@ -2729,12 +3532,12 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         .install_verified_policy(
             holder.id(),
             1,
-            BTreeMap::from([([1; 32], permissions(false)), ([2; 32], permissions(true))]),
+            BTreeMap::from([(crate::test_endpoint(1), permissions(false)), (crate::test_endpoint(2), permissions(true))]),
         )
         .unwrap();
     assert_eq!(
         inbox
-            .serve_range(&holder, &removed_reader_policy, [3; 32], &query, 150)
+            .serve_range(&holder, &removed_reader_policy, crate::test_endpoint(3), &query, UnixSeconds(150))
             .unwrap(),
         wire::denied_reply()
     );
@@ -2743,9 +3546,9 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
             .serve_current(
                 &holder,
                 &removed_reader_policy,
-                [3; 32],
+                crate::test_endpoint(3),
                 &current_query,
-                150
+                UnixSeconds(150)
             )
             .unwrap(),
         current::CurrentView::denied_wire()

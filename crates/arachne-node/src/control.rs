@@ -1,10 +1,10 @@
 //! Bounded host-handled request/reply over authenticated Iroh transport.
 //! Transport identity is not workspace authorization; the host validates payloads.
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::oneshot;
 
-pub(super) const ALPN: &[u8] = b"data-fabric/control/1";
+pub(super) const ALPN: &[u8] = b"arachne/control/1";
 // Durable host control includes queueing and persistence; data/dial budgets stay short.
 pub(super) const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REQUEST: usize = 32 * 1024;
@@ -82,7 +82,18 @@ pub struct ControlRequest {
     timing: Arc<TimingCounters>,
     queued: std::time::Instant,
     taken: Option<std::time::Instant>,
+    /// Held while a stranger's request is queued or served.
+    _stranger: Option<StrangerSlot>,
 }
+
+/// One of the inbox places strangers may hold; returned on drop.
+struct StrangerSlot(Arc<AtomicUsize>);
+impl Drop for StrangerSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl ControlRequest {
     /// Observed path only. The caller must validate workspace authorization
     /// before retaining this as a dial hint.
@@ -131,6 +142,10 @@ pub(super) struct ControlInbox {
     signal: Arc<tokio::sync::Notify>,
     responder: Arc<std::sync::RwLock<Option<InquiryResponder>>>,
     timing: Arc<TimingCounters>,
+    /// Requests from strangers (no installed policy names them) queued now.
+    /// At most half the inbox, so joiners and probes never fill it for members.
+    strangers: Arc<AtomicUsize>,
+    stranger_limit: usize,
 }
 impl ControlInbox {
     pub(super) fn new(
@@ -148,6 +163,8 @@ impl ControlInbox {
                 signal: signal.clone(),
                 responder: Arc::default(),
                 timing: Arc::default(),
+                strangers: Arc::default(),
+                stranger_limit: (capacity / 2).max(1),
             },
             receiver,
             signal,
@@ -192,7 +209,15 @@ impl ControlInbox {
     }
     /// `notify_one` stores one permit when nobody waits. One permit is enough:
     /// the host drains until empty before it waits again.
-    fn offer(&self, request: ControlRequest) -> Result<()> {
+    fn offer(&self, mut request: ControlRequest, stranger: bool) -> Result<()> {
+        if stranger {
+            self.strangers
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                    (queued < self.stranger_limit).then_some(queued + 1)
+                })
+                .map_err(|_| Error::Backpressure)?;
+            request._stranger = Some(StrangerSlot(self.strangers.clone()));
+        }
         self.sender
             .try_send(request)
             .map_err(|_| Error::Backpressure)?;
@@ -244,6 +269,7 @@ pub(super) async fn receive(
     connection: &iroh::endpoint::Connection,
     inbox: &ControlInbox,
     remote_address: Option<SocketAddr>,
+    stranger: bool,
     (send, recv): (
         &mut iroh::endpoint::SendStream,
         &mut iroh::endpoint::RecvStream,
@@ -273,7 +299,8 @@ pub(super) async fn receive(
             timing: inbox.timing.clone(),
             queued: std::time::Instant::now(),
             taken: None,
-        })?;
+            _stranger: None,
+        }, stranger)?;
         tokio::select! {
             response = response => response.map_err(|_| Error::Rejected)?,
             _ = send.stopped() => return Err(Error::Rejected),
@@ -315,8 +342,9 @@ impl ControlClient {
             let payload = payload.ok_or(Error::TooLarge)?;
             let mut stage = "connect";
             let mut observed = None;
-            let outcome = tokio::time::timeout(CONTROL_TIMEOUT, async {
-            let connection = tokio::time::timeout(TIMEOUT, connections.connect(peer, ALPN))
+            let operation_timeout = connections.operation_timeout();
+            let outcome = tokio::time::timeout(CONTROL_TIMEOUT.max(operation_timeout), async {
+            let connection = tokio::time::timeout(operation_timeout, connections.connect(peer, ALPN))
                 .await.map_err(|_| Error::Timeout("control connect"))?
                 ?;
             observed = Some(connection.clone());
@@ -420,7 +448,7 @@ impl Node {
 
     /// Take the first matching request from up to `depth` newly queued ones
     /// plus those already set aside; the rest keep their order. For short
-    /// requests that must not wait behind a long queue (ADR 0009).
+    /// requests that must not wait behind a long queue.
     pub fn poll_control_first(
         &mut self,
         matches: impl Fn(&[u8]) -> bool,
@@ -460,4 +488,26 @@ impl Node {
     ) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send + 'static {
         self.control_client().request_control(peer, payload)
     }
+}
+
+#[test]
+fn strangers_hold_at_most_half_the_control_queue() {
+    let (inbox, mut queued, _) = ControlInbox::new(4);
+    let request = || ControlRequest {
+        peer: [1; 32],
+        remote_address: None,
+        payload: Vec::new(),
+        reply: oneshot::channel().0,
+        timing: inbox.timing.clone(),
+        queued: std::time::Instant::now(),
+        taken: None,
+        _stranger: None,
+    };
+    inbox.offer(request(), true).unwrap();
+    inbox.offer(request(), true).unwrap();
+    assert!(matches!(inbox.offer(request(), true), Err(Error::Backpressure)));
+    inbox.offer(request(), false).unwrap();
+    // A stranger's request that leaves the queue frees its place.
+    drop(queued.try_recv().unwrap());
+    inbox.offer(request(), true).unwrap();
 }

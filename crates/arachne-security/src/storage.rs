@@ -19,6 +19,9 @@ const HEADER: usize = 5 + 32 + 12;
 pub(super) const MAX_PLAIN: usize = 128 * 1024;
 const MAX_RECORDS: usize = 256;
 pub const MAX_SEALED_WORKSPACE: usize = HEADER + MAX_PLAIN + 16;
+const MAX_PENDING_PLAIN: usize = MAX_PLAIN + super::MAX_CHECKPOINT;
+/// Bound for one sealed pending join, which holds its invitation checkpoint.
+pub const MAX_SEALED_PENDING_JOIN: usize = HEADER + MAX_PENDING_PLAIN + 16;
 const BUNDLE: &[u8; 5] = b"DFWB\x01";
 pub const MAX_WORKSPACE_ATTACHMENT: usize = 528 * 1024;
 pub const MAX_SEALED_BUNDLE: usize =
@@ -67,7 +70,24 @@ pub(super) fn read_profile(bytes: &mut &[u8]) -> Result<MemberProfile, &'static 
 }
 pub(super) fn encode_provider(
     provider: &OpenMlsRustCrypto,
+    prefix: Zeroizing<Vec<u8>>,
+) -> Result<Zeroizing<Vec<u8>>, &'static str> {
+    encode_provider_within(provider, prefix, MAX_PLAIN)
+}
+
+/// A pending join's prefix holds its invitation checkpoint (B3a), so it is
+/// encoded within `MAX_PENDING_PLAIN` rather than the workspace bound.
+pub(super) fn encode_pending_provider(
+    provider: &OpenMlsRustCrypto,
+    prefix: Zeroizing<Vec<u8>>,
+) -> Result<Zeroizing<Vec<u8>>, &'static str> {
+    encode_provider_within(provider, prefix, MAX_PENDING_PLAIN)
+}
+
+fn encode_provider_within(
+    provider: &OpenMlsRustCrypto,
     mut prefix: Zeroizing<Vec<u8>>,
+    limit: usize,
 ) -> Result<Zeroizing<Vec<u8>>, &'static str> {
     let state = provider
         .storage()
@@ -86,7 +106,7 @@ pub(super) fn encode_provider(
                 .checked_add(v.len())
         })
         .ok_or("protected state exceeds bounds")?;
-    if size > MAX_PLAIN {
+    if size > limit {
         return Err("protected state exceeds bounds");
     }
     let additional = size - prefix.len();
@@ -193,6 +213,30 @@ impl StorageKey {
             .map_err(|_| "snapshot protection failed")?;
         result.extend(encrypted);
         Ok(result)
+    }
+    /// A pending join carries one invitation checkpoint beside ordinary
+    /// protected state, so its bound adds exactly one checkpoint wire bound.
+    pub(super) fn protect_pending(
+        &self,
+        provider: &OpenMlsRustCrypto,
+        magic: &[u8; 5],
+        id: [u8; 32],
+        endpoint: [u8; 32],
+        plain: &[u8],
+    ) -> Result<Vec<u8>, &'static str> {
+        if plain.len() > MAX_PENDING_PLAIN {
+            return Err("protected state exceeds bounds");
+        }
+        self.protect_record(provider, magic, id, endpoint, plain)
+    }
+    pub(super) fn unprotect_pending(
+        &self,
+        magic: &[u8; 5],
+        id: [u8; 32],
+        endpoint: [u8; 32],
+        sealed: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, &'static str> {
+        self.unprotect_record(magic, id, endpoint, sealed, MAX_SEALED_PENDING_JOIN)
     }
     pub(super) fn unprotect(
         &self,
@@ -447,7 +491,7 @@ impl Workspace {
                     .try_into()
                     .unwrap();
                 let length = number(&mut bytes)?;
-                if length == 0 || length > 64 * 1024 {
+                if length == 0 || length > super::MAX_CHECKPOINT {
                     return Err("invalid retained invitation checkpoint");
                 }
                 invitation_checkpoints.push(super::invitation::RetainedInvitationCheckpoint {
@@ -522,6 +566,7 @@ impl Workspace {
         }
         workspace.verify_retained_invitation_checkpoints()?;
         workspace.object_counter()?;
+        workspace.object_receive_window()?;
         workspace.name_state()?;
         Ok(workspace)
     }
@@ -530,13 +575,13 @@ impl Workspace {
 #[test]
 fn protected_snapshot_restores_and_rejects_wrong_context() {
     let key = StorageKey::derive(&[7; 32]).unwrap();
-    let workspace = Workspace::create([1; 32], "Alex Morgan").unwrap();
+    let workspace = Workspace::create(crate::test_key(1), "Alex Morgan").unwrap();
     let id = workspace.id();
     let profile = workspace.member().unwrap().clone();
     let sealed = workspace.seal(&key).unwrap();
     assert_ne!(sealed, workspace.seal(&key).unwrap());
     drop(workspace);
-    let mut restored = Workspace::restore(&key, [1; 32], id, &sealed).unwrap();
+    let mut restored = Workspace::restore(&key, crate::test_endpoint(1), id, &sealed).unwrap();
     assert_eq!(restored.id(), id);
     assert_eq!(restored.member(), Some(&profile));
     assert_eq!(restored.epoch(), 0);
@@ -546,22 +591,22 @@ fn protected_snapshot_restores_and_rejects_wrong_context() {
         .create_message(&restored.provider, &restored._signer, b"after restore")
         .unwrap();
     let sealed_again = restored.seal(&key).unwrap();
-    assert!(Workspace::restore(&key, [1; 32], id, &sealed_again).is_ok());
+    assert!(Workspace::restore(&key, crate::test_endpoint(1), id, &sealed_again).is_ok());
     assert!(
-        Workspace::restore(&StorageKey::derive(&[8; 32]).unwrap(), [1; 32], id, &sealed).is_err()
+        Workspace::restore(&StorageKey::derive(&[8; 32]).unwrap(), crate::test_endpoint(1), id, &sealed).is_err()
     );
-    assert!(Workspace::restore(&key, [2; 32], id, &sealed).is_err());
-    assert!(Workspace::restore(&key, [1; 32], [9; 32], &sealed).is_err());
+    assert!(Workspace::restore(&key, crate::test_endpoint(2), id, &sealed).is_err());
+    assert!(Workspace::restore(&key, crate::test_endpoint(1), crate::test_endpoint(9), &sealed).is_err());
     for index in [0, 5, 37, HEADER, sealed.len() - 1] {
         let mut bad = sealed.clone();
         bad[index] ^= 1;
-        assert!(Workspace::restore(&key, [1; 32], id, &bad).is_err());
+        assert!(Workspace::restore(&key, crate::test_endpoint(1), id, &bad).is_err());
     }
-    assert!(Workspace::restore(&key, [1; 32], id, &sealed[..sealed.len() - 1]).is_err());
+    assert!(Workspace::restore(&key, crate::test_endpoint(1), id, &sealed[..sealed.len() - 1]).is_err());
     let mut trailing = sealed.clone();
     trailing.push(0);
-    assert!(Workspace::restore(&key, [1; 32], id, &trailing).is_err());
-    assert!(Workspace::restore(&key, [1; 32], id, &vec![0; MAX_SEALED_WORKSPACE + 1]).is_err());
+    assert!(Workspace::restore(&key, crate::test_endpoint(1), id, &trailing).is_err());
+    assert!(Workspace::restore(&key, crate::test_endpoint(1), id, &vec![0; MAX_SEALED_WORKSPACE + 1]).is_err());
 }
 
 #[test]
@@ -606,34 +651,34 @@ fn legacy_snapshot_keeps_credential_and_has_no_invented_profile() {
 #[test]
 fn profile_must_match_the_stored_mls_credential() {
     let key = StorageKey::derive(&[7; 32]).unwrap();
-    let mut workspace = Workspace::create([1; 32], "Alex").unwrap();
+    let mut workspace = Workspace::create(crate::test_key(1), "Alex").unwrap();
     workspace.member.as_mut().unwrap().id = [99; 32];
     // Even a correctly encrypted snapshot cannot substitute a different member
     // ID for the ID bound into the stored MLS credential.
     let sealed = workspace.seal(&key).unwrap();
-    assert!(Workspace::restore(&key, [1; 32], workspace.id(), &sealed).is_err());
+    assert!(Workspace::restore(&key, crate::test_endpoint(1), workspace.id(), &sealed).is_err());
 }
 
 #[test]
 fn combined_record_authenticates_both_parts_and_preserves_legacy_bounds() {
     let key = StorageKey::derive(&[7; 32]).unwrap();
-    let owner = Workspace::create([1; 32], "Alex").unwrap();
+    let owner = Workspace::create(crate::test_key(1), "Alex").unwrap();
     let id = owner.id();
     let attachment = vec![42; MAX_WORKSPACE_ATTACHMENT];
     let sealed = owner.seal_with_attachment(&key, &attachment).unwrap();
     assert!(sealed.len() <= MAX_SEALED_BUNDLE);
     assert!(sealed.len() > MAX_SEALED_WORKSPACE);
     let (restored, actual) =
-        Workspace::restore_with_attachment(&key, [1; 32], id, &sealed).unwrap();
+        Workspace::restore_with_attachment(&key, crate::test_endpoint(1), id, &sealed).unwrap();
     assert_eq!(restored.member(), owner.member());
     assert_eq!(actual.as_slice(), attachment);
-    assert!(Workspace::restore(&key, [1; 32], id, &sealed).is_err());
-    assert!(Workspace::restore_with_attachment(&key, [2; 32], id, &sealed).is_err());
-    assert!(Workspace::restore_with_attachment(&key, [1; 32], [9; 32], &sealed).is_err());
+    assert!(Workspace::restore(&key, crate::test_endpoint(1), id, &sealed).is_err());
+    assert!(Workspace::restore_with_attachment(&key, crate::test_endpoint(2), id, &sealed).is_err());
+    assert!(Workspace::restore_with_attachment(&key, crate::test_endpoint(1), crate::test_endpoint(9), &sealed).is_err());
     assert!(
         Workspace::restore_with_attachment(
             &StorageKey::derive(&[8; 32]).unwrap(),
-            [1; 32],
+            crate::test_endpoint(1),
             id,
             &sealed
         )
@@ -642,26 +687,26 @@ fn combined_record_authenticates_both_parts_and_preserves_legacy_bounds() {
     for offset in [0, 5, 37, HEADER, sealed.len() - 1] {
         let mut bad = sealed.clone();
         bad[offset] ^= 1;
-        assert!(Workspace::restore_with_attachment(&key, [1; 32], id, &bad).is_err());
+        assert!(Workspace::restore_with_attachment(&key, crate::test_endpoint(1), id, &bad).is_err());
     }
     assert!(
-        Workspace::restore_with_attachment(&key, [1; 32], id, &sealed[..sealed.len() - 1]).is_err()
+        Workspace::restore_with_attachment(&key, crate::test_endpoint(1), id, &sealed[..sealed.len() - 1]).is_err()
     );
     let mut trailing = sealed.clone();
     trailing.push(0);
-    assert!(Workspace::restore_with_attachment(&key, [1; 32], id, &trailing).is_err());
+    assert!(Workspace::restore_with_attachment(&key, crate::test_endpoint(1), id, &trailing).is_err());
     assert!(
         owner
             .seal_with_attachment(&key, &vec![0; MAX_WORKSPACE_ATTACHMENT + 1])
             .is_err()
     );
     assert!(
-        Workspace::restore_with_attachment(&key, [1; 32], id, &vec![0; MAX_SEALED_BUNDLE + 1])
+        Workspace::restore_with_attachment(&key, crate::test_endpoint(1), id, &vec![0; MAX_SEALED_BUNDLE + 1])
             .is_err()
     );
     let legacy = owner.seal(&key).unwrap();
-    assert!(Workspace::restore(&key, [1; 32], id, &legacy).is_ok());
-    assert!(Workspace::restore_with_attachment(&key, [1; 32], id, &legacy).is_err());
+    assert!(Workspace::restore(&key, crate::test_endpoint(1), id, &legacy).is_ok());
+    assert!(Workspace::restore_with_attachment(&key, crate::test_endpoint(1), id, &legacy).is_err());
     // Valid encryption does not make malformed inner framing acceptable.
     for (security, length, tail) in [
         (legacy.as_slice(), 2u32, vec![1]),
@@ -680,7 +725,7 @@ fn combined_record_authenticates_both_parts_and_preserves_legacy_bounds() {
         let bad = key
             .protect_record(&owner.provider, BUNDLE, id, [1; 32], &plain)
             .unwrap();
-        assert!(Workspace::restore_with_attachment(&key, [1; 32], id, &bad).is_err());
+        assert!(Workspace::restore_with_attachment(&key, crate::test_endpoint(1), id, &bad).is_err());
     }
 }
 
@@ -688,18 +733,19 @@ fn combined_record_authenticates_both_parts_and_preserves_legacy_bounds() {
 #[test]
 fn twelve_member_snapshot_capacity() {
     let key = StorageKey::derive(&[201; 32]).unwrap();
-    let mut owner = Workspace::create([200; 32], "Capacity publisher").unwrap();
+    let mut owner = Workspace::create(crate::test_key(200), "Capacity publisher").unwrap();
     for member in 1..12u8 {
-        let (invite, checkpoint) = owner.issue_invitation().unwrap();
+        let (registration, invite, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+        owner = registration.workspace;
         let pending = super::PendingJoin::from_invitation(
             &invite,
             &checkpoint,
-            [member; 32],
+            crate::test_key(u64::from(member)),
             "Capacity member",
         )
         .unwrap();
         let next = owner
-            .prepare_admission([member; 32], pending.admission_request().unwrap())
+            .prepare_admission(crate::test_endpoint(u64::from(member)), pending.admission_request().unwrap())
             .unwrap()
             .workspace;
         let state = next.provider.storage().values.read().unwrap();
@@ -727,7 +773,7 @@ fn twelve_member_snapshot_capacity() {
         );
         drop(state);
         let sealed = next.seal(&key).expect("12-member durable snapshot gate");
-        owner = Workspace::restore(&key, [200; 32], next.id(), &sealed).unwrap();
+        owner = Workspace::restore(&key, crate::test_endpoint(200), next.id(), &sealed).unwrap();
     }
     assert_eq!(owner.member_count(), 12);
 }

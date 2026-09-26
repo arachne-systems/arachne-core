@@ -20,7 +20,7 @@ use arachne_runtime::{
     create, create_relay, create_relay_with_options, create_wan, describe, enable_record_storage,
     execute, restore_record_storage, save_candidate, wait_for_work,
 };
-use arachne_security::{AdmissionAuthorization, Invitation, MembershipAuthorization, PendingJoin};
+use arachne_security::{Invitation, MembershipAuthorization, PendingJoin};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -37,7 +37,7 @@ use std::{
 use tempfile::TempDir;
 use tokio::task::JoinSet;
 
-const HISTORY_PAGE_PACKET: &[u8] = b"DFJP\x01";
+const HISTORY_PAGE_PACKET: &[u8] = b"DFJP\x02";
 const MAX_ENDPOINTS: usize = 1_000;
 
 #[derive(Clone, Copy, Debug)]
@@ -522,6 +522,7 @@ fn compact_metrics(value: &Value) -> Value {
         if let Some(route) = path["route"].as_str().map(|route| match route {
             "direct" => "direct",
             "relay" => "relay",
+            "tor" => "tor",
             _ => "custom",
         }) {
             *routes.entry(route).or_default() += 1;
@@ -573,38 +574,23 @@ fn array32(value: &Value) -> Result<[u8; 32], String> {
         .map_err(|_| "expected 32 bytes".to_string())
 }
 
-fn array64(value: &Value) -> Result<[u8; 64], String> {
-    bytes(value)?
-        .try_into()
-        .map_err(|_| "expected 64 bytes".to_string())
-}
-
-fn packet(request: &[u8], name: &str, checkpoint: &[u8]) -> Vec<u8> {
-    let mut packet = b"DFJA\x02".to_vec();
+/// `DFJA\x03`; the checkpoint is not sent (B3a).
+fn packet(request: &[u8], name: &str, _checkpoint: &[u8]) -> Vec<u8> {
+    let mut packet = b"DFJA\x03".to_vec();
     packet.extend((request.len() as u32).to_be_bytes());
     packet.extend((name.len() as u16).to_be_bytes());
     packet.extend(request);
     packet.extend(name.as_bytes());
-    packet.extend(checkpoint);
     packet
 }
 
-fn history_packet(request: &[u8], checkpoint: &[u8], offset: u32) -> Vec<u8> {
+/// `DFJP\x02`; the checkpoint is not sent (B3a).
+fn history_packet(request: &[u8], _checkpoint: &[u8], offset: u32) -> Vec<u8> {
     let mut packet = HISTORY_PAGE_PACKET.to_vec();
     packet.extend((request.len() as u32).to_be_bytes());
-    packet.extend((checkpoint.len() as u32).to_be_bytes());
     packet.extend(offset.to_be_bytes());
     packet.extend(request);
-    packet.extend(checkpoint);
     packet
-}
-
-fn authorization(value: &Value) -> Result<AdmissionAuthorization, String> {
-    Ok(AdmissionAuthorization {
-        invitation_key: array32(&value["invitation_key"])?,
-        grant_signature: array64(&value["grant_signature"])?,
-        redemption_signature: array64(&value["redemption_signature"])?,
-    })
 }
 
 fn steps(value: &Value) -> Result<Vec<(MembershipAuthorization, Vec<u8>)>, String> {
@@ -613,20 +599,8 @@ fn steps(value: &Value) -> Result<Vec<(MembershipAuthorization, Vec<u8>)>, Strin
         .ok_or("admission reply has no commits".to_string())?
         .iter()
         .map(|step| {
-            let commit = bytes(&step["commit"])?;
-            let auth = if !step["authorization"].is_null() {
-                MembershipAuthorization::Admission(authorization(&step["authorization"])?)
-            } else {
-                MembershipAuthorization::AdmissionBatch(
-                    step["admission_batch"]
-                        .as_array()
-                        .ok_or("unsupported admission step".to_string())?
-                        .iter()
-                        .map(authorization)
-                        .collect::<Result<_, _>>()?,
-                )
-            };
-            Ok((auth, commit))
+            arachne_security::decode_membership_step(&bytes(&step["step"])?)
+                .map_err(str::to_owned)
         })
         .collect()
 }
@@ -665,7 +639,7 @@ async fn request_until_welcome(
 ) -> Result<Value, String> {
     loop {
         let reply = request_control(node, peer, payload, deadline).await?;
-        let value: Value = serde_json::from_slice(&reply).map_err(|e| {
+        let value: Value = arachne_runtime::harness::decode_admission_reply(&reply).map_err(|e| {
             format!(
                 "control reply JSON decode failed ({} bytes): {e}",
                 reply.len()
@@ -690,7 +664,7 @@ async fn full_join(
     started: Instant,
     deadline: Instant,
 ) -> Result<(u128, u128, u128, u128), String> {
-    let pending = PendingJoin::from_invitation(&invitation, &checkpoint, node.id(), &name)
+    let pending = PendingJoin::from_invitation(&invitation, &checkpoint, &*node, &name)
         .map_err(str::to_owned)?;
     full_join_with_pending(node, owner, pending, name, scenario, started, deadline).await
 }
@@ -737,7 +711,7 @@ async fn full_join_with_pending(
         )
         .await
         .map_err(|error| format!("history: {error}"))?;
-        page = serde_json::from_slice(&reply).map_err(|e| {
+        page = arachne_runtime::harness::decode_admission_reply(&reply).map_err(|e| {
             format!(
                 "history reply JSON decode failed ({} bytes): {e}",
                 reply.len()
@@ -865,12 +839,19 @@ async fn enable_gossip_profile(
             }
         }
         let node_policy = policy.clone();
+        let tag_key = match arachne_runtime::harness::gossip_tag_key(owner_handle) {
+            Ok(key) => key,
+            Err(error) => {
+                outcomes.fail(&format!("gossip key: {error}"));
+                return;
+            }
+        };
         let result = match remaining(deadline) {
             Ok(limit) => tokio::time::timeout(limit, async {
                 node.install_verified_policy(workspace, 1, node_policy)
                     .await
                     .map_err(|error| error.to_string())?;
-                node.enable_gossip(workspace, 1)
+                node.enable_gossip(workspace, 1, &tag_key)
                     .await
                     .map_err(|error| error.to_string())
             })
@@ -1286,7 +1267,7 @@ async fn cancel_join(
     deadline: Instant,
 ) -> Result<(), String> {
     let invitation = Invitation::from_bytes(&invitation).map_err(str::to_owned)?;
-    let pending = PendingJoin::from_invitation(&invitation, &checkpoint, node.id(), "cancelled")
+    let pending = PendingJoin::from_invitation(&invitation, &checkpoint, &*node, "cancelled")
         .map_err(str::to_owned)?;
     let request = pending.admission_request().map_err(str::to_owned)?.to_vec();
     let payload = packet(&request, "cancelled", &checkpoint);
@@ -1400,7 +1381,7 @@ fn run_owner_loss(options: Options) -> Result<Value, String> {
         .map_err(|error| error.to_string())?;
         let node = Arc::new(node);
         let invitation = Invitation::from_bytes(&invitation).map_err(str::to_owned)?;
-        let pending = PendingJoin::from_invitation(&invitation, &checkpoint, node.id(), "loss")
+        let pending = PendingJoin::from_invitation(&invitation, &checkpoint, &*node, "loss")
             .map_err(str::to_owned)?;
         let request = pending.admission_request().map_err(str::to_owned)?.to_vec();
         let payload = packet(&request, "loss", &checkpoint);
@@ -1494,7 +1475,7 @@ fn run_refusal(options: Options) -> Result<Value, String> {
         .map_err(|error| error.to_string())?;
         let node = Arc::new(node);
         let invitation = Invitation::from_bytes(&invitation).map_err(str::to_owned)?;
-        let pending = PendingJoin::from_invitation(&invitation, &checkpoint, node.id(), "refusal")
+        let pending = PendingJoin::from_invitation(&invitation, &checkpoint, &*node, "refusal")
             .map_err(str::to_owned)?;
         let request = pending.admission_request().map_err(str::to_owned)?.to_vec();
         let payload = packet(&request, "refusal", &checkpoint);
@@ -1655,7 +1636,7 @@ fn run_restart(options: Options) -> Result<Value, String> {
         let pending = PendingJoin::from_invitation(
             &parsed_invitation,
             &checkpoint,
-            initial.id(),
+            &*initial,
             "restarting",
         )
         .map_err(str::to_owned)?;
@@ -1842,7 +1823,7 @@ fn run_partition(options: Options) -> Result<Value, String> {
         let node = Arc::new(node);
         let invitation = Invitation::from_bytes(&invitation).map_err(str::to_owned)?;
         let pending =
-            PendingJoin::from_invitation(&invitation, &checkpoint, node.id(), "partition")
+            PendingJoin::from_invitation(&invitation, &checkpoint, &*node, "partition")
                 .map_err(str::to_owned)?;
         let request = pending.admission_request().map_err(str::to_owned)?.to_vec();
         let payload = packet(&request, "partition", &checkpoint);
@@ -2022,7 +2003,7 @@ fn run_queue_pressure(options: Options) -> Result<Value, String> {
             let pending_join = PendingJoin::from_invitation(
                 &parsed_invitation,
                 &checkpoint,
-                node.id(),
+                &**node,
                 &format!("queue-pressure-{}", index + 1),
             )
             .map_err(str::to_owned)?;

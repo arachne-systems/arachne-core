@@ -18,7 +18,7 @@ Each crate has a short README. The root workspace pins direct dependency
 versions where interoperability or protocol behavior requires it and uses
 `Cargo.lock` to capture the resolved graph. Shared package metadata and
 registry-compatible versions for normal internal dependencies are configured.
-The six first-party packages and two Arachne-maintained Iroh forks are
+The six first-party packages and three Arachne-maintained Iroh forks are
 publishable workspace members. Check crates.io for current publication status;
 new crate names require a one-time manual first publish before Trusted
 Publishing can be enabled.
@@ -29,14 +29,24 @@ Use the Rust 1.98.0 toolchain recorded in the root README:
 
 ```sh
 cargo +1.98.0 check --locked --workspace
-cargo +1.98.0 test --locked --workspace -- --test-threads=1
+cargo +1.98.0 test --locked --workspace --exclude arachne-runtime -- --test-threads=1
+cargo +1.98.0 test --locked -p arachne-runtime
 ```
 
 Published manifests declare Rust 1.91 as the MSRV. Verify that claim with
 `cargo +1.91.0 check --locked --workspace` before changing the dependency lock.
 
-Run from the repository root. Tests are serialized within each test binary
-because runtime tests share process-wide session state and capacity. The
+Run from the repository root. `arachne-runtime` tests run with the default
+thread count: each session belongs to a `Context` with its own limits,
+connection budget and runtime (the default context allows 64 sessions), and
+no runtime test holds a process-wide lock except `tests/nearby_invitation.rs`,
+whose scenarios share LAN discovery. The other crates still run serially.
+Some runtime tests are slow in a debug build and CPU-bound, not serialized
+(measured on a 4-CPU slice): the lib test
+`membership::gossiped_names_from_a_join_wave_survive_until_their_steps_land`
+(about 12 minutes), `tests/record_storage.rs` (about 12 minutes), and
+`hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots`
+in `tests/native_persistence.rs` (about 26 minutes alone). The
 workspace build and tests are Rust checks; they do not build the Android plugin,
 load the library through JNI, or validate an ATAK host/device deployment.
 
@@ -48,8 +58,32 @@ cargo +1.98.0 test --locked -p arachne-routing
 cargo +1.98.0 test --locked -p arachne-delivery
 cargo +1.98.0 test --locked -p arachne-store
 cargo +1.98.0 test --locked -p arachne-node -- --test-threads=1
-cargo +1.98.0 test --locked -p arachne-runtime -- --test-threads=1
+cargo +1.98.0 test --locked -p arachne-runtime
 ```
+
+Supply-chain checks (`.github/workflows/supply-chain.yml` runs the same on each
+PR, on `main` and weekly):
+
+```sh
+cargo +1.98.0 check --locked --workspace --all-targets --all-features
+cargo deny --all-features check   # policy in deny.toml
+```
+
+The CI job `minimal-versions` also runs `cargo update -Z direct-minimal-versions`
+on a pinned nightly. It proves that the lower bounds in the Arachne crates build.
+To keep that true, published crates use caret ranges whose lower bound is a
+version that builds (normally the locked version). Use `=` only where an exact
+match is required, and put a comment next to it: today that is `iroh` and
+the renamed forks, including `arachne-iroh-tor-transport` (unstable
+custom-transport API).
+That job takes the vendored Iroh forks out of `members`, because their upstream
+manifests have loose lower bounds that do not build at their minimums.
+
+`deny.toml` fails on any vulnerability advisory, on unmaintained crates, on a
+license outside the allowlist, on a non-crates.io source, and on a second
+version of a directly used crypto crate (for example `aes-gcm`, `openmls`,
+`sha2`). Existing duplicates and accepted advisories are listed there with a
+reason; review them when you change dependencies.
 
 For the simple transport example:
 
@@ -77,17 +111,34 @@ certification.
 
 ## Vendored dependency patches
 
-`vendor/` contains two Arachne-maintained, publishable forks of Iroh packages:
-`arachne-iroh-gossip` and `arachne-iroh-blobs`. Their Rust import names stay
-`iroh_gossip` and `iroh_blobs`; each retains upstream provenance, notices, and
-MIT/Apache-2.0 terms. They are not official Iroh releases.
+`vendor/` contains four Arachne-maintained, publishable renamed forks:
+`arachne-iroh-gossip`, `arachne-iroh-blobs`, `arachne-iroh-tor-transport` and
+`arachne-bao-tree`. Their Rust import names stay `iroh_gossip`, `iroh_blobs`,
+`iroh_tor_transport` and `bao_tree`; each retains
+upstream provenance, notices, and MIT/Apache-2.0 terms. They are not official
+upstream releases. Because Arachne crates depend on them directly (with
+`package = "arachne-..."`), their fixes reach every downstream consumer.
 
-The root `[patch.crates-io]` still selects local copies of `bao-tree`,
-`netlink-packet-core`, and `hax-lib-macros` for this workspace. Those patches
-are not part of the Arachne crate dependencies; the clean-consumer check must
-therefore build without them. Keep their upstream copyright, license, and
-notice files intact, and do not imply that the Arachne MPL license replaces
-their terms.
+Fork versions use `<upstream version>-arachne.<N>` (for example
+`0.103.0-arachne.1`). Dependents pin them with `=`, because the patched source
+must match. Note: `arachne-iroh-blobs` 0.103.0 and `arachne-iroh-gossip` 0.101.0
+were published earlier with the plain upstream numbers. Under semver, a
+pre-release such as `0.103.0-arachne.1` sorts *below* `0.103.0`. Thus a caret
+requirement or `cargo add` picks the old release. Always use the exact `=` pin.
+
+The root `[patch.crates-io]` still selects local copies of
+`netlink-packet-core` and `hax-lib-macros` for this workspace only. Cargo
+ignores `[patch]` in dependencies. Both come in through third-party parents that
+Arachne does not fork (`iroh` -> `netwatch`/`netdev`, and
+`openmls_rust_crypto` -> `hpke-rs` -> `libcrux` -> `hax-lib`), so a renamed
+fork cannot replace them. Downstream consumers (for example the SDK) that want
+the same lockfile must copy these two entries. The patches are not needed for
+correctness: they only remove "unmaintained" advisories (`paste`
+RUSTSEC-2024-0436, `proc-macro-error2` RUSTSEC-2026-0173). `proc-macro-error2`
+is only a `cfg(hax)` dependency and is never compiled in normal builds. The
+clean-consumer check must therefore build without them. Keep their upstream
+copyright, license, and notice files intact, and do not imply that the Arachne
+MPL license replaces their terms.
 
 When updating a patched dependency:
 
@@ -107,9 +158,21 @@ notices when bundling Core into a binary distribution.
 
 ## Crates.io releases
 
-`arachne-node` depends on the two named Arachne Iroh forks so their required
-APIs are ordinary registry dependencies, not workspace-only patches. The
-other three vendor patches are deliberately excluded from publishing. A clean
+`arachne-node` depends on the two named Arachne Iroh forks, and
+`arachne-iroh-blobs` depends on `arachne-bao-tree`, so their required APIs and
+fixes are ordinary registry dependencies, not workspace-only patches. The
+other two vendor patches (`netlink-packet-core`, `hax-lib-macros`) are
+deliberately excluded from publishing.
+
+`arachne-bao-tree` is in the workspace `exclude` list (to keep its upstream
+dev-dependencies out of `Cargo.lock`), so release-plz does not publish it.
+Publish order for a fork change: `arachne-bao-tree` (by hand, `cargo publish
+--manifest-path vendor/bao-tree/Cargo.toml`), then `arachne-iroh-blobs`,
+`arachne-iroh-gossip`, `arachne-iroh-tor-transport`, `arachne-node`,
+`arachne-runtime`. Until
+`arachne-bao-tree` is on crates.io, `cargo package`/`cargo publish --dry-run`
+verification of `arachne-iroh-blobs`, `arachne-node` and `arachne-runtime`
+fails; use `cargo package --list` or `--no-verify` for a local check. A clean
 consumer build outside this workspace must resolve registry-compatible
 package names and dependencies without inheriting this root manifest's
 `[patch.crates-io]` entries.

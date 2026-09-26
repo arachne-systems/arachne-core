@@ -30,9 +30,26 @@ other typed profiles require one.
 | `Wan` | Public lookup and relay-assisted connectivity. | Does not guarantee a usable route. |
 | `RelayOnly` | Prefer relay-only transport behavior. | A custom operator relay is not configurable through `ClientConfig` today. |
 | `WanOnly` | WAN lookup without LAN discovery or saved address hints. | Intended for diagnostics; direct paths remain enabled. |
+| `Tor` | Tor hidden-service transport only. | Requires the `tor` feature, a stable endpoint secret, and a local Tor daemon; IP and Iroh relay transports are disabled. |
 
 The lower-level node/runtime surface has additional relay configuration. The
 typed `ClientConfig` does not currently expose it as an adopter-ready option.
+
+`Tor` is experimental because it uses Iroh's unstable custom-transport API.
+The Tor transport creates an ephemeral onion service from the endpoint identity,
+so peers can dial by endpoint key without an IP address hint. It expects the
+Tor SOCKS5 and control ports at `127.0.0.1:9050` and `127.0.0.1:9051`. Keep the
+endpoint secret stable to keep the same endpoint identity and derived onion
+address across restarts. The profile does not fall back to direct IP or Iroh
+relay paths.
+
+The Docker-backed Core integration check is ignored in ordinary test runs and
+can be run with a local Tor daemon available on those ports:
+
+```sh
+cargo test -p arachne-node --features tor --test tor_transport -- --ignored --nocapture
+cargo test -p arachne-runtime --features tor --test tor_client -- --ignored --nocapture
+```
 
 ## Workspace lifecycle
 
@@ -67,6 +84,22 @@ lower-level native record-storage functions for enabling, saving, and restoring
 runtime state. Neither path removes the host's obligation to protect its root
 key and storage directory. See [Security](security.md#local-persistence).
 
+Rollback detection needs a freshness anchor that the host keeps outside the
+database:
+
+- While record storage is enabled, call `record_freshness` (or
+  `Client::record_freshness`) after every call that can commit. This includes
+  `enable_record_storage`, `save_candidate`, and `execute` operations, because
+  the lifecycle driver also commits. Persist the anchor before you release that
+  call's result. For FFI, `FreshnessAnchor::to_bytes` gives 40 bytes: the
+  big-endian revision, then the digest. `FreshnessAnchor::from_bytes` reads
+  them back.
+- Restore with `restore_record_storage_with_freshness(..., Some(anchor))`. The
+  store must match the anchor exactly. An older store and a newer store are
+  both rejected before any record is read, and the session stays empty.
+- `restore_record_storage` and an anchor of `None` keep the old behavior. They
+  do not detect a rollback.
+
 `Client::create_workspace` currently creates in-session state and reports
 `durable: false`. The typed `Client` does not expose the complete native
 record-storage setup/restore lifecycle or a durable initial workspace-creation
@@ -98,33 +131,38 @@ There are two paths that must not be conflated:
 
 `publish` is rejected for a workspace after admission; the runtime directs the
 caller to the protected path. Do not use the basic example as a secure group
-messaging recipe. The typed facade currently lacks a corresponding protected
-receive/stage/adopt method set even though lower-level runtime operations and
-tests exercise protected receive. That gap is tracked below.
+messaging recipe. The typed facade receives with `poll_protected` and
+`adopt_protected_reception`, then reads the inbox with `poll_pending_object`
+and resolves each object with `stage_object_acknowledgement` or
+`stage_object_rejection` (save, then `adopt_protected_reception`).
 
 ## Recovery and delivery expectations
 
-The runtime exposes recovery requests, recovery range status, staged recovery,
-adoption, and recovered-publication polling. Recovery is peer-assisted and
-bounded; it is not a central durable queue. A successful send/admission report
-does not mean every offline peer has received the data. Applications must
-define their own retention, retry, acknowledgement, and user-visible delivery
-semantics around the core's reports and recovery results.
+Received and recovered objects wait in a durable inbox. Read them with
+`poll_pending_object`, then stage and adopt an acknowledgement or rejection.
+Recovery is peer-assisted and bounded; it is not a central durable queue. A
+successful send/admission report does not mean every offline peer has
+received the data. [Delivery semantics](delivery.md) states the guarantees
+of each mode: at-least-once delivery, duplicates, ordering, loss, recovery,
+retention bounds and epoch behavior.
 
 ## Known integration gaps
 
 Before presenting this as a supported application SDK, close or explicitly
 accept these gaps:
 
-- The typed facade does not yet expose the complete native record-storage
-  enable/restore/save lifecycle.
-- The typed facade does not yet expose the protected inbound receive and
-  durable adoption path that the lower-level runtime API uses.
 - `ClientConfig` does not expose custom relay settings available in lower-level
   transport construction.
 - Synchronous methods need a documented host threading and cancellation model
   for each target runtime, especially Android.
-- The public API has not been declared stable and the crates are not published.
+- The public API has not been declared stable. The crates have an initial
+  crates.io release, but APIs, wire formats and saved data can still change.
+
+The typed `Client` now covers the record-storage lifecycle
+(`enable_record_storage`, `restore_record_storage`,
+`restore_record_storage_with_freshness`, `record_freshness`, `save_candidate`)
+and protected receive with durable adoption (`poll_protected`,
+`adopt_protected_reception`).
 
 These are concrete implementation boundaries, not guarantees about the timing
 of future releases. Check the current API and tests before integrating.

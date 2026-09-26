@@ -17,7 +17,10 @@ use std::{
 
 mod budget;
 mod connections;
+mod mdns;
 mod control;
+mod endpoint;
+pub use endpoint::IrohEndpointSigner;
 mod overlay;
 #[cfg(feature = "moq")]
 mod streams;
@@ -38,11 +41,13 @@ use tokio::{
     task::JoinHandle,
 };
 
-const ALPN: &[u8] = b"data-fabric/pubsub-experiment/1";
+const ALPN: &[u8] = b"arachne/data/1";
 const MAX_PAYLOAD: usize = 16 * 1024;
 const MAX_RECIPIENTS: usize = 64;
 const MAX_FRAME: usize = 128 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(5);
+/// Default bound on the close drain, the same on every profile.
+const CLOSE_DRAIN: Duration = Duration::from_secs(5);
 const CONNECTION_IDLE: Duration = Duration::from_secs(60);
 const CRITICAL_QUEUE: usize = 256;
 const CURRENT_QUEUE: usize = 64;
@@ -57,18 +62,30 @@ pub enum NetworkProfile {
     Wan,
     RelayOnly,
     WanOnly,
+    #[cfg(feature = "tor")]
+    Tor,
 }
 
 impl NetworkProfile {
     fn settings(self) -> (Option<&'static str>, bool, bool, bool) {
         match self {
             Self::Direct => (None, false, false, true),
-            Self::Lan => (Some("data-fabric"), false, false, true),
+            Self::Lan => (Some("arachne"), false, false, true),
             Self::Nearby => (Some("arachne-nearby"), false, false, true),
-            Self::Wan => (Some("data-fabric"), true, false, false),
+            Self::Wan => (Some("arachne"), true, false, false),
             Self::RelayOnly => (None, true, true, false),
             Self::WanOnly => (None, true, false, false),
+            #[cfg(feature = "tor")]
+            Self::Tor => (None, false, true, false),
         }
+    }
+
+    fn uses_tor(self) -> bool {
+        #[cfg(feature = "tor")]
+        return matches!(self, Self::Tor);
+
+        #[cfg(not(feature = "tor"))]
+        false
     }
 }
 
@@ -83,6 +100,100 @@ pub struct RelayOptions {
 impl RelayOptions {
     pub fn new(map: iroh::RelayMap, tls: iroh::tls::CaTlsConfig) -> Self {
         Self { map, tls }
+    }
+
+    /// Operator relays from plain URLs, without transport types. `roots`
+    /// empty trusts the built-in WebPKI roots; otherwise only these
+    /// DER-encoded roots are trusted, for a private CA.
+    pub fn operator<'a>(
+        urls: impl IntoIterator<Item = &'a str>,
+        roots: Vec<Vec<u8>>,
+    ) -> std::result::Result<Self, &'static str> {
+        let urls = urls
+            .into_iter()
+            .map(|url| url.parse::<iroh::RelayUrl>())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| "invalid operator relay URL")?;
+        if urls.is_empty() {
+            return Err("operator relay requires at least one URL");
+        }
+        if roots.iter().any(Vec::is_empty) {
+            return Err("operator relay root certificate is empty");
+        }
+        let tls = if roots.is_empty() {
+            iroh::tls::CaTlsConfig::embedded()
+        } else {
+            iroh::tls::CaTlsConfig::custom_roots(roots.into_iter().map(Into::into))
+        };
+        Ok(Self::new(urls.into_iter().collect(), tls))
+    }
+}
+
+/// Transport deadlines. Each profile has defaults (`for_profile`); a slow or
+/// constrained link overrides them through `NodeOptions`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Timeouts {
+    /// One data exchange or resource admission, including its dial.
+    pub operation: Duration,
+    /// One dial. A gossip dial holds its dial slot at most this long.
+    pub dial: Duration,
+    /// How long a live broadcast waits for a first overlay neighbor.
+    pub gossip_join: Duration,
+    /// How long `Node::close` waits for peers to acknowledge the close. The
+    /// wait is best effort and blocks the closing caller, so it stays short
+    /// (5 s) on every profile, including Tor.
+    pub close_drain: Duration,
+}
+
+impl Timeouts {
+    pub fn for_profile(profile: NetworkProfile) -> Self {
+        if profile.uses_tor() {
+            // Hidden-service descriptors can take minutes to propagate.
+            return Self {
+                operation: Duration::from_secs(300),
+                dial: Duration::from_secs(240),
+                gossip_join: Duration::from_secs(30),
+                close_drain: CLOSE_DRAIN,
+            };
+        }
+        Self {
+            operation: TIMEOUT,
+            dial: TIMEOUT,
+            gossip_join: Duration::from_secs(2),
+            close_drain: CLOSE_DRAIN,
+        }
+    }
+
+    /// Lifetime of a resource read grant. Its ticket travels in a message
+    /// and the recipient then dials, so the grant outlasts both.
+    pub(crate) fn resource_grant(&self) -> Duration {
+        resources::ADMISSION_LIFETIME.max(self.dial + self.operation * 2)
+    }
+}
+
+/// How a node binds: its network profile, transport deadlines and the
+/// lookup and relay services it may use.
+#[derive(Clone, Debug)]
+pub struct NodeOptions {
+    pub profile: NetworkProfile,
+    pub timeouts: Timeouts,
+    /// Operator relays with their TLS trust. Replaces n0's public relays.
+    pub relay: Option<RelayOptions>,
+    /// Use n0's public DNS/Pkarr address lookup and publishing. The WAN
+    /// profiles default to true; set false for a deployment that must not
+    /// contact n0 (with `relay` for operator relays).
+    pub public_lookup: bool,
+}
+
+impl NodeOptions {
+    /// The profile with its default deadlines and services.
+    pub fn new(profile: NetworkProfile) -> Self {
+        Self {
+            profile,
+            timeouts: Timeouts::for_profile(profile),
+            relay: None,
+            public_lookup: profile.settings().1,
+        }
     }
 }
 
@@ -146,7 +257,6 @@ type CurrentKey = (
     u64,
     String,
     PeerId,
-    PeerId,
     [u8; 32],
     Vec<[u8; 32]>,
 );
@@ -165,6 +275,7 @@ struct DeliveryQueue {
     state: Arc<StdMutex<DeliveryState>>,
     changed: Arc<tokio::sync::Notify>,
     closed: Arc<AtomicBool>,
+    work: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl DeliveryQueue {
@@ -183,7 +294,6 @@ impl DeliveryQueue {
                     message.revision,
                     message.topic.as_str().into(),
                     message.sender,
-                    message.received_from,
                     replacement_key,
                     message.recipients.clone(),
                 );
@@ -197,6 +307,9 @@ impl DeliveryQueue {
         }
         drop(state);
         self.changed.notify_one();
+        if let Some(work) = &self.work {
+            work.notify_one();
+        }
         Ok(())
     }
 
@@ -333,6 +446,9 @@ pub struct Node {
     resources: resources::ResourceTransfers,
     events: DeliveryQueue,
     overlays: Arc<Mutex<BTreeMap<WorkspaceId, Arc<overlay::Overlay>>>>,
+    /// Overlays parked by `suspend`: workspace to (tag, revision). `Some`
+    /// while suspended; `resume` rebuilds them.
+    parked: Arc<StdMutex<Option<BTreeMap<WorkspaceId, ([u8; overlay::TAG], u64)>>>>,
     membership: overlay::MembershipInbox,
     #[cfg(feature = "moq")]
     streams: streams::Streams,
@@ -462,6 +578,19 @@ impl Node {
         .await
     }
 
+    /// Bind using Tor's custom transport and an endpoint identity that derives
+    /// the onion address. Requires a local Tor daemon on ports 9050 and 9051.
+    #[cfg(feature = "tor")]
+    pub async fn bind_tor_with_identity(secret: &[u8; 32]) -> Result<(Self, MessageReceiver)> {
+        Self::bind_with_profile(
+            SocketAddr::from(([0, 0, 0, 0], 0)),
+            Some(secret),
+            NetworkProfile::Tor,
+            ConnectionBudget::default(),
+        )
+        .await
+    }
+
     /// Bind an independently identified endpoint using host-owned shared device
     /// capacity. Clone the same budget for each workspace and discovery endpoint.
     pub async fn bind_with_profile(
@@ -470,7 +599,17 @@ impl Node {
         profile: NetworkProfile,
         budget: ConnectionBudget,
     ) -> Result<(Self, MessageReceiver)> {
-        Self::bind_with_profile_and_relays(address, secret, profile, budget, None).await
+        Self::bind_with_options(address, secret, NodeOptions::new(profile), budget).await
+    }
+
+    /// Bind with explicit options, for example deadlines for a slow link.
+    pub async fn bind_with_options(
+        address: SocketAddr,
+        secret: Option<&[u8; 32]>,
+        options: NodeOptions,
+        budget: ConnectionBudget,
+    ) -> Result<(Self, MessageReceiver)> {
+        Self::bind_with_profile_and_relays(address, secret, options, budget).await
     }
 
     /// Bind with a caller-supplied relay map and TLS trust configuration.
@@ -485,17 +624,20 @@ impl Node {
         budget: ConnectionBudget,
         relay: RelayOptions,
     ) -> Result<(Self, MessageReceiver)> {
-        Self::bind_with_profile_and_relays(address, secret, profile, budget, Some(relay)).await
+        let options = NodeOptions {
+            relay: Some(relay),
+            ..NodeOptions::new(profile)
+        };
+        Self::bind_with_options(address, secret, options, budget).await
     }
 
     async fn bind_with_profile_and_relays(
         address: SocketAddr,
         secret: Option<&[u8; 32]>,
-        profile: NetworkProfile,
+        options: NodeOptions,
         budget: ConnectionBudget,
-        relay: Option<RelayOptions>,
     ) -> Result<(Self, MessageReceiver)> {
-        let alpns = vec![ALPN.to_vec(), control::ALPN.to_vec()];
+        let alpns = vec![ALPN.to_vec(), control::ALPN.to_vec(), overlay::ALPN.to_vec()];
         #[cfg(feature = "moq")]
         let alpns = {
             let mut alpns = alpns;
@@ -504,22 +646,25 @@ impl Node {
         };
         let connections = Connections::bind(
             address,
-            profile,
+            &options,
             secret.map(iroh::SecretKey::from_bytes),
             budget.clone(),
             alpns,
-            relay,
         )
         .await?;
         let routing = Arc::new(Mutex::new(RoutingTable::default()));
         let resources = resources::ResourceTransfers::new(connections.clone(), routing.clone());
-        let events = DeliveryQueue::default();
+        let (control_inbox, controls, control_signal) = control::ControlInbox::new(512);
+        // This shared signal wakes host polling for control and queued delivery work.
+        let events = DeliveryQueue {
+            work: Some(control_signal.clone()),
+            ..DeliveryQueue::default()
+        };
         #[cfg(feature = "moq")]
         let streams = streams::Streams::new(connections.clone(), routing.clone(), events.clone());
         let receiver = MessageReceiver {
             queue: events.clone(),
         };
-        let (control_inbox, controls, control_signal) = control::ControlInbox::new(512);
         let (control_cancel, _) = watch::channel(false);
         let node_control_inbox = control_inbox.clone();
         let overlays: Arc<Mutex<BTreeMap<WorkspaceId, Arc<overlay::Overlay>>>> =
@@ -536,6 +681,7 @@ impl Node {
             // peers cannot occupy the slots needed to reach the control budget.
             let handshake_capacity = budget.handshakes;
             let [data_capacity, control_capacity] = budget.exchanges;
+            let stranger_capacity = budget.stranger_exchanges;
             let mut workers = tokio::task::JoinSet::new();
             while let Some(incoming) = accepted_connections.accept().await {
                 while workers.try_join_next().is_some() {}
@@ -546,6 +692,7 @@ impl Node {
                 let control_inbox = control_inbox.clone();
                 let control_capacity = control_capacity.clone();
                 let data_capacity = data_capacity.clone();
+                let stranger_capacity = stranger_capacity.clone();
                 let routing = shared.clone();
                 let overlays = accepted_overlays.clone();
                 let connections = accepted_connections.clone();
@@ -560,7 +707,7 @@ impl Node {
                     let mut observed_connection = None;
                     let result = async {
                         let observed_address = incoming.remote_addr();
-                        let connection = tokio::time::timeout(TIMEOUT, incoming).await
+                        let connection = tokio::time::timeout(connections.operation_timeout(), incoming).await
                             .map_err(|_| Error::Timeout("accept connection"))?.map_err(transport)?;
                         drop(permit);
                         observed_connection = Some(connection.clone());
@@ -568,25 +715,32 @@ impl Node {
                         remote = Some(connection.remote_id());
                         connection_id = Some(connection.stable_id());
                         let is_control = connection.alpn() == control::ALPN;
-                        let overlay = {
-                            let overlays = overlays.lock().await;
-                            overlays
-                                .values()
-                                .find(|overlay| overlay.alpn.as_slice() == connection.alpn())
-                                .map(|overlay| {
-                                    (
-                                        overlay.workspace,
-                                        overlay.revision(),
-                                        overlay.gossip.clone(),
-                                    )
-                                })
-                        };
-                        if let Some((workspace, revision, gossip)) = overlay {
-                            routing
-                                .lock()
-                                .await
-                                .authorizes_endpoint(workspace, revision, sender)?;
+                        if connection.alpn() == overlay::ALPN {
                             stage = "accept gossip";
+                            let tag = read_gossip_tag(&connection, connections.operation_timeout()).await;
+                            let overlay = match tag {
+                                Some(tag) => overlays
+                                    .lock()
+                                    .await
+                                    .values()
+                                    .find(|overlay| overlay.tag == tag)
+                                    .map(|overlay| (overlay.workspace, overlay.revision(), overlay.tag, overlay.gossip.clone())),
+                                None => None,
+                            };
+                            let admitted = match overlay {
+                                Some((workspace, revision, tag, gossip)) => {
+                                    let allowed = connections.gossip_allows(&tag, sender)
+                                        && routing.lock().await.authorizes_endpoint(workspace, revision, sender).is_ok();
+                                    allowed.then_some(gossip)
+                                }
+                                None => None,
+                            };
+                            // An unknown tag and a known tag this peer may not
+                            // use close the same way: no workspace oracle.
+                            let Some(gossip) = admitted else {
+                                connection.close(403u32.into(), b"gossip denied");
+                                return Err(Error::Rejected);
+                            };
                             tokio::time::timeout(control::CONTROL_TIMEOUT, gossip.handle_connection(connection))
                                 .await.map_err(|_| Error::Timeout("accept gossip"))?.map_err(transport)?;
                             return Ok(());
@@ -613,7 +767,7 @@ impl Node {
                         let (capacity, budget) = if is_control {
                             (control_capacity, control::CONTROL_TIMEOUT)
                         } else {
-                            (data_capacity, TIMEOUT)
+                            (data_capacity, connections.operation_timeout())
                         };
                         let address = match observed_address {
                             iroh::endpoint::IncomingAddr::Ip(address) => Some(address),
@@ -634,7 +788,11 @@ impl Node {
                             tokio::select! {
                                 streams = connection.accept_bi() => {
                                     let Ok((mut send, mut recv)) = streams else { return Ok(()); };
-                                    let Ok(permit) = capacity.clone().try_acquire_owned() else {
+                                    // Strangers (no installed policy names them) share
+                                    // their own part of the control exchanges.
+                                    let stranger = is_control && !connections.is_member(&sender);
+                                    let stranger_permit = stranger.then(|| stranger_capacity.clone().try_acquire_owned());
+                                    let (Ok(permit), None | Some(Ok(_))) = (capacity.clone().try_acquire_owned(), &stranger_permit) else {
                                         let _ = send.reset(1u8.into());
                                         let _ = recv.stop(1u8.into());
                                         continue;
@@ -642,12 +800,12 @@ impl Node {
                                     idle.as_mut().reset(tokio::time::Instant::now() + CONNECTION_IDLE);
                                     let guard = connections.exchange(connection_key);
                                     exchanges.push(async move {
-                                        let _permit = permit;
+                                        let _permits = (permit, stranger_permit);
                                         let _guard = guard;
                                         let result = async {
                                             if !is_control {
                                                 let mut kind = [0; 1];
-                                                tokio::time::timeout(TIMEOUT, recv.read_exact(&mut kind)).await
+                                                tokio::time::timeout(connections.operation_timeout(), recv.read_exact(&mut kind)).await
                                                     .map_err(|_| Error::Timeout("stream kind"))?.map_err(transport)?;
                                                 match kind[0] {
                                                     resources::STREAM_KIND => return resources.serve(connection, &mut send, &mut recv).await,
@@ -657,7 +815,7 @@ impl Node {
                                             }
                                             tokio::time::timeout(budget, async {
                                               if is_control {
-                                                control::receive(connection, control_inbox, address, (&mut send, &mut recv)).await
+                                                control::receive(connection, control_inbox, address, stranger, (&mut send, &mut recv)).await
                                               } else {
                                                 receive_frame(connection, connections, routing, output, address, (&mut send, &mut recv)).await
                                               }
@@ -706,6 +864,7 @@ impl Node {
                 resources,
                 events,
                 overlays,
+                parked: Arc::new(StdMutex::new(None)),
                 membership: overlay::MembershipInbox::new(control_signal_for_membership),
                 #[cfg(feature = "moq")]
                 streams,
@@ -725,7 +884,7 @@ impl Node {
     }
 
     /// Next membership step received by gossip, as (workspace, opaque bytes).
-    /// Delivered without a policy revision check (ADR 0008): the caller must
+    /// Delivered without a policy revision check: the caller must
     /// verify the step itself against its own saved state before using it.
     pub fn poll_membership_gossip(&self) -> Option<(WorkspaceId, Vec<u8>)> {
         self.membership.pop()
@@ -752,12 +911,11 @@ impl Node {
         payload: Vec<u8>,
     ) -> impl std::future::Future<Output = Result<bool>> + Send + 'static {
         let overlays = self.overlays.clone();
-        let sender = self.id();
         async move {
             let Some(overlay) = overlays.lock().await.get(&workspace).cloned() else {
                 return Ok(false);
             };
-            overlay.broadcast_membership(sender, payload).await
+            overlay.broadcast_membership(payload).await
         }
     }
     pub fn address(&self) -> SocketAddr {
@@ -811,6 +969,7 @@ impl Node {
                     let replacement = overlay::Overlay::prepare(
                         &self.connections,
                         overlay.workspace,
+                        overlay.tag,
                         overlay.revision(),
                         peers,
                         self.routing.clone(),
@@ -841,6 +1000,12 @@ impl Node {
         self.connections.address_hint(peer).await
     }
 
+    /// Whether the configured Iroh transport can resolve a destination from
+    /// its authenticated endpoint ID without a socket address hint.
+    pub fn can_dial_by_peer_id(&self) -> bool {
+        self.connections.can_dial_by_peer_id()
+    }
+
     /// Endpoints passively observed on the application-named local mDNS service.
     /// These are route hints only and carry no workspace or human identity claim.
     pub async fn nearby_peers(&self) -> Vec<PeerId> {
@@ -861,36 +1026,34 @@ impl Node {
         revision: u64,
         endpoint_permissions: BTreeMap<PeerId, Permissions>,
     ) -> Result<()> {
-        let replace_overlay = self.overlays.lock().await.contains_key(&workspace);
+        let existing = self.overlays.lock().await.get(&workspace).cloned();
         let peers = endpoint_permissions.keys().copied().collect::<Vec<_>>();
-        self.routing.lock().await.install_verified_policy(
-            workspace,
-            revision,
-            endpoint_permissions,
-        )?;
+        {
+            let mut routing = self.routing.lock().await;
+            routing.install_verified_policy(workspace, revision, endpoint_permissions)?;
+            self.connections.set_members(routing.endpoints());
+        }
         #[cfg(feature = "moq")]
         self.streams.policy_changed().await;
         self.resources.policy_changed();
-        if replace_overlay {
+        if let Some(existing) = existing {
+            let tag = existing.tag;
             if !peers.contains(&self.id()) {
-                self.connections
-                    .authorize_gossip(overlay::alpn(workspace), Vec::new())
-                    .await;
+                self.connections.authorize_gossip(tag, Vec::new());
                 self.overlays.lock().await.remove(&workspace);
                 return Ok(());
             }
-            self.connections
-                .authorize_gossip(overlay::alpn(workspace), peers.clone())
-                .await;
+            self.connections.authorize_gossip(tag, peers.clone());
             // An epoch that only adds members keeps the swarm: rebuilding it on
-            // every admission dropped all neighbors mid-broadcast (ADR 0008).
-            let existing = self.overlays.lock().await.get(&workspace).cloned();
-            if existing.is_some_and(|overlay| overlay.advance(revision, &peers)) {
+            // every admission dropped all neighbors mid-broadcast.
+            if existing.advance(revision, &peers) {
                 return Ok(());
             }
+            drop(existing);
             let candidate = overlay::Overlay::prepare(
                 &self.connections,
                 workspace,
+                tag,
                 revision,
                 peers,
                 self.routing.clone(),
@@ -908,7 +1071,16 @@ impl Node {
 
     /// Enable one bounded workspace-wide live overlay after installing a verified
     /// policy. Direct-recipient publications keep their acknowledged path.
-    pub async fn enable_gossip(&self, workspace: WorkspaceId, revision: u64) -> Result<()> {
+    ///
+    /// `tag_key` must be a secret every member holds and that stays the same
+    /// across policy revisions. It keys the tag that names this overlay inside
+    /// each encrypted gossip link; members with different keys never connect.
+    pub async fn enable_gossip(
+        &self,
+        workspace: WorkspaceId,
+        revision: u64,
+        tag_key: &[u8; 32],
+    ) -> Result<()> {
         if self
             .overlays
             .lock()
@@ -923,12 +1095,17 @@ impl Node {
             .lock()
             .await
             .authorized_endpoints(workspace, revision)?;
-        self.connections
-            .authorize_gossip(overlay::alpn(workspace), peers.clone())
-            .await;
+        let tag = overlay::tag(tag_key, workspace);
+        self.connections.authorize_gossip(tag, peers.clone());
+        if let Some(parked) = self.parked.lock().unwrap().as_mut() {
+            // Suspended: no gossip timers run. `resume` builds this overlay.
+            parked.insert(workspace, (tag, revision));
+            return Ok(());
+        }
         let candidate = overlay::Overlay::prepare(
             &self.connections,
             workspace,
+            tag,
             revision,
             peers,
             self.routing.clone(),
@@ -1129,7 +1306,7 @@ impl Node {
                 report.admitted.push(self.id());
             }
             report.queued = overlay
-                .broadcast(self.id(), &topic, delivery, payload)
+                .broadcast(&topic, delivery, payload)
                 .await?;
             return Ok(report);
         }
@@ -1378,6 +1555,133 @@ impl Node {
         }
     }
 
+    /// The transport deadlines this node was bound with.
+    pub fn timeouts(&self) -> Timeouts {
+        self.connections.timeouts()
+    }
+
+    /// Release the transport. Waits at most `Timeouts::close_drain` for peers
+    /// to acknowledge the close, then finishes the local teardown.
+    /// Control requests wait (new arrivals, not the ones set aside).
+    /// Nothing is consumed; for `next_event`.
+    pub fn has_queued_controls(&self) -> bool {
+        !self.controls.is_empty()
+    }
+
+    /// Membership steps from gossip wait for the host. Nothing is consumed.
+    pub fn has_membership_gossip(&self) -> bool {
+        self.membership.has_pending()
+    }
+
+    /// Stop background work for a host in the background: each workspace
+    /// overlay (its HyParView shuffle timers and bootstrap retries) is
+    /// dropped and parked, every idle connection closes, and the mDNS
+    /// service stops (see `mdns.rs`). The endpoint,
+    /// routing policy and queues stay; an exchange in progress keeps its
+    /// connection. Later dials reconnect. Idempotent.
+    pub async fn suspend(&self) {
+        let overlays = std::mem::take(&mut *self.overlays.lock().await);
+        let mut parked = self.parked.lock().unwrap();
+        let parked = parked.get_or_insert_with(BTreeMap::new);
+        for (workspace, overlay) in overlays {
+            parked.insert(workspace, (overlay.tag, overlay.revision()));
+        }
+        let overlays = parked.len();
+        drop(parked);
+        // Idle links would keep QUIC keep-alives running.
+        let closed = self.connections.close_idle().await;
+        // No local announcements or lookups while in the background.
+        self.connections.pause_mdns().await;
+        tracing::info!(target: "data_fabric_transport", overlays, closed, "NODE_SUSPENDED");
+    }
+
+    /// Rebuild the parked overlays at their current policy, then rebind
+    /// sockets (`network_change`). A no-op when not suspended.
+    pub async fn resume(&self) {
+        let Some(parked) = self.parked.lock().unwrap().take() else {
+            return;
+        };
+        for (workspace, (tag, revision)) in parked {
+            let peers = match self
+                .routing
+                .lock()
+                .await
+                .authorized_endpoints(workspace, revision)
+            {
+                Ok(peers) if peers.contains(&self.id()) => peers,
+                _ => continue,
+            };
+            match overlay::Overlay::prepare(
+                &self.connections,
+                workspace,
+                tag,
+                revision,
+                peers,
+                self.routing.clone(),
+                self.events.clone(),
+                self.membership.clone(),
+            )
+            .await
+            {
+                Ok(overlay) => {
+                    self.overlays
+                        .lock()
+                        .await
+                        .insert(workspace, Arc::new(overlay));
+                }
+                Err(error) => {
+                    tracing::warn!(target: "data_fabric_transport", %error, "NODE_RESUME_OVERLAY_FAILED");
+                }
+            }
+        }
+        self.connections.resume_mdns();
+        self.connections.network_change().await;
+        tracing::info!(target: "data_fabric_transport", "NODE_RESUMED");
+    }
+
+    /// (running mDNS services, address sets announced to mDNS): a test and
+    /// diagnostics hook for `suspend`.
+    pub fn mdns_state(&self) -> (usize, u64) {
+        self.connections.mdns_state()
+    }
+
+    /// Multiply background timer intervals (gossip shuffle, bootstrap
+    /// retries) by `scale` for a low-power host; 1 is normal. Overlays
+    /// built after the call use it; running ones keep theirs until rebuilt.
+    pub fn set_timer_scale(&self, scale: u32) {
+        self.connections.set_timer_scale(scale);
+    }
+
+    pub fn timer_scale(&self) -> u32 {
+        self.connections.timer_scale()
+    }
+
+    /// (HyParView shuffle interval, first bootstrap retry delay) of each
+    /// live overlay (a test and diagnostics hook).
+    pub async fn gossip_intervals(&self) -> Vec<(Duration, Duration)> {
+        self.overlays
+            .lock()
+            .await
+            .values()
+            .map(|overlay| overlay.intervals)
+            .collect()
+    }
+
+    /// Open connections of this endpoint (a test and diagnostics hook).
+    pub fn open_connections(&self) -> usize {
+        self.connections.live_alpns().len()
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        self.parked.lock().unwrap().is_some()
+    }
+
+    /// Live gossip overlays, each with its own timers (a test and
+    /// diagnostics hook for `suspend`).
+    pub async fn active_overlays(&self) -> usize {
+        self.overlays.lock().await.len()
+    }
+
     pub async fn close(mut self) {
         #[cfg(feature = "moq")]
         self.streams.close().await;
@@ -1388,6 +1692,21 @@ impl Node {
         let _ = (&mut self.listener).await;
 
     }
+}
+
+/// The dialer's first stream on a gossip link: exactly one overlay tag.
+async fn read_gossip_tag(
+    connection: &iroh::endpoint::Connection,
+    timeout: Duration,
+) -> Option<[u8; overlay::TAG]> {
+    tokio::time::timeout(timeout, async {
+        let mut recv = connection.accept_uni().await.ok()?;
+        let bytes = recv.read_to_end(overlay::TAG).await.ok()?;
+        bytes.try_into().ok()
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 async fn receive_frame(
@@ -1434,7 +1753,7 @@ async fn send_frame(
     let mut stage = "connect";
     let mut observed_connection = None;
     tracing::info!(target: "data_fabric_transport", remote = %key, bytes = bytes.len(), "TRANSPORT_SEND_BEGIN");
-    let result = tokio::time::timeout(TIMEOUT, async {
+    let result = tokio::time::timeout(connections.operation_timeout(), async {
         let connection = connections.connect(peer, ALPN).await?;
         observed_connection = Some(connection.clone());
         tracing::info!(target: "data_fabric_transport", remote = %key, connection_id = connection.stable_id(), paths = ?connection.paths(), "TRANSPORT_SEND_CONNECTED");
@@ -1632,4 +1951,99 @@ async fn receiver_checks_local_interest_even_if_sender_routes_a_direct_frame() {
         "stale sender interest defeated local unsubscribe"
     );
     assert!(received.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn current_state_replay_across_mesh_paths_does_not_fill_the_queue() {
+    let queue = DeliveryQueue::default();
+    let topic = Topic::new("atak/pli").unwrap();
+    for path in 0..=CURRENT_QUEUE {
+        let route = (path as u64).to_be_bytes();
+        let mut received_from = [0; 32];
+        received_from[..route.len()].copy_from_slice(&route);
+        queue
+            .push(Message {
+                workspace: [1; 32],
+                revision: 1,
+                sender: [2; 32],
+                received_from,
+                topic: topic.clone(),
+                payload: route.to_vec(),
+                recipients: Vec::new(),
+                delivery: DeliveryClass::Current {
+                    replacement_key: [9; 32],
+                },
+            })
+            .expect("one current value should replace its mesh duplicates");
+    }
+    assert_eq!(queue.state.lock().unwrap().current.len(), 1);
+}
+
+#[test]
+fn current_queue_preserves_distinct_replacement_keys() {
+    let queue = DeliveryQueue::default();
+    let topic = Topic::new("atak/pli").unwrap();
+    for key in [1, 2] {
+        queue
+            .push(Message {
+                workspace: [1; 32],
+                revision: 1,
+                sender: [2; 32],
+                received_from: [2; 32],
+                topic: topic.clone(),
+                payload: vec![key],
+                recipients: Vec::new(),
+                delivery: DeliveryClass::Current {
+                    replacement_key: [key; 32],
+                },
+            })
+            .unwrap();
+    }
+    assert_eq!(queue.state.lock().unwrap().current.len(), 2);
+    assert_eq!(queue.pop().unwrap().payload, vec![1]);
+    assert_eq!(queue.pop().unwrap().payload, vec![2]);
+}
+
+#[test]
+fn deadlines_follow_the_profile_and_scale_the_resource_grant() {
+    let direct = Timeouts::for_profile(NetworkProfile::Direct);
+    assert_eq!((direct.operation, direct.dial), (TIMEOUT, TIMEOUT));
+    assert_eq!(direct.resource_grant(), resources::ADMISSION_LIFETIME);
+    // A slow link's grant outlasts delivering the ticket and dialing back.
+    let slow = Timeouts {
+        operation: Duration::from_secs(300),
+        dial: Duration::from_secs(240),
+        gossip_join: Duration::from_secs(30),
+        close_drain: CLOSE_DRAIN,
+    };
+    assert!(slow.resource_grant() >= slow.dial + slow.operation);
+    assert_eq!(NodeOptions::new(NetworkProfile::Lan).timeouts, direct);
+}
+
+/// `close` blocks its caller (a JNI thread on Android) for up to the close
+/// drain. That bound must stay short on every profile, even where the
+/// operation deadline is minutes.
+#[test]
+fn every_profile_keeps_a_short_close_drain() {
+    let profiles = [
+        NetworkProfile::Direct,
+        NetworkProfile::Lan,
+        NetworkProfile::Nearby,
+        NetworkProfile::Wan,
+        NetworkProfile::RelayOnly,
+        NetworkProfile::WanOnly,
+    ];
+    for profile in profiles {
+        assert_eq!(Timeouts::for_profile(profile).close_drain, CLOSE_DRAIN);
+    }
+    assert_eq!(CLOSE_DRAIN, Duration::from_secs(5));
+}
+
+#[cfg(feature = "tor")]
+#[test]
+fn tor_close_drain_is_not_the_tor_operation_deadline() {
+    let tor = Timeouts::for_profile(NetworkProfile::Tor);
+    assert_eq!(tor.operation, Duration::from_secs(300));
+    assert_eq!(tor.close_drain, CLOSE_DRAIN);
+    assert_ne!(tor.close_drain, tor.operation);
 }

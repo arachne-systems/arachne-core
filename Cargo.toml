@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/arachne-api",
     "crates/arachne-store",
     "crates/arachne-security",
     "crates/arachne-delivery",
@@ -8,6 +9,7 @@ members = [
     "crates/arachne-runtime",
     "vendor/iroh-gossip",
     "vendor/iroh-blobs",
+    "vendor/iroh-tor-transport",
 ]
 resolver = "3"
 exclude = ["vendor/bao-tree", "vendor/netlink-packet-core", "vendor/hax-lib-macros"]
@@ -16,13 +18,21 @@ exclude = ["vendor/bao-tree", "vendor/netlink-packet-core", "vendor/hax-lib-macr
 version = "0.1.0"
 authors = ["Arachne Systems"]
 edition = "2024"
-license-file = "LICENSE"
+# SPDX expression. Each crate directory carries a `LICENSE` symlink to the root
+# MPL-2.0 text so `cargo package` still ships the full license with the crate.
+license = "MPL-2.0"
 rust-version = "1.91"
 repository = "https://github.com/arachne-systems/arachne-core"
 homepage = "https://github.com/arachne-systems"
 
+# These two patches only apply inside this workspace; Cargo ignores [patch] in
+# dependencies. Both packages come in through third-party parents (iroh ->
+# netwatch/netdev, openmls_rust_crypto -> hpke-rs -> libcrux -> hax-lib), so a
+# renamed fork cannot replace them. They are advisory hygiene, not correctness
+# fixes: see docs/development.md ("Vendored dependency patches").
+# bao-tree is no longer patched here: arachne-iroh-blobs depends on the renamed
+# `arachne-bao-tree` fork directly.
 [patch.crates-io]
-bao-tree = { path = "vendor/bao-tree" }
 netlink-packet-core = { path = "vendor/netlink-packet-core" }
 hax-lib-macros = { path = "vendor/hax-lib-macros" }
 moq-net = { git = "https://github.com/moq-dev/moq", rev = "6ab7d1a223e1949a5c2e10b68e29db2e8ab9bdd1" }

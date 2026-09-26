@@ -1,5 +1,11 @@
 # bao-tree
 
+> This Arachne-maintained fork is published as `arachne-bao-tree`; its Rust
+> library keeps the `bao_tree` import name. It only changes the dependency
+> feature selection. The change and upstream provenance are documented in
+> [`ARACHNE-PATCH.md`](ARACHNE-PATCH.md). This is not an official upstream
+> release. The upstream MIT/Apache-2.0 license terms remain in force.
+
 [![Actions Status](https://github.com/n0-computer/bao-tree/workflows/tests/badge.svg)](https://github.com/n0-computer/bao-tree/actions) [![docs.rs](https://docs.rs/bao-tree/badge.svg)](https://docs.rs/bao-tree) [![crates.io](https://img.shields.io/crates/v/bao-tree.svg)](https://crates.io/crates/bao-tree)
 
 The merkle tree used for BLAKE3 verified streaming.

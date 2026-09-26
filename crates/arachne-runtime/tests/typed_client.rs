@@ -1,21 +1,15 @@
 use arachne_runtime::{
-    Client, ClientConfig, ErrorKind, JoinAdmissionStep, MemberKind, Network, PeerPolicy,
-    PendingObject, Presence, RecoveredPublication, RecoveryRangeRequest, RecoveryRangeStatus,
-    WorkspacePhase,
+    Client, ClientConfig, ErrorKind, JoinAdmissionStep, MemberKind, Network, PeerPolicy, Presence,
+    ReceivedProtectedPublication, RecoveryRangeRequest, RecoveryRangeStatus, WorkspacePhase,
 };
-use std::{
-    fs,
-    io::Write,
-    time::{Duration, Instant},
-};
-
-mod common;
+use std::time::{Duration, Instant};
 
 #[test]
 fn typed_client_reports_endpoint_and_workspace_state_then_closes() {
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([7; 32]),
+        transport: Default::default(),
     })
     .unwrap();
 
@@ -33,27 +27,10 @@ fn typed_client_reports_endpoint_and_workspace_state_then_closes() {
 
     client.cancel().unwrap();
     client.close().unwrap();
-    let error = client.close().unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Closed);
-}
-
-#[test]
-fn lan_client_binds_to_a_reusable_port() {
-    let port = std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let mut client = Client::open(ClientConfig {
-        network: Network::LanAtPort(port),
-        secret: Some([70; 32]),
-    })
-    .unwrap();
-    assert_eq!(
-        client.endpoint().unwrap().bound_address,
-        format!("0.0.0.0:{port}")
-    );
+    // Close is idempotent (ADR step 4); other calls report Closed.
     client.close().unwrap();
+    let error = client.endpoint().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Closed);
 }
 
 #[test]
@@ -61,6 +38,7 @@ fn typed_client_creates_named_workspace_with_typed_state() {
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([10; 32]),
+        transport: Default::default(),
     })
     .unwrap();
 
@@ -84,12 +62,13 @@ fn typed_client_exposes_recovery_result_without_vendor_types() {
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([11; 32]),
+        transport: Default::default(),
     })
     .unwrap();
     client.create_workspace("Owner", None).unwrap();
 
-    let recovered: Option<RecoveredPublication> = client.poll_recovered_publication().unwrap();
-    assert!(recovered.is_none());
+    let pending: Option<ReceivedProtectedPublication> = client.poll_pending_object().unwrap();
+    assert!(pending.is_none());
     client.close().unwrap();
 }
 
@@ -98,6 +77,7 @@ fn typed_client_exposes_recovery_request_lifecycle() {
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([15; 32]),
+        transport: Default::default(),
     })
     .unwrap();
     let workspace = client.create_workspace("Owner", None).unwrap();
@@ -128,17 +108,20 @@ fn typed_clients_recover_an_opaque_publication() {
     let mut owner = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([16; 32]),
+        transport: Default::default(),
     })
     .unwrap();
     let mut reader = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([17; 32]),
+        transport: Default::default(),
     })
     .unwrap();
     let workspace = owner
         .create_workspace("Owner", Some("Recovery proof"))
         .unwrap();
-    let invitation = owner.issue_invitation().unwrap();
+    let candidate = owner.stage_invitation(0).unwrap();
+    let invitation = owner.adopt_invitation(&candidate.snapshot).unwrap();
     let owner_address = invitation.address.replace("0.0.0.0:", "127.0.0.1:");
     reader
         .add_address_hint(invitation.peer, &owner_address)
@@ -227,22 +210,91 @@ fn typed_clients_recover_an_opaque_publication() {
     let adoption = reader.adopt_recovery(&staged.snapshot).unwrap();
     assert_eq!(adoption.recovered_publications, 1);
 
-    let recovered = loop {
-        if let Some(publication) = reader.poll_recovered_publication().unwrap() {
-            break publication;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "typed recovery publication did not arrive"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    };
+    // Recovered objects wait in the durable inbox until acknowledged.
+    let recovered = reader.poll_pending_object().unwrap().unwrap();
     assert_eq!(recovered.workspace, workspace.workspace);
     assert_eq!(recovered.topic, "streams/example");
     assert_eq!(recovered.payload, payload);
+    assert_eq!(reader.poll_pending_object().unwrap(), Some(recovered.clone()));
+    let acknowledged = reader.stage_object_acknowledgement(&recovered).unwrap();
+    reader
+        .adopt_protected_reception(&acknowledged.snapshot)
+        .unwrap();
+    assert_eq!(reader.poll_pending_object().unwrap(), None);
 
     reader.close().unwrap();
     owner.close().unwrap();
+}
+
+#[test]
+fn typed_client_rejects_wrong_publication_workspace_before_staging() {
+    let mut client = Client::open(ClientConfig {
+        network: Network::Direct,
+        secret: Some([18; 32]),
+        transport: Default::default(),
+    })
+    .unwrap();
+    let workspace = client.create_workspace("Owner", None).unwrap();
+    let revision = workspace.epoch + 1;
+    client.install_workspace_policy(revision).unwrap();
+
+    let mut other = workspace.workspace;
+    other[0] ^= 1;
+    let rejected = client
+        .stage_protected_publication(other, revision, "streams/example", [1; 16], vec![1])
+        .unwrap_err();
+    assert_eq!(rejected.kind(), ErrorKind::InvalidInput, "{rejected}");
+
+    // Nothing was staged: the session still accepts ordinary operations.
+    client.member_roster().unwrap();
+    let staged = client
+        .stage_protected_publication(
+            workspace.workspace,
+            revision,
+            "streams/example",
+            [2; 16],
+            vec![2],
+        )
+        .unwrap();
+    assert_eq!(staged.workspace, workspace.workspace);
+    client.adopt_protected_publication(&staged.snapshot).unwrap();
+    client.close().unwrap();
+}
+
+#[test]
+fn typed_client_restores_only_with_matching_freshness_anchor() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("workspace.db");
+    let root = [19; 32];
+    let mut client = Client::open(ClientConfig {
+        network: Network::Direct,
+        secret: Some(root),
+        transport: Default::default(),
+    })
+    .unwrap();
+    let workspace = client.create_workspace("Owner", None).unwrap();
+    assert_eq!(client.record_freshness().unwrap_err().kind(), ErrorKind::Storage);
+    client.enable_record_storage(&path, &root).unwrap();
+    let anchor = client.record_freshness().unwrap();
+    client.close().unwrap();
+
+    let mut stale = anchor;
+    stale.revision += 1;
+    let mut client = Client::open(ClientConfig {
+        network: Network::Direct,
+        secret: Some(root),
+        transport: Default::default(),
+    })
+    .unwrap();
+    let rejected = client
+        .restore_record_storage_with_freshness(&path, &root, workspace.workspace, Some(stale))
+        .unwrap_err();
+    assert_eq!(rejected.kind(), ErrorKind::Storage);
+    client
+        .restore_record_storage_with_freshness(&path, &root, workspace.workspace, Some(anchor))
+        .unwrap();
+    assert_eq!(client.record_freshness().unwrap(), anchor);
+    client.close().unwrap();
 }
 
 #[test]
@@ -250,6 +302,7 @@ fn typed_client_exposes_workspace_roster_and_profile_projection() {
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([12; 32]),
+        transport: Default::default(),
     })
     .unwrap();
     let workspace = client.create_workspace("Owner", None).unwrap();
@@ -270,13 +323,15 @@ fn typed_client_issues_an_invitation_with_bounded_route_hints() {
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([13; 32]),
+        transport: Default::default(),
     })
     .unwrap();
     let workspace = client
         .create_workspace("Owner", Some("Field Team"))
         .unwrap();
 
-    let invitation = client.issue_invitation().unwrap();
+    let candidate = client.stage_invitation(0).unwrap();
+    let invitation = client.adopt_invitation(&candidate.snapshot).unwrap();
     assert_eq!(invitation.workspace, workspace.workspace);
     assert_eq!(invitation.workspace_name.as_deref(), Some("Field Team"));
     assert!(!invitation.invitation.is_empty());
@@ -288,7 +343,8 @@ fn typed_client_issues_an_invitation_with_bounded_route_hints() {
         .unwrap();
     assert_eq!(inspected.workspace, workspace.workspace);
     assert_eq!(inspected.workspace_name.as_deref(), Some("Field Team"));
-    assert_eq!(inspected.epoch, 0);
+    // +1: registering the invitation now costs an epoch.
+    assert_eq!(inspected.epoch, 1);
     client.close().unwrap();
 }
 
@@ -297,6 +353,7 @@ fn typed_client_reports_connectivity_without_exposing_transport_types() {
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([14; 32]),
+        transport: Default::default(),
     })
     .unwrap();
     let workspace = client.create_workspace("Owner", None).unwrap();
@@ -323,11 +380,13 @@ fn typed_client_routes_opaque_publication_and_reports_interest() {
     let mut publisher = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([8; 32]),
+        transport: Default::default(),
     })
     .unwrap();
     let mut subscriber = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some([9; 32]),
+        transport: Default::default(),
     })
     .unwrap();
     let publisher_endpoint = publisher.endpoint().unwrap();
@@ -399,317 +458,95 @@ fn typed_client_routes_opaque_publication_and_reports_interest() {
     publisher.close().unwrap();
 }
 
+/// The admission ops run typed (no JSON) and report typed error codes made
+/// where the failure happens (ADR A1 step 2).
 #[test]
-fn typed_clients_persist_authenticated_inbox_objects_before_acknowledging() {
-    let owner_secret = [31; 32];
-    let reader_secret = [32; 32];
-    let owner_root = [131; 32];
-    let reader_root = [132; 32];
-    let owner_config = ClientConfig {
+fn typed_admission_ops_report_codes_and_pages() {
+    use arachne_runtime::ErrorCode;
+    let mut owner = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some(owner_secret),
-    };
-    let reader_config = ClientConfig {
-        network: Network::Direct,
-        secret: Some(reader_secret),
-    };
-    let mut owner = Client::open(owner_config.clone()).unwrap();
-    let mut reader = Client::open(reader_config.clone()).unwrap();
-    let owner_store = common::directory();
-    let reader_store = common::directory();
-    let owner_database = owner_store.path().join("workspace.db");
-    let reader_database = reader_store.path().join("workspace.db");
-
-    let workspace = owner
-        .create_workspace("Owner", Some("Object inbox proof"))
-        .unwrap();
-    owner
-        .enable_record_storage(&owner_database, &owner_root)
-        .unwrap();
-    let invitation = owner.issue_invitation().unwrap();
-    reader
-        .add_address_hint(
-            invitation.peer,
-            &invitation.address.replace("0.0.0.0:", "127.0.0.1:"),
-        )
-        .unwrap();
-    let join = reader
-        .begin_join(&invitation.invitation, &invitation.checkpoint, "Reader")
-        .unwrap();
-    reader
-        .enable_record_storage(&reader_database, &reader_root)
-        .unwrap();
-    let candidate = owner
-        .stage_admission(join.endpoint, &join.admission_request)
-        .unwrap();
-    owner.save_candidate(&candidate.snapshot).unwrap();
-    let joined_owner = owner.adopt_admission(&candidate.snapshot).unwrap();
-    let reply = owner
-        .retained_admission(join.endpoint, &join.admission_request)
-        .unwrap();
-    let candidate = reader
-        .stage_join(
-            &reply.welcome,
-            &[JoinAdmissionStep {
-                commit: reply.commit,
-                authorization: reply.authorization,
-            }],
-        )
-        .unwrap();
-    reader.save_candidate(&candidate.snapshot).unwrap();
-    let joined_reader = reader.adopt_join(&candidate.snapshot).unwrap();
-    assert_eq!(joined_owner.epoch, joined_reader.epoch);
-
-    let reader_endpoint = reader.endpoint().unwrap();
-    owner
-        .add_address_hint(
-            reader_endpoint.endpoint_key,
-            &reader_endpoint
-                .bound_address
-                .replace("0.0.0.0:", "127.0.0.1:"),
-        )
-        .unwrap();
-    let revision = joined_owner.epoch + 1;
-    let topic = "streams/ptt";
-    owner.install_workspace_policy(revision).unwrap();
-    reader.install_workspace_policy(revision).unwrap();
-    reader
-        .set_interest(workspace.workspace, revision, topic, true)
-        .unwrap();
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        owner.poll_control().unwrap();
-        if let Some(interest) = reader.poll_interest().unwrap() {
-            assert!(interest.admission.failed.is_empty(), "{interest:?}");
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "object topic interest did not settle"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
-
-    // The legacy MLS publication path remains available before inbox cutover.
-    let ordinary_payload = b"ordinary protected publication".to_vec();
-    let candidate = owner
-        .stage_protected_publication(
-            workspace.workspace,
-            revision,
-            topic,
-            [1; 16],
-            ordinary_payload.clone(),
-        )
-        .unwrap();
-    owner.save_candidate(&candidate.snapshot).unwrap();
-    let delivered = owner
-        .adopt_protected_publication(&candidate.snapshot)
-        .unwrap();
-    assert!(
-        delivered.failed.is_empty(),
-        "ordinary protected delivery: {delivered:?}"
+        secret: Some([21; 32]),
+        transport: Default::default(),
+    })
+    .unwrap();
+    owner.create_workspace("Owner", None).unwrap();
+    let page = owner.admission_approvals(None, None).unwrap();
+    assert!(page.approvals.is_empty());
+    assert!(page.complete);
+    assert_eq!(page.next_after, None);
+    let error = owner.admission_approvals(None, Some(65)).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::InvalidInput);
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert_eq!(
+        owner.acknowledge_admission_approval([1; 32]).unwrap_err().code(),
+        ErrorCode::WrongState
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let candidate = loop {
-        owner.poll_control().unwrap();
-        if let Some(candidate) = reader.poll_protected().unwrap() {
-            break candidate;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "ordinary protected publication did not arrive"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    };
-    reader.save_candidate(&candidate.snapshot).unwrap();
-    let ordinary = reader
-        .adopt_protected_reception(&candidate.snapshot)
-        .unwrap();
-    assert_eq!(ordinary.payload, ordinary_payload);
-
-    #[cfg(feature = "moq")]
-    {
-        owner
-            .set_interest(workspace.workspace, revision, topic, true)
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            reader.poll_control().unwrap();
-            if let Some(interest) = owner.poll_interest().unwrap() {
-                assert!(interest.admission.failed.is_empty(), "{interest:?}");
-                break;
-            }
-            assert!(Instant::now() < deadline, "owner topic interest did not settle");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let owner_endpoint = owner.endpoint().unwrap().endpoint_key;
-        let reader_endpoint = reader.endpoint().unwrap().endpoint_key;
-        if owner_endpoint < reader_endpoint {
-            reader
-                .enable_moq_delivery(workspace.workspace, revision, owner_endpoint, topic)
-                .unwrap();
-            owner
-                .enable_moq_delivery(workspace.workspace, revision, reader_endpoint, topic)
-                .unwrap();
-        } else {
-            owner
-                .enable_moq_delivery(workspace.workspace, revision, reader_endpoint, topic)
-                .unwrap();
-            reader
-                .enable_moq_delivery(workspace.workspace, revision, owner_endpoint, topic)
-                .unwrap();
-        }
-    }
-
-    // Use explicit stage -> save -> adopt operations for durable inbox changes.
-    for client in [&owner, &reader] {
-        let candidate = client.stage_object_delivery().unwrap().unwrap();
-        client.save_candidate(&candidate.snapshot).unwrap();
-        client.adopt_inbox_transition(&candidate.snapshot).unwrap();
-    }
-
-    let payload = b"authenticated object recording".to_vec();
-    let candidate = owner
-        .stage_protected_publication(
-            workspace.workspace,
-            revision,
-            topic,
-            [2; 16],
-            payload.clone(),
-        )
-        .unwrap();
-    owner.save_candidate(&candidate.snapshot).unwrap();
-    let delivered = owner
-        .adopt_protected_publication(&candidate.snapshot)
-        .unwrap();
-    assert!(
-        delivered.failed.is_empty(),
-        "object protected delivery: {delivered:?}"
+    assert_eq!(
+        owner.send_admission_reply().unwrap_err().code(),
+        ErrorCode::WrongState
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let candidate = loop {
-        owner.poll_control().unwrap();
-        if let Some(candidate) = reader.poll_protected().unwrap() {
-            break candidate;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "protected inbox object did not arrive"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    };
-    reader.save_candidate(&candidate.snapshot).unwrap();
-    reader.adopt_inbox_transition(&candidate.snapshot).unwrap();
-    let pending = reader.poll_pending_object().unwrap().unwrap();
-    assert_eq!(pending.workspace, workspace.workspace);
-    assert_eq!(pending.revision, revision);
-    assert_eq!(pending.endpoint, owner.endpoint().unwrap().endpoint_key);
-    assert_eq!(pending.topic, topic);
-    assert_eq!(pending.id, [2; 16]);
-    assert_eq!(pending.payload, payload);
-    assert_eq!(pending.sequence, Some(2));
-
-    let recording = reader_store.path().join("recording.bin");
-    let mut file = fs::File::create(&recording).unwrap();
-    file.write_all(&pending.payload).unwrap();
-    file.sync_all().unwrap();
-    drop(file);
-
-    reader.close().unwrap();
-    reader = Client::open(reader_config.clone()).unwrap();
-    reader
-        .restore_record_storage(&reader_database, &reader_root, workspace.workspace)
-        .unwrap();
-    let restored: PendingObject = reader.poll_pending_object().unwrap().unwrap();
-    assert_eq!(restored, pending);
-    assert_eq!(fs::read(&recording).unwrap(), payload);
-
-    let candidate = reader.stage_object_acknowledgement(&restored).unwrap();
-    reader.save_candidate(&candidate.snapshot).unwrap();
-    reader.adopt_inbox_transition(&candidate.snapshot).unwrap();
-    reader.close().unwrap();
-    reader = Client::open(reader_config).unwrap();
-    reader
-        .restore_record_storage(&reader_database, &reader_root, workspace.workspace)
-        .unwrap();
-    assert!(reader.poll_pending_object().unwrap().is_none());
-
-    reader.close().unwrap();
+    // A candidate that is not the staged one is stale.
+    let staged = owner.stage_invitation(0).unwrap();
+    let mut other = staged.snapshot.clone();
+    *other.last_mut().unwrap() ^= 1;
+    let error = owner.adopt_invitation(&other).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::CandidateStale, "{error}");
+    assert_eq!(error.message(), "workspace snapshot does not match candidate");
+    // The wrong adopt op for this kind of candidate.
+    assert_eq!(
+        owner.adopt_join(&staged.snapshot).unwrap_err().code(),
+        ErrorCode::WrongState
+    );
+    let invitation = owner.adopt_invitation(&staged.snapshot).unwrap();
+    assert!(!invitation.invitation.is_empty());
+    assert!(!owner.poll_control().unwrap());
     owner.close().unwrap();
 }
 
+/// Management, invitation and workspace-name ops, typed end to end.
 #[test]
-fn typed_object_delivery_convenience_handles_durable_and_ephemeral_clients() {
-    let mut ephemeral = Client::open(ClientConfig {
+fn typed_management_invitation_and_name_ops() {
+    use arachne_runtime::{ErrorCode, InvitationKind, MemberAction};
+    let mut owner = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([33; 32]),
+        secret: Some([22; 32]),
+        transport: Default::default(),
     })
     .unwrap();
-    ephemeral.create_workspace("Ephemeral", None).unwrap();
-    ephemeral.enable_object_delivery().unwrap();
-    ephemeral.enable_object_delivery().unwrap();
-    assert!(ephemeral.poll_pending_object().unwrap().is_none());
-    ephemeral.close().unwrap();
+    let workspace = owner.create_workspace("Owner", Some("Team")).unwrap();
 
-    let secret = [34; 32];
-    let root = [134; 32];
-    let mut durable = Client::open(ClientConfig {
-        network: Network::Direct,
-        secret: Some(secret),
-    })
-    .unwrap();
-    let workspace = durable.create_workspace("Durable", None).unwrap();
-    let store = common::directory();
-    let database = store.path().join("workspace.db");
-    durable.enable_record_storage(&database, &root).unwrap();
-    durable.enable_object_delivery().unwrap();
-    durable.close().unwrap();
+    let renamed = owner.stage_workspace_name("Field Team").unwrap();
+    assert_eq!(renamed.workspace, workspace.workspace);
+    let adopted = owner.adopt_admission(&renamed.snapshot).unwrap();
+    assert_eq!(adopted.workspace_name.as_deref(), Some("Field Team"));
 
-    let mut durable = Client::open(ClientConfig {
-        network: Network::Direct,
-        secret: Some(secret),
-    })
-    .unwrap();
-    durable
-        .restore_record_storage(&database, &root, workspace.workspace)
+    let personal = owner
+        .stage_invitation_of(0, InvitationKind::Personal)
         .unwrap();
-    assert!(durable.stage_object_delivery().unwrap().is_none());
-    durable.close().unwrap();
-}
-
-#[test]
-fn failed_object_inbox_save_prevents_adoption_and_publication() {
-    let secret = [35; 32];
-    let root = [135; 32];
-    let mut client = Client::open(ClientConfig {
-        network: Network::Direct,
-        secret: Some(secret),
-    })
-    .unwrap();
-    let workspace = client.create_workspace("Owner", None).unwrap();
-    let store = common::directory();
-    client
-        .enable_record_storage(&store.path().join("workspace.db"), &root)
+    let link = owner.adopt_invitation(&personal.snapshot).unwrap();
+    let controls = owner.invitation_controls().unwrap();
+    assert_eq!(controls.len(), 1);
+    assert!(controls[0].personal);
+    assert_eq!(controls[0].key, link.invitation_key);
+    let details = owner
+        .inspect_invitation(&link.invitation, &link.checkpoint)
         .unwrap();
-    let candidate = client.stage_object_delivery().unwrap().unwrap();
-    let mut invalid = candidate.snapshot.clone();
-    *invalid.last_mut().unwrap() ^= 1;
-    assert_eq!(
-        client.save_candidate(&invalid).unwrap_err().kind(),
-        ErrorKind::Storage
-    );
-    assert!(client.adopt_inbox_transition(&candidate.snapshot).is_err());
-    assert!(
-        client
-            .stage_protected_publication(
-                workspace.workspace,
-                1,
-                "streams/example",
-                [3; 16],
-                vec![1]
-            )
-            .is_err()
-    );
-    client.close().unwrap();
+    assert!(details.personal);
+
+    let disabled = owner
+        .stage_management(MemberAction::DisableInvitation(link.invitation_key))
+        .unwrap();
+    owner.adopt_admission(&disabled.snapshot).unwrap();
+    assert!(!owner.invitation_controls().unwrap()[0].enabled);
+
+    // A management action on a stranger is refused with a code.
+    let error = owner.stage_management(MemberAction::Promote([9; 32])).unwrap_err();
+    assert_ne!(error.code(), ErrorCode::Internal, "{error}");
+
+    // The last member leaves alone; adopting the removal ends the session.
+    let leave = owner.stage_solo_leave().unwrap();
+    let removed = owner.adopt_removal(&leave.snapshot).unwrap();
+    assert_eq!(removed.workspace, workspace.workspace);
+    assert_eq!(owner.member_roster().unwrap_err().code(), ErrorCode::Closed);
+    let _ = owner.close();
 }

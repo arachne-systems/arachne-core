@@ -11,7 +11,12 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::{OpenMlsProvider, crypto::OpenMlsCrypto};
 use sha2::{Digest, Sha256};
 
-const MAX_BYTES: usize = 64 * 1024;
+/// Largest membership commit a verifier accepts. Raised from 64 KiB with the
+/// runtime transport (B3c): steps now travel binary in 128 KiB pages, and a
+/// commit grows about 82 bytes per member that never self-updated, so 96 KiB
+/// holds about 1,170 such members.
+pub const MAX_MEMBERSHIP_COMMIT: usize = 96 * 1024;
+const MAX_BYTES: usize = MAX_MEMBERSHIP_COMMIT;
 /// Bound for this device's own group state re-read for verification. It never
 /// crosses the network, so the 64 KiB wire bound does not apply: GroupInfo
 /// with the ratchet tree passes 64 KiB near 250 members (measured ~255 B per
@@ -35,6 +40,207 @@ pub const MAX_JOIN_HISTORY_STEPS: usize = HISTORY_CHUNK_STEPS * MAX_HISTORY_CHUN
 /// able to grow a pending join's memory one page at a time.
 pub const MAX_JOIN_HISTORY_BYTES: usize = MAX_HISTORY_BYTES;
 
+/// Inline join history: magic and version, checkpoint digest, u32 checkpoint
+/// length, checkpoint, then steps in the v3 step codec (`step.rs`).
+const HISTORY_VERSION: &[u8; 5] = b"DFJH\x03";
+
+/// Invitation checkpoint codec: `DFCK\x01`, u32 pin length, pin, u32 tree
+/// length, tree. The pin is signed MLS GroupInfo without the ratchet tree; an
+/// invitation pins SHA-256 of the pin only. The tree is the TLS-encoded ratchet
+/// tree at the pin's epoch. It is bound by the pin's signed tree hash, which
+/// `PublicGroup::from_external` checks, so a substituted tree fails.
+const CHECKPOINT_MAGIC: &[u8; 5] = b"DFCK\x01";
+/// Wire bound for a checkpoint pin: GroupContext, extensions and signature.
+pub const MAX_CHECKPOINT_PIN: usize = 64 * 1024;
+/// Wire bound for a checkpoint tree. About 270 bytes per member (measured at
+/// 385 and 1,025 members), so this admits about 2,900 members; see the B3a
+/// harness tests. It is sized so a sealed pending join, which holds one
+/// checkpoint, still fits one 1 MiB host record.
+pub const MAX_CHECKPOINT_TREE: usize = 768 * 1024;
+/// Wire bound for a whole encoded checkpoint. Issuer and joiner apply the same
+/// parts bounds, so an issuer never produces a checkpoint a joiner rejects.
+pub const MAX_CHECKPOINT: usize = 13 + MAX_CHECKPOINT_PIN + MAX_CHECKPOINT_TREE;
+
+/// Where checkpoint bytes came from: a peer (wire bounds), or this device's own
+/// accepted state (local-state bound only).
+#[derive(Clone, Copy)]
+pub(super) enum CheckpointBound {
+    Wire,
+    Local,
+}
+
+pub(super) struct CheckpointParts<'a> {
+    pub pin: &'a [u8],
+    pub tree: &'a [u8],
+}
+
+pub(super) fn checkpoint_parts(
+    bytes: &[u8],
+    bound: CheckpointBound,
+) -> Result<CheckpointParts<'_>, &'static str> {
+    use super::storage::{number, take};
+    let limit = match bound {
+        CheckpointBound::Wire => MAX_CHECKPOINT,
+        CheckpointBound::Local => MAX_LOCAL_STATE_BYTES,
+    };
+    if bytes.len() > limit {
+        return Err("checkpoint exceeds bounds");
+    }
+    let mut rest = bytes
+        .strip_prefix(CHECKPOINT_MAGIC)
+        .ok_or("invalid checkpoint")?;
+    let length = number(&mut rest)?;
+    if length == 0 || (matches!(bound, CheckpointBound::Wire) && length > MAX_CHECKPOINT_PIN) {
+        return Err("checkpoint exceeds bounds");
+    }
+    let pin = take(&mut rest, length)?;
+    let length = number(&mut rest)?;
+    if length == 0 || (matches!(bound, CheckpointBound::Wire) && length > MAX_CHECKPOINT_TREE) {
+        return Err("checkpoint exceeds bounds");
+    }
+    let tree = take(&mut rest, length)?;
+    if !rest.is_empty() {
+        return Err("invalid checkpoint");
+    }
+    Ok(CheckpointParts { pin, tree })
+}
+
+/// The digest an invitation pins for these checkpoint bytes: SHA-256 of the
+/// pin. Structure only; this does not verify the checkpoint.
+pub fn checkpoint_digest(bytes: &[u8]) -> Result<[u8; 32], &'static str> {
+    Ok(Sha256::digest(checkpoint_parts(bytes, CheckpointBound::Local)?.pin).into())
+}
+
+/// The signed GroupInfo a checkpoint pins. Structure only.
+pub(super) fn checkpoint_info(bytes: &[u8]) -> Result<openmls::messages::group_info::VerifiableGroupInfo, &'static str> {
+    let parts = checkpoint_parts(bytes, CheckpointBound::Local)?;
+    let message =
+        MlsMessageIn::tls_deserialize_exact(parts.pin).map_err(|_| "invalid checkpoint")?;
+    let MlsMessageBodyIn::GroupInfo(info) = message.extract() else {
+        return Err("expected GroupInfo");
+    };
+    Ok(info)
+}
+
+fn encode_checkpoint(
+    group: &MlsGroup,
+    crypto: &impl OpenMlsCrypto,
+    signer: &impl openmls_traits::signatures::Signer,
+    extensions: Vec<Extension>,
+    bound: CheckpointBound,
+) -> Result<Vec<u8>, &'static str> {
+    let pin = group
+        .export_group_info_with_additional_extensions(crypto, signer, false, extensions)
+        .map_err(|_| "checkpoint creation failed")?
+        .to_bytes()
+        .map_err(|_| "checkpoint encoding failed")?;
+    let tree = group
+        .export_ratchet_tree()
+        .tls_serialize_detached()
+        .map_err(|_| "checkpoint encoding failed")?;
+    let mut bytes = CHECKPOINT_MAGIC.to_vec();
+    for part in [&pin, &tree] {
+        bytes.extend(
+            u32::try_from(part.len())
+                .map_err(|_| "checkpoint exceeds bounds")?
+                .to_be_bytes(),
+        );
+        bytes.extend(part);
+    }
+    // The same check every receiver applies.
+    checkpoint_parts(&bytes, bound)?;
+    Ok(bytes)
+}
+
+/// Public checkpoint of a member's state for an anchor proof. It uses the
+/// wire bounds because other members replay it.
+pub(super) fn public_checkpoint(workspace: &Workspace) -> Result<Vec<u8>, &'static str> {
+    encode_checkpoint(
+        &workspace.group,
+        workspace.provider.crypto(),
+        &workspace._signer,
+        Vec::new(),
+        CheckpointBound::Wire,
+    )
+}
+
+impl Workspace {
+    /// This device's own accepted state as a checkpoint, for local verification.
+    fn local_checkpoint(&self) -> Result<Vec<u8>, &'static str> {
+        encode_checkpoint(
+            &self.group,
+            self.provider.crypto(),
+            &self._signer,
+            Vec::new(),
+            CheckpointBound::Local,
+        )
+        .map_err(|_| "group comparison export failed")
+    }
+}
+
+/// Domain tag of an Add's authenticated data (ADR A2 step 2). The rest is the
+/// committer's asserted Unix time in seconds, as a big-endian u64.
+const ASSERTED_TIME: &[u8] = b"arachne/asserted-time/v1";
+
+pub(super) fn asserted_time_aad(time: u64) -> Vec<u8> {
+    let mut aad = ASSERTED_TIME.to_vec();
+    aad.extend(time.to_be_bytes());
+    aad
+}
+
+/// The committer's asserted time in an admission commit. Parsing only: it
+/// does not verify the commit. A host can compare it with its own clock and
+/// warn on a large difference; verifiers never reject for that.
+pub fn admission_asserted_time(commit: &[u8]) -> Option<u64> {
+    asserted_time(public_message_aad(commit)?).ok()
+}
+
+fn asserted_time(aad: &[u8]) -> Result<u64, &'static str> {
+    aad.strip_prefix(ASSERTED_TIME)
+        .and_then(|time| <[u8; 8]>::try_from(time).ok())
+        .map(u64::from_be_bytes)
+        .ok_or("admission requires the committer's asserted time")
+}
+
+/// Authenticated data of a public MLS message, read from its TLS encoding:
+/// version, wire format, then `FramedContent` up to `authenticated_data`.
+/// Parsing only; OpenMLS exposes the AAD only after verification.
+pub(super) fn public_message_aad(message: &[u8]) -> Option<&[u8]> {
+    fn take<'a>(bytes: &mut &'a [u8], count: usize) -> Option<&'a [u8]> {
+        let (head, rest) = bytes.split_at_checked(count)?;
+        *bytes = rest;
+        Some(head)
+    }
+    // RFC 9000 variable-length integer, as RFC 9420 uses for vector lengths.
+    fn vector<'a>(bytes: &mut &'a [u8]) -> Option<&'a [u8]> {
+        let first = *bytes.first()?;
+        let size = 1usize << (first >> 6);
+        if size == 8 {
+            return None;
+        }
+        let mut length = u64::from(first & 0x3f);
+        for byte in &take(bytes, size)?[1..] {
+            length = (length << 8) | u64::from(*byte);
+        }
+        take(bytes, usize::try_from(length).ok()?)
+    }
+    let mut bytes = message;
+    // mls10, public_message
+    if take(&mut bytes, 4)? != [0, 1, 0, 1] {
+        return None;
+    }
+    vector(&mut bytes)?; // group_id
+    take(&mut bytes, 8)?; // epoch
+    match take(&mut bytes, 1)?[0] {
+        1 | 2 => {
+            take(&mut bytes, 4)?; // member leaf index or external sender index
+        }
+        3 | 4 => {}
+        _ => return None,
+    }
+    vector(&mut bytes)
+}
+
 /// Public proof of an ordinary-member invitation and its exact redemption.
 /// No bearer private key is carried here. Fields are untrusted until verified.
 #[derive(Clone)]
@@ -50,7 +256,28 @@ pub struct AdmissionAuthorization {
 pub enum MembershipAuthorization {
     Admission(AdmissionAuthorization),
     AdmissionBatch(Vec<AdmissionAuthorization>),
+    /// Promote and invitation create / approve / decline. The committer must
+    /// be an administrator. Remove, Demote and DisableInvitation are rejected
+    /// here: they need a signed order (`Revocation`).
     Management(super::ManagementAction),
+    /// Remove, Leave, Demote, DisableInvitation (ADR A2 step 4). Any member
+    /// may commit a valid order.
+    Revocation(super::OrderStep),
+    /// A member's own update path (ADR A2 step 5): an empty commit with an
+    /// update path, no proposals, no extension change and the same
+    /// credential, key, capabilities and leaf extensions. It gives members
+    /// post-compromise security and merges their unmerged tree nodes.
+    SelfUpdate,
+}
+
+impl MembershipAuthorization {
+    /// The member this step removes, if it removes one.
+    pub fn removed_member(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Revocation(step) if step.order.kind.removes() => Some(step.order.target),
+            _ => None,
+        }
+    }
 }
 
 /// Tracks a branch from a trusted checkpoint. This does not settle competing
@@ -77,8 +304,10 @@ struct AppendedHistory {
 /// The caller retains the checkpoint and accepted transitions for durable replay;
 /// verification does not persist them, establish membership, or resolve forks.
 pub struct MembershipVerifier {
-    provider: OpenMlsRustCrypto,
+    pub(super) provider: OpenMlsRustCrypto,
     pub(super) group: PublicGroup,
+    /// Nesting depth of anchor proofs this verifier replays (0 at top level).
+    pub(super) proof_depth: u8,
 }
 
 pub(super) fn authority(
@@ -86,20 +315,14 @@ pub(super) fn authority(
 ) -> Result<Vec<Vec<u8>>, &'static str> {
     let bytes = &extensions.unknown(AUTHORITY).ok_or("missing authority")?.0;
     if bytes.len() < 2
-        || !matches!(bytes[0], 1 | 2)
+        || bytes[0] != 2
         || !(1..=64).contains(&bytes[1])
         || bytes.len() < 2 + usize::from(bytes[1]) * 32
     {
         return Err("invalid authority encoding");
     }
     let end = 2 + usize::from(bytes[1]) * 32;
-    if bytes[0] == 1 {
-        if bytes.len() != end {
-            return Err("invalid authority length");
-        }
-    } else {
-        super::invitation_controls::decode(&bytes[end..])?;
-    }
+    super::invitation_controls::decode(&bytes[end..])?;
     let keys: Vec<Vec<u8>> = bytes[2..end]
         .as_chunks::<32>()
         .0
@@ -117,7 +340,7 @@ pub(super) fn binding(credential: &Credential) -> Result<([u8; 32], [u8; 32]), &
         BasicCredential::try_from(credential.clone()).map_err(|_| "unsupported credential")?;
     let bytes = credential
         .identity()
-        .strip_prefix(b"data-fabric/candidate-member/v2/")
+        .strip_prefix(super::MEMBER_IDENTITY)
         .ok_or("member credential upgrade required")?;
     if bytes.len() != 64 || bytes[..32] == [0; 32] || bytes[32..] == [0; 32] {
         return Err("invalid member binding");
@@ -126,6 +349,52 @@ pub(super) fn binding(credential: &Credential) -> Result<([u8; 32], [u8; 32]), &
         bytes[..32].try_into().unwrap(),
         bytes[32..].try_into().unwrap(),
     ))
+}
+
+/// Verify a leaf's endpoint binding (ADR A2 step 6): the endpoint named in
+/// its credential signed (workspace, member id, MLS signature key). A leaf
+/// without a valid binding is rejected; no leaf can claim an endpoint whose
+/// key did not consent. Returns the leaf's (member id, endpoint).
+pub(super) fn verify_endpoint_binding(
+    crypto: &impl OpenMlsCrypto,
+    workspace: &GroupId,
+    leaf: &LeafNode,
+) -> Result<([u8; 32], [u8; 32]), &'static str> {
+    let (member, endpoint) = binding(leaf.credential())?;
+    let workspace: [u8; 32] = workspace
+        .as_slice()
+        .try_into()
+        .map_err(|_| "invalid workspace id")?;
+    let signature = leaf
+        .extensions()
+        .unknown(super::ENDPOINT_BINDING)
+        .ok_or("member leaf has no endpoint binding")?;
+    crypto
+        .verify_signature(
+            SignatureScheme::ED25519,
+            &super::endpoint_binding_message(workspace, member, leaf.signature_key().as_slice()),
+            &endpoint,
+            &signature.0,
+        )
+        .map_err(|_| "invalid endpoint binding")?;
+    Ok((member, endpoint))
+}
+
+/// A committer's new path leaf keeps its credential, key and extensions,
+/// so its endpoint binding stays valid.
+pub(super) fn check_path_leaf(
+    group: &PublicGroup,
+    actor: LeafNodeIndex,
+    leaf: &LeafNode,
+) -> Result<(), &'static str> {
+    let old = group.leaf(actor).ok_or("unknown committer")?;
+    if leaf.credential() != old.credential()
+        || leaf.signature_key() != old.signature_key()
+        || leaf.extensions() != old.extensions()
+    {
+        return Err("commit cannot replace committer identity");
+    }
+    Ok(())
 }
 
 pub(super) fn grant(group: &GroupId, key: &[u8; 32]) -> Vec<u8> {
@@ -165,21 +434,13 @@ impl Workspace {
         {
             return Err("only an administrator may issue a checkpoint");
         }
-        let bytes = self
-            .group
-            .export_group_info_with_additional_extensions(
-                self.provider.crypto(),
-                &self._signer,
-                true,
-                self.name_checkpoint_extension()?,
-            )
-            .map_err(|_| "checkpoint creation failed")?
-            .to_bytes()
-            .map_err(|_| "checkpoint encoding failed")?;
-        if bytes.len() > MAX_BYTES {
-            return Err("checkpoint exceeds bounds");
-        }
-        Ok(bytes)
+        encode_checkpoint(
+            &self.group,
+            self.provider.crypto(),
+            &self._signer,
+            self.name_checkpoint_extension()?,
+            CheckpointBound::Wire,
+        )
     }
 }
 
@@ -191,35 +452,43 @@ impl MembershipVerifier {
         digest: [u8; 32],
         bytes: &[u8],
     ) -> Result<Self, &'static str> {
-        Self::from_checkpoint_within(workspace, digest, bytes, MAX_BYTES)
+        Self::from_checkpoint_within(workspace, digest, bytes, CheckpointBound::Wire)
+    }
+
+    /// See [`JoinProof::from_local_checkpoint`]: own accepted state only.
+    pub(super) fn from_local_checkpoint(
+        workspace: [u8; 32],
+        digest: [u8; 32],
+        bytes: &[u8],
+    ) -> Result<Self, &'static str> {
+        Self::from_checkpoint_within(workspace, digest, bytes, CheckpointBound::Local)
     }
 
     fn from_checkpoint_within(
         workspace: [u8; 32],
         digest: [u8; 32],
         bytes: &[u8],
-        limit: usize,
+        bound: CheckpointBound,
     ) -> Result<Self, &'static str> {
-        if bytes.len() > limit {
-            return Err("checkpoint exceeds bounds");
-        }
-        if <[u8; 32]>::from(Sha256::digest(bytes)) != digest {
+        let parts = checkpoint_parts(bytes, bound)?;
+        if <[u8; 32]>::from(Sha256::digest(parts.pin)) != digest {
             return Err("checkpoint does not match invitation");
         }
         let message =
-            MlsMessageIn::tls_deserialize_exact(bytes).map_err(|_| "invalid checkpoint")?;
+            MlsMessageIn::tls_deserialize_exact(parts.pin).map_err(|_| "invalid checkpoint")?;
         let MlsMessageBodyIn::GroupInfo(info) = message.extract() else {
             return Err("expected GroupInfo");
         };
         if info.group_id().as_slice() != workspace || info.ciphersuite() != SUITE {
             return Err("wrong checkpoint workspace");
         }
-        let tree = info
-            .extensions()
-            .ratchet_tree()
-            .ok_or("missing checkpoint tree")?
-            .ratchet_tree()
-            .clone();
+        // One canonical form: the tree travels beside the pin, never inside it.
+        if info.extensions().ratchet_tree().is_some() {
+            return Err("invalid checkpoint");
+        }
+        // Bound by the pinned GroupInfo's tree hash in `from_external` below.
+        let tree = RatchetTreeIn::tls_deserialize_exact(parts.tree)
+            .map_err(|_| "invalid checkpoint tree")?;
         let provider = OpenMlsRustCrypto::default();
         let (group, _) = PublicGroup::from_external(
             provider.crypto(),
@@ -234,7 +503,9 @@ impl MembershipVerifier {
         let mut ids = std::collections::BTreeSet::new();
         let mut endpoints = std::collections::BTreeSet::new();
         for member in &members {
-            let (id, endpoint) = binding(&member.credential)?;
+            let leaf = group.leaf(member.index).ok_or("invalid checkpoint tree")?;
+            let (id, endpoint) =
+                verify_endpoint_binding(provider.crypto(), group.group_id(), leaf)?;
             if !ids.insert(id) || !endpoints.insert(endpoint) {
                 return Err("duplicate member binding");
             }
@@ -245,7 +516,27 @@ impl MembershipVerifier {
         {
             return Err("administrator is not a member");
         }
-        Ok(Self { provider, group })
+        Ok(Self {
+            provider,
+            group,
+            proof_depth: 0,
+        })
+    }
+
+    /// Public state from an anchor proof's checkpoint. It is not trusted by
+    /// itself: `order::verify` trusts it only after the winning steps from it
+    /// reach the verifier's own state.
+    pub(super) fn from_proof_checkpoint(
+        workspace: [u8; 32],
+        bytes: &[u8],
+        depth: u8,
+    ) -> Result<Self, &'static str> {
+        let parts = checkpoint_parts(bytes, CheckpointBound::Wire)?;
+        let digest = Sha256::digest(parts.pin).into();
+        let mut verifier =
+            Self::from_checkpoint_within(workspace, digest, bytes, CheckpointBound::Wire)?;
+        verifier.proof_depth = depth;
+        Ok(verifier)
     }
 
     /// Validate one bounded commit against current authority and advance exactly
@@ -259,6 +550,20 @@ impl MembershipVerifier {
             MembershipAuthorization::Admission(auth) => self.apply_add(auth, commit),
             MembershipAuthorization::AdmissionBatch(auths) => self.apply_add_batch(auths, commit),
             MembershipAuthorization::Management(action) => self.apply_management(*action, commit),
+            MembershipAuthorization::SelfUpdate => {
+                let staged = self.self_update_commit(commit)?;
+                self.group
+                    .merge_commit(self.provider.storage(), staged)
+                    .map_err(|_| "public self-update merge failed")?;
+                Ok(())
+            }
+            MembershipAuthorization::Revocation(step) => {
+                let staged = self.revocation_commit(step, commit)?;
+                self.group
+                    .merge_commit(self.provider.storage(), staged)
+                    .map_err(|_| "public revocation merge failed")?;
+                Ok(())
+            }
         }
     }
 
@@ -272,6 +577,79 @@ impl MembershipVerifier {
             .merge_commit(self.provider.storage(), staged)
             .map_err(|_| "public management merge failed")?;
         Ok(())
+    }
+
+    /// Verify one member self-update against this parent state (ADR A2 step 5).
+    fn self_update_commit(&self, commit: &[u8]) -> Result<StagedCommit, &'static str> {
+        if commit.is_empty() || commit.len() > MAX_BYTES {
+            return Err("self update commit exceeds bounds");
+        }
+        let message = MlsMessageIn::tls_deserialize_exact(commit)
+            .map_err(|_| "invalid self update commit")?
+            .try_into_protocol_message()
+            .map_err(|_| "expected self update commit")?;
+        let processed = self
+            .group
+            .process_message(self.provider.crypto(), message)
+            .map_err(|_| "invalid self update signature or epoch")?;
+        let Sender::Member(index) = *processed.sender() else {
+            return Err("self update sender is not a member");
+        };
+        if !processed.aad().is_empty() {
+            return Err("self update carries authenticated data");
+        }
+        let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
+            return Err("not a self update commit");
+        };
+        // RFC 9420 does not let a committer include its own Update; the
+        // commit is empty and carries only the path.
+        if staged.queued_proposals().next().is_some() {
+            return Err("self update carries proposals");
+        }
+        let leaf = staged
+            .update_path_leaf_node()
+            .ok_or("self update requires an update path")?;
+        let old = self.group.leaf(index).ok_or("unknown self update sender")?;
+        if leaf.credential() != old.credential()
+            || leaf.signature_key() != old.signature_key()
+            || leaf.capabilities() != old.capabilities()
+            || leaf.extensions() != old.extensions()
+        {
+            return Err("self update changed the member leaf");
+        }
+        if staged.group_context().extensions() != self.group.group_context().extensions() {
+            return Err("self update changed group policy");
+        }
+        Ok(*staged)
+    }
+
+    /// Verify one revocation step against this parent state (ADR A2 step 4).
+    fn revocation_commit(
+        &self,
+        step: &super::OrderStep,
+        commit: &[u8],
+    ) -> Result<StagedCommit, &'static str> {
+        if commit.is_empty() || commit.len() > MAX_BYTES {
+            return Err("management commit exceeds bounds");
+        }
+        let message = MlsMessageIn::tls_deserialize_exact(commit)
+            .map_err(|_| "invalid management commit")?
+            .try_into_protocol_message()
+            .map_err(|_| "expected management commit")?;
+        let processed = self
+            .group
+            .process_message(self.provider.crypto(), message)
+            .map_err(|_| "invalid management signature or epoch")?;
+        if processed.aad() != super::order::commit_aad(&step.order) {
+            return Err("revocation commit does not carry its order");
+        }
+        let sender = processed.sender().clone();
+        let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
+            return Err("not a management commit");
+        };
+        super::order::verify(self, step)?;
+        super::management::verify_revocation(&self.group, &sender, &staged, &step.order)?;
+        Ok(*staged)
     }
 
     fn apply_add(
@@ -309,30 +687,59 @@ impl MembershipVerifier {
             .members()
             .find(|member| member.index == *index)
             .ok_or("unknown committer")?;
+        let admins = authority(self.group.group_context().extensions())?;
+        // ADR A2 step 2: only administrators commit Adds.
+        if !admins.contains(&actor.signature_key) {
+            return Err("only an administrator may commit an Add");
+        }
+        // Every verifier checks expiry against the committer's signed time,
+        // never its own clock, so all verifiers reach the same answer.
+        let asserted = asserted_time(processed.aad())?;
         let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
             return Err("not a commit");
         };
-        if staged.queued_proposals().count() != authorizations.len()
-            || staged.group_context().extensions() != self.group.group_context().extensions()
-        {
-            return Err("invitation authorizes only Adds without policy changes");
-        }
-        if let Some(leaf) = staged.update_path_leaf_node()
-            && (leaf.credential() != &actor.credential
-                || leaf.signature_key().as_slice() != actor.signature_key)
-        {
-            return Err("admission cannot replace committer identity");
-        }
         let adds: Vec<_> = staged.add_proposals().collect();
         if adds.len() != authorizations.len() {
             return Err("admission authorizes only Add proposals");
         }
+        // The only policy change an admission may carry is disabling the
+        // single-use approvals it consumes, inline from the committer.
+        let admitted: Vec<_> = authorizations
+            .iter()
+            .zip(&adds)
+            .map(|(auth, add)| (auth.invitation_key, add.add_proposal().key_package()))
+            .collect();
+        let policy = super::invitation_controls::consumed(
+            self.group.group_context().extensions(),
+            &admitted,
+        )?;
+        let policy_proposals = staged
+            .queued_proposals()
+            .filter(|p| matches!(p.proposal(), Proposal::GroupContextExtensions(_)))
+            .count();
+        if staged.queued_proposals().count() != authorizations.len() + usize::from(policy.is_some())
+            || policy_proposals != usize::from(policy.is_some())
+            || !staged.queued_proposals().all(|p| {
+                !matches!(p.proposal(), Proposal::GroupContextExtensions(_))
+                    || (p.sender() == &Sender::Member(actor.index)
+                        && p.proposal_or_ref_type() == ProposalOrRefType::Proposal)
+            })
+            || staged.group_context().extensions()
+                != policy
+                    .as_ref()
+                    .unwrap_or(self.group.group_context().extensions())
+        {
+            return Err("invitation authorizes only Adds without policy changes");
+        }
+        if let Some(leaf) = staged.update_path_leaf_node() {
+            check_path_leaf(&self.group, actor.index, leaf)?;
+        }
         let mut bindings = std::collections::BTreeSet::new();
-        let admins = authority(self.group.group_context().extensions())?;
         let crypto = self.provider.crypto();
         for (authorization, add) in authorizations.iter().zip(adds) {
             let package = add.add_proposal().key_package();
-            let (id, endpoint) = binding(package.leaf_node().credential())?;
+            let (id, endpoint) =
+                verify_endpoint_binding(crypto, self.group.group_id(), package.leaf_node())?;
             if !bindings.insert((id, endpoint))
                 || self.group.members().any(|member| {
                     binding(&member.credential)
@@ -347,7 +754,7 @@ impl MembershipVerifier {
             super::invitation_controls::check(
                 self.group.group_context().extensions(),
                 authorization.invitation_key,
-                None,
+                Some(asserted),
                 package,
             )?;
             if !admins.iter().any(|admin| {
@@ -388,13 +795,8 @@ impl MembershipVerifier {
     }
 
     pub(super) fn from_workspace(workspace: &Workspace) -> Result<Self, &'static str> {
-        let bytes = workspace
-            .group
-            .export_group_info(workspace.provider.crypto(), &workspace._signer, true)
-            .map_err(|_| "group comparison export failed")?
-            .to_bytes()
-            .map_err(|_| "group comparison encoding failed")?;
-        Self::from_checkpoint_within(workspace.id(), Sha256::digest(&bytes).into(), &bytes, MAX_LOCAL_STATE_BYTES)
+        let bytes = workspace.local_checkpoint()?;
+        Self::from_local_checkpoint(workspace.id(), checkpoint_digest(&bytes)?, &bytes)
     }
 
     pub(super) fn member_for_endpoint(
@@ -414,19 +816,14 @@ impl MembershipVerifier {
         self.group.group_context().epoch().as_u64()
     }
 
-    pub(super) fn verify_management(
-        &self,
-        action: super::ManagementAction,
-        commit: &[u8],
-    ) -> Result<(), &'static str> {
-        self.management_commit(action, commit).map(|_| ())
-    }
-
     fn management_commit(
         &self,
         action: super::ManagementAction,
         commit: &[u8],
     ) -> Result<StagedCommit, &'static str> {
+        if super::ForkClass::of_action(&action) < super::ForkClass::Management {
+            return Err("revocation requires a signed order");
+        }
         if commit.is_empty() || commit.len() > MAX_BYTES {
             return Err("management commit exceeds bounds");
         }
@@ -442,13 +839,7 @@ impl MembershipVerifier {
         let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
             return Err("not a management commit");
         };
-        super::management::verify(
-            self.provider.crypto(),
-            &self.group,
-            &sender,
-            &staged,
-            action,
-        )?;
+        super::management::verify(&self.group, &sender, &staged, action)?;
         Ok(*staged)
     }
 
@@ -473,22 +864,35 @@ impl JoinProof {
         digest: [u8; 32],
         bytes: &[u8],
     ) -> Result<Self, &'static str> {
-        if bytes.len() > MAX_BYTES - 41 {
-            return Err("checkpoint exceeds inline history bounds");
-        }
-        let verifier = MembershipVerifier::from_trusted_checkpoint(workspace, digest, bytes)?;
-        let message =
-            MlsMessageIn::tls_deserialize_exact(bytes).map_err(|_| "invalid checkpoint")?;
-        let MlsMessageBodyIn::GroupInfo(info) = message.extract() else {
-            return Err("expected GroupInfo");
-        };
+        Self::from_checkpoint_within(workspace, digest, bytes, CheckpointBound::Wire)
+    }
+
+    /// A checkpoint this device holds as its own accepted state (a saved join
+    /// history, or one rebuilt from its own group). It never came from a peer
+    /// in this call, so the local-state bound applies, not the wire bound.
+    pub(super) fn from_local_checkpoint(
+        workspace: [u8; 32],
+        digest: [u8; 32],
+        bytes: &[u8],
+    ) -> Result<Self, &'static str> {
+        Self::from_checkpoint_within(workspace, digest, bytes, CheckpointBound::Local)
+    }
+
+    fn from_checkpoint_within(
+        workspace: [u8; 32],
+        digest: [u8; 32],
+        bytes: &[u8],
+        bound: CheckpointBound,
+    ) -> Result<Self, &'static str> {
+        let verifier = MembershipVerifier::from_checkpoint_within(workspace, digest, bytes, bound)?;
+        let info = checkpoint_info(bytes)?;
         let name_checkpoint = info
             .extensions()
             .unknown(super::name::EXTENSION)
             .map(|e| super::name::NameState::decode(&e.0))
             .transpose()?
             .unwrap_or_default();
-        let mut history = b"DFJH\x01".to_vec();
+        let mut history = HISTORY_VERSION.to_vec();
         history.extend(digest);
         history.extend((bytes.len() as u32).to_be_bytes());
         history.extend(bytes);
@@ -519,12 +923,16 @@ impl JoinProof {
         limit: usize,
     ) -> Result<Vec<(MembershipAuthorization, Vec<u8>)>, &'static str> {
         use super::storage::{number, take};
-        if encoded.len() > limit
-            || !(encoded.starts_with(b"DFJH\x01") || encoded.starts_with(b"DFJH\x02"))
-        {
+        if encoded.len() > limit {
             return Err("invalid join history");
         }
-        let version = encoded[4];
+        if !encoded.starts_with(HISTORY_VERSION) {
+            return Err(if encoded.starts_with(b"DFJH") {
+                super::step::FORMAT_NOT_SUPPORTED
+            } else {
+                "invalid join history"
+            });
+        }
         let mut bytes = &encoded[5..];
         take(&mut bytes, 32)?;
         let length = number(&mut bytes)?;
@@ -537,90 +945,9 @@ impl JoinProof {
             if steps.len() == MAX_JOIN_HISTORY_STEPS {
                 return Err("join history exceeds step bounds");
             }
-            steps.push(Self::read_step(&mut bytes, version == 2)?);
+            steps.push(super::step::read_step(&mut bytes)?);
         }
         Ok(steps)
-    }
-
-    fn read_step(
-        rest: &mut &[u8],
-        tagged: bool,
-    ) -> Result<(MembershipAuthorization, Vec<u8>), &'static str> {
-        use super::storage::{number, take};
-        let mut bytes = *rest;
-        let step = {
-            let tag = if tagged { take(&mut bytes, 1)?[0] } else { 0 };
-            let authorization = match tag {
-                0 => MembershipAuthorization::Admission(AdmissionAuthorization {
-                    invitation_key: take(&mut bytes, 32)?.try_into().unwrap(),
-                    grant_signature: take(&mut bytes, 64)?.try_into().unwrap(),
-                    redemption_signature: take(&mut bytes, 64)?.try_into().unwrap(),
-                }),
-                11 => {
-                    let count = u16::from_be_bytes(take(&mut bytes, 2)?.try_into().unwrap()) as usize;
-                    if count == 0 || count > super::MAX_ADMISSION_BATCH {
-                        return Err("invalid admission batch size");
-                    }
-                    MembershipAuthorization::AdmissionBatch(
-                        (0..count)
-                            .map(|_| {
-                                Ok(AdmissionAuthorization {
-                                    invitation_key: take(&mut bytes, 32)?.try_into().unwrap(),
-                                    grant_signature: take(&mut bytes, 64)?.try_into().unwrap(),
-                                    redemption_signature: take(&mut bytes, 64)?.try_into().unwrap(),
-                                })
-                            })
-                            .collect::<Result<Vec<_>, _>>()?,
-                    )
-                }
-                1..=10 => {
-                    let id = take(&mut bytes, 32)?.try_into().unwrap();
-                    MembershipAuthorization::Management(match tag {
-                        1 => super::ManagementAction::Promote(id),
-                        2 => super::ManagementAction::Demote(id),
-                        3 => super::ManagementAction::Remove(id),
-                        4 => super::ManagementAction::Leave(
-                            id,
-                            take(&mut bytes, 64)?.try_into().unwrap(),
-                        ),
-                        5 => super::ManagementAction::CreateInvitation(
-                            id,
-                            u64::from_be_bytes(take(&mut bytes, 8)?.try_into().unwrap()),
-                            match take(&mut bytes, 1)?[0] {
-                                0 => false,
-                                1 => true,
-                                _ => return Err("invalid invitation mode"),
-                            },
-                        ),
-                        6 => super::ManagementAction::DisableInvitation(id),
-                        7 => super::ManagementAction::ApproveInvitation(
-                            id,
-                            take(&mut bytes, 32)?.try_into().unwrap(),
-                        ),
-                        9 => super::ManagementAction::CreateRequestInvitation(
-                            id,
-                            u64::from_be_bytes(take(&mut bytes, 8)?.try_into().unwrap()),
-                        ),
-                        10 => super::ManagementAction::DeclineInvitationRequest(
-                            id,
-                            take(&mut bytes, 32)?.try_into().unwrap(),
-                        ),
-                        _ => super::ManagementAction::CreateAutomaticInvitation(
-                            id,
-                            u64::from_be_bytes(take(&mut bytes, 8)?.try_into().unwrap()),
-                        ),
-                    })
-                }
-                _ => return Err("unknown membership history action"),
-            };
-            let length = number(&mut bytes)?;
-            if length == 0 {
-                return Err("empty membership history commit");
-            }
-            (authorization, take(&mut bytes, length)?.to_vec())
-        };
-        *rest = bytes;
-        Ok(step)
     }
 
     pub fn from_history(
@@ -629,9 +956,8 @@ impl JoinProof {
         encoded: &[u8],
     ) -> Result<Self, &'static str> {
         use super::storage::{number, take};
-        if encoded.len() > MAX_BYTES {
-            return Err("invalid join history");
-        }
+        // Bounded by `history_steps` (MAX_HISTORY_BYTES); the checkpoint
+        // inside keeps its wire bound in `from_trusted_checkpoint`.
         let steps = Self::history_steps(encoded)?;
         let mut bytes = &encoded[5..];
         if take(&mut bytes, 32)? != digest {
@@ -640,9 +966,6 @@ impl JoinProof {
         let length = number(&mut bytes)?;
         let checkpoint = take(&mut bytes, length)?;
         let mut proof = Self::from_trusted_checkpoint(workspace, digest, checkpoint)?;
-        if encoded[4] == 2 {
-            proof.history[4] = 2;
-        }
         for (authorization, commit) in steps {
             proof.apply_transition(&authorization, &commit)?;
         }
@@ -653,7 +976,7 @@ impl JoinProof {
         &self,
         key: [u8; 32],
     ) -> Result<Option<super::InvitationControl>, &'static str> {
-        let (_, controls) =
+        let controls =
             super::invitation_controls::decode(&super::invitation_controls::policy_bytes(
                 self.verifier.group.group_context().extensions(),
             )?)?;
@@ -674,6 +997,12 @@ impl JoinProof {
                 Ok(())
             }
             MembershipAuthorization::Management(action) => self.apply_management(*action, commit),
+            MembershipAuthorization::Revocation(_) | MembershipAuthorization::SelfUpdate => {
+                let appended = self.appended_history(authorization, commit)?;
+                self.verifier.apply_transition(authorization, commit)?;
+                self.adopt_history(appended);
+                Ok(())
+            }
         }
     }
 
@@ -686,16 +1015,7 @@ impl JoinProof {
             return Err("membership history exceeds bounds");
         }
         let mut history = self.history.clone();
-        if history[4] == 1 && !matches!(authorization, MembershipAuthorization::Admission(_)) {
-            let steps = Self::history_steps_with_limit(&self.history, MAX_HISTORY_BYTES)?;
-            let length = u32::from_be_bytes(history[37..41].try_into().unwrap()) as usize;
-            history.truncate(41 + length);
-            history[4] = 2;
-            for (auth, bytes) in &steps {
-                Self::write_step(&mut history, auth, bytes);
-            }
-        }
-        Self::write_step(&mut history, authorization, commit);
+        super::step::write_step(&mut history, authorization, commit)?;
         if history.len() > MAX_HISTORY_BYTES {
             return Err("membership history exceeds bounds");
         }
@@ -710,71 +1030,9 @@ impl JoinProof {
         self.steps = appended.steps;
     }
 
-    fn write_step(history: &mut Vec<u8>, authorization: &MembershipAuthorization, commit: &[u8]) {
-        match authorization {
-            MembershipAuthorization::Admission(auth) => {
-                if history[4] >= 2 {
-                    history.push(0);
-                }
-                history.extend(auth.invitation_key);
-                history.extend(auth.grant_signature);
-                history.extend(auth.redemption_signature);
-            }
-            MembershipAuthorization::AdmissionBatch(auths) => {
-                history.push(11);
-                history.extend((auths.len() as u16).to_be_bytes());
-                for auth in auths {
-                    history.extend(auth.invitation_key);
-                    history.extend(auth.grant_signature);
-                    history.extend(auth.redemption_signature);
-                }
-            }
-            MembershipAuthorization::Management(action) => {
-                let (tag, id) = match action {
-                    super::ManagementAction::Promote(id) => (1, id),
-                    super::ManagementAction::Demote(id) => (2, id),
-                    super::ManagementAction::Remove(id) => (3, id),
-                    super::ManagementAction::Leave(id, _) => (4, id),
-                    super::ManagementAction::CreateInvitation(id, ..) => (5, id),
-                    super::ManagementAction::CreateAutomaticInvitation(id, ..) => (8, id),
-                    super::ManagementAction::CreateRequestInvitation(id, ..) => (9, id),
-                    super::ManagementAction::DeclineInvitationRequest(id, _) => (10, id),
-                    super::ManagementAction::DisableInvitation(id) => (6, id),
-                    super::ManagementAction::ApproveInvitation(id, _) => (7, id),
-                };
-                history.push(tag);
-                history.extend(id);
-                if let super::ManagementAction::Leave(_, signature) = action {
-                    history.extend(signature);
-                }
-                if let super::ManagementAction::CreateInvitation(_, expires, personal) = action {
-                    history.extend(expires.to_be_bytes());
-                    history.push(u8::from(*personal));
-                }
-                if let super::ManagementAction::CreateAutomaticInvitation(_, expires)
-                | super::ManagementAction::CreateRequestInvitation(_, expires) = action
-                {
-                    history.extend(expires.to_be_bytes());
-                }
-                if let super::ManagementAction::ApproveInvitation(_, package)
-                | super::ManagementAction::DeclineInvitationRequest(_, package) = action
-                {
-                    history.extend(package);
-                }
-            }
-        }
-        history.extend((commit.len() as u32).to_be_bytes());
-        history.extend(commit);
-    }
-
     pub(super) fn from_workspace(workspace: &Workspace) -> Result<Self, &'static str> {
-        let bytes = workspace
-            .group
-            .export_group_info(workspace.provider.crypto(), &workspace._signer, true)
-            .map_err(|_| "group comparison export failed")?
-            .to_bytes()
-            .map_err(|_| "group comparison encoding failed")?;
-        Self::from_trusted_checkpoint(workspace.id(), Sha256::digest(&bytes).into(), &bytes)
+        let bytes = workspace.local_checkpoint()?;
+        Self::from_local_checkpoint(workspace.id(), checkpoint_digest(&bytes)?, &bytes)
     }
 
     pub fn apply_management(
@@ -807,13 +1065,6 @@ impl JoinProof {
     pub fn epoch(&self) -> u64 {
         self.verifier.epoch()
     }
-    pub(super) fn verify_management(
-        &self,
-        action: super::ManagementAction,
-        commit: &[u8],
-    ) -> Result<(), &'static str> {
-        self.verifier.verify_management(action, commit)
-    }
     pub fn matches_workspace(&self, workspace: &Workspace) -> Result<bool, &'static str> {
         self.verifier.matches_workspace(workspace)
     }
@@ -834,25 +1085,37 @@ mod tests {
         package: KeyPackage,
     }
     impl Candidate {
-        fn new(n: u8) -> Self {
+        fn new(n: u8, workspace: [u8; 32]) -> Self {
+            Self::bound_by(n, workspace, crate::test_key(u64::from(n) + 10))
+        }
+        /// A candidate whose endpoint is test key `n + 10`, with the binding
+        /// signed by `binder` (a wrong key makes an invalid binding).
+        fn bound_by(n: u8, workspace: [u8; 32], binder: &dyn crate::EndpointSigner) -> Self {
+            Self::build(n, Some((workspace, binder)))
+        }
+        /// A candidate whose leaf carries no endpoint binding.
+        fn unbound(n: u8) -> Self {
+            Self::build(n, None)
+        }
+        fn build(n: u8, binding: Option<([u8; 32], &dyn crate::EndpointSigner)>) -> Self {
             let provider = OpenMlsRustCrypto::default();
             let signer = SignatureKeyPair::new(SUITE.signature_algorithm()).unwrap();
             signer.store(provider.storage()).unwrap();
             let profile = MemberProfile::new([n; 32], "Alex").unwrap();
-            let endpoint = [n + 10; 32];
+            let endpoint = crate::test_endpoint(u64::from(n) + 10);
             let credential = CredentialWithKey {
                 credential: BasicCredential::new(credential_identity(endpoint, Some(&profile)))
                     .into(),
                 signature_key: signer.to_public_vec().into(),
             };
-            let package = KeyPackage::builder()
-                .leaf_node_capabilities(Capabilities::new(
-                    None,
-                    None,
-                    Some(&[ExtensionType::Unknown(AUTHORITY)]),
-                    None,
-                    None,
-                ))
+            let mut builder = KeyPackage::builder().leaf_node_capabilities(crate::leaf_capabilities());
+            if let Some((workspace, binder)) = binding {
+                builder = builder.leaf_node_extensions(
+                    crate::endpoint_binding(binder, workspace, profile.id(), signer.public())
+                        .unwrap(),
+                );
+            }
+            let package = builder
                 .build(SUITE, &provider, &signer, credential)
                 .unwrap()
                 .key_package()
@@ -895,6 +1158,150 @@ mod tests {
         }
     }
 
+    fn now_for_test() -> u64 {
+        crate::invitation_controls::now().unwrap()
+    }
+
+    /// A raw administrator Add that carries `time` as its asserted time.
+    fn add_raw(owner: &mut Workspace, package: &KeyPackage, time: u64) -> (Vec<u8>, MlsMessageOut) {
+        owner.group.set_aad(asserted_time_aad(time));
+        let (commit, welcome, _) = owner
+            .group
+            .add_members(&owner.provider, &owner._signer, std::slice::from_ref(package))
+            .unwrap();
+        (commit.to_bytes().unwrap(), welcome)
+    }
+
+    /// ADR A2 T12: the committer's asserted time, not the verifier's clock,
+    /// decides expiry. Every verifier reaches the same answer.
+    #[test]
+    fn asserted_time_decides_invitation_expiry_for_every_verifier() {
+        let invite = SignatureKeyPair::new(SUITE.signature_algorithm()).unwrap();
+        let invitation_key: [u8; 32] = invite.public().try_into().unwrap();
+        // Expiry far in the past of every verifier's clock.
+        let expires_at = 1_000;
+        let mut admin = Workspace::create(crate::test_key(1), "Coordinator")
+            .unwrap()
+            .prepare_management(crate::ManagementAction::CreateInvitation(
+                invitation_key,
+                expires_at,
+                false,
+            ))
+            .unwrap()
+            .workspace;
+        let checkpoint = admin.join_checkpoint().unwrap();
+        let digest = checkpoint_digest(&checkpoint).unwrap();
+        let candidate = Candidate::new(3, admin.id());
+        let authorization = AdmissionAuthorization {
+            invitation_key,
+            grant_signature: admin
+                ._signer
+                .sign(&grant(admin.group.group_id(), &invitation_key))
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            redemption_signature: invite
+                .sign(&redemption(admin.group.group_id(), &invitation_key, &candidate.package).unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        };
+        let (late, _) = add_raw(&mut admin, &candidate.package, expires_at);
+        assert_eq!(admission_asserted_time(&late), Some(expires_at));
+        admin
+            .group
+            .clear_pending_commit(admin.provider.storage())
+            .unwrap();
+        let (in_time, _) = add_raw(&mut admin, &candidate.package, expires_at - 1);
+        for _ in 0..2 {
+            let mut joiner = JoinProof::from_trusted_checkpoint(admin.id(), digest, &checkpoint).unwrap();
+            let mut member =
+                MembershipVerifier::from_trusted_checkpoint(admin.id(), digest, &checkpoint).unwrap();
+            assert_eq!(
+                joiner.apply_add(&authorization, &late),
+                Err(crate::INVITATION_EXPIRED)
+            );
+            assert_eq!(
+                member.apply_transition(&MembershipAuthorization::Admission(authorization.clone()), &late),
+                Err(crate::INVITATION_EXPIRED)
+            );
+            // Before expiry by the committer's time: accepted, although every
+            // local clock is long past the expiry.
+            joiner.apply_add(&authorization, &in_time).unwrap();
+            member
+                .apply_transition(&MembershipAuthorization::Admission(authorization.clone()), &in_time)
+                .unwrap();
+            assert_eq!(joiner.epoch(), 2);
+            assert_eq!(member.epoch(), 2);
+        }
+    }
+
+    /// ADR A2 T11: every verifier rejects a leaf whose endpoint binding is
+    /// missing, signed by another key, or made for another workspace.
+    #[test]
+    fn a_leaf_without_a_valid_endpoint_binding_is_rejected() {
+        let invite = SignatureKeyPair::new(SUITE.signature_algorithm()).unwrap();
+        let invitation_key: [u8; 32] = invite.public().try_into().unwrap();
+        let mut admin = Workspace::create(crate::test_key(1), "Coordinator")
+            .unwrap()
+            .prepare_management(crate::ManagementAction::CreateInvitation(
+                invitation_key,
+                0,
+                false,
+            ))
+            .unwrap()
+            .workspace;
+        let checkpoint = admin.join_checkpoint().unwrap();
+        let digest = checkpoint_digest(&checkpoint).unwrap();
+        // The creator's own leaf is bound.
+        verify_endpoint_binding(
+            admin.provider.crypto(),
+            admin.group.group_id(),
+            admin.group.own_leaf_node().unwrap(),
+        )
+        .unwrap();
+        let authorize = |admin: &Workspace, package: &KeyPackage| AdmissionAuthorization {
+            invitation_key,
+            grant_signature: admin
+                ._signer
+                .sign(&grant(admin.group.group_id(), &invitation_key))
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            redemption_signature: invite
+                .sign(&redemption(admin.group.group_id(), &invitation_key, package).unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        };
+        let cases = [
+            (
+                Candidate::bound_by(7, admin.id(), crate::test_key(999)),
+                "invalid endpoint binding",
+            ),
+            (
+                Candidate::bound_by(8, [9; 32], crate::test_key(18)),
+                "invalid endpoint binding",
+            ),
+            (Candidate::unbound(9), "member leaf has no endpoint binding"),
+        ];
+        for (candidate, error) in cases {
+            let authorization = authorize(&admin, &candidate.package);
+            let (commit, _) = add_raw(&mut admin, &candidate.package, now_for_test());
+            admin
+                .group
+                .clear_pending_commit(admin.provider.storage())
+                .unwrap();
+            let mut proof = JoinProof::from_trusted_checkpoint(admin.id(), digest, &checkpoint).unwrap();
+            assert_eq!(proof.apply_add(&authorization, &commit), Err(error));
+        }
+        let good = Candidate::new(10, admin.id());
+        let authorization = authorize(&admin, &good.package);
+        let (commit, _) = add_raw(&mut admin, &good.package, now_for_test());
+        let mut proof = JoinProof::from_trusted_checkpoint(admin.id(), digest, &checkpoint).unwrap();
+        proof.apply_add(&authorization, &commit).unwrap();
+    }
+
     #[test]
     fn trusted_checkpoint_rejects_substitution_and_unauthorized_branch() {
         let invalid = BasicCredential::new(credential_identity(
@@ -903,39 +1310,62 @@ mod tests {
         ))
         .into();
         assert!(binding(&invalid).is_err());
-        let mut admin = Workspace::create([1; 32], "Coordinator").unwrap();
+        let invite = SignatureKeyPair::new(SUITE.signature_algorithm()).unwrap();
+        let invitation_key = invite.public().try_into().unwrap();
+        let mut admin = Workspace::create(crate::test_key(1), "Coordinator")
+            .unwrap()
+            .prepare_management(crate::ManagementAction::CreateInvitation(
+                invitation_key,
+                0,
+                false,
+            ))
+            .unwrap()
+            .workspace;
         let checkpoint = admin.join_checkpoint().unwrap();
-        let digest: [u8; 32] = Sha256::digest(&checkpoint).into();
+        let digest: [u8; 32] = checkpoint_digest(&checkpoint).unwrap();
         let mut proof =
             JoinProof::from_trusted_checkpoint(admin.id(), digest, &checkpoint).unwrap();
         assert!(proof.matches_workspace(&admin).unwrap());
-        let other = Workspace::create([2; 32], "Coordinator")
+        let other = Workspace::create(crate::test_key(2), "Coordinator")
             .unwrap()
             .join_checkpoint()
             .unwrap();
         assert!(JoinProof::from_trusted_checkpoint(admin.id(), digest, &other).is_err());
         assert!(JoinProof::from_trusted_checkpoint([99; 32], digest, &checkpoint).is_err());
+        // The last byte is in the tree, outside the pinned digest: the pin's
+        // signed tree hash must still reject the substituted tree.
         let mut damaged = checkpoint.clone();
         let end = damaged.len() - 1;
         damaged[end] ^= 1;
+        assert_eq!(checkpoint_digest(&damaged).unwrap(), digest);
         assert!(JoinProof::from_trusted_checkpoint(admin.id(), digest, &damaged).is_err());
-        // Even a caller supplying the damaged hash cannot bypass MLS signature validation.
+        // A tree from another group with the same pin also fails.
+        let parts = checkpoint_parts(&checkpoint, CheckpointBound::Wire).unwrap();
+        let other_parts = checkpoint_parts(&other, CheckpointBound::Wire).unwrap();
+        let mut swapped = CHECKPOINT_MAGIC.to_vec();
+        for part in [parts.pin, other_parts.tree] {
+            swapped.extend((part.len() as u32).to_be_bytes());
+            swapped.extend(part);
+        }
+        assert!(JoinProof::from_trusted_checkpoint(admin.id(), digest, &swapped).is_err());
+        // A damaged pin: even a caller supplying the damaged hash cannot bypass
+        // MLS signature validation.
+        let mut damaged = checkpoint.clone();
+        damaged[9 + parts.pin.len() - 1] ^= 1;
         assert!(
             JoinProof::from_trusted_checkpoint(
                 admin.id(),
-                Sha256::digest(&damaged).into(),
+                checkpoint_digest(&damaged).unwrap(),
                 &damaged
             )
             .is_err()
         );
         assert!(
-            JoinProof::from_trusted_checkpoint(admin.id(), [0; 32], &vec![0; MAX_BYTES + 1])
+            JoinProof::from_trusted_checkpoint(admin.id(), [0; 32], &vec![0; MAX_CHECKPOINT + 1])
                 .is_err()
         );
 
-        let helper = Candidate::new(3);
-        let invite = SignatureKeyPair::new(SUITE.signature_algorithm()).unwrap();
-        let invitation_key = invite.public().try_into().unwrap();
+        let helper = Candidate::new(3, admin.id());
         let grant_signature = admin
             ._signer
             .sign(&grant(admin.group.group_id(), &invitation_key))
@@ -952,7 +1382,8 @@ mod tests {
                 .unwrap(),
         };
         let helper_auth = authorize(admin.group.group_id(), &helper.package);
-        let (commit, welcome, _) = admin
+        // An Add without the committer's asserted time is rejected.
+        let (untimed, _, _) = admin
             .group
             .add_members(
                 &admin.provider,
@@ -960,47 +1391,58 @@ mod tests {
                 std::slice::from_ref(&helper.package),
             )
             .unwrap();
-        let commit = commit.to_bytes().unwrap();
+        assert_eq!(
+            proof.apply_add(&helper_auth, &untimed.to_bytes().unwrap()),
+            Err("admission requires the committer's asserted time")
+        );
+        admin
+            .group
+            .clear_pending_commit(admin.provider.storage())
+            .unwrap();
+        let (commit, welcome) = add_raw(&mut admin, &helper.package, now_for_test());
         let mut invalid_auth = authorize(admin.group.group_id(), &helper.package);
         invalid_auth.grant_signature[0] ^= 1;
+        // Epochs start at 1: the invitation registration is epoch 1.
         assert!(proof.apply_add(&invalid_auth, &commit).is_err());
-        assert_eq!(proof.epoch(), 0);
+        assert_eq!(proof.epoch(), 1);
         let mut trailing = commit.clone();
         trailing.push(0);
         assert!(proof.apply_add(&helper_auth, &trailing).is_err());
-        assert_eq!(proof.epoch(), 0);
+        assert_eq!(proof.epoch(), 1);
         proof.apply_add(&helper_auth, &commit).unwrap();
         assert!(proof.apply_add(&helper_auth, &commit).is_err()); // replay
-        assert_eq!(proof.epoch(), 1);
+        assert_eq!(proof.epoch(), 2);
         admin.group.merge_pending_commit(&admin.provider).unwrap();
         let mut helper = helper.join(admin.id(), welcome);
         assert!(proof.matches_workspace(&helper).unwrap());
         assert!(helper.join_checkpoint().is_err()); // ordinary member cannot issue a new trust root
 
-        // Admin is no longer involved. An ordinary helper fulfills the existing grant.
-        let fork_key = crate::StorageKey::derive(&[42; 32]).unwrap();
-        let fork_snapshot = helper.seal(&fork_key).unwrap();
-        let mut fork =
-            Workspace::restore(&fork_key, helper.endpoint, helper.id(), &fork_snapshot).unwrap();
-        let joined = Candidate::new(4);
+        // ADR A2 step 2 (T10): an ordinary member cannot commit an Add, even
+        // for a valid grant and redemption. Only administrators admit.
+        let joined = Candidate::new(4, admin.id());
         let joined_auth = authorize(helper.group.group_id(), &joined.package);
-        let (commit, welcome, _) = helper
+        let (member_commit, _) = add_raw(&mut helper, &joined.package, now_for_test());
+        assert_eq!(
+            proof.apply_add(&joined_auth, &member_commit),
+            Err("only an administrator may commit an Add")
+        );
+        assert_eq!(proof.epoch(), 2);
+        helper
             .group
-            .add_members(
-                &helper.provider,
-                &helper._signer,
-                std::slice::from_ref(&joined.package),
-            )
+            .clear_pending_commit(helper.provider.storage())
             .unwrap();
-        let commit = commit.to_bytes().unwrap();
-        let mismatched = authorize(helper.group.group_id(), &Candidate::new(5).package);
+
+        // An independent copy of the administrator at the same epoch.
+        let mut fork = admin.provisional_copy().unwrap();
+        let (commit, welcome) = add_raw(&mut admin, &joined.package, now_for_test());
+        let mismatched = authorize(admin.group.group_id(), &Candidate::new(5, admin.id()).package);
         assert!(proof.apply_add(&mismatched, &commit).is_err());
-        assert_eq!(proof.epoch(), 1);
+        assert_eq!(proof.epoch(), 2);
         proof.apply_add(&joined_auth, &commit).unwrap();
-        helper.group.merge_pending_commit(&helper.provider).unwrap();
-        let mut joined = joined.join(helper.id(), welcome);
+        admin.group.merge_pending_commit(&admin.provider).unwrap();
+        let mut joined = joined.join(admin.id(), welcome);
         assert!(proof.matches_workspace(&joined).unwrap());
-        assert!(!proof.matches_workspace(&admin).unwrap()); // same ID and admin, older branch
+        assert!(!proof.matches_workspace(&fork).unwrap()); // same ID and admin, older branch
         let encrypted = joined
             .group
             .create_message(
@@ -1017,22 +1459,17 @@ mod tests {
 
         // A fully MLS-valid unauthorized Welcome at the SAME epoch/ID/admin
         // roster is not the authorized branch. This catches more than staleness.
-        let uninvited = Candidate::new(6);
+        // The grant is signed by an ordinary member, not an administrator.
+        let before_fork = fork.join_checkpoint().unwrap();
+        let uninvited = Candidate::new(6, admin.id());
         let mut forged = authorize(fork.group.group_id(), &uninvited.package);
-        forged.grant_signature = fork
+        forged.grant_signature = helper
             ._signer
             .sign(&grant(fork.group.group_id(), &invitation_key))
             .unwrap()
             .try_into()
             .unwrap();
-        let (bad_commit, bad_welcome, _) = fork
-            .group
-            .add_members(
-                &fork.provider,
-                &fork._signer,
-                std::slice::from_ref(&uninvited.package),
-            )
-            .unwrap();
+        let (bad_commit, bad_welcome) = add_raw(&mut fork, &uninvited.package, now_for_test());
         fork.group.merge_pending_commit(&fork.provider).unwrap();
         let uninvited = uninvited.join(fork.id(), bad_welcome);
         assert_eq!(uninvited.epoch(), proof.epoch());
@@ -1042,19 +1479,18 @@ mod tests {
         // Verify authorization rejection from the correct previous epoch too.
         // A separate verifier starts at the pre-fork checkpoint, so this
         // negative assertion tests grant authority rather than epoch mismatch.
-        let before_fork = admin.join_checkpoint().unwrap();
         let mut fork_proof = JoinProof::from_trusted_checkpoint(
             admin.id(),
-            Sha256::digest(&before_fork).into(),
+            checkpoint_digest(&before_fork).unwrap(),
             &before_fork,
         )
         .unwrap();
         assert_eq!(
-            fork_proof.apply_add(&forged, &bad_commit.to_bytes().unwrap()),
+            fork_proof.apply_add(&forged, &bad_commit),
             Err("unapproved invitation")
         );
-        assert_eq!(fork_proof.epoch(), 1);
-        assert_eq!(proof.epoch(), 2);
+        assert_eq!(fork_proof.epoch(), 2);
+        assert_eq!(proof.epoch(), 3);
         assert!(proof.matches_workspace(&joined).unwrap());
     }
 }

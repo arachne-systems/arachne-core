@@ -11,10 +11,19 @@ fn removed_membership_restore_shuts_down_runtime_and_rejects_active_fallback() {
     let handle = create(Some(&seed)).unwrap();
     let info: Value = serde_json::from_str(&describe(handle).unwrap()).unwrap();
     let endpoint: [u8; 32] = serde_json::from_value(info["endpoint_key"].clone()).unwrap();
-    let admin = Workspace::create([91; 32], "Admin").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
-    let join =
-        PendingJoin::from_invitation(&invite, &checkpoint, endpoint, "Former member").unwrap();
+    let admin_key = arachne_security::EndpointKey::generate().unwrap();
+    let admin = Workspace::create(&admin_key, "Admin").unwrap();
+    let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let admin = registered.workspace;
+    // The runtime node's own key signs the member's endpoint binding.
+    let secret = iroh::SecretKey::from_bytes(&seed);
+    let join = PendingJoin::from_invitation(
+        &invite,
+        &checkpoint,
+        &arachne_node::IrohEndpointSigner(&secret),
+        "Former member",
+    )
+    .unwrap();
     let admitted = admin
         .prepare_admission(endpoint, join.admission_request().unwrap())
         .unwrap();
@@ -27,8 +36,9 @@ fn removed_membership_restore_shuts_down_runtime_and_rejects_active_fallback() {
     let old = member.seal(&key).unwrap();
     let action = ManagementAction::Remove(member.member().unwrap().id());
     let change = admitted.workspace.prepare_management(action).unwrap();
+    // A Remove is a signed order: the member verifies the order's step.
     let PreparedManagementUpdate::Removed(removed) = member
-        .prepare_management_update(action, &change.commit)
+        .prepare_step_update(&change.authorization, &change.commit)
         .unwrap()
     else {
         panic!("removed member returned active state")
@@ -46,7 +56,7 @@ fn removed_membership_restore_shuts_down_runtime_and_rejects_active_fallback() {
     for request in [
         json!({"op":"create_workspace","display_name":"Do not resurrect"}),
         json!({"op":"restore_workspace","workspace":member.id(),"snapshot":old}),
-        json!({"op":"issue_invitation"}),
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
         json!({"op":"install_workspace_policy","revision":99}),
         json!({"op":"install_verified_policy","workspace":member.id(),"revision":99,"endpoints":[]}),
         json!({"op":"publish","workspace":member.id(),"revision":99,"topic":"atak/pli","payload":[1]}),

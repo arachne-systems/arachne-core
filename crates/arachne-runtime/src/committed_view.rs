@@ -15,7 +15,8 @@ pub(super) struct CommittedView {
 
 /// The published view of one session. `None` until a workspace is committed.
 /// It also carries the session's retained member profiles: a membership
-/// query reads and extends them without the host (ADR 0010).
+/// query reads and extends them without the host (see
+/// docs/architecture.md#membership-gossip-vocabulary, "inquiry").
 #[derive(Clone, Default)]
 pub(super) struct Published {
     view: Arc<RwLock<Option<Arc<CommittedView>>>>,
@@ -121,24 +122,23 @@ impl CommittedView {
     /// the authenticated transport identity, never a field of the payload.
     fn answer(&self, peer: [u8; 32], payload: &[u8]) -> Option<Vec<u8>> {
         if payload.starts_with(INVITATION_CHECKPOINT_REQUEST) {
-            let proof = &payload[INVITATION_CHECKPOINT_REQUEST.len()..];
             return Some(
-                self.workspace
-                    .checkpoint_for_invitation(peer, self.endpoint, proof)
+                invitation_checkpoint_page(&self.workspace, peer, self.endpoint, payload)
                     .unwrap_or_default(),
             );
         }
         if payload.starts_with(ADMISSION_HISTORY_PAGE_REQUEST) {
             let page = parse_admission_history_page_packet(payload).ok().and_then(
-                |(request, checkpoint, offset)| {
-                    admission_reply_page(&self.workspace, peer, request, Some(checkpoint), offset)
+                |(request, offset)| {
+                    let checkpoint = pinned_checkpoint(&self.workspace, request).ok()?;
+                    admission_reply_page(&self.workspace, peer, request, Some(&checkpoint), offset)
                         .ok()
                 },
             );
             return Some(page.unwrap_or_else(|| UNAVAILABLE.to_vec()));
         }
-        // A range pull reads committed steps only (ADR 0009).
-        if payload.starts_with(b"DFMS") {
+        // A range pull reads committed steps only.
+        if payload.starts_with(membership::wire::RANGE_QUERY) {
             return Some(membership::range_reply(
                 Some(&self.workspace),
                 peer,
@@ -148,9 +148,14 @@ impl CommittedView {
         // A join request is an inquiry only when its result is already
         // retained. Otherwise it asks for a membership change: host queue.
         if payload.starts_with(b"DFJA") {
-            let (request, checkpoint, _) = admission_packet(payload).ok()?;
+            let (request, pinned, _) = admission_packet(payload).ok()?;
             self.workspace.retained_admission(peer, request).ok()??;
-            return admission_reply_page(&self.workspace, peer, request, checkpoint, 0).ok();
+            let checkpoint = match pinned {
+                true => Some(pinned_checkpoint(&self.workspace, request).ok()?),
+                false => None,
+            };
+            return admission_reply_page(&self.workspace, peer, request, checkpoint.as_deref(), 0)
+                .ok();
         }
         None
     }
@@ -222,7 +227,7 @@ fn a_membership_query_answer_is_the_host_answer() {
     .unwrap();
     let host_page = membership::profile_page_reply(
         host.workspace.as_deref(),
-        &membership::lock_profiles(&host.profiles),
+        &membership::lock_profiles(&host.membership.profiles),
         endpoints[0],
         &page,
     );

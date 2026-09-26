@@ -3,7 +3,7 @@ name = "arachne-security"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
-license-file.workspace = true
+license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -14,12 +14,12 @@ readme = "README.md"
 publish = ["crates-io"]
 
 [dependencies]
-openmls = "=0.9.0"
-openmls_basic_credential = "=0.6.0"
-openmls_rust_crypto = "=0.6.0"
-openmls_traits = "=0.6.0"
-aes-gcm = "=0.10.3"
-hkdf = "=0.12.4"
-sha2 = "=0.10.9"
-zeroize = "1"
-sframe = "=1.4.3"
+openmls = "0.9.0"
+openmls_basic_credential = "0.6.0"
+openmls_rust_crypto = "0.6.0"
+openmls_traits = "0.6.0"
+aes-gcm = "0.10.3"
+hkdf = "0.12.4"
+sha2 = "0.10.9"
+zeroize = "1.9.0"
+sframe = "1.4.3"

@@ -218,7 +218,7 @@ impl Workspace {
             return Err("invalid recovery window");
         }
         if request.workspace != self.id()
-            || request.epoch != self.epoch()
+            || !self.in_receive_window(request.epoch)
             || self.member().map(|m| m.id()) != Some(request.author)
         {
             return Err("invalid recovery cutoff scope");
@@ -253,7 +253,7 @@ impl Workspace {
     ) -> Result<(u64, u64), &'static str> {
         if self.member().is_none()
             || expected.workspace != self.id()
-            || expected.epoch != self.epoch()
+            || !self.in_receive_window(expected.epoch)
         {
             return Err("wrong recovery workspace or epoch");
         }
@@ -304,7 +304,7 @@ impl Workspace {
         packets: &[(&[u8], &[u8])],
     ) -> Result<Vec<u8>, &'static str> {
         if request.workspace != self.id()
-            || request.epoch != self.epoch()
+            || !self.in_receive_window(request.epoch)
             || self.member().map(|m| m.id()) != Some(request.author)
             || packets.len() > MAX_RECOVERY_PACKETS
         {
@@ -337,7 +337,7 @@ impl Workspace {
     ) -> Result<VerifiedRecoveryOffer<'a>, &'static str> {
         if self.member().is_none()
             || expected.workspace != self.id()
-            || expected.epoch != self.epoch()
+            || !self.in_receive_window(expected.epoch)
         {
             return Err("wrong recovery workspace or epoch");
         }
@@ -394,11 +394,12 @@ fn current_view_statement(context: &[u8], body: &[u8]) -> Vec<u8> {
 #[test]
 fn recovery_offer_authenticates_request_and_exact_packet_set() {
     use crate::{PendingJoin, StorageKey};
-    let admin = Workspace::create([1; 32], "Publisher").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
-    let pending = PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+    let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
+    let (registration, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let admin = registration.workspace;
+    let pending = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission([2; 32], pending.admission_request().unwrap())
+        .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
         .unwrap();
     let mut proof = pending.join_proof().unwrap();
     proof
@@ -573,7 +574,7 @@ fn recovery_offer_authenticates_request_and_exact_packet_set() {
         assert!(receiver.verify_recovery_offer(&wrong, &encoded).is_err());
     }
     assert!(receiver.sign_recovery_offer(&request, &packets).is_err());
-    let outsider = Workspace::create([5; 32], "Outsider").unwrap();
+    let outsider = Workspace::create(crate::test_key(5), "Outsider").unwrap();
     assert!(outsider.verify_recovery_offer(&request, &encoded).is_err());
     let empty = sender.sign_recovery_offer(&request, &[]).unwrap();
     let verified_empty = receiver.verify_recovery_offer(&request, &empty).unwrap();
@@ -603,7 +604,7 @@ fn recovery_offer_authenticates_request_and_exact_packet_set() {
     let mut invalid = request.clone();
     invalid.through = invalid.after;
     assert!(sender.sign_recovery_offer(&invalid, &packets).is_err());
-    let mut candidate = Workspace::restore(&key, [2; 32], receiver.id(), &before).unwrap();
+    let mut candidate = Workspace::restore(&key, crate::test_endpoint(2), receiver.id(), &before).unwrap();
     for (context, packet) in &packets {
         let mut message = candidate.unprotect_application(context, packet).unwrap();
         verified.verify_origin(&message).unwrap();
@@ -614,7 +615,7 @@ fn recovery_offer_authenticates_request_and_exact_packet_set() {
         assert!(verified.verify_origin(&message).is_err());
     }
     let saved = candidate.seal(&key).unwrap();
-    let mut restored = Workspace::restore(&key, [2; 32], receiver.id(), &saved).unwrap();
+    let mut restored = Workspace::restore(&key, crate::test_endpoint(2), receiver.id(), &saved).unwrap();
     assert!(
         restored
             .unprotect_application(packets[0].0, packets[0].1)

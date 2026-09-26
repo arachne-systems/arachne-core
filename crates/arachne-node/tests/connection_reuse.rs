@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-const CONTROL: &[u8] = b"data-fabric/control/1";
+const CONTROL: &[u8] = b"arachne/control/1";
 
 #[tokio::test]
 async fn stalled_frame_times_out_without_closing_other_exchanges() {
@@ -21,11 +21,22 @@ async fn stalled_frame_times_out_without_closing_other_exchanges() {
             .bind()
             .await
             .unwrap();
+        // Only a policy member reaches the data plane.
+        node.install_verified_policy(
+            [46; 32],
+            1,
+            std::collections::BTreeMap::from([
+                (node.id(), arachne_node::Permissions::AllTopics),
+                (*peer.id().as_bytes(), arachne_node::Permissions::AllTopics),
+            ]),
+        )
+        .await
+        .unwrap();
         let connection = peer
             .connect(
                 iroh::EndpointAddr::new(iroh::PublicKey::from_bytes(&node.id()).unwrap())
                     .with_ip_addr(node.address()),
-                b"data-fabric/pubsub-experiment/1",
+                b"arachne/data/1",
             )
             .await
             .unwrap();

@@ -2,12 +2,9 @@ use arachne_runtime::{
     close, create, describe, enable_record_storage, execute, restore_record_storage, save_candidate,
 };
 use serde_json::{Value, json};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 mod common;
-
-static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn call(handle: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
@@ -16,6 +13,20 @@ fn call(handle: i64, request: Value) -> Result<Value, String> {
 
 fn endpoint(handle: i64) -> Value {
     serde_json::from_str(&describe(handle).unwrap()).unwrap()
+}
+
+fn issue_invitation(handle: i64) -> Value {
+    let staged = call(
+        handle,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    )
+    .unwrap();
+    call(
+        handle,
+        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+    )
+    .unwrap()["issued_invitation"]
+        .clone()
 }
 
 fn serve_once(handle: i64) -> Value {
@@ -35,7 +46,6 @@ fn serve_once(handle: i64) -> Value {
 
 #[test]
 fn fetches_only_the_exact_invitation_checkpoint_over_authenticated_iroh() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = create(Some(&[201; 32])).unwrap();
     let joiner = create(Some(&[202; 32])).unwrap();
     call(
@@ -43,7 +53,7 @@ fn fetches_only_the_exact_invitation_checkpoint_over_authenticated_iroh() {
         json!({"op":"create_workspace","display_name":"Coordinator","workspace_name":"Ridge Team"}),
     )
     .unwrap();
-    let invitation = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let invitation = issue_invitation(admin);
     let admin_node = endpoint(admin);
     call(
         joiner,
@@ -61,7 +71,7 @@ fn fetches_only_the_exact_invitation_checkpoint_over_authenticated_iroh() {
             json!({"op":"fetch_invitation_checkpoint","peer":peer,"invitation":bearer}),
         )
     });
-    // An invitation checkpoint is an inquiry (ADR 0010): the committed view
+    // An invitation checkpoint is an inquiry: the committed view
     // answers it and the host sees no event.
     let fetched = fetch.join().unwrap().unwrap();
     assert_eq!(fetched["checkpoint"], invitation["checkpoint"]);
@@ -88,15 +98,36 @@ fn fetches_only_the_exact_invitation_checkpoint_over_authenticated_iroh() {
         json!({"op":"adopt_admission","snapshot":renamed["snapshot"]}),
     )
     .unwrap();
-    let peer = admin_node["endpoint_key"].clone();
-    let bearer = invitation["invitation"].clone();
-    let stale = std::thread::spawn(move || {
-        call(
-            joiner,
-            json!({"op":"fetch_invitation_checkpoint","peer":peer,"invitation":bearer}),
-        )
-    });
-    assert!(stale.join().unwrap().is_err());
+    let fetch_again = || {
+        let peer = admin_node["endpoint_key"].clone();
+        let bearer = invitation["invitation"].clone();
+        std::thread::spawn(move || {
+            call(
+                joiner,
+                json!({"op":"fetch_invitation_checkpoint","peer":peer,"invitation":bearer}),
+            )
+        })
+        .join()
+        .unwrap()
+    };
+    // A registered link keeps its retained checkpoint across later changes.
+    assert_eq!(
+        fetch_again().unwrap()["checkpoint"],
+        invitation["checkpoint"]
+    );
+    // Once the link is disabled its checkpoint is gone and becomes stale.
+    let disabled = call(
+        admin,
+        json!({"op":"stage_management","action":{"kind":"disable_invitation",
+            "member":invitation["invitation_key"]}}),
+    )
+    .unwrap();
+    call(
+        admin,
+        json!({"op":"adopt_admission","snapshot":disabled["snapshot"]}),
+    )
+    .unwrap();
+    assert!(fetch_again().is_err());
 
     let outsider = create(Some(&[203; 32])).unwrap();
     let outsider_node = endpoint(outsider);
@@ -127,7 +158,6 @@ fn fetches_only_the_exact_invitation_checkpoint_over_authenticated_iroh() {
 
 #[test]
 fn ordinary_member_serves_the_checkpoint_it_joined_from_after_issuer_closes() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = create(Some(&[211; 32])).unwrap();
     let mut helper = create(Some(&[212; 32])).unwrap();
     let late = create(Some(&[213; 32])).unwrap();
@@ -136,7 +166,7 @@ fn ordinary_member_serves_the_checkpoint_it_joined_from_after_issuer_closes() {
         json!({"op":"create_workspace","display_name":"Coordinator","workspace_name":"Event Team"}),
     )
     .unwrap();
-    let invitation = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let invitation = issue_invitation(admin);
     let pending = call(
         helper,
         json!({"op":"begin_join","display_name":"First member","invitation":invitation["invitation"],
@@ -196,7 +226,7 @@ fn ordinary_member_serves_the_checkpoint_it_joined_from_after_issuer_closes() {
             json!({"op":"fetch_invitation_checkpoint","peer":peer,"invitation":bearer}),
         )
     });
-    // An invitation checkpoint is an inquiry (ADR 0010): the committed view
+    // An invitation checkpoint is an inquiry: the committed view
     // answers it and the host sees no event.
     let fetched = fetch.join().unwrap().unwrap();
     assert_eq!(fetched["checkpoint"], invitation["checkpoint"]);
@@ -206,42 +236,18 @@ fn ordinary_member_serves_the_checkpoint_it_joined_from_after_issuer_closes() {
             "checkpoint":fetched["checkpoint"]}),
     )
     .unwrap();
+    // Only administrators admit (ADR A2): the ordinary member serves the
+    // checkpoint, but refuses the admission itself so the joiner asks an
+    // administrator.
     let peer = helper_node["endpoint_key"].clone();
-    let retry_peer = peer.clone();
     let admission = std::thread::spawn(move || {
         call(late, json!({"op":"request_admission","peer":peer})).unwrap()
     });
-    assert_eq!(serve_once(helper), json!({"state":"admission_queued"}));
-    let staged = serve_once(helper);
-    assert_eq!(staged["state"], "awaiting_save");
-    call(
-        helper,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
-    )
-    .unwrap();
-    let retry = std::thread::spawn(move || {
-        call(late, json!({"op":"request_admission","peer":retry_peer})).unwrap()
-    });
-    // The result is retained, so this retry is an inquiry (ADR 0010): the
-    // committed view answers it and the host sees no event.
-    // The owner holds the request's exchange and writes the committed
-    // result onto it after save and adopt (event-driven admission).
-    assert!(admission.join().unwrap()["commits"].is_array());
-    let reply = retry.join().unwrap();
-    assert_eq!(reply["commits"].as_array().unwrap().len(), 2);
-    let joined = call(
-        late,
-        json!({"op":"stage_join","welcome":reply["welcome"],"commits":reply["commits"]}),
-    )
-    .unwrap();
-    assert_eq!(
-        call(
-            late,
-            json!({"op":"adopt_join","snapshot":joined["snapshot"]})
-        )
-        .unwrap()["members"],
-        3
-    );
+    let served = serve_once(helper);
+    assert_eq!(served["reason"], "administrator_required", "{served}");
+    let refused = admission.join().unwrap();
+    assert_eq!(refused["state"], "admission_unavailable", "{refused}");
+    assert_eq!(refused["reason"], "administrator_required", "{refused}");
     for handle in [helper, late] {
         close(handle).unwrap();
     }
@@ -249,7 +255,6 @@ fn ordinary_member_serves_the_checkpoint_it_joined_from_after_issuer_closes() {
 
 #[test]
 fn existing_member_serves_a_later_invitation_after_learning_it_and_restarting() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = create(Some(&[221; 32])).unwrap();
     let mut helper = create(Some(&[222; 32])).unwrap();
     let late = create(Some(&[223; 32])).unwrap();
@@ -259,7 +264,7 @@ fn existing_member_serves_a_later_invitation_after_learning_it_and_restarting() 
     )
     .unwrap()["workspace"]
         .clone();
-    let first = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let first = issue_invitation(admin);
     let pending = call(
         helper,
         json!({"op":"begin_join","display_name":"Relay member","invitation":first["invitation"],
@@ -348,9 +353,11 @@ fn existing_member_serves_a_later_invitation_after_learning_it_and_restarting() 
         )
         .is_err()
     );
+    // +1: registering the first invitation now costs an epoch before the
+    // admission that seated helper, so helper's epoch here is one higher.
     assert_eq!(
         call(helper, json!({"op":"member_roster"})).unwrap()["epoch"],
-        1
+        2
     );
     let learned = call(
         helper,
@@ -393,7 +400,7 @@ fn existing_member_serves_a_later_invitation_after_learning_it_and_restarting() 
             json!({"op":"fetch_invitation_checkpoint","peer":peer,"invitation":bearer}),
         )
     });
-    // An invitation checkpoint is an inquiry (ADR 0010): the committed view
+    // An invitation checkpoint is an inquiry: the committed view
     // answers it and the host sees no event.
     assert_eq!(
         fetch.join().unwrap().unwrap()["checkpoint"],

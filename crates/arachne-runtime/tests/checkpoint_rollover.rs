@@ -23,10 +23,7 @@
 use arachne_node::MAX_CONTROL_REPLY;
 use arachne_runtime::{close, create, describe, enable_record_storage, execute, save_candidate};
 use serde_json::{Value, json};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
-
-static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// 55 promote/demote cycles on top of the helper's own admission puts the
 /// workspace far past the 64-step ceiling without a network round trip each.
@@ -121,7 +118,15 @@ fn ramp(seed: u8) -> Ramp {
     )
     .unwrap();
     enable_record_storage(admin, &dirs[0].path().join("admin.db"), &[seed; 32]).unwrap();
-    let invite = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let staged = call(
+        admin,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    )
+    .unwrap();
+    save_candidate(admin, &bytes(&staged["snapshot"])).unwrap();
+    let invite = call(admin, json!({"op":"adopt_admission","snapshot":staged["snapshot"]}))
+        .unwrap()["issued_invitation"]
+        .clone();
 
     // The helper joins at the very beginning, so its own retained history is
     // anchored at the same epoch-0 checkpoint the late joiner pins.
@@ -164,7 +169,15 @@ fn ramp(seed: u8) -> Ramp {
             adopt(admin, "adopt_admission", &change);
         }
     }
-    let steps = 1 + 2 * RAMP_CYCLES as u64;
+    // Only administrators admit (ADR A2): end with the helper promoted, so
+    // it can redeem the old invitation while the issuer is offline.
+    let change = call(
+        admin,
+        json!({"op":"stage_management","action":{"kind":"promote","member":member}}),
+    )
+    .unwrap();
+    adopt(admin, "adopt_admission", &change);
+    let steps = 2 + 2 * RAMP_CYCLES as u64;
     assert!(
         steps > 64,
         "the scenario must exceed the 64-step ceiling it is about to test"
@@ -180,8 +193,11 @@ fn ramp(seed: u8) -> Ramp {
     }
     assert_eq!(
         current["epoch"],
-        json!(steps),
-        "the ordinary member must be current before it serves an old invitation"
+        // +1: registering the invitation now costs an epoch, and that epoch
+        // lands before the pinned checkpoint, so it is not one of `steps`
+        // but still counts toward the helper's absolute epoch.
+        json!(steps + 1),
+        "the helper must be current before it serves an old invitation"
     );
 
     Ramp {
@@ -305,7 +321,6 @@ fn redeem(ramp: &Ramp, responder: i64, responder_peer: Value) -> Value {
 
 #[test]
 fn epoch_zero_invitation_redeems_through_the_issuer_after_a_hundred_epochs() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let ramp = ramp(171);
     let peer = ramp.invite["peer"].clone();
     let reply = redeem(&ramp, ramp.admin, peer);
@@ -316,7 +331,10 @@ fn epoch_zero_invitation_redeems_through_the_issuer_after_a_hundred_epochs() {
     )
     .expect("a joiner must be able to verify more than 64 steps of history");
     let joined = adopt(ramp.late, "adopt_join", &staged);
-    assert_eq!(joined["epoch"], json!(ramp.steps + 1));
+    // +1 on top of the usual +1: the registration epoch that pinned this
+    // invitation's checkpoint also lands before it, and late's own join adds
+    // one more on top of the full ramp.
+    assert_eq!(joined["epoch"], json!(ramp.steps + 2));
 
     close(ramp.late).unwrap();
     close(ramp.helper).unwrap();
@@ -324,8 +342,7 @@ fn epoch_zero_invitation_redeems_through_the_issuer_after_a_hundred_epochs() {
 }
 
 #[test]
-fn epoch_zero_invitation_redeems_through_an_ordinary_member_with_the_issuer_offline() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+fn epoch_zero_invitation_redeems_through_another_administrator_with_the_issuer_offline() {
     let ramp = ramp(181);
     let helper_peer = node(ramp.helper)["endpoint_key"].clone();
     close(ramp.admin).unwrap();
@@ -347,8 +364,12 @@ fn epoch_zero_invitation_redeems_through_an_ordinary_member_with_the_issuer_offl
     );
     let mut tampered = reply["commits"].as_array().unwrap().clone();
     let last = tampered.len() - 1;
-    let byte = tampered[last]["commit"][0].as_u64().unwrap() ^ 1;
-    tampered[last]["commit"][0] = json!(byte);
+    // Flip the first byte of the step's commit (its MLS version).
+    let step: Vec<u8> = serde_json::from_value(tampered[last]["step"].clone()).unwrap();
+    let (authorization, mut commit) = arachne_security::decode_membership_step(&step).unwrap();
+    commit[0] ^= 1;
+    tampered[last]["step"] =
+        json!(arachne_security::encode_membership_step(&authorization, &commit).unwrap());
     assert!(
         call(
             ramp.late,
@@ -362,9 +383,12 @@ fn epoch_zero_invitation_redeems_through_an_ordinary_member_with_the_issuer_offl
         ramp.late,
         json!({"op":"stage_join","welcome":reply["welcome"],"commits":reply["commits"]}),
     )
-    .expect("an ordinary member must serve the full authorized history");
+    .expect("another administrator must serve the full authorized history");
     let joined = adopt(ramp.late, "adopt_join", &staged);
-    assert_eq!(joined["epoch"], json!(ramp.steps + 1));
+    // +1 on top of the usual +1: the registration epoch that pinned this
+    // invitation's checkpoint also lands before it, and late's own join adds
+    // one more on top of the full ramp.
+    assert_eq!(joined["epoch"], json!(ramp.steps + 2));
 
     close(ramp.late).unwrap();
     close(ramp.helper).unwrap();

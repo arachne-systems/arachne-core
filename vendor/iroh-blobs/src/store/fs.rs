@@ -1,3 +1,4 @@
+// Modified by Arachne Systems from iroh-blobs 0.103.0; see ARACHNE-PATCH.md.
 //! # File based blob store.
 //!
 //! A file based blob store needs a writeable directory to work with.

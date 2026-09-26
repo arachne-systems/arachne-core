@@ -32,6 +32,28 @@ pub struct FreshnessAnchor {
     pub digest: [u8; 32],
 }
 
+impl FreshnessAnchor {
+    /// Big-endian revision followed by the digest; stable for host storage and FFI.
+    pub const ENCODED_LEN: usize = 40;
+
+    pub fn to_bytes(&self) -> [u8; Self::ENCODED_LEN] {
+        let mut bytes = [0; Self::ENCODED_LEN];
+        bytes[..8].copy_from_slice(&self.revision.to_be_bytes());
+        bytes[8..].copy_from_slice(&self.digest);
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != Self::ENCODED_LEN {
+            return Err("invalid freshness anchor length".into());
+        }
+        Ok(Self {
+            revision: u64::from_be_bytes(bytes[..8].try_into()?),
+            digest: bytes[8..].try_into()?,
+        })
+    }
+}
+
 /// One exclusive local owner. Reopen authenticates every retained record before
 /// exposing state. Whole-store rollback requires an external anchor to detect.
 pub struct Store {
@@ -77,7 +99,7 @@ impl Store {
         connection.set_limit(
             rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
             (MAX_RECORD_BYTES + MAX_KEY_BYTES + 4096) as i32,
-        );
+        )?;
         connection.execute_batch(
             "PRAGMA locking_mode=EXCLUSIVE;
              PRAGMA journal_mode=DELETE;
@@ -294,7 +316,7 @@ impl Store {
     }
     fn seal(&self, kind: u8, name: &[u8], plain: &[u8]) -> Result<Vec<u8>> {
         let mut nonce = [0; 12];
-        getrandom::getrandom(&mut nonce).map_err(|_| "record randomness failed")?;
+        getrandom::fill(&mut nonce).map_err(|_| "record randomness failed")?;
         let cipher =
             Aes256Gcm::new_from_slice(self.key.as_ref()).map_err(|_| "invalid storage key")?;
         let mut packet = nonce.to_vec();

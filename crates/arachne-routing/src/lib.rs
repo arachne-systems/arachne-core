@@ -39,6 +39,12 @@ impl Topic {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Application namespace: the first segment ("chat" for "chat/room/1").
+    /// Object keys and AAD are scoped to it (docs/security.md, A8).
+    pub fn namespace(&self) -> &str {
+        self.0.split('/').next().unwrap_or(&self.0)
+    }
 }
 
 /// Topic authorization is independent from subscription interest.
@@ -101,6 +107,55 @@ struct Workspace {
     revision: u64,
     endpoint_permissions: BTreeMap<PeerId, Permissions>,
     subscriptions: BTreeMap<PeerId, BTreeSet<Topic>>,
+    /// The revision replaced by the current one. A frame from a peer one
+    /// revision behind is still accepted, never with more than both grant.
+    previous: Option<(u64, BTreeMap<PeerId, Permissions>)>,
+}
+
+impl Workspace {
+    /// The permissions an operation at `revision` may use: the current
+    /// policy, or for the previous revision the intersection of both.
+    fn policy(&self, revision: u64) -> Result<Policy<'_>, Error> {
+        if revision == self.revision {
+            return Ok(Policy {
+                current: &self.endpoint_permissions,
+                previous: None,
+            });
+        }
+        match &self.previous {
+            Some((previous, permissions)) if *previous == revision => Ok(Policy {
+                current: &self.endpoint_permissions,
+                previous: Some(permissions),
+            }),
+            _ => Err(Error::WrongPolicyRevision),
+        }
+    }
+}
+
+/// Current permissions, narrowed by the frame's older revision if any.
+struct Policy<'a> {
+    current: &'a BTreeMap<PeerId, Permissions>,
+    previous: Option<&'a BTreeMap<PeerId, Permissions>>,
+}
+
+impl Policy<'_> {
+    fn allows(&self, peer: &PeerId, check: impl Fn(&Permissions) -> bool) -> bool {
+        self.current.get(peer).is_some_and(&check)
+            && self
+                .previous
+                .is_none_or(|previous| previous.get(peer).is_some_and(&check))
+    }
+
+    fn contains(&self, peer: &PeerId) -> bool {
+        self.allows(peer, |_| true)
+    }
+
+    fn endpoints(&self) -> impl Iterator<Item = (&PeerId, &Permissions)> {
+        self.current.iter().filter(|(peer, _)| {
+            self.previous
+                .is_none_or(|previous| previous.contains_key(*peer))
+        })
+    }
 }
 
 #[derive(Default)]
@@ -109,6 +164,12 @@ pub struct RoutingTable {
 }
 
 impl RoutingTable {
+    /// The revision this table last installed for `workspace`. Frames from
+    /// peers may still use the previous one; a local re-check must not.
+    pub fn installed_revision(&self, workspace: WorkspaceId) -> Option<u64> {
+        self.workspaces.get(&workspace).map(|state| state.revision)
+    }
+
     /// Authorized transport endpoints for an already verified policy revision.
     /// This is bootstrap input, never evidence that an endpoint is online.
     pub fn authorized_endpoints(
@@ -120,10 +181,20 @@ impl RoutingTable {
             .workspaces
             .get(&workspace)
             .ok_or(Error::UnknownWorkspace)?;
-        if state.revision != revision {
-            return Err(Error::WrongPolicyRevision);
-        }
-        Ok(state.endpoint_permissions.keys().copied().collect())
+        Ok(state
+            .policy(revision)?
+            .endpoints()
+            .map(|(peer, _)| *peer)
+            .collect())
+    }
+
+    /// Every endpoint the current policy of any workspace names. A connection
+    /// from any other endpoint carries no workspace authority at all.
+    pub fn endpoints(&self) -> BTreeSet<PeerId> {
+        self.workspaces
+            .values()
+            .flat_map(|state| state.endpoint_permissions.keys().copied())
+            .collect()
     }
 
     /// Check an authenticated transport endpoint against the current policy.
@@ -137,10 +208,7 @@ impl RoutingTable {
             .workspaces
             .get(&workspace)
             .ok_or(Error::UnknownWorkspace)?;
-        if state.revision != revision {
-            return Err(Error::WrongPolicyRevision);
-        }
-        if state.endpoint_permissions.contains_key(&peer) {
+        if state.policy(revision)?.contains(&peer) {
             Ok(())
         } else {
             Err(Error::Denied)
@@ -159,25 +227,20 @@ impl RoutingTable {
             .workspaces
             .get(&workspace)
             .ok_or(Error::UnknownWorkspace)?;
-        if state.revision != revision {
-            return Err(Error::WrongPolicyRevision);
-        }
-        if !state
-            .endpoint_permissions
-            .get(&subscriber)
-            .is_some_and(|access| access.can_subscribe(topic))
-        {
+        let policy = state.policy(revision)?;
+        if !policy.allows(&subscriber, |access| access.can_subscribe(topic)) {
             return Err(Error::Denied);
         }
-        Ok(state
-            .endpoint_permissions
-            .iter()
-            .filter_map(|(peer, access)| access.can_publish(topic).then_some(*peer))
+        Ok(policy
+            .endpoints()
+            .filter(|(peer, _)| policy.allows(peer, |access| access.can_publish(topic)))
+            .map(|(peer, _)| *peer)
             .collect())
     }
 
     /// Atomically install an externally verified policy snapshot. Revisions must
-    /// increase strictly. Revocation also removes now-unauthorized interests.
+    /// increase strictly. The replaced revision stays usable for one step, only
+    /// where both revisions grant. Revocation also removes now-unauthorized interests.
     /// The caller must persist accepted revisions to prevent rollback on restart.
     /// This revision describes authorization, not a cryptographic epoch. The map
     /// is an endpoint permission projection, not the workspace member registry.
@@ -201,10 +264,15 @@ impl RoutingTable {
         {
             return Err(Error::WrongPolicyRevision);
         }
-        let mut subscriptions = self
+        let (mut subscriptions, previous) = self
             .workspaces
             .remove(&workspace)
-            .map(|old| old.subscriptions)
+            .map(|old| {
+                (
+                    old.subscriptions,
+                    Some((old.revision, old.endpoint_permissions)),
+                )
+            })
             .unwrap_or_default();
         subscriptions.retain(|peer, topics| {
             if let Some(access) = endpoint_permissions.get(peer) {
@@ -220,6 +288,7 @@ impl RoutingTable {
                 revision,
                 endpoint_permissions,
                 subscriptions,
+                previous,
             },
         );
         Ok(())
@@ -236,13 +305,9 @@ impl RoutingTable {
             .workspaces
             .get_mut(&workspace)
             .ok_or(Error::UnknownWorkspace)?;
-        if state.revision != revision {
-            return Err(Error::WrongPolicyRevision);
-        }
         if !state
-            .endpoint_permissions
-            .get(&peer)
-            .is_some_and(|access| access.can_subscribe(&topic))
+            .policy(revision)?
+            .allows(&peer, |access| access.can_subscribe(&topic))
         {
             return Err(Error::Denied);
         }
@@ -265,10 +330,7 @@ impl RoutingTable {
             .workspaces
             .get_mut(&workspace)
             .ok_or(Error::UnknownWorkspace)?;
-        if state.revision != revision {
-            return Err(Error::WrongPolicyRevision);
-        }
-        if !state.endpoint_permissions.contains_key(&peer) {
+        if !state.policy(revision)?.contains(&peer) {
             return Err(Error::Denied);
         }
         if let Some(topics) = state.subscriptions.get_mut(&peer) {
@@ -292,13 +354,9 @@ impl RoutingTable {
             .workspaces
             .get(&workspace)
             .ok_or(Error::UnknownWorkspace)?;
-        if state.revision != revision {
-            return Err(Error::WrongPolicyRevision);
-        }
         if !state
-            .endpoint_permissions
-            .get(&peer)
-            .is_some_and(|access| access.can_subscribe(topic))
+            .policy(revision)?
+            .allows(&peer, |access| access.can_subscribe(topic))
         {
             return Err(Error::Denied);
         }
@@ -322,13 +380,9 @@ impl RoutingTable {
             .workspaces
             .get(&workspace)
             .ok_or(Error::UnknownWorkspace)?;
-        if state.revision != revision {
-            return Err(Error::WrongPolicyRevision);
-        }
         if !state
-            .endpoint_permissions
-            .get(&sender)
-            .is_some_and(|access| access.can_publish(topic))
+            .policy(revision)?
+            .allows(&sender, |access| access.can_publish(topic))
         {
             return Err(Error::Denied);
         }
@@ -354,28 +408,20 @@ impl RoutingTable {
             .workspaces
             .get(&workspace)
             .ok_or(Error::UnknownWorkspace)?;
-        if state.revision != revision {
-            return Err(Error::WrongPolicyRevision);
-        }
+        let policy = state.policy(revision)?;
         if recipients.is_empty()
             || recipients.len() > MAX_ENDPOINTS
             || recipients.windows(2).any(|pair| pair[0] >= pair[1])
         {
             return Err(Error::Denied);
         }
-        if !state
-            .endpoint_permissions
-            .get(&sender)
-            .is_some_and(|access| access.can_publish(topic))
-        {
+        if !policy.allows(&sender, |access| access.can_publish(topic)) {
             return Err(Error::Denied);
         }
-        if recipients.iter().any(|peer| {
-            !state
-                .endpoint_permissions
-                .get(peer)
-                .is_some_and(|access| access.can_subscribe(topic))
-        }) {
+        if recipients
+            .iter()
+            .any(|peer| !policy.allows(peer, |access| access.can_subscribe(topic)))
+        {
             return Err(Error::Denied);
         }
         Ok(recipients
@@ -389,6 +435,13 @@ impl RoutingTable {
             })
             .collect())
     }
+}
+
+#[test]
+fn topic_namespace_is_the_first_segment() {
+    assert_eq!(Topic::new("chat/room/1").unwrap().namespace(), "chat");
+    assert_eq!(Topic::new("atak").unwrap().namespace(), "atak");
+    assert_eq!(Topic::new("a.b-c/d").unwrap().namespace(), "a.b-c");
 }
 
 #[test]
@@ -473,4 +526,20 @@ fn all_member_access_still_requires_bounded_explicit_interests() {
             .is_empty()
     );
     assert!(table.subscribe(workspace, 2, [2; 32], topic).is_err());
+}
+
+/// A caller re-checking a result it holds locally must compare against the
+/// revision it installed, not the one-behind window kept for peers' frames.
+#[test]
+fn installed_revision_is_the_current_one_not_the_window() {
+    let mut table = RoutingTable::default();
+    let workspace = [1; 32];
+    assert_eq!(table.installed_revision(workspace), None);
+    let policy = BTreeMap::from([([1; 32], Permissions::AllTopics)]);
+    table
+        .install_verified_policy(workspace, 18, policy.clone())
+        .unwrap();
+    table.install_verified_policy(workspace, 19, policy).unwrap();
+    assert!(table.authorizes_endpoint(workspace, 18, [1; 32]).is_ok());
+    assert_eq!(table.installed_revision(workspace), Some(19));
 }

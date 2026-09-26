@@ -47,7 +47,9 @@ silently persist application state on the host’s behalf.
 ## Status
 
 Pre-release software under active development. APIs and persisted formats may
-change. All eight crates have an initial release on crates.io.
+change. The six Arachne crates and the two Iroh forks have an initial release on
+crates.io; the `arachne-bao-tree` and `arachne-iroh-tor-transport` forks are
+not yet published.
 Direct, local, and selected relay paths have Rust test coverage, but that is not
 a guarantee of reachability or capacity on every network or deployment.
 
@@ -57,12 +59,14 @@ Install Rust 1.98.0, then run from the repository root:
 
 ```sh
 cargo +1.98.0 check --locked --workspace
-cargo +1.98.0 test --locked --workspace -- --test-threads=1
+cargo +1.98.0 test --locked --workspace --exclude arachne-runtime -- --test-threads=1
+cargo +1.98.0 test --locked -p arachne-runtime
 ```
 
-Tests run serially because some runtime tests share a process-wide session-
-capacity limit. These commands build the portable Rust workspace; they do not
-require Android, ATAK, or a device.
+The lower crates run their tests serially. Runtime tests own their sessions
+through a `Context`, so they run with the default thread count. These
+commands build the portable Rust workspace; they do not require Android, ATAK,
+or a device.
 
 ## Documentation
 

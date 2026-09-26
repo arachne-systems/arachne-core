@@ -7,6 +7,11 @@ fn call(handle: i64, request: Value) -> Value {
         .unwrap()
 }
 
+// +1 throughout this file: registering the invitation below now costs an
+// epoch, so the workspace settles at epoch 3 (not 2) once the receiver
+// joins. All "revision" literals that must match the current epoch shift by
+// the same +1.
+
 #[test]
 fn recipient_publication_survives_receiver_restart_with_object_delivery_enabled() {
     let sender = create(Some(&[81; 32])).unwrap();
@@ -16,7 +21,12 @@ fn recipient_publication_survives_receiver_restart_with_object_delivery_enabled(
         sender,
         json!({"op":"create_workspace","display_name":"Publisher"}),
     );
-    let invite = call(sender, json!({"op":"issue_invitation"}));
+    let staged = call(sender, json!({"op":"stage_invitation","personal":false,"expires_at":0}));
+    let invite = call(
+        sender,
+        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+    )["issued_invitation"]
+        .clone();
     let pending = call(
         receiver,
         json!({"op":"begin_join","invitation":invite["invitation"],
@@ -46,14 +56,9 @@ fn recipient_publication_survives_receiver_restart_with_object_delivery_enabled(
         json!({"op":"adopt_join","snapshot":staged["snapshot"]}),
     );
     for handle in [sender, receiver] {
-        let staged = call(handle, json!({"op":"enable_object_delivery"}));
         call(
             handle,
-            json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
-        );
-        call(
-            handle,
-            json!({"op":"install_workspace_policy","revision":2}),
+            json!({"op":"install_workspace_policy","revision":3}),
         );
     }
     let info: Value = serde_json::from_str(&describe(receiver).unwrap()).unwrap();
@@ -68,7 +73,7 @@ fn recipient_publication_survives_receiver_restart_with_object_delivery_enabled(
     assert_eq!(initial_metrics["pending_objects"], 0);
     let refused = call(
         sender,
-        json!({"op":"stage_network_publication","revision":2,
+        json!({"op":"stage_network_publication","revision":3,
         "topic":"streams/opaque","id":vec![0;16],"payload":[9],"recipients":recipients}),
     );
     let refused = call(
@@ -94,12 +99,12 @@ fn recipient_publication_survives_receiver_restart_with_object_delivery_enabled(
     let subscribed = call(
         receiver,
         json!({"op":"subscribe","workspace":workspace["workspace"],
-        "revision":2,"topic":"streams/opaque"}),
+        "revision":3,"topic":"streams/opaque"}),
     );
     assert_eq!(subscribed["failed"], json!([]));
     let staged = call(
         sender,
-        json!({"op":"stage_network_publication","revision":2,
+        json!({"op":"stage_network_publication","revision":3,
         "topic":"streams/opaque","id":vec![1;16],"payload":[0,255,42],"recipients":recipients}),
     );
     let sent = call(
@@ -162,7 +167,7 @@ fn recipient_publication_survives_receiver_restart_with_object_delivery_enabled(
     );
     call(
         receiver,
-        json!({"op":"install_workspace_policy","revision":2}),
+        json!({"op":"install_workspace_policy","revision":3}),
     );
     assert!(call(receiver, json!({"op":"poll_pending_object"})).is_null());
     let gap = call(receiver, json!({"op":"next_direct_gap"}));
@@ -217,7 +222,7 @@ fn recipient_publication_survives_receiver_restart_with_object_delivery_enabled(
     // Recipient publications must not enter or advance group recovery history.
     let staged = call(
         sender,
-        json!({"op":"stage_network_publication","revision":2,
+        json!({"op":"stage_network_publication","revision":3,
         "topic":"streams/opaque","id":vec![2;16],"payload":[7]}),
     );
     let published = call(

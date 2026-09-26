@@ -8,11 +8,9 @@ use arachne_runtime::{
 use arachne_security::{Invitation, PendingJoin};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
-use std::sync::{Mutex, mpsc};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-
-static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn call(handle: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
@@ -28,13 +26,14 @@ fn bytes(value: &Value) -> Vec<u8> {
         .collect()
 }
 
-fn admission_packet(request: &[u8], name: &str, checkpoint: &[u8]) -> Vec<u8> {
-    let mut packet = b"DFJA\x02".to_vec();
+/// `DFJA\x03`: the checkpoint is not sent; the owner resolves it from the
+/// digest the request's grant pins (B3a).
+fn admission_packet(request: &[u8], name: &str, _checkpoint: &[u8]) -> Vec<u8> {
+    let mut packet = b"DFJA\x03".to_vec();
     packet.extend((request.len() as u32).to_be_bytes());
     packet.extend((name.len() as u16).to_be_bytes());
     packet.extend(request);
     packet.extend(name.as_bytes());
-    packet.extend(checkpoint);
     packet
 }
 
@@ -133,12 +132,12 @@ fn joiner(owner: &Owner, seed_index: u64) -> (mpsc::Sender<()>, mpsc::Receiver<V
                 .unwrap();
             let invitation = Invitation::from_bytes(&invitation).unwrap();
             let pending =
-                PendingJoin::from_invitation(&invitation, &checkpoint, node.id(), "Joiner").unwrap();
+                PendingJoin::from_invitation(&invitation, &checkpoint, &node, "Joiner").unwrap();
             let packet = admission_packet(pending.admission_request().unwrap(), "Joiner", &checkpoint);
             node.add_address_hint(peer, address).await.unwrap();
             while asked.recv().is_ok() {
                 let reply = node.request_control(peer, &packet).await.unwrap();
-                replied.send(serde_json::from_slice(&reply).unwrap()).unwrap();
+                replied.send(arachne_runtime::harness::decode_admission_reply(&reply).unwrap()).unwrap();
             }
         })
     });
@@ -147,7 +146,6 @@ fn joiner(owner: &Owner, seed_index: u64) -> (mpsc::Sender<()>, mpsc::Receiver<V
 
 #[test]
 fn a_retained_result_is_answered_while_the_host_never_polls() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let owner = owner(61);
     let (go, replies) = joiner(&owner, 6100);
 
@@ -159,7 +157,7 @@ fn a_retained_result_is_answered_while_the_host_never_polls() {
         admitted.is_some()
     }));
     let admitted: Value = admitted.unwrap();
-    assert!(admitted["commit"].is_array(), "{admitted}");
+    assert!(admitted["commits"].is_array(), "{admitted}");
     let before = inquiries(owner.handle);
 
     // Second ask: the result is retained, so this is an inquiry. From here on
@@ -168,7 +166,7 @@ fn a_retained_result_is_answered_while_the_host_never_polls() {
     let again = replies
         .recv_timeout(Duration::from_secs(5))
         .expect("no answer without a host poll");
-    assert_eq!(again["commit"], admitted["commit"]);
+    assert_eq!(again["commits"], admitted["commits"]);
     assert_eq!(again["welcome"], admitted["welcome"]);
     assert_eq!(inquiries(owner.handle), before + 1);
     close(owner.handle).unwrap();
@@ -176,7 +174,6 @@ fn a_retained_result_is_answered_while_the_host_never_polls() {
 
 #[test]
 fn a_new_join_request_is_a_change_and_goes_to_the_host() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let owner = owner(62);
     let (go, replies) = joiner(&owner, 6200);
     go.send(()).unwrap();
@@ -192,14 +189,13 @@ fn a_new_join_request_is_a_change_and_goes_to_the_host() {
         reply.is_some()
     }));
     assert!(intake, "the host never saw the join request");
-    assert!(reply.unwrap()["commit"].is_array());
+    assert!(reply.unwrap()["commits"].is_array());
     assert_eq!(inquiries(owner.handle), 0, "a membership change was answered as an inquiry");
     close(owner.handle).unwrap();
 }
 
 #[test]
 fn an_invitation_checkpoint_is_answered_while_the_host_never_polls() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let owner = owner(63);
     let late = create(Some(&[64; 32])).unwrap();
     call(
@@ -232,7 +228,6 @@ fn an_invitation_checkpoint_is_answered_while_the_host_never_polls() {
 #[ignore]
 fn bench_inquiries_under_a_paced_host() {
     const JOINERS: u64 = 32;
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let owner = owner(65);
     let joiners: Vec<_> = (0..JOINERS).map(|index| joiner(&owner, 6500 + index)).collect();
     for (go, _) in &joiners {
@@ -279,7 +274,14 @@ fn bench_inquiries_under_a_paced_host() {
 /// Admit `joiner` to `admin`'s workspace in-process (no network), as the
 /// management tests do.
 fn add_member(admin: i64, joiner: i64, name: &str) {
-    let invite = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let staged = call(
+        admin,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    )
+    .unwrap();
+    let invite = call(admin, json!({"op":"adopt_admission","snapshot":staged["snapshot"]}))
+        .unwrap()["issued_invitation"]
+        .clone();
     let begin = call(
         joiner,
         json!({"op":"begin_join","invitation":invite["invitation"],"checkpoint":invite["checkpoint"],"display_name":name}),
@@ -303,7 +305,6 @@ fn add_member(admin: i64, joiner: i64, name: &str) {
 
 #[test]
 fn a_membership_query_is_answered_while_the_host_never_polls() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = create(Some(&[66; 32])).unwrap();
     call(admin, json!({"op":"create_workspace","display_name":"Owner"})).unwrap();
     let member = create(Some(&[67; 32])).unwrap();

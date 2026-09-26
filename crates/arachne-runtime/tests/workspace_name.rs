@@ -2,21 +2,30 @@ use arachne_runtime::{
     close, create, describe, enable_record_storage, execute, execute_stored, save_candidate,
 };
 use serde_json::{Value, json};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 mod common;
-
-static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn call(handle: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
         .map_err(|e| e.to_string())
 }
+fn issue_invitation(handle: i64) -> Value {
+    let staged = call(
+        handle,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    )
+    .unwrap();
+    call(
+        handle,
+        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+    )
+    .unwrap()["issued_invitation"]
+        .clone()
+}
 
 #[test]
 fn creator_name_is_authenticated_in_invitation_without_creating_join_state() {
-    let _nodes = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = create(Some(&[171; 32])).unwrap();
     let invitee = create(Some(&[172; 32])).unwrap();
     let created = call(
@@ -26,7 +35,7 @@ fn creator_name_is_authenticated_in_invitation_without_creating_join_state() {
     )
     .expect("creation must accept the creator workspace name");
     assert_eq!(created["workspace_name"], "Storm Assessment");
-    let invitation = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let invitation = issue_invitation(admin);
     let inspected = call(
         invitee,
         json!({"op":"inspect_invitation",
@@ -64,7 +73,6 @@ fn bytes(value: &Value) -> Vec<u8> {
 
 #[test]
 fn rename_preserves_legacy_and_native_pending_delivery_across_interruption() {
-    let _nodes = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     use arachne_delivery::{
         PublisherLog,
         inbox::{InboxStage, ObjectInbox},
@@ -75,12 +83,24 @@ fn rename_preserves_legacy_and_native_pending_delivery_across_interruption() {
     let root = [173; 32];
     let mut handle = create(Some(&root)).unwrap();
     let endpoint: [u8; 32] = serde_json::from_value(serde_json::from_str::<Value>(&arachne_runtime::describe(handle).unwrap()).unwrap()["endpoint_key"].clone()).unwrap();
-    let creator = Workspace::create_named(endpoint, "Alex", Some("Storm Assessment")).unwrap();
-    let (invitation, checkpoint) = creator.issue_invitation().unwrap();
+    let _ = endpoint;
+    let secret = iroh::SecretKey::from_bytes(&root);
+    let mut creator = Workspace::create_named(
+        &arachne_node::IrohEndpointSigner(&secret),
+        "Alex",
+        Some("Storm Assessment"),
+    )
+    .unwrap();
+    let (registered, invitation, checkpoint) = creator.prepare_invitation(0, false, false).unwrap();
+    creator = registered.workspace;
+    let jordan_key = arachne_security::EndpointKey::generate().unwrap();
     let pending =
-        PendingJoin::from_invitation(&invitation, &checkpoint, [174; 32], "Jordan").unwrap();
+        PendingJoin::from_invitation(&invitation, &checkpoint, &jordan_key, "Jordan").unwrap();
     let add = creator
-        .prepare_admission([174; 32], pending.admission_request().unwrap())
+        .prepare_admission(
+            arachne_security::EndpointSigner::endpoint(&jordan_key),
+            pending.admission_request().unwrap(),
+        )
         .unwrap();
     let mut proof = pending.join_proof().unwrap();
     proof.apply_add(&add.authorization, &add.commit).unwrap();
@@ -94,18 +114,25 @@ fn rename_preserves_legacy_and_native_pending_delivery_across_interruption() {
         id: [1; 16],
         sequence: std::num::NonZeroU64::new(1),
     };
-    let mut publisher =
-        PublisherLog::new(workspace, creator.member().unwrap().id(), creator.epoch());
+    let mut publisher = PublisherLog::new(&creator).unwrap();
     publisher
         .append(
             context.clone(),
             creator
-                .protect_object(&context.authenticated_bytes(), b"Retained outbound chat")
+                .protect_object(
+                    context.topic.namespace().as_bytes(),
+                    &context.authenticated_bytes(),
+                    b"Retained outbound chat",
+                )
                 .unwrap(),
         )
         .unwrap();
     let packet = member
-        .protect_object(&context.authenticated_bytes(), b"Unread incoming chat")
+        .protect_object(
+            context.topic.namespace().as_bytes(),
+            &context.authenticated_bytes(),
+            b"Unread incoming chat",
+        )
         .unwrap();
     let InboxStage::Prepared(inbox) = ObjectInbox::new(workspace, creator.epoch())
         .stage(&creator, &context, &packet)
@@ -250,7 +277,6 @@ fn poll_reply(responder: i64, receiver: i64) -> Value {
 
 #[test]
 fn existing_control_poll_pages_names_and_discards_reply_for_old_name_head() {
-    let _nodes = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = create(Some(&[175; 32])).unwrap();
     let mut member = create(Some(&[176; 32])).unwrap();
     let created = call(
@@ -258,7 +284,7 @@ fn existing_control_poll_pages_names_and_discards_reply_for_old_name_head() {
         json!({"op":"create_workspace","display_name":"Alex","workspace_name":"Storm Assessment"}),
     )
     .unwrap();
-    let invite = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let invite = issue_invitation(admin);
     let identity = join(admin, member, &invite);
     assert!(
         call(
@@ -296,7 +322,7 @@ fn existing_control_poll_pages_names_and_discards_reply_for_old_name_head() {
             json!({"op":"adopt_admission","snapshot":change["snapshot"]}),
         )
         .unwrap();
-        assert_eq!(adopted["epoch"], 2);
+        assert_eq!(adopted["epoch"], 3); // Registration and admission come first.
     }
     member = create(Some(&[176; 32])).unwrap();
     call(member, json!({"op":"restore_workspace","workspace":created["workspace"],"snapshot":saved["snapshot"]})).unwrap();
@@ -320,7 +346,7 @@ fn existing_control_poll_pages_names_and_discards_reply_for_old_name_head() {
         )
         .unwrap();
         assert_eq!(adopted["workspace_name"], expected);
-        assert_eq!(adopted["epoch"], 2);
+        assert_eq!(adopted["epoch"], 3); // Registration and admission come first.
     }
     call(
         member,
@@ -351,7 +377,6 @@ fn existing_control_poll_pages_names_and_discards_reply_for_old_name_head() {
 
 #[test]
 fn rust_workspace_driver_converges_same_epoch_name_from_presence() {
-    let _nodes = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = create(Some(&[179; 32])).unwrap();
     let member = create(Some(&[180; 32])).unwrap();
     call(
@@ -359,7 +384,7 @@ fn rust_workspace_driver_converges_same_epoch_name_from_presence() {
         json!({"op":"create_workspace", "display_name":"Alex", "workspace_name":"Storm Assessment"}),
     )
     .unwrap();
-    let invite = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let invite = issue_invitation(admin);
     let identity = join(admin, member, &invite);
     let admin_info: Value = serde_json::from_str(&describe(admin).unwrap()).unwrap();
     let member_info: Value = serde_json::from_str(&describe(member).unwrap()).unwrap();
@@ -393,6 +418,18 @@ fn rust_workspace_driver_converges_same_epoch_name_from_presence() {
         json!({"op":"add_address_hint","peer":admin_info["endpoint_key"],"address":loopback(&admin_info)}),
     )
     .unwrap();
+    // The new member's Rust driver self-updates through the administrator
+    // first (B3c policy); the rename below then lands at the same epoch.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        call(admin, json!({"op":"drive_workspace"})).unwrap();
+        let value = call(member, json!({"op":"drive_workspace"})).unwrap();
+        if value["state"] == "self_update_committed" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no self-update: {value}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     // Consume the initial announcement so the rename below must trigger its
     // own native presence packet.
     call(
@@ -423,7 +460,10 @@ fn rust_workspace_driver_converges_same_epoch_name_from_presence() {
     let committed = loop {
         call(member, json!({"op":"poll_admission"})).unwrap();
         call(admin, json!({"op":"poll_workspace_presence"})).unwrap();
-        call(admin, json!({"op":"poll_admission"})).unwrap();
+        // The admin's Rust driver, like a host: it saves and adopts what it
+        // stages (for example the member's own self-update, B3c).
+        let tick = call(admin, json!({"op":"drive_workspace"})).unwrap();
+        let _ = tick;
         let value = call(member, json!({"op":"drive_workspace"})).unwrap();
         if value["state"] == "workspace_name_committed" {
             break value;
@@ -445,7 +485,6 @@ fn rust_workspace_driver_converges_same_epoch_name_from_presence() {
 
 #[test]
 fn rust_workspace_driver_reports_a_stale_name_peer_without_overwriting_local() {
-    let _nodes = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = create(Some(&[181; 32])).unwrap();
     let member = create(Some(&[182; 32])).unwrap();
     call(
@@ -453,7 +492,7 @@ fn rust_workspace_driver_reports_a_stale_name_peer_without_overwriting_local() {
         json!({"op":"create_workspace", "display_name":"Alex", "workspace_name":"Original"}),
     )
     .unwrap();
-    let invite = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let invite = issue_invitation(admin);
     let identity = join(admin, member, &invite);
     let member_info: Value = serde_json::from_str(&describe(member).unwrap()).unwrap();
     call(
@@ -493,7 +532,6 @@ fn rust_workspace_driver_reports_a_stale_name_peer_without_overwriting_local() {
 
 #[test]
 fn rust_workspace_driver_reports_equal_revision_name_conflict_without_overwriting_local() {
-    let _nodes = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = create(Some(&[183; 32])).unwrap();
     let member = create(Some(&[184; 32])).unwrap();
     call(
@@ -501,7 +539,7 @@ fn rust_workspace_driver_reports_equal_revision_name_conflict_without_overwritin
         json!({"op":"create_workspace", "display_name":"Alex", "workspace_name":"Original"}),
     )
     .unwrap();
-    let invite = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let invite = issue_invitation(admin);
     let identity = join(admin, member, &invite);
     let promotion = call(
         admin,
@@ -569,7 +607,6 @@ fn rust_workspace_driver_reports_equal_revision_name_conflict_without_overwritin
 
 #[test]
 fn iroh_name_checkpoint_recovers_after_renaming_admin_is_demoted() {
-    let _nodes = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let admin = create(Some(&[177; 32])).unwrap();
     let mut member = create(Some(&[178; 32])).unwrap();
     let created = call(
@@ -577,7 +614,7 @@ fn iroh_name_checkpoint_recovers_after_renaming_admin_is_demoted() {
         json!({"op":"create_workspace","display_name":"Alex","workspace_name":"Storm Assessment"}),
     )
     .unwrap();
-    let invite = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let invite = issue_invitation(admin);
     let identity = join(admin, member, &invite);
     let member_node = call(member, json!({"op":"endpoint_info"})).unwrap();
     call(
@@ -698,7 +735,7 @@ fn iroh_name_checkpoint_recovers_after_renaming_admin_is_demoted() {
     .unwrap();
     assert_eq!(adopted["workspace_name"], "Valley Recovery");
     assert_eq!(adopted["workspace_name_missing_history"], 1);
-    assert_eq!(adopted["epoch"], 3);
+    assert_eq!(adopted["epoch"], 4); // One more for the link registration.
     close(member).unwrap();
     member = create(Some(&[178; 32])).unwrap();
     let restored = call(

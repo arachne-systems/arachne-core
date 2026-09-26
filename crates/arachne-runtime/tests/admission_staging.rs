@@ -47,12 +47,10 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
-
-static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn call(handle: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
@@ -72,13 +70,14 @@ fn endpoint(value: &Value) -> [u8; 32] {
     bytes(value).try_into().unwrap()
 }
 
-fn admission_packet(request: &[u8], name: &str, checkpoint: &[u8]) -> Vec<u8> {
-    let mut packet = b"DFJA\x02".to_vec();
+/// `DFJA\x03`: the checkpoint is not sent; the owner resolves it from the
+/// digest the request's grant pins (B3a).
+fn admission_packet(request: &[u8], name: &str, _checkpoint: &[u8]) -> Vec<u8> {
+    let mut packet = b"DFJA\x03".to_vec();
     packet.extend((request.len() as u32).to_be_bytes());
     packet.extend((name.len() as u16).to_be_bytes());
     packet.extend(request);
     packet.extend(name.as_bytes());
-    packet.extend(checkpoint);
     packet
 }
 
@@ -176,7 +175,8 @@ async fn bind_joiner(seed_index: u64, invitation: &Invitation, checkpoint: &[u8]
         .unwrap();
     let node = Arc::new(node);
     let peer = node.id();
-    let pending = PendingJoin::from_invitation(invitation, checkpoint, peer, "Staging member")
+    let _ = peer;
+    let pending = PendingJoin::from_invitation(invitation, checkpoint, &*node, "Staging member")
         .unwrap();
     let packet = admission_packet(
         pending.admission_request().unwrap(),
@@ -188,7 +188,6 @@ async fn bind_joiner(seed_index: u64, invitation: &Invitation, checkpoint: &[u8]
 
 #[test]
 fn admission_batch_staging_keeps_committing_under_continuous_intake() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     const PRIORITY: usize = 64;
     // FUT-30's own field behavior: joiners retry every 0.5-5s. 500ms is the
     // fast end of that real range. The owner's poll loop below is paced to
@@ -302,14 +301,14 @@ fn admission_batch_staging_keeps_committing_under_continuous_intake() {
                         let Ok(reply) = node.request_control(owner_peer, &packet).await else {
                             continue;
                         };
-                        let value: Value = serde_json::from_slice(&reply).unwrap();
+                        let value: Value = arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
                         // A retry here (after a lost/timed-out reply to a
                         // send that the owner actually processed) can land
                         // after the request was already staged and
                         // retained -- that is also success, just observed
                         // late, not a failure.
                         assert!(
-                            value["state"] == "admission_queued" || value["commit"].is_array(),
+                            value["state"] == "admission_queued" || value["commits"].is_array(),
                             "unexpected initial admission reply: {value}"
                         );
                         return;
@@ -339,7 +338,7 @@ fn admission_batch_staging_keeps_committing_under_continuous_intake() {
                         else {
                             continue;
                         };
-                        let value: Value = serde_json::from_slice(&reply).unwrap();
+                        let value: Value = arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
                         if value["state"] != "admission_queued" {
                             // Retained: nothing further to do for this joiner.
                             return;

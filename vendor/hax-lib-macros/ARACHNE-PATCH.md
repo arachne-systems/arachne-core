@@ -17,9 +17,12 @@ Backport the macro-package portion of genuine upstream removal commit
 https://github.com/cryspen/hax/commit/8f9cb576e58f6cc7e9ed249a7d4439b0f7ed0da7 :
 
 - Remove `proc-macro-error2` from the normalized manifest's `cfg(hax)` dependencies.
-- `src/implementation.rs` exactly matches that commit: ordinary `syn::Error`
+- `src/implementation.rs` matches that commit: ordinary `syn::Error`
   compile errors replace abort wrappers, using the already-present `syn`.
   The non-hax implementation and all crypto/proof algorithms are unchanged.
+  The file also has a comment header at the top. This header is the
+  notice of modification that Apache-2.0 section 4(b) requires. The header is
+  the only difference from the upstream commit.
 - Add `tests/check-diagnostics.py` to exercise actual rustc diagnostics and
   successful expansion from the built `cfg(hax)` macro library.
 
@@ -28,6 +31,20 @@ Upstream's whole-commit patch SHA-256:
 No cfg branch is removed or disabled. Upgrading this package alone to 0.4 would
 not satisfy the parent's exact 0.3.7 dependency; retire this backport with a
 compatible upstream parent upgrade.
+
+## Reach: workspace only
+
+This package is applied through the root `[patch.crates-io]`. Cargo ignores
+`[patch]` in dependencies, so downstream consumers get the unpatched registry
+package unless they copy the patch entry. A renamed fork cannot help: the parent
+chain is third-party (`openmls_rust_crypto` -> `hpke-rs` -> `libcrux-*` ->
+`hax-lib` -> `hax-lib-macros`, with an exact `=0.3.7` requirement).
+
+The patch is not needed for correctness. Upstream declares `proc-macro-error2`
+only under `[target."cfg(hax)".dependencies]`. Normal builds do not set
+`cfg(hax)`, so that crate is never compiled; it only appears in `Cargo.lock`.
+The only advisory this patch removes from `cargo deny check advisories` is
+the "unmaintained" advisory RUSTSEC-2026-0173, not a vulnerability.
 
 Build the macro with its existing nightly requirement and `RUSTFLAGS='--cfg hax'`,
 then run `python3 tests/check-diagnostics.py PATH_TO_LIBHAX_LIB_MACROS.so RUSTC`.

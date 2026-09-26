@@ -18,6 +18,33 @@ fn poll(h: i64, op: &str) -> Value {
 fn step(reply: &Value) -> Value {
     json!({"commit":reply["commit"],"authorization":reply["authorization"]})
 }
+/// An admission reply's step in the binary step codec.
+fn binary_step(reply: &Value) -> Vec<u8> {
+    let bytes = |value: &Value| serde_json::from_value::<Vec<u8>>(value.clone()).unwrap();
+    let auth = &reply["authorization"];
+    arachne_security::encode_membership_step(
+        &arachne_security::MembershipAuthorization::Admission(
+            arachne_security::AdmissionAuthorization {
+                invitation_key: bytes(&auth["invitation_key"]).try_into().unwrap(),
+                grant_signature: bytes(&auth["grant_signature"]).try_into().unwrap(),
+                redemption_signature: bytes(&auth["redemption_signature"]).try_into().unwrap(),
+            },
+        ),
+        &bytes(&reply["commit"]),
+    )
+    .unwrap()
+}
+fn issue(admin: i64) -> Value {
+    let staged = call(
+        admin,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    );
+    call(
+        admin,
+        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+    )["issued_invitation"]
+        .clone()
+}
 fn add(owner: i64, joiner: i64, invite: &Value, prior: Vec<Value>, name: &str) -> Value {
     let begin = call(
         joiner,
@@ -56,11 +83,44 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
         admin,
         json!({"op":"create_workspace","display_name":"Admin"}),
     );
-    let invite = call(admin, json!({"op":"issue_invitation"}));
+    let invite = issue(admin);
     let first = add(admin, helper, &invite, vec![], "Helper");
+    // Only administrators admit (ADR A2): the helper admits while the admin
+    // is away, so the admin promotes it first and the helper applies that.
+    let roster = call(admin, json!({"op":"member_roster"}));
+    let helper_id = roster["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|member| member["self"] == false)
+        .unwrap()["id"]
+        .clone();
+    let promotion = call(
+        admin,
+        json!({"op":"stage_management","action":{"kind":"promote","member":helper_id}}),
+    );
+    let promoted = call(
+        admin,
+        json!({"op":"adopt_admission","snapshot":promotion["snapshot"]}),
+    );
+    let promote_step = promoted["step"].clone();
+    let applied = call(
+        helper,
+        json!({"op":"stage_admission_update","step":promote_step}),
+    );
+    call(
+        helper,
+        json!({"op":"adopt_admission","snapshot":applied["snapshot"]}),
+    );
     let saved = call(admin, json!({"op":"seal_workspace"}));
     close(admin).unwrap();
-    let second = add(helper, newer, &invite, vec![step(&first)], "New member");
+    let second = add(
+        helper,
+        newer,
+        &invite,
+        vec![step(&first), promote_step],
+        "New member",
+    );
     close(helper).unwrap();
     let admin = create(Some(&[71; 32])).unwrap();
     call(
@@ -88,14 +148,10 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
         "membership_denied"
     );
     // A transport-authenticated outsider's corrupted offer must not mutate membership.
-    let mut altered = step(&second);
-    altered["authorization"]["grant_signature"][0] = json!(
-        altered["authorization"]["grant_signature"][0]
-            .as_u64()
-            .unwrap()
-            ^ 1
-    );
-    let mut packet = b"DFMO\x01".to_vec();
+    let mut altered = binary_step(&second);
+    // Byte 39 is the first grant signature byte of a binary admission step.
+    altered[39] ^= 1;
+    let mut packet = b"DFMO\x02".to_vec();
     packet.extend(
         invite["workspace"]
             .as_array()
@@ -103,8 +159,10 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
             .iter()
             .map(|v| v.as_u64().unwrap() as u8),
     );
-    packet.extend(1u64.to_be_bytes());
-    packet.extend(serde_json::to_vec(&altered).unwrap());
+    // Epoch 3: the link registration, the helper's admission and its
+    // promotion come first.
+    packet.extend(3u64.to_be_bytes());
+    packet.extend(arachne_runtime::harness::wire_step(&altered));
     let peer: [u8; 32] = info["endpoint_key"]
         .as_array()
         .unwrap()
@@ -114,13 +172,13 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
         .try_into()
         .unwrap();
     let mut valid = packet[..45].to_vec();
-    valid.extend(serde_json::to_vec(&step(&second)).unwrap());
+    valid.extend(arachne_runtime::harness::wire_step(&binary_step(&second)));
     let mut wrong_workspace = valid.clone();
     wrong_workspace[5] ^= 1;
     let mut wrong_epoch = valid.clone();
     wrong_epoch[44] = 9;
     let mut wrong_version = valid.clone();
-    wrong_version[4] = 2;
+    wrong_version[4] = 1;
     let packets = vec![
         packet,
         wrong_workspace,
@@ -133,7 +191,7 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
         execute(
             newer,
             &serde_json::to_vec(
-                &json!({"op":"offer_membership_update","peer":([99;32]),"after":1})
+                &json!({"op":"offer_membership_update","peer":([99;32]),"after":3})
             )
             .unwrap()
         )
@@ -160,7 +218,7 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
     outsider.join().unwrap();
     call(
         newer,
-        json!({"op":"offer_membership_update","peer":info["endpoint_key"],"after":1}),
+        json!({"op":"offer_membership_update","peer":info["endpoint_key"],"after":3}),
     );
     let candidate = poll(admin, "poll_admission");
     assert_eq!(candidate["state"], "awaiting_save");
@@ -170,7 +228,7 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
         json!({"op":"adopt_admission","snapshot":candidate["snapshot"]}),
     );
     assert_eq!(saved["members"], 3);
-    assert_eq!(saved["epoch"], 2);
+    assert_eq!(saved["epoch"], 4);
     assert_eq!(
         call(admin, json!({"op":"send_admission_reply"}))["queued"],
         true
@@ -182,7 +240,7 @@ fn newer_member_offers_verified_history_to_returning_admin_without_helper() {
     // Replayed transition receives only a generic rejection, never duplicate membership.
     call(
         newer,
-        json!({"op":"offer_membership_update","peer":info["endpoint_key"],"after":1}),
+        json!({"op":"offer_membership_update","peer":info["endpoint_key"],"after":3}),
     );
     assert_eq!(poll(admin, "poll_admission")["state"], "membership_replied");
     poll(newer, "poll_membership_offer");
@@ -203,7 +261,7 @@ fn group_presence_announces_new_members_and_returning_peers_without_application_
     let b = create(Some(&[102; 32])).unwrap();
     let c = create(Some(&[103; 32])).unwrap();
     call(a, json!({"op":"create_workspace","display_name":"Admin"}));
-    let invite = call(a, json!({"op":"issue_invitation"}));
+    let invite = issue(a);
     let first = add(a, b, &invite, vec![], "Existing member");
     add(a, c, &invite, vec![step(&first)], "New member");
     let info = |h| serde_json::from_str::<Value>(&describe(h).unwrap()).unwrap();
@@ -217,8 +275,8 @@ fn group_presence_announces_new_members_and_returning_peers_without_application_
     assert_eq!(call(b, json!({"op":"member_roster"}))["members"].as_array().unwrap().len(), 2);
     call(a, json!({"op":"poll_workspace_presence","announce":true}));
     assert_eq!(poll(b, "poll_admission")["state"], "presence_replied");
-    // A newer epoch in a presence reply starts the runtime's range pull
-    // (ADR 0009); the host is not asked to sync as well.
+    // A newer epoch in a presence reply starts the runtime's range pull;
+    // the host is not asked to sync as well.
     let observed = call(b, json!({"op":"poll_workspace_presence"}));
     assert!(observed["sync_peer"].is_null(), "{observed}");
     // An authenticated announcement prompts synchronization but never grants membership.

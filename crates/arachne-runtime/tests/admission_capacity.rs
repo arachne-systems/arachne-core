@@ -6,12 +6,10 @@ use arachne_security::{Invitation, PendingJoin};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
-
-static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn call(handle: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
@@ -31,20 +29,20 @@ fn endpoint(value: &Value) -> [u8; 32] {
     bytes(value).try_into().unwrap()
 }
 
-fn admission_packet(request: &[u8], name: &str, checkpoint: &[u8]) -> Vec<u8> {
-    let mut packet = b"DFJA\x02".to_vec();
+/// `DFJA\x03`: the checkpoint is not sent; the owner resolves it from the
+/// digest the request's grant pins (B3a).
+fn admission_packet(request: &[u8], name: &str, _checkpoint: &[u8]) -> Vec<u8> {
+    let mut packet = b"DFJA\x03".to_vec();
     packet.extend((request.len() as u32).to_be_bytes());
     packet.extend((name.len() as u16).to_be_bytes());
     packet.extend(request);
     packet.extend(name.as_bytes());
-    packet.extend(checkpoint);
     packet
 }
 
 #[test]
 #[ignore = "explicit 500-client public runtime capacity run"]
 fn public_runtime_admission_path_handles_500_authenticated_joiners() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     const MEMBERS: usize = 500;
     const RETRIES: usize = 16;
     let started = Instant::now();
@@ -56,7 +54,18 @@ fn public_runtime_admission_path_handles_500_authenticated_joiners() {
     .unwrap();
     let dir = tempfile::tempdir().unwrap();
     enable_record_storage(owner, &dir.path().join("owner.db"), &[17; 32]).unwrap();
-    let invitation = call(owner, json!({"op":"issue_invitation"})).unwrap();
+    let staged = call(
+        owner,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    )
+    .unwrap();
+    save_candidate(owner, &bytes(&staged["snapshot"])).unwrap();
+    let invitation = call(
+        owner,
+        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+    )
+    .unwrap()["issued_invitation"]
+        .clone();
     let invitation_bytes = bytes(&invitation["invitation"]);
     let checkpoint = bytes(&invitation["checkpoint"]);
     let owner_info: Value = serde_json::from_str(&describe(owner).unwrap()).unwrap();
@@ -98,11 +107,10 @@ fn public_runtime_admission_path_handles_500_authenticated_joiners() {
             let packets: Vec<_> = nodes
                 .iter()
                 .map(|node| {
-                    let peer = node.id();
                     let pending = PendingJoin::from_invitation(
                         &invitation,
                         &checkpoint,
-                        peer,
+                        &**node,
                         "Burst member",
                     )
                     .unwrap();
@@ -134,7 +142,7 @@ fn public_runtime_admission_path_handles_500_authenticated_joiners() {
             let mut initial_queued = 0;
             while let Some(result) = first.join_next().await {
                 let reply = result.unwrap().unwrap();
-                let value: Value = serde_json::from_slice(&reply).unwrap();
+                let value: Value = arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
                 assert_eq!(
                     value["state"], "admission_queued",
                     "unexpected admission reply: {value}"
@@ -152,7 +160,7 @@ fn public_runtime_admission_path_handles_500_authenticated_joiners() {
                 retry.spawn(async move {
                     for _ in 0..200 {
                         let reply = node.request_control(owner_peer, &packet).await?;
-                        let state: Value = serde_json::from_slice(&reply).unwrap();
+                        let state: Value = arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
                         if state["state"] != "admission_queued" {
                             return Ok(reply);
                         }
@@ -164,7 +172,7 @@ fn public_runtime_admission_path_handles_500_authenticated_joiners() {
             let mut retained = 0;
             while let Some(result) = retry.join_next().await {
                 let reply = result.unwrap().unwrap();
-                let value: Value = serde_json::from_slice(&reply).unwrap();
+                let value: Value = arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
                 assert!(
                     value["commit"].is_array(),
                     "unexpected retained reply: {value}"

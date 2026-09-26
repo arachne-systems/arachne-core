@@ -7,6 +7,18 @@ fn call(handle: i64, request: Value) -> Value {
         .unwrap()
 }
 
+fn issue_invitation(handle: i64) -> Value {
+    let staged = call(
+        handle,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    );
+    call(
+        handle,
+        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+    )["issued_invitation"]
+        .clone()
+}
+
 fn synchronize(server: i64, client: i64, peer: &Value) -> Value {
     call(client, json!({"op":"fetch_membership_update","peer":peer}));
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -29,7 +41,7 @@ fn unchanged_state_does_not_repeat_profiles_but_restart_recovers_them() {
         admin,
         json!({"op":"create_workspace","display_name":"Coordinator"}),
     );
-    let invite = call(admin, json!({"op":"issue_invitation"}));
+    let invite = issue_invitation(admin);
     let begin = call(
         member,
         json!({"op":"begin_join","invitation":invite["invitation"],

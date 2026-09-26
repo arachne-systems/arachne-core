@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Modified by Arachne Systems; see ARACHNE-PATCH.md.
 
 use std::{
     mem::size_of,

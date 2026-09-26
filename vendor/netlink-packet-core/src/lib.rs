@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Modified by Arachne Systems; see ARACHNE-PATCH.md.
 
 //! `netlink-packet-core` provides a generic netlink message
 //! `NetlinkMessage<T>` that is independant of the sub-protocol. Such

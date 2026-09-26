@@ -5,6 +5,48 @@ use std::{
 };
 
 #[tokio::test]
+async fn accepted_data_raises_work_signal_for_host_polling() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (sender, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let (receiver, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let workspace = [91; 32];
+        let topic = Topic::new("streams/work-signal").unwrap();
+        let policy = BTreeMap::from([
+            (sender.id(), Permissions::AllTopics),
+            (receiver.id(), Permissions::AllTopics),
+        ]);
+        sender
+            .install_verified_policy(workspace, 1, policy.clone())
+            .await
+            .unwrap();
+        receiver
+            .install_verified_policy(workspace, 1, policy)
+            .await
+            .unwrap();
+        sender
+            .add_address_hint(receiver.id(), receiver.address())
+            .await
+            .unwrap();
+        receiver
+            .add_address_hint(sender.id(), sender.address())
+            .await
+            .unwrap();
+        receiver.subscribe(workspace, 1, topic.clone()).await.unwrap();
+        let signal = receiver.control_signal();
+        let notified = signal.notified();
+        let report = sender.publish(workspace, 1, topic, vec![1]).await.unwrap();
+        assert_eq!(report.admitted, vec![receiver.id()]);
+        tokio::time::timeout(Duration::from_secs(1), notified)
+            .await
+            .expect("accepted data must wake the host work loop");
+        receiver.close().await;
+        sender.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn transport_metrics_observe_reused_paths_without_retaining_closed_connections() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let (sender, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
@@ -95,7 +137,7 @@ async fn supplied_identity_survives_rebind_without_restoring_authority() {
 #[tokio::test]
 async fn withheld_ack_reports_stage_without_claiming_admission() {
     tokio::time::timeout(Duration::from_secs(15), async {
-        let alpn = b"data-fabric/pubsub-experiment/1";
+        let alpn = b"arachne/data/1";
         let (node, _messages) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         // Make the stalled peer sort first, so serial fanout cannot pass by luck.
         let mut seeds = [[11; 32], [12; 32]];
@@ -518,20 +560,6 @@ async fn wire_sender_cannot_claim_the_receivers_identity() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let (node, mut messages) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let topic = Topic::new("data").unwrap();
-        node.install_verified_policy(
-            [1; 32],
-            1,
-            BTreeMap::from([(
-                node.id(),
-                Permissions::Selected {
-                    publish: BTreeSet::from([topic.clone()]),
-                    subscribe: BTreeSet::from([topic.clone()]),
-                },
-            )]),
-        )
-        .await
-        .unwrap();
-        node.subscribe([1; 32], 1, topic).await.unwrap();
         let stranger = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
             .clear_ip_transports()
             .bind_addr("127.0.0.1:0")
@@ -539,6 +567,25 @@ async fn wire_sender_cannot_claim_the_receivers_identity() {
             .bind()
             .await
             .unwrap();
+        // A member without topic rights: a key no policy names never gets
+        // past the data handshake at all.
+        node.install_verified_policy(
+            [1; 32],
+            1,
+            BTreeMap::from([
+                (
+                    node.id(),
+                    Permissions::Selected {
+                        publish: BTreeSet::from([topic.clone()]),
+                        subscribe: BTreeSet::from([topic.clone()]),
+                    },
+                ),
+                (*stranger.id().as_bytes(), Permissions::default()),
+            ]),
+        )
+        .await
+        .unwrap();
+        node.subscribe([1; 32], 1, topic).await.unwrap();
         let mut frame = postcard::to_allocvec(&(1_u8, [1_u8;32], 1_u64, "data", DeliveryClass::Critical, 2_u8, &[99_u8][..])).unwrap();
         for spoof_sender in [false, true] {
             if spoof_sender {
@@ -548,7 +595,7 @@ async fn wire_sender_cannot_claim_the_receivers_identity() {
             let conn = stranger
                 .connect(
                     iroh::EndpointAddr::new(peer).with_ip_addr(node.address()),
-                    b"data-fabric/pubsub-experiment/1",
+                    b"arachne/data/1",
                 )
                 .await
                 .unwrap();
@@ -678,13 +725,11 @@ async fn authorized_subscription_learns_return_path_but_rejection_does_not() {
         .add_address_hint(publisher.id(), publisher.address())
         .await
         .unwrap();
+    // The publisher's policy does not name the outsider: refused at the
+    // data handshake.
     let rejected = outsider.subscribe([1; 32], 1, topic.clone()).await.unwrap();
-    assert!(
-        rejected
-            .failed
-            .iter()
-            .any(|(id, error)| *id == publisher.id() && matches!(error, Error::Rejected))
-    );
+    assert!(rejected.failed.iter().any(|(id, _)| *id == publisher.id()));
+    assert!(!rejected.admitted.contains(&publisher.id()));
     // Only the subscriber knows an initial address. The publisher learns its
     // authenticated source path when admitting the subscription.
     subscriber
@@ -744,6 +789,18 @@ async fn stalled_data_connections_do_not_consume_control_capacity() {
         .bind()
         .await
         .unwrap();
+    // A member: a key no policy names is refused at the data handshake.
+    server
+        .install_verified_policy(
+            [1; 32],
+            1,
+            BTreeMap::from([
+                (server.id(), Permissions::AllTopics),
+                (*attacker.id().as_bytes(), Permissions::AllTopics),
+            ]),
+        )
+        .await
+        .unwrap();
     let destination = iroh::EndpointAddr::new(iroh::PublicKey::from_bytes(&server.id()).unwrap())
         .with_ip_addr(server.address());
     let mut stalled = Vec::new();
@@ -751,7 +808,7 @@ async fn stalled_data_connections_do_not_consume_control_capacity() {
     // This is a data-slot attack, not a handshake/CPU flood or membership test.
     for _ in 0..32 {
         let connection = attacker
-            .connect(destination.clone(), b"data-fabric/pubsub-experiment/1")
+            .connect(destination.clone(), b"arachne/data/1")
             .await
             .unwrap();
         let (mut send, recv) = connection.open_bi().await.unwrap();

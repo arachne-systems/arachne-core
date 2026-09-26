@@ -2,7 +2,10 @@
 //! holding the session/journal lock. Peer identity comes from accepted membership.
 use arachne_node::resources::ResourceTicket;
 use serde::Deserialize;
+use arachne_api::{ApiError, ErrorCode};
 use serde_json::{Value, json};
+
+use crate::errors::{self, security};
 use std::{collections::BTreeMap, path::PathBuf};
 use tokio::{sync::watch, task::JoinHandle};
 
@@ -50,7 +53,7 @@ pub(super) struct Jobs {
     jobs: BTreeMap<u64, Job>,
 }
 
-pub(super) fn execute(session: &mut super::Session, request: Request) -> Result<Value, String> {
+pub(super) fn execute(session: &mut super::Session, request: Request) -> Result<Value, ApiError> {
     let resources = session.node.resources();
     match request {
         Request::Poll { id } => {
@@ -58,7 +61,7 @@ pub(super) fn execute(session: &mut super::Session, request: Request) -> Result<
                 .resources
                 .jobs
                 .get(&id)
-                .ok_or("unknown resource operation")?;
+                .ok_or_else(|| ApiError::invalid_input("id", "unknown resource operation"))?;
             if !job.task.is_finished() {
                 return Ok(json!({"state":"running", "bytes":*job.progress.borrow()}));
             }
@@ -66,7 +69,8 @@ pub(super) fn execute(session: &mut super::Session, request: Request) -> Result<
             return session
                 .runtime
                 .block_on(&mut job.task)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| ApiError::internal(error.to_string()))?
+                .map_err(|error| ApiError::transport_failed(None, error));
         }
         Request::Cancel { id } => {
             session.resources.jobs.remove(&id);
@@ -82,23 +86,27 @@ pub(super) fn execute(session: &mut super::Session, request: Request) -> Result<
         session.resources.jobs.clear();
     }
     if session.resources.jobs.len() >= 8 {
-        return Err("resource workers busy".into());
+        return Err(ApiError::capacity_exceeded(
+            "resource workers",
+            8,
+            "resource workers busy",
+        ));
     }
     let (progress, receiver) = watch::channel(0);
     let owner = session
         .workspace
         .as_ref()
-        .ok_or("session has no workspace")?;
+        .ok_or_else(errors::no_workspace)?;
     let workspace = owner.id();
     let revision = owner
         .epoch()
         .checked_add(1)
-        .ok_or("workspace epoch overflow")?;
+        .ok_or_else(|| ApiError::internal("workspace epoch overflow"))?;
     let task = match request {
         Request::Prepare { member, root, path } => {
             let peer = owner
                 .endpoints_for_members(&[member])
-                .map_err(str::to_owned)?[0];
+                .map_err(security(ErrorCode::NotMember))?[0];
             session.runtime.spawn(async move {
                 let ticket = resources
                     .prepare(&root, &path, workspace, revision, peer)
@@ -115,7 +123,7 @@ pub(super) fn execute(session: &mut super::Session, request: Request) -> Result<
         } => {
             let peer = owner
                 .endpoints_for_members(&[member])
-                .map_err(str::to_owned)?[0];
+                .map_err(security(ErrorCode::NotMember))?[0];
             session.runtime.spawn(async move {
                 let size = ticket.size;
                 resources
@@ -138,7 +146,7 @@ pub(super) fn execute(session: &mut super::Session, request: Request) -> Result<
         .resources
         .next
         .checked_add(1)
-        .ok_or("resource operation overflow")?;
+        .ok_or_else(|| ApiError::internal("resource operation overflow"))?;
     let id = session.resources.next;
     session.resources.jobs.insert(
         id,

@@ -1,7 +1,8 @@
 //! One real runtime owner; admission requests/Welcome validation are local.
 //! This proves storage lifecycle, not a hundred-endpoint network topology.
 use arachne_runtime::{
-    close, create, enable_record_storage, execute, restore_record_storage, save_candidate,
+    FreshnessAnchor, close, create, enable_record_storage, execute, record_freshness,
+    restore_record_storage, restore_record_storage_with_freshness, save_candidate,
 };
 use arachne_security::{AdmissionAuthorization, Invitation, PendingJoin};
 use serde_json::{Value, json};
@@ -30,6 +31,62 @@ fn save(handle: i64, staged: &Value, op: &str) -> Value {
     save_candidate(handle, &token).unwrap();
     call(handle, json!({"op":op,"snapshot":token})).unwrap()
 }
+#[test]
+fn restore_with_freshness_anchor_rejects_a_rolled_back_database() {
+    let directory = common::directory();
+    let path = directory.path().join("workspace.db");
+    let old = directory.path().join("workspace-old.db");
+    let root = [93; 32];
+    let mut handle = create(Some(&root)).unwrap();
+    let created = call(
+        handle,
+        json!({"op":"create_workspace","display_name":"Owner"}),
+    )
+    .unwrap();
+    let workspace: [u8; 32] = serde_json::from_value(created["workspace"].clone()).unwrap();
+    assert!(record_freshness(handle).is_err());
+    enable_record_storage(handle, &path, &root).unwrap();
+    let enabled = record_freshness(handle).unwrap();
+    close(handle).unwrap();
+    // The attacker's copy: an authentic, older database.
+    std::fs::copy(&path, &old).unwrap();
+
+    handle = create(Some(&root)).unwrap();
+    restore_record_storage_with_freshness(handle, &path, &root, workspace, Some(enabled)).unwrap();
+    call(handle, json!({"op":"install_workspace_policy","revision":1})).unwrap();
+    let staged = call(
+        handle,
+        json!({"op":"stage_network_publication","workspace":workspace,"revision":1,
+            "topic":"streams/opaque","id":vec![1;16],"payload":[1]}),
+    )
+    .unwrap();
+    let token = bytes(&staged["snapshot"]);
+    save_candidate(handle, &token).unwrap();
+    // The host saves the new anchor before the publication can leave.
+    let latest = record_freshness(handle).unwrap();
+    assert!(latest.revision > enabled.revision);
+    assert_eq!(FreshnessAnchor::from_bytes(&latest.to_bytes()).unwrap(), latest);
+    call(handle, json!({"op":"adopt_publication","snapshot":token})).unwrap();
+    close(handle).unwrap();
+
+    // Whole-database rollback: restoring would replay the sender counter.
+    std::fs::copy(&old, &path).unwrap();
+    handle = create(Some(&root)).unwrap();
+    let rejected =
+        restore_record_storage_with_freshness(handle, &path, &root, workspace, Some(latest))
+            .unwrap_err();
+    assert!(rejected.contains("freshness"), "{rejected}");
+    // Rejection leaves the session empty; the matching anchor still restores.
+    assert!(record_freshness(handle).is_err());
+    restore_record_storage_with_freshness(handle, &path, &root, workspace, Some(enabled)).unwrap();
+    close(handle).unwrap();
+    // Callers that supply no anchor keep today's behavior.
+    handle = create(Some(&root)).unwrap();
+    restore_record_storage(handle, &path, &root, workspace).unwrap();
+    close(handle).unwrap();
+    directory.close().unwrap();
+}
+
 #[test]
 #[cfg(unix)]
 fn runtime_test_directories_are_private_unique_and_cleaned_on_drop() {
@@ -62,24 +119,40 @@ fn hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots() 
     let legacy = call(handle, json!({"op":"seal_workspace"})).unwrap();
     enable_record_storage(handle, &path, &root).unwrap();
     let mut final_reader = None;
+    // Each join also registers its link (one commit); the policy revision is epoch + 1.
+    let mut revision = 0;
     for member in 1..100u8 {
-        let invite = call(handle, json!({"op":"issue_invitation"})).unwrap();
+        let staged = call(
+            handle,
+            json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+        )
+        .unwrap();
+        save_candidate(handle, &bytes(&staged["snapshot"])).unwrap();
+        let invite = call(
+            handle,
+            json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        )
+        .unwrap()["issued_invitation"]
+            .clone();
         let invitation = Invitation::from_bytes(&bytes(&invite["invitation"])).unwrap();
+        let _ = member;
+        let member_key = arachne_security::EndpointKey::generate().unwrap();
+        let member_endpoint = arachne_security::EndpointSigner::endpoint(&member_key);
         let pending = PendingJoin::from_invitation(
             &invitation,
             &bytes(&invite["checkpoint"]),
-            [member; 32],
+            &member_key,
             "Member",
         )
         .unwrap();
         let request = pending.admission_request().unwrap();
         let staged = call(
             handle,
-            json!({"op":"stage_admission","authenticated_endpoint":vec![member;32],"request":request}),
+            json!({"op":"stage_admission","authenticated_endpoint":member_endpoint,"request":request}),
         )
         .unwrap();
         save(handle, &staged, "adopt_admission");
-        let reply = call(handle,json!({"op":"retained_admission","authenticated_endpoint":vec![member;32],"request":request})).unwrap();
+        let reply = call(handle,json!({"op":"retained_admission","authenticated_endpoint":member_endpoint,"request":request})).unwrap();
         let auth = &reply["authorization"];
         let authorization = AdmissionAuthorization {
             invitation_key: bytes(&auth["invitation_key"]).try_into().unwrap(),
@@ -100,17 +173,16 @@ fn hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots() 
             handle = create(Some(&root)).unwrap();
             let restored = restore_record_storage(handle, &path, &root, workspace).unwrap();
             assert_eq!(restored["members"], u64::from(member) + 1);
+            revision = restored["epoch"].as_u64().unwrap() + 1;
             println!("runtime reopened members={}", member + 1);
         }
     }
-    let enabled = call(handle, json!({"op":"enable_object_delivery"})).unwrap();
-    save(handle, &enabled, "adopt_reception");
     call(
         handle,
-        json!({"op":"install_workspace_policy","revision":100}),
+        json!({"op":"install_workspace_policy","revision":revision}),
     )
     .unwrap();
-    let staged=call(handle,json!({"op":"stage_network_publication","revision":100,"topic":"streams/opaque","id":vec![1;16],"payload":[9,8,7]})).unwrap();
+    let staged=call(handle,json!({"op":"stage_network_publication","revision":revision,"topic":"streams/opaque","id":vec![1;16],"payload":[9,8,7]})).unwrap();
     let token = bytes(&staged["snapshot"]);
     assert!(call(handle, json!({"op":"adopt_publication","snapshot":token})).is_err());
     save_candidate(handle, &token).unwrap();
@@ -121,10 +193,10 @@ fn hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots() 
     assert!(call(handle, json!({"op":"adopt_publication","snapshot":token})).is_err());
     call(
         handle,
-        json!({"op":"install_workspace_policy","revision":100}),
+        json!({"op":"install_workspace_policy","revision":revision}),
     )
     .unwrap();
-    let staged=call(handle,json!({"op":"stage_network_publication","revision":100,"topic":"streams/opaque","id":vec![2;16],"payload":[6]})).unwrap();
+    let staged=call(handle,json!({"op":"stage_network_publication","revision":revision,"topic":"streams/opaque","id":vec![2;16],"payload":[6]})).unwrap();
     let adopted = save(handle, &staged, "adopt_publication");
     assert_eq!(adopted["sequence"], 2);
     close(handle).unwrap();
@@ -141,12 +213,12 @@ fn hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots() 
     let mut owner =
         arachne_security::Workspace::restore_records(endpoint, workspace, &records).unwrap();
     let object = owner
-        .protect_object(b"counter check", b"test only")
+        .protect_object(b"counter", b"counter check", b"test only")
         .unwrap();
     assert_eq!(
         final_reader
             .unwrap()
-            .unprotect_object(b"counter check", &object)
+            .unprotect_object(b"counter", b"counter check", &object)
             .unwrap()
             .counter,
         3
@@ -187,9 +259,18 @@ fn migration_preserves_pending_inbox_and_removal_cannot_reopen_active_state() {
     let description: Value =
         serde_json::from_str(&arachne_runtime::describe(handle).unwrap()).unwrap();
     let endpoint = serde_json::from_value(description["endpoint_key"].clone()).unwrap();
-    let admin = Workspace::create([104; 32], "Administrator").unwrap();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
-    let pending = PendingJoin::from_invitation(&invite, &checkpoint, endpoint, "Receiver").unwrap();
+    let admin_key = arachne_security::EndpointKey::generate().unwrap();
+    let admin = Workspace::create(&admin_key, "Administrator").unwrap();
+    let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let admin = registered.workspace;
+    let secret = iroh::SecretKey::from_bytes(&root);
+    let pending = PendingJoin::from_invitation(
+        &invite,
+        &checkpoint,
+        &arachne_node::IrohEndpointSigner(&secret),
+        "Receiver",
+    )
+    .unwrap();
     let prepared = admin
         .prepare_admission(endpoint, pending.admission_request().unwrap())
         .unwrap();
@@ -210,7 +291,11 @@ fn migration_preserves_pending_inbox_and_removal_cannot_reopen_active_state() {
         sequence: std::num::NonZeroU64::new(1),
     };
     let object = admin
-        .protect_object(&context.authenticated_bytes(), b"pending chat")
+        .protect_object(
+            context.topic.namespace().as_bytes(),
+            &context.authenticated_bytes(),
+            b"pending chat",
+        )
         .unwrap();
     let InboxStage::Prepared(inbox) = ObjectInbox::new(workspace, reader.epoch())
         .stage(&reader, &context, &object)
@@ -218,7 +303,7 @@ fn migration_preserves_pending_inbox_and_removal_cannot_reopen_active_state() {
     else {
         panic!("missing candidate")
     };
-    let publisher = PublisherLog::new(workspace, reader.member().unwrap().id(), reader.epoch());
+    let publisher = PublisherLog::new(&reader).unwrap();
     let key = StorageKey::derive(&root).unwrap();
     let legacy = inbox.seal(&reader, &key, &publisher).unwrap();
     call(
@@ -235,12 +320,10 @@ fn migration_preserves_pending_inbox_and_removal_cannot_reopen_active_state() {
     let removed = admin
         .prepare_management(ManagementAction::Remove(reader.member().unwrap().id()))
         .unwrap();
-    let step = json!({"commit":removed.commit,"management":{"kind":"remove","member":reader.member().unwrap().id()}});
-    assert!(
-        call(handle, json!({"op":"stage_admission_update","step":step}))
-            .unwrap_err()
-            .contains("pending application")
-    );
+    // A Remove travels as a signed revocation order in the binary step codec.
+    let step = json!({"step":arachne_security::encode_membership_step(&removed.authorization, &removed.commit).unwrap()});
+    // A pending object never delays a membership step (A3); this test acks
+    // first only to check acknowledgement persistence before the removal.
     let ack=call(handle,json!({"op":"stage_object_acknowledgement","member":pending["member"],"topic":pending["topic"],"counter":pending["counter"],"id":pending["id"]})).unwrap();
     save(handle, &ack, "adopt_reception");
     close(handle).unwrap();
@@ -287,9 +370,11 @@ fn native_pending_join_keeps_identity_until_atomic_admission_commit() {
     let root = [141; 32];
     let directory = common::directory();
     let path = directory.path().join("workspace.db");
-    let admin = Workspace::create([142; 32], "Administrator").unwrap();
+    let admin_key = arachne_security::EndpointKey::generate().unwrap();
+    let admin = Workspace::create(&admin_key, "Administrator").unwrap();
     let workspace = admin.id();
-    let (invite, checkpoint) = admin.issue_invitation().unwrap();
+    let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let admin = registered.workspace;
     let mut handle = create(Some(&root)).unwrap();
     let pending = call(
         handle,

@@ -1,5 +1,6 @@
 //! Authenticated, bounded current views for opaque latest-value publications.
 
+use crate::UnixSeconds;
 use arachne_routing::{PublicationContext, Topic};
 use arachne_security::{MAX_APPLICATION_CIPHERTEXT, Workspace};
 use sha2::{Digest, Sha256};
@@ -249,10 +250,11 @@ pub struct VerifiedCurrentView {
 }
 
 impl VerifiedCurrentView {
-    pub fn current_values(&self, now: u64) -> impl Iterator<Item = &CurrentValue> {
+    /// Values another member's clock has not expired, with clock skew.
+    pub fn current_values(&self, now: UnixSeconds) -> impl Iterator<Item = &CurrentValue> {
         self.values
             .iter()
-            .filter(move |value| value.expires_at > now)
+            .filter(move |value| now.before_remote_expiry(value.expires_at))
     }
 }
 
@@ -434,6 +436,38 @@ impl CurrentViewIndex {
         Ok(index)
     }
 
+    /// Drop entries no view can serve any more: older policy revisions (`serve`
+    /// authorizes only the current one) and values or tombstones expired at the
+    /// injected `now`. A current selection that loses a value advances its cut,
+    /// so readers see a newer view, never a conflicting one at the same cut.
+    fn prune(&mut self, revision: u64, now: UnixSeconds) -> Result<(), &'static str> {
+        self.values.retain(|key, _| key.0 >= revision);
+        self.cuts.retain(|scope, _| scope.0 >= revision);
+        // The authority's own values, judged by its own clock.
+        let expired: Vec<_> = self
+            .values
+            .iter()
+            .filter(|(_, entry)| !now.before_local_expiry(entry.value.expires_at))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut scopes = BTreeSet::new();
+        for key in expired {
+            self.values.remove(&key);
+            scopes.insert((key.0, key.1, key.2));
+        }
+        for scope in scopes {
+            let cut = self
+                .cuts
+                .get_mut(&scope)
+                .ok_or("invalid current-view index")?;
+            *cut = cut.checked_add(1).ok_or("current-view cut exhausted")?;
+        }
+        Ok(())
+    }
+
+    /// Add or replace one latest value. Expired and superseded-revision entries
+    /// are pruned first.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert(
         &mut self,
         context: PublicationContext,
@@ -442,6 +476,7 @@ impl CurrentViewIndex {
         expires_at: u64,
         tombstone: bool,
         packet: Vec<u8>,
+        now: UnixSeconds,
     ) -> Result<(), &'static str> {
         let sequence = context
             .sequence
@@ -478,7 +513,9 @@ impl CurrentViewIndex {
                     Err("conflicting current value")
                 };
             }
-        } else if self.values.len() == MAX_CURRENT_VALUES {
+        }
+        self.prune(context.revision, now)?;
+        if !self.values.contains_key(&key) && self.values.len() == MAX_CURRENT_VALUES {
             return Err("current-view value capacity exhausted");
         }
         if self
@@ -839,12 +876,13 @@ mod tests {
     use std::num::NonZeroU64;
 
     fn pair() -> (Workspace, Workspace) {
-        let admin = Workspace::create([1; 32], "Publisher").unwrap();
-        let (invite, checkpoint) = admin.issue_invitation().unwrap();
+        let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
+        let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+        let admin = registered.workspace;
         let pending =
-            PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Reader").unwrap();
+            PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
         let prepared = admin
-            .prepare_admission([2; 32], pending.admission_request().unwrap())
+            .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
             .unwrap();
         let mut proof = pending.join_proof().unwrap();
         proof
@@ -877,7 +915,11 @@ mod tests {
                 sequence: NonZeroU64::new(sequence),
             };
             let ciphertext = publisher
-                .protect_application(&context.authenticated_bytes(), payload)
+                .protect_object(
+                    context.topic.namespace().as_bytes(),
+                    &context.authenticated_bytes(),
+                    payload,
+                )
                 .unwrap();
             CurrentValue {
                 replacement_key: [key; 32],
@@ -999,7 +1041,11 @@ mod tests {
                 sequence: NonZeroU64::new(sequence),
             };
             let ciphertext = publisher
-                .protect_application(&context.authenticated_bytes(), payload)
+                .protect_object(
+                    context.topic.namespace().as_bytes(),
+                    &context.authenticated_bytes(),
+                    payload,
+                )
                 .unwrap();
             let packet = context.packet(&ciphertext).unwrap();
             (context, packet)
@@ -1007,11 +1053,11 @@ mod tests {
         let mut index = CurrentViewIndex::new(publisher.id(), authority, publisher.epoch());
         let (first, first_packet) = packet(&mut publisher, 1, 1, b"old");
         index
-            .insert(first, [8; 32], [1; 32], 20, false, first_packet)
+            .insert(first, [8; 32], [1; 32], 20, false, first_packet, UnixSeconds(0))
             .unwrap();
         let (other, other_packet) = packet(&mut publisher, 2, 2, b"other selector");
         index
-            .insert(other, [9; 32], [2; 32], 30, false, other_packet)
+            .insert(other, [9; 32], [2; 32], 30, false, other_packet, UnixSeconds(0))
             .unwrap();
         let (newer, newer_packet) = packet(&mut publisher, 3, 3, b"new");
         index
@@ -1022,10 +1068,11 @@ mod tests {
                 30,
                 false,
                 newer_packet.clone(),
+                UnixSeconds(0),
             )
             .unwrap();
         index
-            .insert(newer, [8; 32], [1; 32], 30, false, newer_packet)
+            .insert(newer, [8; 32], [1; 32], 30, false, newer_packet, UnixSeconds(0))
             .unwrap();
         let revision_eight = PublicationContext {
             workspace: publisher.id(),
@@ -1035,9 +1082,15 @@ mod tests {
             sequence: NonZeroU64::new(1),
         };
         let revision_eight_object = publisher
-            .protect_application(&revision_eight.authenticated_bytes(), b"new policy")
+            .protect_object(
+                revision_eight.topic.namespace().as_bytes(),
+                &revision_eight.authenticated_bytes(),
+                b"new policy",
+            )
             .unwrap();
-        index
+        // Revision 8 supersedes revision 7, which serve() can no longer authorize.
+        let mut superseded = index.clone();
+        superseded
             .insert(
                 revision_eight.clone(),
                 [8; 32],
@@ -1045,23 +1098,32 @@ mod tests {
                 40,
                 false,
                 revision_eight.packet(&revision_eight_object).unwrap(),
+                UnixSeconds(0),
             )
             .unwrap();
-        assert_eq!(index.len(), 3);
+        assert_eq!(index.len(), 2);
+        assert_eq!(superseded.len(), 1);
 
         let view = index.view(&publisher, &query).unwrap();
         let current = verify(&reader, &query, &view).unwrap();
         assert_eq!(current.cut, 2);
         assert_eq!(current.values.len(), 1);
         assert_eq!(current.values[0].replacement_key, [1; 32]);
-        assert_eq!(current.current_values(30).count(), 0);
+        // A remote expiry is judged with clock skew.
+        assert_eq!(current.current_values(UnixSeconds(30)).count(), 1);
+        assert_eq!(
+            current
+                .current_values(UnixSeconds(30 + crate::EXPIRY_SKEW_SECONDS))
+                .count(),
+            0
+        );
 
         let mut revision_eight_query = query.clone();
         revision_eight_query.policy_revision = 8;
         let revision_eight_view = verify(
             &reader,
             &revision_eight_query,
-            &index.view(&publisher, &revision_eight_query).unwrap(),
+            &superseded.view(&publisher, &revision_eight_query).unwrap(),
         )
         .unwrap();
         assert_eq!(revision_eight_view.cut, 1);
@@ -1084,12 +1146,12 @@ mod tests {
                 publisher.id(),
                 7,
                 BTreeMap::from([
-                    ([1; 32], Permissions::AllTopics),
-                    ([2; 32], Permissions::AllTopics),
+                    (crate::test_endpoint(1), Permissions::AllTopics),
+                    (crate::test_endpoint(2), Permissions::AllTopics),
                 ]),
             )
             .unwrap();
-        let served = index.serve(&publisher, &policy, [2; 32], &query).unwrap();
+        let served = index.serve(&publisher, &policy, crate::test_endpoint(2), &query).unwrap();
         assert_eq!(
             verify_wire_reply(&reader, &query, &served)
                 .unwrap()
@@ -1118,5 +1180,157 @@ mod tests {
             CurrentViewIndex::restore(publisher.id(), authority, publisher.epoch(), &trailing)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn latest_value_index_prunes_expired_and_superseded_revisions() {
+        let (mut publisher, reader) = pair();
+        let topic = Topic::new("streams/opaque").unwrap();
+        let authority = publisher.member().unwrap().id();
+        let (workspace, epoch) = (publisher.id(), publisher.epoch());
+        let query = |revision, selector| CurrentViewQuery {
+            workspace,
+            authority,
+            epoch,
+            policy_revision: revision,
+            topic: topic.clone(),
+            selector,
+        };
+        let mut sequence = 0u64;
+        let mut insert = |publisher: &mut Workspace,
+                          index: &mut CurrentViewIndex,
+                          revision: u64,
+                          selector: [u8; 32],
+                          key: u8,
+                          expires_at: u64,
+                          tombstone: bool,
+                          now: u64| {
+            sequence += 1;
+            let context = PublicationContext {
+                workspace: publisher.id(),
+                revision,
+                topic: topic.clone(),
+                id: u128::from(sequence).to_be_bytes(),
+                sequence: NonZeroU64::new(sequence),
+            };
+            let ciphertext = publisher
+                .protect_object(
+                    context.topic.namespace().as_bytes(),
+                    &context.authenticated_bytes(),
+                    b"value",
+                )
+                .unwrap();
+            let packet = context.packet(&ciphertext).unwrap();
+            index.insert(
+                context,
+                selector,
+                [key; 32],
+                expires_at,
+                tombstone,
+                packet,
+                UnixSeconds(now),
+            )
+        };
+
+        // Fill every value slot: one short-lived value under selector 9, then
+        // short-lived values and a tombstone under selector 8.
+        let mut index = CurrentViewIndex::new(publisher.id(), authority, publisher.epoch());
+        insert(&mut publisher, &mut index, 7, [9; 32], 0, 10, false, 0).unwrap();
+        for key in 1..MAX_CURRENT_VALUES as u8 {
+            let tombstone = key == 1;
+            insert(
+                &mut publisher,
+                &mut index,
+                7,
+                [8; 32],
+                key,
+                10,
+                tombstone,
+                0,
+            )
+            .unwrap();
+        }
+        assert_eq!(index.len(), MAX_CURRENT_VALUES);
+        assert_eq!(
+            insert(&mut publisher, &mut index, 7, [8; 32], 200, 1000, false, 9),
+            Err("current-view value capacity exhausted")
+        );
+        let before = verify(
+            &reader,
+            &query(7, [9; 32]),
+            &index.view(&publisher, &query(7, [9; 32])).unwrap(),
+        )
+        .unwrap();
+        assert_eq!((before.cut, before.values.len()), (1, 1));
+
+        // Expired values and tombstones free their slots at the injected time.
+        insert(&mut publisher, &mut index, 7, [8; 32], 200, 1000, false, 10).unwrap();
+        assert_eq!(index.len(), 1);
+        // A pruned selection advances its cut, so a reader holding cut 1 sees
+        // a newer view instead of a conflicting one.
+        let after = verify(
+            &reader,
+            &query(7, [9; 32]),
+            &index.view(&publisher, &query(7, [9; 32])).unwrap(),
+        )
+        .unwrap();
+        assert_eq!((after.cut, after.values.len()), (2, 0));
+        let current = verify(
+            &reader,
+            &query(7, [8; 32]),
+            &index.view(&publisher, &query(7, [8; 32])).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(current.values.len(), 1);
+        assert!(current.cut > 1);
+
+        // A newer policy revision supersedes every unservable older entry.
+        for key in 1..MAX_CURRENT_VALUES as u8 {
+            insert(
+                &mut publisher,
+                &mut index,
+                7,
+                [8; 32],
+                key,
+                u64::MAX,
+                false,
+                10,
+            )
+            .unwrap();
+        }
+        assert_eq!(index.len(), MAX_CURRENT_VALUES);
+        insert(
+            &mut publisher,
+            &mut index,
+            8,
+            [8; 32],
+            1,
+            u64::MAX,
+            false,
+            10,
+        )
+        .unwrap();
+        assert_eq!(index.len(), 1);
+        let old = verify(
+            &reader,
+            &query(7, [8; 32]),
+            &index.view(&publisher, &query(7, [8; 32])).unwrap(),
+        )
+        .unwrap();
+        assert_eq!((old.cut, old.values.len()), (0, 0));
+        let new = verify(
+            &reader,
+            &query(8, [8; 32]),
+            &index.view(&publisher, &query(8, [8; 32])).unwrap(),
+        )
+        .unwrap();
+        assert_eq!((new.cut, new.values.len()), (1, 1));
+
+        // The persisted format is unchanged and restores the pruned index.
+        let saved = index.snapshot().unwrap();
+        let restored =
+            CurrentViewIndex::restore(publisher.id(), authority, publisher.epoch(), &saved)
+                .unwrap();
+        assert_eq!(restored.snapshot().unwrap(), saved);
     }
 }

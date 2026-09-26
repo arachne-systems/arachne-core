@@ -1,21 +1,27 @@
 //! Host-owned capacity shared by independent workspace endpoints. Permits are
 //! resources, not authorization; cancellation and connection close return them.
 use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex as StdMutex},
+    collections::{BTreeSet, HashMap},
+    sync::{Arc, Mutex as StdMutex, RwLock},
     time::{Duration, Instant},
 };
 
-use iroh::endpoint::{AfterHandshakeOutcome, Connection, EndpointHooks};
+use iroh::endpoint::{AfterHandshakeOutcome, Connection, EndpointHooks, Side};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::{Error, Result};
+use crate::{Error, PeerId, Result};
 
 /// Clone one budget into all endpoints on a device. Workspace identities and
 /// connection caches remain independent. Data cannot consume the control reserve.
 #[derive(Clone, Debug)]
 pub struct ConnectionBudget {
     connections: [Arc<Semaphore>; 2],
+    /// Control connections of endpoints no installed policy names (joiners,
+    /// probes). Taken together with a control slot, so members always keep
+    /// the other half of the control slots.
+    stranger_connections: Arc<Semaphore>,
+    /// Recent new connections per stranger key, for the per-key rate limit.
+    stranger_arrivals: Arc<StdMutex<HashMap<PeerId, (Instant, u32)>>>,
     dials: [Arc<Semaphore>; 2],
     /// Gossip's own dial slots. Shared with data, dials to offline peers held
     /// every slot and a gossip link to a live member waited behind them
@@ -27,9 +33,18 @@ pub struct ConnectionBudget {
     refused: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) handshakes: Arc<Semaphore>,
     pub(crate) exchanges: [Arc<Semaphore>; 2],
+    /// Stranger control exchanges, taken together with a control exchange.
+    pub(crate) stranger_exchanges: Arc<Semaphore>,
 }
 
 const GOSSIP_DIALS: usize = 8;
+/// New connections one stranger key may open per window. Joiners reuse one
+/// cached connection; many new ones from a key are a flood.
+const STRANGER_ARRIVALS: u32 = 8;
+const STRANGER_WINDOW: Duration = Duration::from_secs(10);
+/// Stranger keys whose arrivals are remembered. Keys cost nothing to make:
+/// when full, a new stranger waits for a window to end.
+const MAX_STRANGER_KEYS: usize = 4096;
 /// A connection must be this long without an exchange before it can be
 /// closed to make room.
 const EVICTABLE_AFTER: Duration = Duration::from_secs(1);
@@ -54,6 +69,8 @@ struct Tracked {
     /// Only incoming exchange connections: never gossip links (HyParView
     /// manages those) or this node's own outgoing cache.
     evictable: bool,
+    /// No installed policy named the remote when it connected.
+    stranger: bool,
 }
 
 /// Marks one exchange on a connection; the connection is busy until it drops.
@@ -100,16 +117,58 @@ impl ConnectionBudget {
     }
 
     fn new(connections: [usize; 2], dials: [usize; 2]) -> Self {
+        let exchanges = [32, 512];
         Self {
             connections: connections.map(|n| Arc::new(Semaphore::new(n))),
+            stranger_connections: Arc::new(Semaphore::new((connections[1] / 2).max(1))),
+            stranger_arrivals: Arc::default(),
             dials: dials.map(|n| Arc::new(Semaphore::new(n))),
             gossip_dials: Arc::new(Semaphore::new(GOSSIP_DIALS)),
             tracked: Arc::default(),
             evicted: Arc::default(),
             refused: Arc::default(),
             handshakes: Arc::new(Semaphore::new(512)),
-            exchanges: [32, 512].map(|n| Arc::new(Semaphore::new(n))),
+            exchanges: exchanges.map(|n| Arc::new(Semaphore::new(n))),
+            stranger_exchanges: Arc::new(Semaphore::new(exchanges[1] / 2)),
         }
+    }
+
+    /// Count a new connection from a stranger key; false when over its rate.
+    fn stranger_arrival(&self, peer: PeerId) -> bool {
+        let now = Instant::now();
+        let mut arrivals = self.stranger_arrivals.lock().unwrap();
+        if arrivals.len() >= MAX_STRANGER_KEYS && !arrivals.contains_key(&peer) {
+            arrivals.retain(|_, (start, _)| now.saturating_duration_since(*start) < STRANGER_WINDOW);
+            if arrivals.len() >= MAX_STRANGER_KEYS {
+                return false;
+            }
+        }
+        let (start, count) = arrivals.entry(peer).or_insert((now, 0));
+        if now.saturating_duration_since(*start) >= STRANGER_WINDOW {
+            (*start, *count) = (now, 0);
+        }
+        *count += 1;
+        *count <= STRANGER_ARRIVALS
+    }
+
+    /// Take a slot, making room by closing an idle link of this plane if
+    /// needed. A stranger may close only a stranger's link.
+    async fn acquire(
+        &self,
+        slots: &Arc<Semaphore>,
+        plane: usize,
+        stranger: bool,
+    ) -> Option<OwnedSemaphorePermit> {
+        if let Ok(permit) = slots.clone().try_acquire_owned() {
+            return Some(permit);
+        }
+        if !self.evict_idle(plane, stranger) {
+            return None;
+        }
+        tokio::time::timeout(EVICTION_WAIT, slots.clone().acquire_owned())
+            .await
+            .ok()
+            .and_then(|permit| permit.ok())
     }
 
     pub(crate) fn capacity_counts(&self) -> CapacityCounts {
@@ -126,6 +185,15 @@ impl ConnectionBudget {
         }
     }
 
+    /// An exchange runs on this connection now.
+    pub(crate) fn is_busy(&self, id: usize) -> bool {
+        self.tracked
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|entry| entry.busy != 0)
+    }
+
     pub(crate) fn exchange(&self, id: usize) -> ExchangeGuard {
         if let Some(entry) = self.tracked.lock().unwrap().get_mut(&id) {
             entry.busy += 1;
@@ -137,18 +205,20 @@ impl ConnectionBudget {
         }
     }
 
-    /// Close the longest-idle evictable connection of this plane. A device
-    /// full of idle joiner links refused its members (500-joiner run, HEWN,
-    /// 2026-09-19): an idle link now gives way instead.
-    fn evict_idle(&self, plane: usize) -> bool {
+    /// Close the longest-idle evictable connection of this plane, a
+    /// stranger's first. A device full of idle joiner links refused its
+    /// members (500-joiner run, HEWN, 2026-09-19): an idle link now gives way
+    /// instead. `only_strangers`: a member's link never gives way to a stranger.
+    fn evict_idle(&self, plane: usize, only_strangers: bool) -> bool {
         let now = Instant::now();
         let victim = {
             let tracked = self.tracked.lock().unwrap();
             tracked
                 .values()
                 .filter(|entry| entry.plane == plane && entry.evictable && entry.busy == 0)
+                .filter(|entry| entry.stranger || !only_strangers)
                 .filter(|entry| now.saturating_duration_since(entry.last_active) >= EVICTABLE_AFTER)
-                .min_by_key(|entry| entry.last_active)
+                .min_by_key(|entry| (!entry.stranger, entry.last_active))
                 .and_then(|entry| entry.handle.upgrade())
         };
         let Some(connection) = victim else {
@@ -173,34 +243,35 @@ fn plane(alpn: &[u8]) -> usize {
     usize::from(alpn == crate::control::ALPN)
 }
 
-impl EndpointHooks for ConnectionBudget {
-    async fn after_handshake<'a>(&'a self, connection: &'a Connection) -> AfterHandshakeOutcome {
+impl ConnectionBudget {
+    /// Admit an established connection into its plane's slots. A stranger
+    /// takes a stranger slot too, and is rate limited per key.
+    async fn admit(&self, connection: &Connection, stranger: bool) -> AfterHandshakeOutcome {
         let plane = plane(connection.alpn());
-        let slots = self.connections[plane].clone();
-        let permit = match slots.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                let waited = if self.evict_idle(plane) {
-                    tokio::time::timeout(EVICTION_WAIT, slots.acquire_owned())
-                        .await
-                        .ok()
-                        .and_then(|permit| permit.ok())
-                } else {
-                    None
-                };
-                match waited {
-                    Some(permit) => permit,
-                    None => {
-                        self.refused
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tracing::info!(target: "data_fabric_transport", remote = %connection.remote_id().fmt_short(), plane, "CONNECTION_REFUSED_CAPACITY");
-                        return AfterHandshakeOutcome::Reject {
-                            error_code: 429u32.into(),
-                            reason: b"device connection capacity".to_vec(),
-                        };
-                    }
-                }
+        let stranger = stranger && plane == 1;
+        let remote = *connection.remote_id().as_bytes();
+        let refuse = |reason: &'static [u8]| {
+            self.refused
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(target: "data_fabric_transport", remote = %connection.remote_id().fmt_short(), plane, stranger, "CONNECTION_REFUSED_CAPACITY");
+            AfterHandshakeOutcome::Reject {
+                error_code: 429u32.into(),
+                reason: reason.to_vec(),
             }
+        };
+        if stranger && !self.stranger_arrival(remote) {
+            return refuse(b"stranger connection rate");
+        }
+        let stranger_permit = if stranger {
+            match self.acquire(&self.stranger_connections, plane, true).await {
+                Some(permit) => Some(permit),
+                None => return refuse(b"device connection capacity"),
+            }
+        } else {
+            None
+        };
+        let Some(permit) = self.acquire(&self.connections[plane], plane, stranger).await else {
+            return refuse(b"device connection capacity");
         };
         let id = connection.stable_id();
         let handle = connection.weak_handle();
@@ -212,6 +283,7 @@ impl EndpointHooks for ConnectionBudget {
                 last_active: Instant::now(),
                 busy: 0,
                 evictable: false,
+                stranger,
             },
         );
         // Iroh's weak close future does not keep an otherwise idle connection
@@ -219,11 +291,52 @@ impl EndpointHooks for ConnectionBudget {
         let closed = handle.closed();
         let tracked = self.tracked.clone();
         tokio::spawn(async move {
-            let _permit = permit;
+            let _permits = (permit, stranger_permit);
             closed.await;
             tracked.lock().unwrap().remove(&id);
         });
         AfterHandshakeOutcome::Accept
+    }
+}
+
+/// Endpoints the installed policies of one local endpoint name. Kept current
+/// by its Node; a connection from any other key has no workspace authority.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Members(Arc<RwLock<BTreeSet<PeerId>>>);
+
+impl Members {
+    pub(crate) fn replace(&self, members: BTreeSet<PeerId>) {
+        *self.0.write().unwrap() = members;
+    }
+
+    pub(crate) fn contains(&self, peer: &PeerId) -> bool {
+        self.0.read().unwrap().contains(peer)
+    }
+}
+
+/// Handshake admission of one endpoint: the data plane only for policy
+/// members, and the shared budget with strangers kept to their own share.
+#[derive(Debug)]
+pub(crate) struct Admission {
+    pub(crate) budget: ConnectionBudget,
+    pub(crate) members: Members,
+}
+
+impl EndpointHooks for Admission {
+    async fn after_handshake<'a>(&'a self, connection: &'a Connection) -> AfterHandshakeOutcome {
+        // Only who reaches this device is a stranger: its own calls (a
+        // joiner calling an owner) never use the stranger share. Outgoing
+        // data dials go only to endpoints routing selected.
+        let stranger = connection.side() == Side::Server
+            && !self.members.contains(connection.remote_id().as_bytes());
+        if stranger && connection.alpn() == crate::ALPN {
+            tracing::info!(target: "data_fabric_transport", remote = %connection.remote_id().fmt_short(), "DATA_HANDSHAKE_REJECTED_STRANGER");
+            return AfterHandshakeOutcome::Reject {
+                error_code: 403u32.into(),
+                reason: b"not a workspace member".to_vec(),
+            };
+        }
+        self.budget.admit(connection, stranger).await
     }
 }
 
@@ -342,21 +455,251 @@ mod tests {
         .unwrap();
     }
 
+    /// Only an endpoint an installed policy names reaches the data plane. A
+    /// stranger used to be admitted and could hold the data exchanges and
+    /// blob slots before any membership check (A7).
+    #[tokio::test]
+    async fn a_stranger_is_refused_at_the_data_handshake() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let (server, _) = crate::Node::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            let member = iroh::SecretKey::from_bytes(&[61; 32]);
+            let stranger = iroh::SecretKey::from_bytes(&[62; 32]);
+            server
+                .install_verified_policy(
+                    [63; 32],
+                    1,
+                    std::collections::BTreeMap::from([
+                        (server.id(), crate::Permissions::AllTopics),
+                        (*member.public().as_bytes(), crate::Permissions::AllTopics),
+                    ]),
+                )
+                .await
+                .unwrap();
+            let address = EndpointAddr::new(iroh::PublicKey::from_bytes(&server.id()).unwrap())
+                .with_ip_addr(server.address());
+            let dial = |secret: iroh::SecretKey| {
+                let address = address.clone();
+                async move {
+                    let endpoint = Endpoint::builder(presets::Minimal)
+                        .clear_relay_transports()
+                        .clear_ip_transports()
+                        .bind_addr("127.0.0.1:0")
+                        .unwrap()
+                        .secret_key(secret)
+                        .bind()
+                        .await
+                        .unwrap();
+                    let connection = endpoint.connect(address, crate::ALPN).await.unwrap();
+                    (endpoint, connection)
+                }
+            };
+            let (_stranger_endpoint, refused) = dial(stranger).await;
+            let reason = tokio::time::timeout(Duration::from_secs(5), refused.closed())
+                .await
+                .expect("a stranger's data link stayed open");
+            assert!(
+                format!("{reason:?}").contains("not a workspace member"),
+                "{reason:?}"
+            );
+            let (_member_endpoint, admitted) = dial(member).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(admitted.close_reason().is_none());
+            server.close().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Strangers (joiners, probes) get at most half of the control slots,
+    /// and a stranger may close only another stranger's idle link to make
+    /// room: a flood of new keys can never push a member off the device.
+    #[tokio::test]
+    async fn strangers_use_half_the_control_slots_and_never_evict_a_member() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let (mut server, _) = crate::Node::bind_with_profile(
+                "127.0.0.1:0".parse().unwrap(),
+                None,
+                NetworkProfile::Direct,
+                ConnectionBudget::new([4, 2], [4, 4]),
+            )
+            .await
+            .unwrap();
+            let bind = || crate::Node::bind("127.0.0.1:0".parse().unwrap());
+            let (member, _) = bind().await.unwrap();
+            let (first, _) = bind().await.unwrap();
+            let (second, _) = bind().await.unwrap();
+            server
+                .install_verified_policy(
+                    [64; 32],
+                    1,
+                    std::collections::BTreeMap::from([
+                        (server.id(), crate::Permissions::AllTopics),
+                        (member.id(), crate::Permissions::AllTopics),
+                    ]),
+                )
+                .await
+                .unwrap();
+            for client in [&member, &first, &second] {
+                client
+                    .add_address_hint(server.id(), server.address())
+                    .await
+                    .unwrap();
+            }
+            // A stranger waiting for its reply holds the one stranger slot.
+            let pending = tokio::spawn(first.request_control(server.id(), b"pending"));
+            let held = loop {
+                if let Some(request) = server.poll_control() {
+                    break request;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            // Refused at once; a queued request would wait for its reply.
+            let refused = tokio::time::timeout(
+                Duration::from_secs(3),
+                second.request_control(server.id(), b"second"),
+            )
+            .await;
+            assert!(
+                matches!(refused, Ok(Err(_))),
+                "a second stranger took the member slot"
+            );
+            let reached = tokio::spawn(member.request_control(server.id(), b"member"));
+            serve_one(&mut server).await;
+            assert_eq!(reached.await.unwrap().unwrap(), vec![1]);
+            held.respond(vec![7]).unwrap();
+            assert_eq!(pending.await.unwrap().unwrap(), vec![7]);
+            // Both links are idle now. A new stranger may take only the
+            // idle stranger's slot, never the member's.
+            tokio::time::sleep(Duration::from_millis(1300)).await;
+            let third = tokio::spawn(second.request_control(server.id(), b"third"));
+            serve_one(&mut server).await;
+            assert_eq!(third.await.unwrap().unwrap(), vec![1]);
+            assert!(
+                member
+                    .connections
+                    .live_alpns()
+                    .contains(&crate::control::ALPN.to_vec()),
+                "the member's idle link was closed for a stranger"
+            );
+            server.close().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The stranger share limits who reaches this device, not whom it
+    /// calls: a joiner's own calls to endpoints it has no policy for must
+    /// not use it up.
+    #[tokio::test]
+    async fn outgoing_calls_never_take_the_stranger_share() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let (client, _) = crate::Node::bind_with_profile(
+                "127.0.0.1:0".parse().unwrap(),
+                None,
+                NetworkProfile::Direct,
+                ConnectionBudget::new([4, 2], [4, 4]),
+            )
+            .await
+            .unwrap();
+            let bind = || crate::Node::bind("127.0.0.1:0".parse().unwrap());
+            let (mut first, _) = bind().await.unwrap();
+            let (mut second, _) = bind().await.unwrap();
+            for server in [&first, &second] {
+                client
+                    .add_address_hint(server.id(), server.address())
+                    .await
+                    .unwrap();
+            }
+            let held = tokio::spawn(client.request_control(first.id(), b"held"));
+            let request = loop {
+                if let Some(request) = first.poll_control() {
+                    break request;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            let other = tokio::spawn(client.request_control(second.id(), b"other"));
+            tokio::time::timeout(Duration::from_secs(5), serve_one(&mut second))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("an outgoing call was refused by the caller's own stranger share")
+                });
+            assert_eq!(
+                other.await.unwrap().unwrap(),
+                vec![1],
+                "an outgoing call was refused by the caller's own stranger share"
+            );
+            request.respond(vec![7]).unwrap();
+            assert_eq!(held.await.unwrap().unwrap(), vec![7]);
+            client.close().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A gossip dial to a silent peer held its dial slot until Iroh gave up,
+    /// with the overlay still running. The dial deadline returns the slot.
+    #[tokio::test]
+    async fn a_gossip_dial_to_a_silent_peer_returns_its_slot_at_the_dial_deadline() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let budget = ConnectionBudget::default().with_gossip_dials(1);
+            let (node, _) = crate::Node::bind_with_profile(
+                "127.0.0.1:0".parse().unwrap(),
+                Some(&[65; 32]),
+                NetworkProfile::Direct,
+                budget.clone(),
+            )
+            .await
+            .unwrap();
+            let blackhole = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let silent = *iroh::SecretKey::from_bytes(&[66; 32]).public().as_bytes();
+            node.add_address_hint(silent, blackhole.local_addr().unwrap())
+                .await
+                .unwrap();
+            let workspace = [67; 32];
+            node.install_verified_policy(
+                workspace,
+                1,
+                std::collections::BTreeMap::from([
+                    (node.id(), crate::Permissions::AllTopics),
+                    (silent, crate::Permissions::AllTopics),
+                ]),
+            )
+            .await
+            .unwrap();
+            node.enable_gossip(workspace, 1, &workspace).await.unwrap();
+            while budget.gossip_dials.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+            let started = Instant::now();
+            while budget.gossip_dials.available_permits() == 0 {
+                assert!(
+                    started.elapsed() < crate::TIMEOUT + Duration::from_secs(2),
+                    "the silent dial held its slot past the dial deadline"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            node.close().await;
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn native_gossip_dials_use_their_own_capacity_and_release_on_cancel_and_success() {
         tokio::time::timeout(Duration::from_secs(10), async {
             let budget = ConnectionBudget::new([4, 1], [1, 1]).with_gossip_dials(1);
             let node = Connections::bind(
                 "127.0.0.1:0".parse().unwrap(),
-                NetworkProfile::Direct,
+                &crate::NodeOptions::new(NetworkProfile::Direct),
                 None,
                 budget.clone(),
                 vec![],
-                None,
             )
             .await
             .unwrap();
-            let alpn = b"arachne/workspace-gossip/1/dial-test";
+            let alpn = crate::overlay::ALPN;
             let peer = Endpoint::builder(presets::Minimal)
                 .clear_relay_transports()
                 .clear_ip_transports()
@@ -375,8 +718,7 @@ mod tests {
             node.add_address_hint(*unreachable.as_bytes(), blackhole.local_addr().unwrap())
                 .await
                 .unwrap();
-            node.authorize_gossip(alpn.to_vec(), vec![id, *unreachable.as_bytes()])
-                .await;
+            node.authorize_gossip([0; 32], vec![id, *unreachable.as_bytes()]);
             let spawn_gossip = || {
                 iroh_gossip::net::Gossip::builder()
                     .alpn(alpn)
@@ -442,21 +784,19 @@ mod tests {
             drop(dial);
             let first = Connections::bind(
                 "127.0.0.1:0".parse().unwrap(),
-                NetworkProfile::Direct,
+                &crate::NodeOptions::new(NetworkProfile::Direct),
                 None,
                 budget.clone(),
                 vec![],
-                None,
             )
             .await
             .unwrap();
             let second = Connections::bind(
                 "127.0.0.1:0".parse().unwrap(),
-                NetworkProfile::Direct,
+                &crate::NodeOptions::new(NetworkProfile::Direct),
                 None,
                 budget.clone(),
                 vec![],
-                None,
             )
             .await
             .unwrap();
@@ -465,7 +805,7 @@ mod tests {
                 second.id(),
                 "capacity must not unify identities"
             );
-            let gossip = b"arachne/workspace-gossip/1/budget-test";
+            let gossip = crate::overlay::ALPN;
             let peer = Endpoint::builder(presets::Minimal)
                 .clear_relay_transports()
                 .clear_ip_transports()
@@ -480,7 +820,7 @@ mod tests {
                 .await
                 .unwrap();
             let id = *peer.id().as_bytes();
-            first.authorize_gossip(gossip.to_vec(), vec![id]).await;
+            first.authorize_gossip([0; 32], vec![id]);
             second
                 .add_address_hint(id, peer.bound_sockets()[0])
                 .await

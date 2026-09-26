@@ -4,8 +4,10 @@ use super::*;
 use arachne_security::{ApplicationMessage, VerifiedRecoveryOffer, Workspace};
 
 const QUERY: &[u8] = b"DFRQ\x01";
+/// Rejection statuses. An offer always uses `OFFER`.
 const REPLY: &[u8] = b"DFRP\x01";
-const SEQUENCED_REPLY: &[u8] = b"DFRP\x02";
+/// Offer: every packet carries its publisher sequence.
+const OFFER: &[u8] = b"DFRP\x02";
 pub const MAX_QUERY_BYTES: usize = 32 * 1024;
 pub const MAX_REPLY_BYTES: usize = 128 * 1024;
 
@@ -251,6 +253,7 @@ pub fn verify_direct_reply(
         };
         let object = take(&mut input, length)?.to_vec();
         let authenticated = owner.unprotect_object(
+            context.topic.namespace().as_bytes(),
             &context.direct_authenticated_bytes(&query.recipients)?,
             &object,
         )?;
@@ -459,27 +462,24 @@ pub fn serve_cutoff(
     requester: [u8; 32],
     query: &CutoffQuery,
 ) -> Result<Vec<u8>, &'static str> {
-    if log
-        .authorize_history(
-            owner,
-            policy,
-            requester,
-            (query.workspace, query.author, query.epoch),
-            query.policy_revision,
-            &query.topics,
-        )
-        .is_err()
-    {
+    let Ok(epoch_log) = log.authorize_history(
+        owner,
+        policy,
+        requester,
+        (query.workspace, query.author, query.epoch),
+        query.policy_revision,
+        &query.topics,
+    ) else {
         return Ok(denied_reply());
-    }
+    };
     let after = query
         .topics
         .iter()
-        .filter_map(|t| log.topics.get(t))
+        .filter_map(|t| epoch_log.topics.get(t))
         .map(|h| h.evicted_through)
         .max()
         .unwrap_or(0);
-    owner.sign_recovery_window(&query.request()?, after, log.head())
+    owner.sign_recovery_window(&query.request()?, after, epoch_log.head())
 }
 
 /// None is a generic advisory denial, not a zero head. Caller owns nonce lifetime.
@@ -616,25 +616,17 @@ pub fn serve_range(
         Err(error) => return Ok(rejected(error)),
     };
     let offer = range.sign_offer(owner)?;
-    let sequenced = range.records().iter().any(|r| r.context.sequence.is_some());
     let size = 9
         + offer.len()
         + range
             .records()
             .iter()
-            .map(|r| {
-                8 + 1
-                    + r.context.topic.as_str().len()
-                    + 16
-                    + 4
-                    + r.ciphertext.len()
-                    + if sequenced { 8 } else { 0 }
-            })
+            .map(|r| 8 + 1 + r.context.topic.as_str().len() + 16 + 4 + r.ciphertext.len() + 8)
             .sum::<usize>();
     if size > MAX_REPLY_BYTES {
         return Ok(rejected(RetrievalError::History(RangeError::TooLarge)));
     }
-    let mut bytes = if sequenced { SEQUENCED_REPLY } else { REPLY }.to_vec();
+    let mut bytes = OFFER.to_vec();
     bytes.push(0);
     bytes.extend((offer.len() as u16).to_be_bytes());
     bytes.extend(offer);
@@ -643,9 +635,14 @@ pub fn serve_range(
         bytes.extend(record.context.revision.to_be_bytes());
         write_topic(&mut bytes, &record.context.topic);
         bytes.extend(record.context.id);
-        if sequenced {
-            bytes.extend(record.context.sequence.map_or(0, |n| n.get()).to_be_bytes());
-        }
+        bytes.extend(
+            record
+                .context
+                .sequence
+                .ok_or("retained publication lacks sequence")?
+                .get()
+                .to_be_bytes(),
+        );
         bytes.extend((record.ciphertext.len() as u32).to_be_bytes());
         bytes.extend(&record.ciphertext);
     }
@@ -654,6 +651,8 @@ pub fn serve_range(
 
 /// Return the next bounded publisher-signed range after a receiver's durable
 /// cursor. The authenticated requester learns no history state on denial.
+/// When the full packet window exceeds the reply bound, the holder serves the
+/// largest complete prefix that fits; the embedded query states its `through`.
 pub fn serve_available_range(
     log: &PublisherLog,
     owner: &Workspace,
@@ -661,35 +660,56 @@ pub fn serve_available_range(
     requester: [u8; 32],
     request: &AvailableRangeQuery,
 ) -> Result<Vec<u8>, &'static str> {
-    if log
-        .authorize_history(
-            owner,
-            policy,
-            requester,
-            (request.workspace, request.author, request.epoch),
-            request.policy_revision,
-            &request.topics,
-        )
-        .is_err()
-    {
+    let Ok(epoch_log) = log.authorize_history(
+        owner,
+        policy,
+        requester,
+        (request.workspace, request.author, request.epoch),
+        request.policy_revision,
+        &request.topics,
+    ) else {
         return Ok(unavailable_available_reply());
-    }
-    if request.after >= log.head() {
-        return Ok(unavailable_available_reply());
-    }
-    let query = RangeQuery {
-        workspace: request.workspace,
-        author: request.author,
-        epoch: request.epoch,
-        policy_revision: request.policy_revision,
-        after: request.after,
-        through: log
-            .head()
-            .min(request.after.saturating_add(MAX_RECOVERY_PACKETS as u64)),
-        topics: request.topics.clone(),
     };
-    let reply = serve_range(log, owner, policy, requester, &query)?;
-    available_offer(&query, &reply).or_else(|_| Ok(unavailable_available_reply()))
+    let head = epoch_log.head();
+    if request.after >= head {
+        return Ok(unavailable_available_reply());
+    }
+    // None when (after, through] is authorized but too large for one reply.
+    let offer = |through: u64| -> Result<Option<Vec<u8>>, &'static str> {
+        let query = RangeQuery {
+            workspace: request.workspace,
+            author: request.author,
+            epoch: request.epoch,
+            policy_revision: request.policy_revision,
+            after: request.after,
+            through,
+            topics: request.topics.clone(),
+        };
+        let reply = serve_range(log, owner, policy, requester, &query)?;
+        if reply == rejected(RetrievalError::History(RangeError::TooLarge)) {
+            return Ok(None);
+        }
+        Ok(available_offer(&query, &reply).ok())
+    };
+    let mut high = head.min(request.after.saturating_add(MAX_RECOVERY_PACKETS as u64));
+    if let Some(bytes) = offer(high)? {
+        return Ok(bytes);
+    }
+    // Fit only worsens as `through` grows, so bisect for the largest complete
+    // prefix. Each probe is a whole signed range; nothing is ever partial.
+    let mut low = request.after;
+    let mut best = None;
+    while high - low > 1 {
+        let middle = low + (high - low) / 2;
+        match offer(middle)? {
+            Some(bytes) => {
+                low = middle;
+                best = Some(bytes);
+            }
+            None => high = middle,
+        }
+    }
+    Ok(best.unwrap_or_else(unavailable_available_reply))
 }
 
 /// The query is locally established. Validate all framing, scope, contexts and
@@ -705,10 +725,10 @@ pub fn verify_reply<'a>(
     }
     let mut input = bytes;
     let magic = take(&mut input, 5)?;
-    if magic != REPLY && magic != SEQUENCED_REPLY {
+    let status = take(&mut input, 1)?[0];
+    if (magic != REPLY || status == 0) && (magic != OFFER || status != 0) {
         return Err("wrong range reply format");
     }
-    let status = take(&mut input, 1)?[0];
     if status != 0 {
         if !input.is_empty() {
             return Err("trailing rejection");
@@ -735,17 +755,12 @@ pub fn verify_reply<'a>(
         let revision = number64(&mut input)?;
         let topic = read_topic(&mut input)?;
         let id = take(&mut input, 16)?.try_into().unwrap();
-        let sequence = if magic == SEQUENCED_REPLY {
-            std::num::NonZeroU64::new(number64(&mut input)?)
-        } else {
-            None
-        };
-        if let Some(number) = sequence {
-            if number.get() <= last_sequence || number.get() > query.through {
-                return Err("publisher sequence outside ordered requested range");
-            }
-            last_sequence = number.get();
+        let number = number64(&mut input)?;
+        if number <= last_sequence || number > query.through {
+            return Err("publisher sequence outside ordered requested range");
         }
+        last_sequence = number;
+        let sequence = std::num::NonZeroU64::new(number);
         if !query.topics.contains(&topic) || !ids.insert(id) {
             return Err("unexpected topic or repeated publication ID");
         }
@@ -899,7 +914,7 @@ fn query_and_status_framing_are_bounded_and_canonical() {
             .unwrap(),
         largest_cutoff.to_wire().unwrap()
     );
-    let owner = Workspace::create([1; 32], "Reader").unwrap();
+    let owner = Workspace::create(crate::test_key(1), "Reader").unwrap();
     assert_eq!(
         verify_cutoff_reply(&owner, &cutoff, &denied_reply()).unwrap(),
         None

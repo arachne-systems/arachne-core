@@ -1,0 +1,42 @@
+--- a/bindgen/templates/EnumTemplate.go
++++ b/bindgen/templates/EnumTemplate.go
+@@ -107,6 +107,31 @@
+ }
+ 
+ {%- if e.is_flat() %}
++{%- if e.variant_discr_type().is_some() %}
++// The wire value is the 1-based variant index, not the discriminant.
++func ({{ ffi_converter_name }}) Read(reader io.Reader) {{ type_name }} {
++	id := readInt32(reader)
++	switch id {
++	{%- for variant in e.variants() %}
++	case {{ loop.index }}:
++		return {{ type_name }}{{ variant.name()|enum_variant_name }}
++	{%- endfor %}
++	default:
++		panic(fmt.Sprintf("invalid enum value, %v, in {{ ffi_converter_name }}.Read()", id))
++	}
++}
++
++func ({{ ffi_converter_name }}) Write(writer io.Writer, value {{ type_name }}) {
++	switch value {
++	{%- for variant in e.variants() %}
++	case {{ type_name }}{{ variant.name()|enum_variant_name }}:
++		writeInt32(writer, {{ loop.index }})
++	{%- endfor %}
++	default:
++		panic(fmt.Sprintf("invalid enum value `%v` in {{ ffi_converter_name }}.Write", value))
++	}
++}
++{%- else %}
+ func ({{ ffi_converter_name }}) Read(reader io.Reader) {{ type_name }} {
+ 	id := readInt32(reader)
+ 	return {{ type_name }}(id)
+@@ -115,6 +140,7 @@
+ func ({{ ffi_converter_name }}) Write(writer io.Writer, value {{ type_name }}) {
+ 	writeInt32(writer, int32(value))
+ }
++{%- endif %}
+ {%- else %}
+ func ({{ ffi_converter_name }}) Read(reader io.Reader) {{ type_name }} {
+ 	id := readInt32(reader)

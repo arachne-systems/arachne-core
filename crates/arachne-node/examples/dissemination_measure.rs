@@ -91,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if mode == "gossip" {
         for node in &nodes {
-            node.enable_gossip(workspace, 1).await.unwrap();
+            node.enable_gossip(workspace, 1, &workspace).await.unwrap();
         }
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {

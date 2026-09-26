@@ -36,7 +36,8 @@ use tokio::sync::{Mutex, OnceCell, Semaphore, watch};
 use crate::{ALPN, Error, PeerId, Result, WorkspaceId, connections::Connections, transport};
 
 pub(crate) const STREAM_KIND: u8 = 1;
-const ADMISSION_LIFETIME: Duration = Duration::from_secs(120);
+/// Shortest read-grant lifetime; slow transports extend it (`Timeouts`).
+pub(crate) const ADMISSION_LIFETIME: Duration = Duration::from_secs(120);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Transmitted only inside an authenticated, recipient-scoped application
@@ -176,7 +177,7 @@ impl ResourceTransfers {
                     revision,
                     peer,
                     path: path.to_owned(),
-                    expires: Instant::now() + ADMISSION_LIFETIME,
+                    expires: Instant::now() + self.0.connections.timeouts().resource_grant(),
                     tag,
                 }),
             );
@@ -228,7 +229,7 @@ impl ResourceTransfers {
             .map_err(|_| Error::Backpressure)?;
         let mut changes = self.0.changed.subscribe();
         let mut token = [0; 32];
-        tokio::time::timeout(crate::TIMEOUT, recv.read_exact(&mut token))
+        tokio::time::timeout(self.0.connections.operation_timeout(), recv.read_exact(&mut token))
             .await
             .map_err(|_| Error::Timeout("resource admission"))?
             .map_err(transport)?;
@@ -256,7 +257,7 @@ impl ResourceTransfers {
             IdleWriter(send),
             EventSender::default(),
         );
-        let request = tokio::time::timeout(crate::TIMEOUT, pair.read_request())
+        let request = tokio::time::timeout(self.0.connections.operation_timeout(), pair.read_request())
             .await
             .map_err(|_| Error::Timeout("blob request"))?
             .map_err(transport)?;
@@ -316,10 +317,12 @@ impl ResourceTransfers {
         progress.send_replace(local.local_bytes());
         if !local.is_complete() {
             let mut changes = self.0.changed.subscribe();
-            let connection =
-                tokio::time::timeout(IDLE_TIMEOUT, self.0.connections.connect(peer, ALPN))
-                    .await
-                    .map_err(|_| Error::Timeout("resource connect"))??;
+            let connection = tokio::time::timeout(
+                self.0.connections.operation_timeout(),
+                self.0.connections.connect(peer, ALPN),
+            )
+            .await
+            .map_err(|_| Error::Timeout("resource connect"))??;
             self.authorize(workspace, revision, peer).await?;
             let (mut send, recv) = connection.open_bi().await.map_err(transport)?;
             send.write_all(&[STREAM_KIND]).await.map_err(transport)?;

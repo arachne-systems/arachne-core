@@ -454,7 +454,7 @@ mod tests {
 
     fn accept_role(owner: &Workspace, change: &crate::PreparedManagement) -> Workspace {
         let PreparedManagementUpdate::Active(next) = owner
-            .prepare_management_update(change.action, &change.commit)
+            .prepare_step_update(&change.authorization, &change.commit)
             .unwrap()
         else {
             panic!("unexpected removal")
@@ -462,12 +462,13 @@ mod tests {
         *next
     }
     fn pair() -> (Workspace, Workspace) {
-        let admin = Workspace::create_named([1; 32], "Alex", Some("Storm Assessment")).unwrap();
-        let (invite, checkpoint) = admin.issue_invitation().unwrap();
+        let admin = Workspace::create_named(crate::test_key(1), "Alex", Some("Storm Assessment")).unwrap();
+        let (registration, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+        let admin = registration.workspace;
         let pending =
-            PendingJoin::from_invitation(&invite, &checkpoint, [2; 32], "Jordan").unwrap();
+            PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Jordan").unwrap();
         let add = admin
-            .prepare_admission([2; 32], pending.admission_request().unwrap())
+            .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
             .unwrap();
         let mut proof = pending.join_proof().unwrap();
         proof.apply_add(&add.authorization, &add.commit).unwrap();
@@ -489,8 +490,8 @@ mod tests {
         }
         assert!(validate_workspace_name(&"x".repeat(81)).is_err());
         assert!(validate_workspace_name(&"🌲".repeat(80)).is_ok());
-        let a = Workspace::create_named([1; 32], "Alex", Some(" Storm Assessment ")).unwrap();
-        let b = Workspace::create_named([2; 32], "Alex", Some("Storm Assessment")).unwrap();
+        let a = Workspace::create_named(crate::test_key(1), "Alex", Some(" Storm Assessment ")).unwrap();
+        let b = Workspace::create_named(crate::test_key(2), "Alex", Some("Storm Assessment")).unwrap();
         assert_eq!(
             a.workspace_name().unwrap().as_deref(),
             Some("Storm Assessment")
@@ -582,7 +583,7 @@ mod tests {
         let creator = admin.member().unwrap().id();
         let key = StorageKey::derive(&[71; 32]).unwrap();
         assert!(member.prepare_workspace_name("Unauthorized").is_err());
-        let retained = admin.protect_object(b"chat", b"Keep this history").unwrap();
+        let retained = admin.protect_object(b"app", b"chat", b"Keep this history").unwrap();
         let fingerprint = admin.epoch_fingerprint();
         let change = admin.prepare_workspace_name("Valley Recovery").unwrap();
         assert_eq!(
@@ -606,7 +607,7 @@ mod tests {
         );
         assert_eq!(
             member
-                .unprotect_object(b"chat", &retained)
+                .unprotect_object(b"app", b"chat", &retained)
                 .unwrap()
                 .message
                 .payload,
@@ -632,8 +633,8 @@ mod tests {
         );
         member = renamed.workspace;
         let records = member.export_records().unwrap();
-        member = Workspace::restore_records([2; 32], id, &records).unwrap();
-        member = Workspace::restore(&key, [2; 32], id, &member.seal(&key).unwrap()).unwrap();
+        member = Workspace::restore_records(crate::test_endpoint(2), id, &records).unwrap();
+        member = Workspace::restore(&key, crate::test_endpoint(2), id, &member.seal(&key).unwrap()).unwrap();
         assert_eq!(
             member.workspace_name().unwrap().as_deref(),
             Some("Mountain Search")
@@ -668,9 +669,9 @@ mod tests {
         backdated[end..].copy_from_slice(&signature);
         assert!(admin.prepare_workspace_name_update(&backdated).is_err());
 
-        let legacy = Workspace::create([3; 32], "Legacy admin").unwrap();
+        let legacy = Workspace::create(crate::test_key(3), "Legacy admin").unwrap();
         let legacy =
-            Workspace::restore(&key, [3; 32], legacy.id(), &legacy.seal(&key).unwrap()).unwrap();
+            Workspace::restore(&key, crate::test_endpoint(3), legacy.id(), &legacy.seal(&key).unwrap()).unwrap();
         assert_eq!(legacy.workspace_name().unwrap(), None);
         let initialized = legacy.prepare_workspace_name("Existing Operation").unwrap();
         assert_eq!(initialized.workspace.id(), legacy.id());
@@ -687,8 +688,16 @@ mod tests {
     #[test]
     fn admission_helper_cannot_replace_invitation_name_and_bad_saved_metadata_fails_restore() {
         let (admin, helper) = pair();
-        let (invite, checkpoint) = admin.issue_invitation().unwrap();
-        let pending = PendingJoin::from_invitation(&invite, &checkpoint, [3; 32], "Sam").unwrap();
+        // Only administrators admit (ADR A2 step 2): the helper is a second admin.
+        let promotion = admin
+            .prepare_management(ManagementAction::Promote(helper.member().unwrap().id()))
+            .unwrap();
+        let helper = accept_role(&helper, &promotion);
+        let admin = promotion.workspace;
+        let (registration, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+        let helper = accept_role(&helper, &registration);
+        let admin = registration.workspace;
+        let pending = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(3), "Sam").unwrap();
         helper
             .initialize_name_checkpoint(&NameState {
                 revision: 999,
@@ -697,7 +706,7 @@ mod tests {
             })
             .unwrap();
         let add = helper
-            .prepare_admission([3; 32], pending.admission_request().unwrap())
+            .prepare_admission(crate::test_endpoint(3), pending.admission_request().unwrap())
             .unwrap();
         let mut proof = pending.join_proof().unwrap();
         proof.apply_add(&add.authorization, &add.commit).unwrap();

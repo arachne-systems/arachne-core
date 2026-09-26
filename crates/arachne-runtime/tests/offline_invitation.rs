@@ -6,9 +6,21 @@ fn call(handle: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap())?)
         .map_err(|e| e.to_string())
 }
+fn issue_invitation(handle: i64) -> Value {
+    let staged = call(
+        handle,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    )
+    .unwrap();
+    call(
+        handle,
+        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+    )
+    .unwrap()
+}
 
 #[test]
-fn old_invitation_redeems_through_an_ordinary_member_with_issuer_closed() {
+fn old_invitation_redeems_through_another_administrator_with_issuer_closed() {
     let admin = create(Some(&[81; 32])).unwrap();
     let mut helper = create(Some(&[82; 32])).unwrap();
     let late = create(Some(&[83; 32])).unwrap();
@@ -17,7 +29,7 @@ fn old_invitation_redeems_through_an_ordinary_member_with_issuer_closed() {
         json!({"op":"create_workspace","display_name":"Coordinator"}),
     )
     .unwrap();
-    let invite = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let invite = issue_invitation(admin)["issued_invitation"].clone();
     let begin = |handle, name| {
         call(
             handle,
@@ -58,7 +70,7 @@ fn old_invitation_redeems_through_an_ordinary_member_with_issuer_closed() {
     close(helper).unwrap();
     helper = create(Some(&[82; 32])).unwrap();
     call(helper, json!({"op":"restore_workspace","workspace":invite["workspace"],"snapshot":staged["snapshot"]})).unwrap();
-    assert!(call(helper, json!({"op":"issue_invitation"})).is_err());
+    assert!(call(helper, json!({"op":"stage_invitation","personal":false,"expires_at":0})).is_err());
     let node: Value = serde_json::from_str(&describe(helper).unwrap()).unwrap();
     let helper_address = node["bound_address"]
         .as_str()
@@ -75,7 +87,20 @@ fn old_invitation_redeems_through_an_ordinary_member_with_issuer_closed() {
         json!({"op":"add_address_hint","peer":outsider["endpoint_key"],"address":"127.0.0.1:9"}),
     )
     .unwrap();
-    let routed = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let adopted = issue_invitation(admin);
+    // helper is already a member at this point, so it must apply the
+    // registration step too or it forks from admin's view.
+    let s = call(
+        helper,
+        json!({"op":"stage_admission_update","step":adopted["step"]}),
+    )
+    .unwrap();
+    call(
+        helper,
+        json!({"op":"adopt_admission","snapshot":s["snapshot"]}),
+    )
+    .unwrap();
+    let routed = adopted["issued_invitation"].clone();
     assert_eq!(
         routed["routes"],
         json!([{"peer":node["endpoint_key"],"address":helper_address}])
@@ -88,6 +113,24 @@ fn old_invitation_redeems_through_an_ordinary_member_with_issuer_closed() {
             .unwrap()
             .contains(&node["endpoint_key"])
     );
+    // Only administrators admit (ADR A2): the issuer promotes the helper,
+    // which then redeems the old invitation while the issuer is closed.
+    let promotion = call(
+        admin,
+        json!({"op":"stage_management","action":{"kind":"promote","member":early["member"]["id"]}}),
+    )
+    .unwrap();
+    let promoted = call(
+        admin,
+        json!({"op":"adopt_admission","snapshot":promotion["snapshot"]}),
+    )
+    .unwrap();
+    let s = call(
+        helper,
+        json!({"op":"stage_admission_update","step":promoted["step"]}),
+    )
+    .unwrap();
+    call(helper, json!({"op":"adopt_admission","snapshot":s["snapshot"]})).unwrap();
     close(admin).unwrap();
     assert!(describe(admin).is_err());
     begin(late, "Late arrival");
@@ -145,18 +188,18 @@ fn old_invitation_redeems_through_an_ordinary_member_with_issuer_closed() {
         )
         .unwrap()
     });
-    // The result is retained, so this retry is an inquiry (ADR 0010): the
+    // The result is retained, so this retry is an inquiry: the
     // committed view answers it and the host sees no event.
     let reply = retry.join().unwrap();
     let steps = reply.get("commits").expect("complete authorized history");
-    assert_eq!(steps.as_array().unwrap().len(), 2);
+    // The helper's admission, the "routed" invitation's registration, the
+    // helper's promotion and this admission: the invite1 checkpoint is
+    // captured after its own registration.
+    assert_eq!(steps.as_array().unwrap().len(), 4);
     let mut altered = steps.clone();
-    altered[0]["authorization"]["grant_signature"][0] = json!(
-        steps[0]["authorization"]["grant_signature"][0]
-            .as_u64()
-            .unwrap()
-            ^ 1
-    );
+    // Byte 39 of a binary step lies in its authorization fields (after
+    // `DFMS\x03`, tag, class and a 32-byte key or id).
+    altered[0]["step"][39] = json!(steps[0]["step"][39].as_u64().unwrap() ^ 1);
     assert!(
         call(
             late,
@@ -176,7 +219,8 @@ fn old_invitation_redeems_through_an_ordinary_member_with_issuer_closed() {
     )
     .unwrap();
     assert_eq!(joined["members"], 3);
-    assert_eq!(joined["epoch"], 2);
+    // Two link registrations, two admissions and the helper's promotion.
+    assert_eq!(joined["epoch"], 5);
     close(late).unwrap();
     close(helper).unwrap();
 }

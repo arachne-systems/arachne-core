@@ -1,3 +1,4 @@
+// Modified by Arachne Systems from iroh-blobs 0.103.0; see ARACHNE-PATCH.md.
 use std::path::PathBuf;
 
 use iroh::{endpoint::presets, protocol::Router, Endpoint};
