@@ -170,8 +170,10 @@ Group objects go to every subscriber of the topic.
   whole range, the records at or below that sequence are exactly the
   complete prefix. When no record fits, the state is
   `recovery_awaiting_application`: no candidate, no progress. Drain, then
-  request again. An explicit range (with `after` and `through` from the
-  caller) stays all-or-nothing and fails at the bound.
+  request again. An explicit range (with `after` from the caller) stays all-or-nothing
+  and fails at the bound. `through` can be omitted to ask a holder for its
+  bounded available tail. Such a range never advances full-history progress
+  across the omitted prefix, even when Core selects the holder automatically.
   Cost: in the worst case, each cycle fetches up to 128 KiB again to admit
   about two full-size objects. The wire format did not change.
 - **Epochs (A3f).** Authors and holders serve, and receivers verify, ranges

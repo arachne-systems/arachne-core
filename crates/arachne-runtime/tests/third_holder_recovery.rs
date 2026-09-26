@@ -214,6 +214,52 @@ fn retained_replay_delivers_events_current_values_and_deletions() {
 }
 
 #[test]
+fn explicit_tail_recovery_does_not_claim_evicted_history() {
+    let author = node(141);
+    let reader = node(142);
+    call(author, json!({"op":"create_workspace","display_name":"Author"}));
+    let invite = issue_invitation(author);
+    add(author, reader, &invite, vec![], "Reader");
+    for handle in [author, reader] {
+        call(handle, json!({"op":"install_workspace_policy","revision":3}));
+    }
+    connect(author, reader);
+    connect(reader, author);
+    for id in 1u8..=40 {
+        let staged = call(author, json!({"op":"stage_network_publication","revision":3,
+            "topic":EVENT,"id":vec![id;16],"payload":[id]}));
+        call(author, json!({"op":"adopt_publication","candidate":staged["candidate"]}));
+    }
+    connect(reader, author);
+    let info: Value = serde_json::from_str(&describe(author).unwrap()).unwrap();
+    let pending = call(reader, json!({"op":"fetch_recovery_range","peer":info["endpoint_key"],
+        "revision":3,"topics":[EVENT],"after":39}));
+    assert_eq!(pending["state"], "recovery_range_pending");
+    let ready = finish_range(&[author], reader);
+    assert_eq!(ready["after"], 39);
+    assert_eq!(ready["through"], 40);
+    assert_eq!(ready["packet_count"], 1);
+    assert_eq!(ready["automatic_source"], true);
+    let staged = call(reader, json!({"op":"stage_recovery_range"}));
+    assert_eq!(staged["publication_count"], 1);
+    assert!(staged["accepted_through"].is_null(), "explicit tails must not advance full-history progress");
+    call(reader, json!({"op":"adopt_recovery","candidate":staged["candidate"]}));
+    let object = call(reader, json!({"op":"poll_pending_object"}));
+    assert_eq!(object["id"], json!(vec![40; 16]));
+    assert_eq!(object["payload"], json!([40]));
+
+    // Continuing full history must still report the old, honestly missing prefix.
+    call(reader, json!({"op":"fetch_recovery_range","peer":info["endpoint_key"],
+        "revision":3,"topics":[EVENT]}));
+    let unavailable = finish_range(&[author], reader);
+    assert_eq!(unavailable["state"], "recovery_source_unavailable");
+    assert_eq!(unavailable["accepted_progress"], false);
+    assert!(unavailable["reason"].as_str().unwrap().contains("Unavailable"));
+    close(reader).unwrap();
+    close(author).unwrap();
+}
+
+#[test]
 fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
     let author = node(111);
     let stale_holder = node(112);

@@ -793,7 +793,9 @@ pub struct RecoveryRangeRequest {
     pub author: Option<MemberId>,
     pub revision: u64,
     pub topics: Vec<String>,
+    /// None continues saved full-history progress. Some selects an independent tail.
     pub after: Option<u64>,
+    /// None asks a holder for its bounded available range after the cursor.
     pub through: Option<u64>,
 }
 
