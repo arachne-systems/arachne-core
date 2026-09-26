@@ -4,6 +4,9 @@ use super::*;
 use crate::errors::{self, security};
 use crate::ops::management::{StagedCandidate, StagedChange, StagedRemoval};
 use arachne_api::{ApiError, ErrorCode};
+#[cfg(test)]
+mod fork_tests;
+pub(crate) mod fork;
 pub(crate) mod self_update;
 pub(crate) mod wire;
 pub(super) use wire::encode_reply;
@@ -1281,10 +1284,9 @@ fn poll_with_budget(
             if value["state"] == "membership_current" {
                 let state = agreement(owner, &value)?;
                 if state != "membership_current" {
-                    // A peer disagreement is not authority to replace local state.
-                    return Ok(
-                        json!({"state":state,"workspace":owner.id(),"epoch":owner.epoch(),"peer":pending.peer}),
-                    );
+                    let result = json!({"state":state,"workspace":owner.id(),"epoch":owner.epoch(),"peer":pending.peer});
+                    if state == "membership_branch_mismatch" { fork::start(session, pending.peer); }
+                    return Ok(result);
                 }
             }
             if let Some(profiles) = value.get("profiles") {
@@ -2166,7 +2168,7 @@ pub(super) fn stage_update(
 }
 
 /// Head announcement: workspace, epoch, committing member's endpoint.
-const GOSSIP_HEAD: &[u8] = b"DFMH\x01";
+const GOSSIP_HEAD: &[u8] = b"DFMH\x02";
 /// A range pull that gets no reply gives up after this; pull still recovers.
 /// Longer than the 5 s connect limit, so the logs tell the two apart.
 const RANGE_PULL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2361,6 +2363,11 @@ pub(super) fn announce_head(session: &mut Session) {
     payload.extend(owner.id());
     payload.extend(owner.epoch().to_be_bytes());
     payload.extend(session.node.id());
+    payload.extend(owner.epoch_fingerprint());
+    let key = owner.epoch().checked_sub(1).and_then(|epoch| owner.branch_key(epoch).ok().flatten());
+    payload.extend(key.map_or([255; arachne_security::FORK_KEY_BYTES], |key| key.to_bytes()));
+    let Ok(signature) = owner.sign_announcement(&payload) else { return };
+    payload.extend(signature);
     let send = session.node.broadcast_membership(owner.id(), payload);
     // A failed broadcast is not an error for the commit: members pull. The
     // outcome is counted (sent / no overlay or no member / failed).
@@ -2393,17 +2400,26 @@ pub(super) fn stage_gossiped_step(session: &mut Session) -> Result<Option<Value>
             continue;
         }
         if workspace == id
-            && payload.len() == GOSSIP_HEAD.len() + 72
+            && payload.len() == GOSSIP_HEAD.len() + 72 + 32 + arachne_security::FORK_KEY_BYTES + 64
             && payload.starts_with(GOSSIP_HEAD)
             && payload[GOSSIP_HEAD.len()..GOSSIP_HEAD.len() + 32] == id
         {
             let at = GOSSIP_HEAD.len() + 32;
             let head = u64::from_be_bytes(payload[at..at + 8].try_into().unwrap());
             let author: [u8; 32] = payload[at + 8..at + 40].try_into().unwrap();
+            let signed = payload.len() - 64;
+            let signature = payload[signed..].try_into().unwrap();
+            let owner = session.workspace.as_ref().unwrap();
+            if owner.verify_announcement(author, &payload[..signed], &signature).is_err() { continue }
+            let fingerprint = &payload[at + 40..at + 72];
+            if head == owner.epoch() && fingerprint != owner.epoch_fingerprint() {
+                fork::start(session, author);
+            }
             note_head(session, head, author);
             continue;
         }
     }
+    if let Some(staged) = fork::poll(session)? { return Ok(Some(staged)) }
     finish_range_pull(session);
     finish_profile_pull(session);
     session
@@ -2432,8 +2448,12 @@ pub(super) fn stage_gossiped_step(session: &mut Session) -> Result<Option<Value>
             GossipCounts::add(&session.membership.gossip_counts.staged);
             Ok(Some(value))
         }
-        // A step that does not verify is dropped; pull recovers.
+        // A step may name a parent on a competing branch. Ask the peer
+        // for the first divergence before applying any fork choice.
         Err(_) => {
+            if let Some(peer) = session.membership.head.as_ref().and_then(|(_, peers)| peers.first()).copied() {
+                fork::start(session, peer);
+            }
             GossipCounts::add(&session.membership.gossip_counts.rejected);
             Ok(None)
         }
@@ -2847,11 +2867,15 @@ pub(super) fn receive_offer(session: &mut Session, packet: &[u8]) -> Result<Valu
         return Err(ApiError::invalid_input("offer", "invalid membership offer"));
     }
     let owner = session.workspace.as_ref().ok_or_else(|| ApiError::wrong_state("no workspace"))?;
-    if packet[5..37] != owner.id() || packet[37..45] != owner.epoch().to_be_bytes() {
+    let after = u64::from_be_bytes(packet[37..45].try_into().unwrap());
+    if packet[5..37] != owner.id() || after > owner.epoch() {
         return Err(ApiError::epoch_mismatch("membership offer does not extend current epoch"));
     }
     let step = join_step_from_wire(&packet[OFFER_HEADER..])
         .map_err(|_| ApiError::invalid_input("offer", "invalid offered transition"))?;
+    if after < owner.epoch() {
+        return fork::stage(session, after, step);
+    }
     serde_json::to_value(stage_update(session, step)?).map_err(errors::encode)
 }
 

@@ -212,6 +212,7 @@ pub(crate) struct JoinState {
 
 /// Membership reconciliation: queries, offers, gossip and profiles.
 pub(crate) struct MembershipState {
+    pub(crate) fork: membership::fork::ForkState,
     pub(crate) update: Option<PendingControl<membership::StateBasis>>,
     pub(crate) offer: Option<PendingControl<u64>>,
     pub(crate) offer_requires_adoption: bool,
@@ -247,6 +248,7 @@ pub(crate) struct MembershipState {
 impl MembershipState {
     pub(crate) fn new(profiles: membership::Profiles) -> Self {
         Self {
+            fork: membership::fork::ForkState::default(),
             update: None,
             offer: None,
             offer_requires_adoption: false,
@@ -402,6 +404,7 @@ pub(crate) fn seal_state(
 // Pending application objects never block a membership step: they are
 // authenticated plaintext and `carry_delivery` keeps them (A3).
 pub(crate) fn check_epoch_transition(session: &mut Session) -> Result<(), ApiError> {
+    membership::fork::require_send(session)?;
     session
         .workspace
         .as_ref()

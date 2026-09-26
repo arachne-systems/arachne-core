@@ -204,7 +204,7 @@ pub(crate) fn enable(session: &mut Session, path: &Path, root: &[u8; 32]) -> Res
     if session.storage_key.is_none() {
         return Err(ApiError::wrong_state("protected endpoint root required"));
     }
-    let (workspace, records) = if let Some(owner) = &session.workspace {
+    let (workspace, mut records) = if let Some(owner) = &session.workspace {
         (
             owner.id(),
             active_records(
@@ -221,6 +221,7 @@ pub(crate) fn enable(session: &mut Session, path: &Path, root: &[u8; 32]) -> Res
             "session has no workspace or pending join",
         ));
     };
+    records.extend(membership::fork::records(session, false)?);
     let store = Store::open(path, root, workspace).map_err(errors::store)?;
     if store.revision() != 0 {
         return Err(ApiError::wrong_state(
@@ -247,7 +248,8 @@ pub fn save_candidate(handle: i64, token: &[u8]) -> Result<(), String> {
 /// this session. The lifecycle driver calls this before adoption, so Android
 /// never becomes the authority for the save/adopt ordering.
 pub(super) fn commit_candidate(session: &mut Session, token: &[u8]) -> Result<(), ApiError> {
-    let records = if let Some(staged) = &session.transition.staged {
+    membership::fork::prepare_candidate(session)?;
+    let mut records = if let Some(staged) = &session.transition.staged {
         if token != staged.snapshot {
             return Err(ApiError::candidate_stale("token does not match candidate"));
         }
@@ -276,6 +278,9 @@ pub(super) fn commit_candidate(session: &mut Session, token: &[u8]) -> Result<()
     } else {
         return Err(ApiError::wrong_state("session has no candidate"));
     };
+    if session.transition.staged.is_some() {
+        records.extend(membership::fork::records(session, true)?);
+    }
     let store = session.records.as_mut().ok_or_else(not_enabled)?;
     if store.require_committed(token).is_ok() {
         return Ok(());
@@ -460,7 +465,8 @@ pub(crate) fn restore(
         }));
     }
     for name in store.keys(b"") {
-        if !name.starts_with(b"security/") && ![TOKEN, INBOX, ACTIVITY].contains(&name) {
+        if !name.starts_with(b"security/") && !name.starts_with(membership::fork::PREFIX)
+            && ![TOKEN, INBOX, ACTIVITY].contains(&name) {
             return Err(corrupt("unknown native runtime record"));
         }
     }
@@ -496,6 +502,10 @@ pub(crate) fn restore(
     if !matches!(activity.phase, WorkspacePhase::Active | WorkspacePhase::Recovering) {
         return Err(corrupt("active store has invalid workspace activity"));
     }
+    let branch_records = store.keys(membership::fork::PREFIX).map(|name| {
+        Ok((name.to_vec(), get(name)?.ok_or_else(|| corrupt("missing branch record"))?))
+    }).collect::<Result<SecurityRecords, ApiError>>()?;
+    membership::fork::restore(session, &branch_records)?;
     value.activity = activity.view();
     session.activity = activity;
     session.delivery.publisher = publisher;

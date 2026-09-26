@@ -245,6 +245,8 @@ pub(crate) fn adopt(
         ));
     }
     require_committed(session, &snapshot)?;
+    membership::fork::prepare_candidate(session)?;
+    membership::fork::adopt_candidate(session, &snapshot)?;
     let staged = session.transition.staged.take().unwrap();
     let joined = matches!(&staged.transition, WorkspaceTransition::Join);
     let mut value = Adopted {
@@ -288,6 +290,7 @@ pub(crate) fn adopt(
     let committed_here = matches!(
         staged.transition,
         WorkspaceTransition::Admission | WorkspaceTransition::SelfUpdate(_)
+            | WorkspaceTransition::Management(..) | WorkspaceTransition::Invitation(..)
     ) && !received;
     match staged.transition {
         WorkspaceTransition::Inbox => value.state = Some("inbox_adopted"),

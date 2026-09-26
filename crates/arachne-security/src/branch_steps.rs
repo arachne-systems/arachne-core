@@ -20,6 +20,103 @@ fn announcement(workspace: [u8; 32], message: &[u8]) -> Vec<u8> {
 }
 
 impl Workspace {
+    /// A bounded security-only rollback snapshot. Delivery state is kept
+    /// separately. This uses record encoding rather than the legacy bundle
+    /// ceiling, and is sealed with a distinct record family.
+    pub fn seal_branch_snapshot(&self, key: &super::StorageKey) -> Result<Vec<u8>, &'static str> {
+        use zeroize::Zeroizing;
+        let records = self.export_branch_records()?;
+        let mut plain = Zeroizing::new((records.len() as u32).to_be_bytes().to_vec());
+        for (name, value) in records {
+            let size = plain
+                .len()
+                .checked_add(8 + name.len() + value.len())
+                .ok_or("branch snapshot exceeds size limit")?;
+            if size + 65 > super::MAX_BRANCH_SNAPSHOT {
+                return Err("branch snapshot exceeds size limit");
+            }
+            plain.extend((name.len() as u32).to_be_bytes());
+            plain.extend(name);
+            plain.extend((value.len() as u32).to_be_bytes());
+            plain.extend(value.as_slice());
+        }
+        key.protect_record(&self.provider, b"DFBS\x01", self.id, self.endpoint, &plain)
+    }
+
+    pub fn restore_branch_snapshot(
+        key: &super::StorageKey,
+        endpoint: [u8; 32],
+        workspace: [u8; 32],
+        sealed: &[u8],
+    ) -> Result<Self, &'static str> {
+        use super::storage::{number, take};
+        use zeroize::Zeroizing;
+        let plain = key.unprotect_record(
+            b"DFBS\x01",
+            workspace,
+            endpoint,
+            sealed,
+            super::MAX_BRANCH_SNAPSHOT,
+        )?;
+        let mut bytes = plain.as_slice();
+        let count = number(&mut bytes)?;
+        if count > bytes.len() / 8 {
+            return Err("invalid branch record count");
+        }
+        let mut records = super::SecurityRecords::new();
+        for _ in 0..count {
+            let length = number(&mut bytes)?;
+            let name = take(&mut bytes, length)?.to_vec();
+            let length = number(&mut bytes)?;
+            let value = Zeroizing::new(take(&mut bytes, length)?.to_vec());
+            if records.insert(name, value).is_some() {
+                return Err("duplicate branch record");
+            }
+        }
+        if !bytes.is_empty() {
+            return Err("trailing branch snapshot bytes");
+        }
+        Self::restore_records(endpoint, workspace, &records)
+    }
+
+    /// Attach only the accepted history before this snapshot's epoch. The
+    /// public verifier must end at exactly the restored MLS state. Losing
+    /// suffix admissions and invitation checkpoints are not copied.
+    pub fn restore_branch_history(&mut self, current: &Workspace) -> Result<(), &'static str> {
+        if self.id != current.id
+            || self.endpoint != current.endpoint
+            || self.epoch() > current.epoch()
+        {
+            return Err("branch snapshot does not belong to this workspace");
+        }
+        let Some(mut history) = current.join_history.clone() else {
+            if self.epoch() != current.epoch() {
+                return Err("common branch history is missing");
+            }
+            return Ok(());
+        };
+        let start = history.verifier(self.id)?.epoch();
+        let count = self
+            .epoch()
+            .checked_sub(start)
+            .ok_or("common branch history is missing")? as usize;
+        if count > history.steps.len() {
+            return Err("common branch history is missing");
+        }
+        history.steps.truncate(count);
+        history.verify(self)?;
+        self.join_history = Some(history);
+        self.admissions = current
+            .admissions
+            .iter()
+            .filter(|entry| entry.reply.epoch <= self.epoch())
+            .cloned()
+            .collect();
+        // Checkpoints are availability metadata. The winning public steps
+        // can supply them again; copying losing suffix records is unsafe.
+        Ok(())
+    }
+
     /// First epoch of this chain's retained step history. Steps out of
     /// epochs at or above it (and below the current epoch) are retained.
     pub fn history_start(&self) -> Result<u64, &'static str> {
@@ -122,6 +219,7 @@ impl Workspace {
 mod tests {
     use crate::order::tests::{follow, team};
     use crate::{ManagementAction, MembershipAuthorization, Workspace, fork_key};
+    use openmls_traits::OpenMlsProvider;
 
     fn id(owner: &Workspace) -> [u8; 32] {
         owner.member().unwrap().id()
@@ -133,7 +231,9 @@ mod tests {
         let [first, second] = <[Workspace; 2]>::try_from(members).ok().unwrap();
         let fork = admin.epoch();
         // Two competing steps out of the same epoch.
-        let promote = admin.prepare_management(ManagementAction::Promote(id(&first))).unwrap();
+        let promote = admin
+            .prepare_management(ManagementAction::Promote(id(&first)))
+            .unwrap();
         let invite = admin
             .prepare_management(ManagementAction::CreateInvitation([9; 32], 0, false))
             .unwrap();
@@ -145,22 +245,103 @@ mod tests {
             on_promote.branch_key(fork).unwrap(),
             Some(fork_key(&promote.authorization, &promote.commit))
         );
-        assert_eq!(fork_key(&auth, &commit), fork_key(&promote.authorization, &promote.commit));
+        assert_eq!(
+            fork_key(&auth, &commit),
+            fork_key(&promote.authorization, &promote.commit)
+        );
         // No step out of the current epoch yet.
         assert_eq!(on_promote.branch_key(on_promote.epoch()).unwrap(), None);
         // The other branch's step verifies against this node's state at the fork.
         assert_eq!(
-            on_promote.verify_branch_step(fork, &invite.authorization, &invite.commit).unwrap(),
+            on_promote
+                .verify_branch_step(fork, &invite.authorization, &invite.commit)
+                .unwrap(),
             fork_key(&invite.authorization, &invite.commit)
         );
         // A relabelled step fails: the class comes only from a verified step.
-        let relabelled = MembershipAuthorization::Management(ManagementAction::Promote(id(&second)));
-        assert!(on_promote.verify_branch_step(fork, &relabelled, &invite.commit).is_err());
+        let relabelled =
+            MembershipAuthorization::Management(ManagementAction::Promote(id(&second)));
+        assert!(
+            on_promote
+                .verify_branch_step(fork, &relabelled, &invite.commit)
+                .is_err()
+        );
         // A step for another epoch fails.
-        assert!(on_promote.verify_branch_step(fork + 1, &invite.authorization, &invite.commit).is_err());
+        assert!(
+            on_promote
+                .verify_branch_step(fork + 1, &invite.authorization, &invite.commit)
+                .is_err()
+        );
         // Below the retained history nothing can be verified.
-        assert!(on_promote.verify_branch_step(0, &invite.authorization, &invite.commit).is_err());
+        assert!(
+            on_promote
+                .verify_branch_step(0, &invite.authorization, &invite.commit)
+                .is_err()
+        );
         let _ = first;
+    }
+
+    #[test]
+    fn a_branch_snapshot_is_sealed_bounded_and_bound_to_the_endpoint() {
+        let (owner, _) = team(1);
+        let key = crate::StorageKey::derive(&[81; 32]).unwrap();
+        // Storage fields not used by MLS make the record snapshot larger
+        // than the old128KiB workspace bundle without building a big group.
+        owner
+            .provider
+            .storage()
+            .values
+            .write()
+            .unwrap()
+            .insert(b"branch-snapshot-test".to_vec(), vec![42; 160 * 1024]);
+        assert!(owner.seal(&key).is_err());
+        let bytes = owner.seal_branch_snapshot(&key).unwrap();
+        let restored =
+            Workspace::restore_branch_snapshot(&key, owner.endpoint(), owner.id(), &bytes).unwrap();
+        assert_eq!(restored.epoch_fingerprint(), owner.epoch_fingerprint());
+        assert!(Workspace::restore_branch_snapshot(&key, [0; 32], owner.id(), &bytes).is_err());
+        let mut corrupt = bytes.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(
+            Workspace::restore_branch_snapshot(&key, owner.endpoint(), owner.id(), &corrupt)
+                .is_err()
+        );
+        owner.provider.storage().values.write().unwrap().insert(
+            b"branch-snapshot-test".to_vec(),
+            vec![42; crate::MAX_BRANCH_SNAPSHOT],
+        );
+        assert_eq!(
+            owner.seal_branch_snapshot(&key).unwrap_err(),
+            "branch snapshot exceeds size limit"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_restores_only_history_that_reaches_its_exact_state() {
+        let (owner, members) = team(1);
+        let key = crate::StorageKey::derive(&[82; 32]).unwrap();
+        let at_fork = owner.seal_branch_snapshot(&key).unwrap();
+        let promote = owner
+            .prepare_management(ManagementAction::Promote(id(&members[0])))
+            .unwrap();
+        let invite = owner
+            .prepare_management(ManagementAction::CreateInvitation([8; 32], 0, false))
+            .unwrap();
+        let mut restored =
+            Workspace::restore_branch_snapshot(&key, owner.endpoint(), owner.id(), &at_fork)
+                .unwrap();
+        assert!(restored.admissions.is_empty());
+        assert!(restored.join_history.is_none());
+        restored.restore_branch_history(&promote.workspace).unwrap();
+        assert_eq!(
+            restored.history_start().unwrap(),
+            owner.history_start().unwrap()
+        );
+        assert_eq!(restored.epoch_fingerprint(), owner.epoch_fingerprint());
+        let wrong = invite.workspace.seal_branch_snapshot(&key).unwrap();
+        let mut wrong =
+            Workspace::restore_branch_snapshot(&key, owner.endpoint(), owner.id(), &wrong).unwrap();
+        assert!(wrong.restore_branch_history(&promote.workspace).is_err());
     }
 
     #[test]
@@ -169,11 +350,25 @@ mod tests {
         let [first, second] = <[Workspace; 2]>::try_from(members).ok().unwrap();
         let signature = first.sign_announcement(b"head 7").unwrap();
         assert_eq!(
-            second.verify_announcement(first.endpoint(), b"head 7", &signature).unwrap(),
+            second
+                .verify_announcement(first.endpoint(), b"head 7", &signature)
+                .unwrap(),
             id(&first)
         );
-        assert!(second.verify_announcement(first.endpoint(), b"head 8", &signature).is_err());
-        assert!(second.verify_announcement(admin.endpoint(), b"head 7", &signature).is_err());
-        assert!(second.verify_announcement([3; 32], b"head 7", &signature).is_err());
+        assert!(
+            second
+                .verify_announcement(first.endpoint(), b"head 8", &signature)
+                .is_err()
+        );
+        assert!(
+            second
+                .verify_announcement(admin.endpoint(), b"head 7", &signature)
+                .is_err()
+        );
+        assert!(
+            second
+                .verify_announcement([3; 32], b"head 7", &signature)
+                .is_err()
+        );
     }
 }

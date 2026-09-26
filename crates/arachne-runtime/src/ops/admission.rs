@@ -323,7 +323,11 @@ pub(crate) fn poll(session: &mut Session, args: PollAdmissionArgs) -> Result<Val
         let offered = membership::receive_offer(session, incoming.payload());
         return match offered {
             Ok(value) => {
-                session.transition.inbound = Some(incoming);
+                if session.transition.staged.is_some() || session.transition.removal.is_some() {
+                    session.transition.inbound = Some(incoming);
+                } else {
+                    let _ = incoming.respond(vec![1]);
+                }
                 Ok(value)
             }
             Err(_) => {
@@ -340,6 +344,11 @@ pub(crate) fn poll(session: &mut Session, args: PollAdmissionArgs) -> Result<Val
         let accepted = reply.is_ok();
         let _ = incoming.respond(reply.unwrap_or_default());
         return Ok(json!({"state":"invitation_checkpoint_replied","accepted":accepted}));
+    }
+    if incoming.payload().starts_with(membership::wire::BRANCH_QUERY) {
+        let reply = membership::fork::reply(session.workspace.as_deref(), incoming.peer(), incoming.payload());
+        let _ = incoming.respond(reply);
+        return Ok(json!({"state":"membership_replied", "remote_receipt":false}));
     }
     if incoming.payload().starts_with(membership::wire::RANGE_QUERY) {
         let reply = membership::range_reply(
