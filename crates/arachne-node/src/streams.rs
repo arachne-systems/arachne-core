@@ -215,6 +215,7 @@ impl Streams {
                 EndpointAddr::new(key),
                 self.0.connections.clone(),
                 session,
+                Arc::downgrade(&self.0.counters),
             ));
             route.workers.lock().unwrap().push(worker);
         }
@@ -444,10 +445,18 @@ async fn reconnect_peer(
     address: EndpointAddr,
     connections: Connections,
     mut session: MoqSession,
+    counters: Weak<Counters>,
 ) {
     let mut delay = Duration::from_millis(250);
     loop {
-        session.closed().await;
+        let reason = session.closed().await;
+        if let Some(counters) = counters.upgrade() {
+            *counters.last_error.lock().unwrap() = Some(format!(
+                "reconnect {}: closed {reason}; transport={:?}",
+                address.id,
+                session.conn().close_reason(),
+            ));
+        }
         tokio::time::sleep(delay).await;
         let permit = match connections.dial_capacity(iroh_moq::ALPN) {
             Ok(permit) => permit,
@@ -460,10 +469,23 @@ async fn reconnect_peer(
         drop(permit);
         match result {
             Ok(Ok(reconnected)) => {
+                if let Some(counters) = counters.upgrade() {
+                    *counters.last_error.lock().unwrap() = Some(format!(
+                        "reconnect {}: connected; reused={}",
+                        address.id,
+                        session.conn().stable_id() == reconnected.conn().stable_id(),
+                    ));
+                }
                 session = reconnected;
                 delay = Duration::from_millis(250);
             }
-            Ok(Err(_)) | Err(_) => delay = (delay * 2).min(Duration::from_secs(5)),
+            other => {
+                if let Some(counters) = counters.upgrade() {
+                    *counters.last_error.lock().unwrap() =
+                        Some(format!("reconnect {}: dial failed {other:?}", address.id,));
+                }
+                delay = (delay * 2).min(Duration::from_secs(5));
+            }
         }
     }
 }
