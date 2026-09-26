@@ -58,7 +58,10 @@ pub(crate) struct StagedObject {
 
 /// B5: a publication names the session workspace, checked before anything
 /// is staged so the session stays usable.
-pub(crate) fn check_workspace(session: &Session, workspace: Option<[u8; 32]>) -> Result<(), ApiError> {
+pub(crate) fn check_workspace(
+    session: &Session,
+    workspace: Option<[u8; 32]>,
+) -> Result<(), ApiError> {
     crate::membership::fork::require_send(session)?;
     let owner = session
         .workspace
@@ -154,15 +157,25 @@ pub(crate) fn hold_object(
 }
 
 /// Stage one outgoing protected object. Adopting it sends it.
-pub(crate) fn stage(session: &mut Session, args: StagePublicationArgs) -> Result<StagedObject, ApiError> {
+pub(crate) fn stage(
+    session: &mut Session,
+    args: StagePublicationArgs,
+) -> Result<StagedObject, ApiError> {
     stage_publication(session, args, false)
 }
 
-pub(crate) fn stage_republication(session: &mut Session, args: StagePublicationArgs) -> Result<StagedObject, ApiError> {
+pub(crate) fn stage_republication(
+    session: &mut Session,
+    args: StagePublicationArgs,
+) -> Result<StagedObject, ApiError> {
     stage_publication(session, args, true)
 }
 
-fn stage_publication(session: &mut Session, args: StagePublicationArgs, recovering: bool) -> Result<StagedObject, ApiError> {
+fn stage_publication(
+    session: &mut Session,
+    args: StagePublicationArgs,
+    recovering: bool,
+) -> Result<StagedObject, ApiError> {
     let owner = session
         .workspace
         .as_ref()
@@ -188,13 +201,10 @@ fn stage_publication(session: &mut Session, args: StagePublicationArgs, recoveri
         .map_err(security(ErrorCode::Internal))?;
     let mut publisher = session.delivery.publisher.clone();
     // Object delivery is the only receive path.
-    let mut inbox = Some(
-        session
-            .delivery
-            .inbox
-            .clone()
-            .unwrap_or_else(|| arachne_delivery::inbox::ObjectInbox::new(owner.id(), owner.epoch())),
-    );
+    let mut inbox =
+        Some(session.delivery.inbox.clone().unwrap_or_else(|| {
+            arachne_delivery::inbox::ObjectInbox::new(owner.id(), owner.epoch())
+        }));
     if bulk && current.is_some() {
         return Err(ApiError::invalid_input(
             "bulk",
@@ -256,7 +266,11 @@ fn stage_publication(session: &mut Session, args: StagePublicationArgs, recoveri
                         .map_or(0, |log| log.head())
                         .checked_add(1)
                         .ok_or_else(|| {
-                            ApiError::limit_reached("publisher sequence", u64::MAX, "publisher sequence exhausted")
+                            ApiError::limit_reached(
+                                "publisher sequence",
+                                u64::MAX,
+                                "publisher sequence exhausted",
+                            )
                         })?,
                 )
                 .unwrap(),
@@ -350,11 +364,19 @@ fn stage_publication(session: &mut Session, args: StagePublicationArgs, recoveri
     let transition = if recovering {
         WorkspaceTransition::Republication(context, delivery_class, packet, endpoints, recipients)
     } else {
-        WorkspaceTransition::RoutedPublication(context, delivery_class, packet, endpoints, recipients)
+        WorkspaceTransition::RoutedPublication(
+            context,
+            delivery_class,
+            packet,
+            endpoints,
+            recipients,
+        )
     };
     let publisher = match publisher {
         Some(publisher) => publisher,
-        None => arachne_delivery::PublisherLog::new(owner).map_err(delivery(ErrorCode::Internal))?,
+        None => {
+            arachne_delivery::PublisherLog::new(owner).map_err(delivery(ErrorCode::Internal))?
+        }
     };
     let inbox = inbox.expect("object delivery inbox");
     // Self-update policy (B3c): count objects this member sends.
@@ -365,6 +387,10 @@ fn stage_publication(session: &mut Session, args: StagePublicationArgs, recoveri
         publisher,
         inbox,
         transition,
-        if recovering { "awaiting_save" } else { "awaiting_publication_save" },
+        if recovering {
+            "awaiting_save"
+        } else {
+            "awaiting_publication_save"
+        },
     )
 }

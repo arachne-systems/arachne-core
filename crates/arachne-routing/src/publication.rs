@@ -243,7 +243,9 @@ fn direct_scope_is_canonical_and_authenticated() {
             .unwrap()
     );
     assert_eq!(
-        context.direct_authenticated_bytes(&[[4; 32], [5; 32]]).unwrap(),
+        context
+            .direct_authenticated_bytes(&[[4; 32], [5; 32]])
+            .unwrap(),
         context
             .direct_authenticated_bytes(&[[4; 32], [5; 32]])
             .unwrap()

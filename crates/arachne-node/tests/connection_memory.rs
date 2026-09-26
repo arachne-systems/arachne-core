@@ -18,7 +18,10 @@ fn rss_kib() -> usize {
 #[test]
 #[ignore = "memory measurement; prints numbers"]
 fn memory_per_open_control_connection() {
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     runtime.block_on(async {
         const CLIENTS: usize = 200;
         let (mut server, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();

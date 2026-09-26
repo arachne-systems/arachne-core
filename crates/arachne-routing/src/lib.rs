@@ -539,7 +539,9 @@ fn installed_revision_is_the_current_one_not_the_window() {
     table
         .install_verified_policy(workspace, 18, policy.clone())
         .unwrap();
-    table.install_verified_policy(workspace, 19, policy).unwrap();
+    table
+        .install_verified_policy(workspace, 19, policy)
+        .unwrap();
     assert!(table.authorizes_endpoint(workspace, 18, [1; 32]).is_ok());
     assert_eq!(table.installed_revision(workspace), Some(19));
 }

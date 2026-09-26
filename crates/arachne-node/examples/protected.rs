@@ -104,13 +104,12 @@ async fn main() -> Result<()> {
     let admin = Workspace::create(&IrohEndpointSigner(&alice_root), "Stream publisher")?;
     let (registered, invitation, checkpoint) = admin.prepare_invitation(0, false, false)?;
     let admin = registered.workspace;
-    let pending =
-        PendingJoin::from_invitation(
-            &invitation,
-            &checkpoint,
-            &IrohEndpointSigner(&bob_root),
-            "Stream subscriber",
-        )?;
+    let pending = PendingJoin::from_invitation(
+        &invitation,
+        &checkpoint,
+        &IrohEndpointSigner(&bob_root),
+        "Stream subscriber",
+    )?;
     let prepared = admin.prepare_admission(bob.id(), pending.admission_request()?)?;
     let mut proof = pending.join_proof()?;
     proof.apply_add(&prepared.authorization, &prepared.commit)?;

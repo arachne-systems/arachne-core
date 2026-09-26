@@ -24,23 +24,50 @@ use arachne_api::{ApiError, ErrorCode};
 /// matching. The literal rows are covered by tests that make the error
 /// through a real call.
 const SECURITY: &[(&str, ErrorCode)] = &[
-    (arachne_security::INVITATION_DISABLED, ErrorCode::InvitationInvalid),
-    (arachne_security::INVITATION_EXPIRED, ErrorCode::InvitationExpired),
-    (arachne_security::INVITATION_APPROVAL_REQUIRED, ErrorCode::NotAuthorized),
+    (
+        arachne_security::INVITATION_DISABLED,
+        ErrorCode::InvitationInvalid,
+    ),
+    (
+        arachne_security::INVITATION_EXPIRED,
+        ErrorCode::InvitationExpired,
+    ),
+    (
+        arachne_security::INVITATION_APPROVAL_REQUIRED,
+        ErrorCode::NotAuthorized,
+    ),
     (
         arachne_security::INVITATION_AUTOMATIC_APPROVAL_REQUIRED,
         ErrorCode::NotAuthorized,
     ),
-    (arachne_security::INVITATION_CONTROLS_FULL, ErrorCode::LimitReached),
+    (
+        arachne_security::INVITATION_CONTROLS_FULL,
+        ErrorCode::LimitReached,
+    ),
     ("member already admitted", ErrorCode::NotAuthorized),
-    ("invalid or disabled invitation request", ErrorCode::InvitationInvalid),
-    ("invitation belongs to another workspace", ErrorCode::InvitationInvalid),
-    ("checkpoint does not match invitation", ErrorCode::InvitationInvalid),
+    (
+        "invalid or disabled invitation request",
+        ErrorCode::InvitationInvalid,
+    ),
+    (
+        "invitation belongs to another workspace",
+        ErrorCode::InvitationInvalid,
+    ),
+    (
+        "checkpoint does not match invitation",
+        ErrorCode::InvitationInvalid,
+    ),
     ("invalid invitation format", ErrorCode::InvitationInvalid),
     ("invalid invitation size", ErrorCode::InvitationInvalid),
     ("current members only", ErrorCode::NotMember),
-    ("direct recipient is not a current member", ErrorCode::NotMember),
-    ("management target is not a current member", ErrorCode::NotMember),
+    (
+        "direct recipient is not a current member",
+        ErrorCode::NotMember,
+    ),
+    (
+        "management target is not a current member",
+        ErrorCode::NotMember,
+    ),
     ("member is already an administrator", ErrorCode::WrongState),
     ("member is not an administrator", ErrorCode::NotAuthorized),
     ("object epoch ahead", ErrorCode::EpochMismatch),
@@ -49,18 +76,48 @@ const SECURITY: &[(&str, ErrorCode)] = &[
 
 /// Delivery texts with their own code.
 const DELIVERY: &[(&str, ErrorCode)] = &[
-    ("too many deferred delivery streams", ErrorCode::LimitReached),
+    (
+        "too many deferred delivery streams",
+        ErrorCode::LimitReached,
+    ),
     ("too many inbox recipients", ErrorCode::LimitReached),
     ("pending inbox full", ErrorCode::CapacityExceeded),
-    ("pending inbox capacity exceeded", ErrorCode::CapacityExceeded),
-    ("author pending quota exhausted", ErrorCode::CapacityExceeded),
-    ("retained range capacity exceeded", ErrorCode::CapacityExceeded),
-    ("retained current-view capacity exceeded", ErrorCode::CapacityExceeded),
-    ("current-view selection capacity exceeded", ErrorCode::CapacityExceeded),
-    ("direct recovery stream capacity exceeded", ErrorCode::CapacityExceeded),
-    ("inbox epoch/workspace not current", ErrorCode::EpochMismatch),
-    ("recovery coverage has wrong workspace or epoch", ErrorCode::EpochMismatch),
-    ("current-view scope is not current", ErrorCode::EpochMismatch),
+    (
+        "pending inbox capacity exceeded",
+        ErrorCode::CapacityExceeded,
+    ),
+    (
+        "author pending quota exhausted",
+        ErrorCode::CapacityExceeded,
+    ),
+    (
+        "retained range capacity exceeded",
+        ErrorCode::CapacityExceeded,
+    ),
+    (
+        "retained current-view capacity exceeded",
+        ErrorCode::CapacityExceeded,
+    ),
+    (
+        "current-view selection capacity exceeded",
+        ErrorCode::CapacityExceeded,
+    ),
+    (
+        "direct recovery stream capacity exceeded",
+        ErrorCode::CapacityExceeded,
+    ),
+    (
+        "inbox epoch/workspace not current",
+        ErrorCode::EpochMismatch,
+    ),
+    (
+        "recovery coverage has wrong workspace or epoch",
+        ErrorCode::EpochMismatch,
+    ),
+    (
+        "current-view scope is not current",
+        ErrorCode::EpochMismatch,
+    ),
     ("current-view rollback", ErrorCode::CandidateStale),
     ("object author not current", ErrorCode::NotMember),
 ];
@@ -88,9 +145,7 @@ pub(crate) fn node(error: arachne_node::Error) -> ApiError {
     let detail = error.to_string();
     match error {
         E::Routing(inner) => routing_with_detail(inner, detail),
-        E::Transport(_) | E::InvalidFrame | E::Rejected => {
-            ApiError::transport_failed(None, detail)
-        }
+        E::Transport(_) | E::InvalidFrame | E::Rejected => ApiError::transport_failed(None, detail),
         E::MissingPeer | E::ControlNotSent(_) => ApiError::peer_unreachable(None, detail),
         E::TooLarge => ApiError::invalid_input("payload", detail),
         E::Timeout(_) => ApiError::timeout(None, detail),

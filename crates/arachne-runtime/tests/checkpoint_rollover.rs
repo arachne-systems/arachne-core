@@ -247,8 +247,15 @@ fn redeem(ramp: &Ramp, responder: i64, responder_peer: Value) -> Value {
     // after save and adopt (event-driven admission), so the first request
     // carries the retained reply, paged over as many control replies as the
     // rolled-over history needs. Keep serving pages until it completes.
-    pump(responder, &queueing, "responder never served the join history");
-    let reply = queueing.join().unwrap().expect("old invitation must redeem");
+    pump(
+        responder,
+        &queueing,
+        "responder never served the join history",
+    );
+    let reply = queueing
+        .join()
+        .unwrap()
+        .expect("old invitation must redeem");
 
     let carried = reply["commits"]
         .as_array()

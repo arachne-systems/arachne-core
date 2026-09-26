@@ -22,7 +22,10 @@ fn adopt(handle: i64, op: &str, staged: &Value) -> Value {
 }
 
 fn restore(handle: i64, workspace: [u8; 32]) -> Result<Value, String> {
-    call(handle, json!({"op":"restore_workspace","workspace":workspace}))
+    call(
+        handle,
+        json!({"op":"restore_workspace","workspace":workspace}),
+    )
 }
 
 fn bytes(value: &Value) -> Vec<u8> {
@@ -117,8 +120,14 @@ async fn joiner(seed_index: u64, owner: &Owner) -> (Arc<Node>, Vec<u8>) {
     let invitation = Invitation::from_bytes(&owner.invitation).unwrap();
     let pending =
         PendingJoin::from_invitation(&invitation, &owner.checkpoint, &node, "Joiner").unwrap();
-    let packet = admission_packet(pending.admission_request().unwrap(), "Joiner", &owner.checkpoint);
-    node.add_address_hint(owner.peer, owner.address).await.unwrap();
+    let packet = admission_packet(
+        pending.admission_request().unwrap(),
+        "Joiner",
+        &owner.checkpoint,
+    );
+    node.add_address_hint(owner.peer, owner.address)
+        .await
+        .unwrap();
     (Arc::new(node), packet)
 }
 
@@ -159,15 +168,13 @@ fn queued_admission_rearms_the_host_for_staging() {
                 .unwrap();
             let invitation = Invitation::from_bytes(&invitation).unwrap();
             let pending =
-                PendingJoin::from_invitation(&invitation, &checkpoint, &node, "Joiner")
-                    .unwrap();
-            let packet = admission_packet(
-                pending.admission_request().unwrap(),
-                "Joiner",
-                &checkpoint,
-            );
+                PendingJoin::from_invitation(&invitation, &checkpoint, &node, "Joiner").unwrap();
+            let packet =
+                admission_packet(pending.admission_request().unwrap(), "Joiner", &checkpoint);
             node.add_address_hint(peer, address).await.unwrap();
-            reply_tx.send(node.request_control(peer, &packet).await).unwrap();
+            reply_tx
+                .send(node.request_control(peer, &packet).await)
+                .unwrap();
         });
     });
 
@@ -192,7 +199,12 @@ fn queued_admission_rearms_the_host_for_staging() {
     assert_eq!(committed["state"], "workspace_committed");
     assert_eq!(committed["results_delivered"], 1);
     assert_eq!(committed["results_pushed"], 0);
-    assert!(reply_rx.recv_timeout(Duration::from_secs(2)).unwrap().is_ok());
+    assert!(
+        reply_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .is_ok()
+    );
     waiter.join().unwrap().unwrap();
     requester.join().unwrap();
     close(owner.handle).unwrap();
@@ -216,10 +228,14 @@ fn rust_driver_commits_and_replies_without_host_candidate_steps() {
                 .await
                 .unwrap();
             let invitation = Invitation::from_bytes(&invitation).unwrap();
-            let pending = PendingJoin::from_invitation(&invitation, &checkpoint, &node, "Joiner").unwrap();
-            let packet = admission_packet(pending.admission_request().unwrap(), "Joiner", &checkpoint);
+            let pending =
+                PendingJoin::from_invitation(&invitation, &checkpoint, &node, "Joiner").unwrap();
+            let packet =
+                admission_packet(pending.admission_request().unwrap(), "Joiner", &checkpoint);
             node.add_address_hint(peer, address).await.unwrap();
-            reply_tx.send(node.request_control(peer, &packet).await).unwrap();
+            reply_tx
+                .send(node.request_control(peer, &packet).await)
+                .unwrap();
         });
     });
 
@@ -233,13 +249,22 @@ fn rust_driver_commits_and_replies_without_host_candidate_steps() {
     };
     assert_eq!(committed["state"], "workspace_committed");
     assert_eq!(committed["members"], 2);
-    let reply: Value = arachne_runtime::harness::decode_admission_reply(&reply_rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap()).unwrap();
+    let reply: Value = arachne_runtime::harness::decode_admission_reply(
+        &reply_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     assert!(reply.get("welcome").is_some());
     requester.join().unwrap();
 
     close(owner.handle).unwrap();
     let reopened = common::stored(&[84; 32], &owner.provider);
-    assert_eq!(restore(reopened, bytes(&committed["workspace"]).try_into().unwrap()).unwrap()["members"], 2);
+    assert_eq!(
+        restore(reopened, bytes(&committed["workspace"]).try_into().unwrap()).unwrap()["members"],
+        2
+    );
     close(reopened).unwrap();
 }
 
@@ -255,12 +280,28 @@ fn rust_join_driver_persists_iroh_peer_and_adopts_the_welcome() {
     )
     .unwrap();
     assert_eq!(pending["activity"]["state"], "joining");
-    assert!(call(joiner, json!({"op":"create_workspace","display_name":"stale"})).is_err());
-    assert_eq!(call(joiner, json!({"op":"workspace_state"})).unwrap()["activity"]["state"], "joining");
+    assert!(
+        call(
+            joiner,
+            json!({"op":"create_workspace","display_name":"stale"})
+        )
+        .is_err()
+    );
+    assert_eq!(
+        call(joiner, json!({"op":"workspace_state"})).unwrap()["activity"]["state"],
+        "joining"
+    );
     let workspace: [u8; 32] = bytes(&pending["workspace"]).try_into().unwrap();
     assert_eq!(pending["durable"], true);
-    assert_eq!(call(joiner, json!({"op":"workspace_state"})).unwrap()["activity"]["state"], "joining");
-    call(joiner, json!({"op":"add_address_hint","peer":owner.peer,"address":owner.address.to_string()})).unwrap();
+    assert_eq!(
+        call(joiner, json!({"op":"workspace_state"})).unwrap()["activity"]["state"],
+        "joining"
+    );
+    call(
+        joiner,
+        json!({"op":"add_address_hint","peer":owner.peer,"address":owner.address.to_string()}),
+    )
+    .unwrap();
 
     let requester = thread::spawn(move || complete_join(joiner));
     assert!(wait_for_work(owner.handle).unwrap());
@@ -276,14 +317,20 @@ fn rust_join_driver_persists_iroh_peer_and_adopts_the_welcome() {
     assert_eq!(joined["activity"]["state"], "active");
     assert_eq!(joined["members"], 2);
     assert!(call(joiner, json!({"op":"drive_join"})).is_err());
-    assert_eq!(call(joiner, json!({"op":"workspace_state"})).unwrap()["activity"]["state"], "active");
+    assert_eq!(
+        call(joiner, json!({"op":"workspace_state"})).unwrap()["activity"]["state"],
+        "active"
+    );
 
     close(joiner).unwrap();
     let reopened = common::stored(&[87; 32], &joiner_storage);
     let restored = restore(reopened, workspace).unwrap();
     assert_eq!(restored["members"], 2);
     assert_eq!(restored["activity"]["state"], "active");
-    assert_eq!(call(reopened, json!({"op":"workspace_state"})).unwrap()["activity"]["state"], "active");
+    assert_eq!(
+        call(reopened, json!({"op":"workspace_state"})).unwrap()["activity"]["state"],
+        "active"
+    );
     close(reopened).unwrap();
     close(owner.handle).unwrap();
 }
@@ -306,7 +353,11 @@ fn rust_join_driver_resumes_the_persisted_iroh_peer_after_restart() {
     let restored = restore(resumed, workspace).unwrap();
     assert_eq!(restored["state"], "pending");
     assert_eq!(restored["activity"]["state"], "joining");
-    call(resumed, json!({"op":"add_address_hint","peer":owner.peer,"address":owner.address.to_string()})).unwrap();
+    call(
+        resumed,
+        json!({"op":"add_address_hint","peer":owner.peer,"address":owner.address.to_string()}),
+    )
+    .unwrap();
 
     let requester = thread::spawn(move || complete_join(resumed));
     assert!(wait_for_work(owner.handle).unwrap());
@@ -356,16 +407,18 @@ fn fresh_pending_join_reports_remove_and_reinvite_recovery() {
     )
     .unwrap();
 
-    let requester = thread::spawn(move || {
-        call(fresh, json!({"op":"request_admission","peer":owner.peer}))
-    });
+    let requester =
+        thread::spawn(move || call(fresh, json!({"op":"request_admission","peer":owner.peer})));
     let deadline = Instant::now() + Duration::from_secs(10);
     let owner_event = loop {
         let value = call(owner.handle, json!({"op":"poll_admission"})).unwrap();
         if value["state"] == "admission_replied" {
             break value;
         }
-        assert!(Instant::now() < deadline, "fresh admission was not rejected");
+        assert!(
+            Instant::now() < deadline,
+            "fresh admission was not rejected"
+        );
         thread::sleep(Duration::from_millis(5));
     };
     let joiner_reply = requester.join().unwrap().unwrap();
@@ -464,17 +517,25 @@ fn a_busy_inbox_cannot_delay_a_small_batch_until_it_drains() {
 
     let mut admission_reads = 0usize;
     let mut reads_before_stage: Option<usize> = None;
-    drive(owner.handle, Instant::now() + Duration::from_secs(30), |value| {
-        if value["state"] == "admission_queued" {
-            admission_reads += 1;
-        }
-        if value["state"] == "awaiting_save" && reads_before_stage.is_none() {
-            reads_before_stage = Some(admission_reads);
-        }
-        reads_before_stage.is_some()
-    });
+    drive(
+        owner.handle,
+        Instant::now() + Duration::from_secs(30),
+        |value| {
+            if value["state"] == "admission_queued" {
+                admission_reads += 1;
+            }
+            if value["state"] == "awaiting_save" && reads_before_stage.is_none() {
+                reads_before_stage = Some(admission_reads);
+            }
+            reads_before_stage.is_some()
+        },
+    );
     // Keep answering so every waiting request completes and the clients end.
-    drive(owner.handle, Instant::now() + Duration::from_secs(30), |_| clients.is_finished());
+    drive(
+        owner.handle,
+        Instant::now() + Duration::from_secs(30),
+        |_| clients.is_finished(),
+    );
     clients.join().unwrap();
     close(owner.handle).unwrap();
 
@@ -513,13 +574,20 @@ fn one_request_is_enough_the_result_arrives_on_the_same_exchange() {
 
     let started = Instant::now();
     let mut delivered = 0;
-    drive(owner.handle, Instant::now() + Duration::from_secs(20), |_| client.is_finished());
+    drive(
+        owner.handle,
+        Instant::now() + Duration::from_secs(20),
+        |_| client.is_finished(),
+    );
     let metrics = call(owner.handle, json!({"op":"workspace_metrics"})).unwrap();
     let reply = client.join().unwrap();
     delivered += usize::from(reply["commits"].is_array());
     close(owner.handle).unwrap();
 
-    assert_eq!(delivered, 1, "the single request got {reply} instead of its result");
+    assert_eq!(
+        delivered, 1,
+        "the single request got {reply} instead of its result"
+    );
     assert!(reply["welcome"].is_array());
     assert_eq!(metrics["admission_waiters"], 0);
     assert!(
@@ -547,8 +615,10 @@ fn expired_admission_exchange_receives_a_pushed_result_without_retry() {
                 .await
                 .unwrap();
             let invitation = Invitation::from_bytes(&invitation).unwrap();
-            let pending = PendingJoin::from_invitation(&invitation, &checkpoint, &node, "Joiner").unwrap();
-            let packet = admission_packet(pending.admission_request().unwrap(), "Joiner", &checkpoint);
+            let pending =
+                PendingJoin::from_invitation(&invitation, &checkpoint, &node, "Joiner").unwrap();
+            let packet =
+                admission_packet(pending.admission_request().unwrap(), "Joiner", &checkpoint);
             node.add_address_hint(peer, address).await.unwrap();
             let request = tokio::spawn(node.request_control(peer, &packet));
             tokio::task::spawn_blocking(move || expire_rx.recv().unwrap())
@@ -565,11 +635,17 @@ fn expired_admission_exchange_receives_a_pushed_result_without_retry() {
             loop {
                 if let Some(incoming) = node.poll_control() {
                     let payload = incoming.payload().to_vec();
-                    assert!(payload.starts_with(b"DFAR\x01"), "unexpected push: {payload:?}");
+                    assert!(
+                        payload.starts_with(b"DFAR\x01"),
+                        "unexpected push: {payload:?}"
+                    );
                     incoming.respond(vec![1]).unwrap();
                     return payload;
                 }
-                assert!(Instant::now() < deadline, "owner did not push the retained admission result");
+                assert!(
+                    Instant::now() < deadline,
+                    "owner did not push the retained admission result"
+                );
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -581,12 +657,25 @@ fn expired_admission_exchange_receives_a_pushed_result_without_retry() {
         if value["state"] == "admission_queued" {
             break value;
         }
-        assert!(Instant::now() < deadline, "admission request never reached the owner");
+        assert!(
+            Instant::now() < deadline,
+            "admission request never reached the owner"
+        );
         thread::sleep(Duration::from_millis(5));
     };
     assert_eq!(queued["state"], "admission_queued");
     expire_tx.send(()).unwrap();
     expired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    // Local task cancellation precedes the owner's observation of QUIC STOP.
+    // This case requires an expired exchange before the admission is adopted.
+    while arachne_runtime::harness::expired_admission_waiters(owner.handle).unwrap() != 1 {
+        assert!(
+            Instant::now() < deadline,
+            "owner did not observe the cancelled admission exchange"
+        );
+        thread::yield_now();
+    }
 
     let staged = loop {
         let value = call(owner.handle, json!({"op":"poll_admission"})).unwrap();
@@ -598,6 +687,8 @@ fn expired_admission_exchange_receives_a_pushed_result_without_retry() {
     };
     let committed = adopt(owner.handle, "adopt_admission", &staged);
     assert_eq!(committed["members"], 2);
+    assert_eq!(committed["results_delivered"], 0);
+    assert_eq!(committed["results_pushed"], 1);
     commit_tx.send(()).unwrap();
     let pushed = client.join().unwrap();
     let reply: Value = arachne_runtime::harness::decode_admission_reply(&pushed[9..]).unwrap();
@@ -661,7 +752,10 @@ fn tampered_and_replayed_admission_pushes_are_rejected() {
     let rejected = call(joiner, json!({"op":"drive_join"})).unwrap();
     assert_eq!(rejected["state"], "admission_unavailable");
     assert_eq!(rejected["reason"], "invalid_admission_offer");
-    assert_eq!(tampered_exchange.join().unwrap().unwrap()["reply"], json!([0]));
+    assert_eq!(
+        tampered_exchange.join().unwrap().unwrap()["reply"],
+        json!([0])
+    );
 
     let valid_exchange = send(admission_result_packet(&reply));
     assert!(wait_for_work(joiner).unwrap());
@@ -676,7 +770,10 @@ fn tampered_and_replayed_admission_pushes_are_rejected() {
     let replayed = call(joiner, json!({"op":"drive_join"})).unwrap();
     assert_eq!(replayed["state"], "admission_unavailable");
     assert_eq!(replayed["reason"], "unrecognized_admission_pusher");
-    assert_eq!(replay_exchange.join().unwrap().unwrap()["reply"], json!([0]));
+    assert_eq!(
+        replay_exchange.join().unwrap().unwrap()["reply"],
+        json!([0])
+    );
 
     close(joiner).unwrap();
     close(owner.handle).unwrap();
@@ -727,16 +824,27 @@ fn a_request_set_aside_during_a_commit_wakes_the_host_when_the_commit_lands() {
             .build()
             .unwrap();
         runtime.block_on(async move {
-            let shadow = Owner { handle: 0, peer, address, invitation, checkpoint, provider: MemoryProvider::default() };
+            let shadow = Owner {
+                handle: 0,
+                peer,
+                address,
+                invitation,
+                checkpoint,
+                provider: MemoryProvider::default(),
+            };
             let (node, packet) = joiner(5500, &shadow).await;
             let admission = tokio::spawn({
                 let node = Arc::clone(&node);
                 async move { node.request_control(peer, &packet).await }
             });
-            tokio::task::spawn_blocking(move || recovery_now.recv().unwrap()).await.unwrap();
+            tokio::task::spawn_blocking(move || recovery_now.recv().unwrap())
+                .await
+                .unwrap();
             let (other, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
             other.add_address_hint(peer, address).await.unwrap();
-            let _ = other.request_control(peer, b"DFHQ not a real range query").await;
+            let _ = other
+                .request_control(peer, b"DFHQ not a real range query")
+                .await;
             let _ = admission.await;
         })
     });
@@ -763,19 +871,32 @@ fn a_request_set_aside_during_a_commit_wakes_the_host_when_the_commit_lands() {
     });
     send_recovery.send(()).unwrap();
     // The recovery request arrives and is set aside while the commit is pending.
-    wakes.recv_timeout(Duration::from_secs(10)).expect("the recovery request never arrived");
+    wakes
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the recovery request never arrived");
     thread::sleep(Duration::from_millis(200));
-    assert!(call(owner.handle, json!({"op":"poll_admission"})).unwrap().is_null(),
-        "a pending commit must set the recovery request aside");
+    assert!(
+        call(owner.handle, json!({"op":"poll_admission"}))
+            .unwrap()
+            .is_null(),
+        "a pending commit must set the recovery request aside"
+    );
     while wakes.try_recv().is_ok() {}
 
     adopt(owner.handle, "adopt_admission", &staged);
     let woken = wakes.recv_timeout(Duration::from_secs(1));
-    let served = drive(owner.handle, Instant::now() + Duration::from_secs(5), |value| value["state"] == "recovery_replied");
+    let served = drive(
+        owner.handle,
+        Instant::now() + Duration::from_secs(5),
+        |value| value["state"] == "recovery_replied",
+    );
     close(owner.handle).unwrap();
     clients.join().unwrap();
 
-    assert!(woken.is_ok(), "the commit landed but the host was not woken for the request set aside");
+    assert!(
+        woken.is_ok(),
+        "the commit landed but the host was not woken for the request set aside"
+    );
     assert!(served, "the request set aside was never served");
 }
 
@@ -790,9 +911,20 @@ fn waiting_requests_are_one_group_commit() {
     let (peer, address) = (owner.peer, owner.address);
     let (invitation, checkpoint) = (owner.invitation.clone(), owner.checkpoint.clone());
     let clients = thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
         runtime.block_on(async move {
-            let shadow = Owner { handle: 0, peer, address, invitation, checkpoint, provider: MemoryProvider::default() };
+            let shadow = Owner {
+                handle: 0,
+                peer,
+                address,
+                invitation,
+                checkpoint,
+                provider: MemoryProvider::default(),
+            };
             let mut tasks = tokio::task::JoinSet::new();
             for index in 0..6u64 {
                 let (node, packet) = joiner(5600 + index, &shadow).await;
@@ -804,13 +936,21 @@ fn waiting_requests_are_one_group_commit() {
     // Test code may sleep: let every request land before the owner reads.
     thread::sleep(Duration::from_secs(3));
     let mut first_commit = None;
-    drive(owner.handle, Instant::now() + Duration::from_secs(20), |value| {
-        if first_commit.is_none() && value["state"] == "awaiting_save" {
-            first_commit = Some(value["admissions"].as_u64().unwrap_or(0));
-        }
-        clients.is_finished()
-    });
+    drive(
+        owner.handle,
+        Instant::now() + Duration::from_secs(20),
+        |value| {
+            if first_commit.is_none() && value["state"] == "awaiting_save" {
+                first_commit = Some(value["admissions"].as_u64().unwrap_or(0));
+            }
+            clients.is_finished()
+        },
+    );
     clients.join().unwrap();
     close(owner.handle).unwrap();
-    assert_eq!(first_commit, Some(6), "the six waiting joiners were not one commit");
+    assert_eq!(
+        first_commit,
+        Some(6),
+        "the six waiting joiners were not one commit"
+    );
 }

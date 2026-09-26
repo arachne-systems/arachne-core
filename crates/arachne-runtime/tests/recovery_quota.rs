@@ -201,7 +201,10 @@ fn automatic_recovery_of_large_objects_progresses_under_author_quota() {
         accepted = progress;
     }
     // At least one served range was larger than what the quota admits.
-    assert!(first_range.unwrap() > 2, "served range fit the quota anyway");
+    assert!(
+        first_range.unwrap() > 2,
+        "served range fit the quota anyway"
+    );
     assert!(cycles > 1);
     assert_eq!(delivered, (1..=OBJECTS).collect::<Vec<_>>());
     // Nothing is left to recover, and nothing is delivered twice.
@@ -215,7 +218,10 @@ fn automatic_recovery_of_large_objects_progresses_under_author_quota() {
         json!({"op":"fetch_recovery_range","peer":info["endpoint_key"],"revision":3,
             "topics":[EVENT],"after":0,"through":2}),
     );
-    assert_eq!(finish_range(author, reader)["state"], "recovery_range_ready");
+    assert_eq!(
+        finish_range(author, reader)["state"],
+        "recovery_range_ready"
+    );
     assert_eq!(
         call(reader, json!({"op":"stage_recovery_range"}))["state"],
         "recovery_no_new_objects"

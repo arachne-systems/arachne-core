@@ -121,7 +121,10 @@ mod tests {
     fn a_timed_wait_returns_on_timeout_wake_and_close() {
         let signal = Arc::new(WorkSignal::default());
         let started = Instant::now();
-        assert_eq!(signal.wait_for(Some(Duration::from_millis(50))), Wake::TimedOut);
+        assert_eq!(
+            signal.wait_for(Some(Duration::from_millis(50))),
+            Wake::TimedOut
+        );
         assert!(started.elapsed() >= Duration::from_millis(50));
         signal.wake();
         assert_eq!(signal.wait_for(Some(Duration::ZERO)), Wake::Woken);

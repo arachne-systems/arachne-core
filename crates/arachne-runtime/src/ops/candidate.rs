@@ -464,7 +464,13 @@ pub(crate) fn adopt(
                 stale,
             });
         }
-        WorkspaceTransition::RoutedPublication(context, delivery, packet, endpoints, recipients)
+        WorkspaceTransition::RoutedPublication(
+            context,
+            delivery,
+            packet,
+            endpoints,
+            recipients,
+        )
         | WorkspaceTransition::Republication(context, delivery, packet, endpoints, recipients) => {
             // Adoption is final even if network admission fails or times out.
             // The send (and its gossip join) also ends at the op deadline.
@@ -769,7 +775,8 @@ mod tests {
             panic!("object was not staged")
         };
         let publisher = PublisherLog::new(&admin).unwrap();
-        crate::persistence::seed_workspace(&provider, &admin, Some(&publisher), Some(&inbox)).unwrap();
+        crate::persistence::seed_workspace(&provider, &admin, Some(&publisher), Some(&inbox))
+            .unwrap();
         call(json!({"op":"restore_workspace","workspace":admin.id()})).unwrap();
         let pending = call(json!({"op":"poll_pending_object"})).unwrap();
         assert_eq!(pending["payload"], json!(b"still pending"));

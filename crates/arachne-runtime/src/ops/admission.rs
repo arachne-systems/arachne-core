@@ -201,17 +201,27 @@ pub(crate) fn poll(session: &mut Session, args: PollAdmissionArgs) -> Result<Val
     // A range pull is a short read of committed steps. Serve it before
     // the rest of the queue: behind a join wave's profile-page queries it
     // waited past the puller's limit (tablets, fix16).
-    if let Some(incoming) = session
-        .node
-        .poll_control_first(|payload| payload.starts_with(membership::wire::RANGE_QUERY)
-            || payload.starts_with(membership::transfer::QUERY), RANGE_SCAN_DEPTH)
-    {
+    if let Some(incoming) = session.node.poll_control_first(
+        |payload| {
+            payload.starts_with(membership::wire::RANGE_QUERY)
+                || payload.starts_with(membership::transfer::QUERY)
+        },
+        RANGE_SCAN_DEPTH,
+    ) {
         let waited_ms = incoming.waited().as_millis() as u64;
         let reply = if incoming.payload().starts_with(membership::transfer::QUERY) {
-            membership::transfer::reply(session.workspace.as_deref(), &membership::fork::shared_orders(session),
-                incoming.peer(), incoming.payload())
+            membership::transfer::reply(
+                session.workspace.as_deref(),
+                &membership::fork::shared_orders(session),
+                incoming.peer(),
+                incoming.payload(),
+            )
         } else {
-            membership::range_reply(session.workspace.as_deref(), incoming.peer(), incoming.payload())
+            membership::range_reply(
+                session.workspace.as_deref(),
+                incoming.peer(),
+                incoming.payload(),
+            )
         };
         tracing::info!(target: "data_fabric_transport", waited_ms, "RANGE_REQUEST_SERVED");
         let _ = incoming.respond(reply);
@@ -379,12 +389,19 @@ pub(crate) fn poll(session: &mut Session, args: PollAdmissionArgs) -> Result<Val
         return Ok(json!({"state":"membership_replied", "remote_receipt":false}));
     }
     if incoming.payload().starts_with(membership::transfer::QUERY) {
-        let reply = membership::transfer::reply(session.workspace.as_deref(), &membership::fork::shared_orders(session),
-            incoming.peer(), incoming.payload());
+        let reply = membership::transfer::reply(
+            session.workspace.as_deref(),
+            &membership::fork::shared_orders(session),
+            incoming.peer(),
+            incoming.payload(),
+        );
         let _ = incoming.respond(reply);
         return Ok(json!({"state":"membership_replied", "remote_receipt":false}));
     }
-    if incoming.payload().starts_with(membership::wire::RANGE_QUERY) {
+    if incoming
+        .payload()
+        .starts_with(membership::wire::RANGE_QUERY)
+    {
         let reply = membership::range_reply(
             session.workspace.as_deref(),
             incoming.peer(),
@@ -683,8 +700,17 @@ fn drive_workspace_step(session: &mut Session) -> Result<Value, ApiError> {
 }
 
 fn copy_branch_outcome(staged: &Value, committed: &mut Value) {
-    for name in ["branch_state", "fork_epoch", "first_unsettled", "action_id", "reason",
-        "carried_revocation", "republication", "republication_lost", "publication_id"] {
+    for name in [
+        "branch_state",
+        "fork_epoch",
+        "first_unsettled",
+        "action_id",
+        "reason",
+        "carried_revocation",
+        "republication",
+        "republication_lost",
+        "publication_id",
+    ] {
         if let Some(value) = staged.get(name) {
             committed[name] = value.clone();
         }
@@ -906,6 +932,8 @@ fn reply_too_large(detail: &str) -> ApiError {
 /// admission commit travels once, as the last step.
 const ADMISSION_REPLY: &[u8; 5] = b"DFAY\x02";
 
+type AdmissionWelcomeWire<'a> = (&'a [u8], [u8; 32], &'a [u8], &'a [u8]);
+
 #[derive(Serialize, Deserialize)]
 struct AdmissionReplyWire<'a> {
     workspace: [u8; 32],
@@ -915,7 +943,7 @@ struct AdmissionReplyWire<'a> {
     /// Final page only: the Welcome and the admission's authorization
     /// (invitation key, grant and redemption signatures).
     #[serde(borrow)]
-    welcome: Option<(&'a [u8], [u8; 32], &'a [u8], &'a [u8])>,
+    welcome: Option<AdmissionWelcomeWire<'a>>,
     /// `(offset, next, complete)` when the history spans more than one page.
     page: Option<(u32, u32, bool)>,
 }
@@ -935,14 +963,20 @@ fn encode_admission_page(
     let mut encoded_steps = Vec::new();
     for (index, step) in steps[offset..next].iter().enumerate() {
         if step.len() > membership::MAX_INLINE_STEP {
-            let first_epoch = reply.epoch.checked_sub(total as u64)
-                .ok_or_else(|| ApiError::invalid_input("history", "admission history epoch underflow"))?;
-            let reference = membership::transfer::Reference::new(reply.workspace.to_bytes(),
-                membership::transfer::Object::Step(first_epoch + offset as u64 + index as u64), step)
-                .and_then(|reference| reference.encode())
-                .map_err(|_| reply_too_large("admission proof exceeds fragment bound"))?;
+            let first_epoch = reply.epoch.checked_sub(total as u64).ok_or_else(|| {
+                ApiError::invalid_input("history", "admission history epoch underflow")
+            })?;
+            let reference = membership::transfer::Reference::new(
+                reply.workspace.to_bytes(),
+                membership::transfer::Object::Step(first_epoch + offset as u64 + index as u64),
+                step,
+            )
+            .and_then(|reference| reference.encode())
+            .map_err(|_| reply_too_large("admission proof exceeds fragment bound"))?;
             encoded_steps.push(reference);
-        } else { encoded_steps.push(step.clone()); }
+        } else {
+            encoded_steps.push(step.clone());
+        }
     }
     let wire = AdmissionReplyWire {
         workspace: reply.workspace.to_bytes(),
@@ -1087,23 +1121,36 @@ fn decode_admission_reply_with_limit(bytes: &[u8], limit: usize) -> Result<Value
 /// Resolve large proof references before the native join verifier sees the
 /// page. Return expanded bytes for the whole-history allocation budget.
 pub(crate) async fn resolve_admission_reply(
-    client: arachne_node::ControlClient, peer: [u8; 32], bytes: &[u8],
+    client: arachne_node::ControlClient,
+    peer: [u8; 32],
+    bytes: &[u8],
 ) -> Result<(Value, usize), arachne_node::Error> {
     use arachne_node::Error;
-    if bytes.len() > arachne_node::MAX_CONTROL_REPLY { return Err(Error::TooLarge); }
+    if bytes.len() > arachne_node::MAX_CONTROL_REPLY {
+        return Err(Error::TooLarge);
+    }
     let Some(body) = bytes.strip_prefix(ADMISSION_REPLY) else {
-        return decode_admission_reply(bytes).map(|value| (value, bytes.len())).map_err(|_| Error::InvalidFrame);
+        return decode_admission_reply(bytes)
+            .map(|value| (value, bytes.len()))
+            .map_err(|_| Error::InvalidFrame);
     };
-    let (wire, trailing): (AdmissionReplyWire<'_>, _) = postcard::take_from_bytes(body).map_err(|_| Error::InvalidFrame)?;
+    let (wire, trailing): (AdmissionReplyWire<'_>, _) =
+        postcard::take_from_bytes(body).map_err(|_| Error::InvalidFrame)?;
     if !trailing.is_empty() || wire.steps.len() > arachne_security::MAX_JOIN_HISTORY_STEPS {
         return Err(Error::InvalidFrame);
     }
-    let steps = membership::transfer::resolve_steps(client, peer, wire.workspace, &wire.steps, false).await?;
-    let wire = AdmissionReplyWire { steps: steps.iter().map(Vec::as_slice).collect(), ..wire };
+    let steps =
+        membership::transfer::resolve_steps(client, peer, wire.workspace, &wire.steps, false)
+            .await?;
+    let wire = AdmissionReplyWire {
+        steps: steps.iter().map(Vec::as_slice).collect(),
+        ..wire
+    };
     let mut expanded = ADMISSION_REPLY.to_vec();
     expanded.extend(postcard::to_allocvec(&wire).map_err(|_| Error::InvalidFrame)?);
-    let value = decode_admission_reply_with_limit(&expanded, membership::transfer::RESOLVED_PAGE_BYTES)
-        .map_err(|_| Error::InvalidFrame)?;
+    let value =
+        decode_admission_reply_with_limit(&expanded, membership::transfer::RESOLVED_PAGE_BYTES)
+            .map_err(|_| Error::InvalidFrame)?;
     Ok((value, expanded.len()))
 }
 
@@ -2067,7 +2114,14 @@ mod tests {
                     .collect(),
             );
             let step = membership::encode_step(&authorization, &prepared.commit).unwrap();
-            let offer = membership::offer_packet(&prepared.workspace, owner.epoch(), &authorization, &prepared.commit, false).unwrap();
+            let offer = membership::offer_packet(
+                &prepared.workspace,
+                owner.epoch(),
+                &authorization,
+                &prepared.commit,
+                false,
+            )
+            .unwrap();
             let step_size = step.len();
             let reply = admission_history_page(
                 &retained_reply(&prepared.workspace, endpoint(20_000), &requests[0]).unwrap(),
@@ -2093,7 +2147,10 @@ mod tests {
             assert_eq!(owner.member_count(), count + 1);
             assert_eq!(joins.len(), count);
         }
-        assert_eq!(MAX_RUNTIME_ADMISSION_BATCH, 128, "binary transport can admit a full supported batch");
+        assert_eq!(
+            MAX_RUNTIME_ADMISSION_BATCH, 128,
+            "binary transport can admit a full supported batch"
+        );
     }
 
     #[test]

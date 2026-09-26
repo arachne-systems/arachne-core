@@ -50,9 +50,13 @@ fn objects_are_independent_authenticated_and_epoch_scoped() {
     let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     let (registration, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let admin = registration.workspace;
-    let pending = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
+    let pending =
+        PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
+        .prepare_admission(
+            crate::test_endpoint(2),
+            pending.admission_request().unwrap(),
+        )
         .unwrap();
     let mut proof = pending.join_proof().unwrap();
     proof
@@ -68,9 +72,13 @@ fn objects_are_independent_authenticated_and_epoch_scoped() {
         .unwrap();
     let size = sender.seal(&storage_key).unwrap().len();
     for _ in 0..10_000 {
-        sender.protect_object(b"app", b"feed", b"opaque sample").unwrap();
+        sender
+            .protect_object(b"app", b"feed", b"opaque sample")
+            .unwrap();
     }
-    let live = sender.protect_object(b"app", b"chat/latest", b"live chat").unwrap();
+    let live = sender
+        .protect_object(b"app", b"chat/latest", b"live chat")
+        .unwrap();
     assert_eq!(
         reader
             .unprotect_object(b"app", b"chat/latest", &live)
@@ -78,21 +86,36 @@ fn objects_are_independent_authenticated_and_epoch_scoped() {
             .counter,
         10_002
     );
-    let first = reader.unprotect_object(b"app", b"chat/first", &old).unwrap();
+    let first = reader
+        .unprotect_object(b"app", b"chat/first", &old)
+        .unwrap();
     assert_eq!(first.counter, 1);
     assert_eq!(first.message.payload, b"retained chat");
     assert_eq!(first.message.endpoint, sender.endpoint());
     assert_eq!(first.message.member, sender.member().unwrap().id());
     assert_eq!(size, sender.seal(&storage_key).unwrap().len());
     // No ratchet/replay side effects in crypto; delivery must suppress repeats.
-    assert_eq!(reader.unprotect_object(b"app", b"chat/first", &old).unwrap(), first);
+    assert_eq!(
+        reader
+            .unprotect_object(b"app", b"chat/first", &old)
+            .unwrap(),
+        first
+    );
     assert!(reader.unprotect_object(b"app", b"feed", &old).is_err());
     let outsider = Workspace::create(crate::test_key(3), "Other workspace").unwrap();
-    assert!(outsider.unprotect_object(b"app", b"chat/first", &old).is_err());
+    assert!(
+        outsider
+            .unprotect_object(b"app", b"chat/first", &old)
+            .is_err()
+    );
     for offset in [0, 5, 37, 45, HEADER, old.len() - 1] {
         let mut changed = old.clone();
         changed[offset] ^= 1;
-        assert!(reader.unprotect_object(b"app", b"chat/first", &changed).is_err());
+        assert!(
+            reader
+                .unprotect_object(b"app", b"chat/first", &changed)
+                .is_err()
+        );
     }
     let mut forged = old.clone();
     let end = forged.len() - SIGNATURE;
@@ -102,11 +125,17 @@ fn objects_are_independent_authenticated_and_epoch_scoped() {
         .unwrap();
     forged[end..].copy_from_slice(&signature);
     assert_eq!(
-        reader.unprotect_object(b"app", b"chat/first", &forged).unwrap_err(),
+        reader
+            .unprotect_object(b"app", b"chat/first", &forged)
+            .unwrap_err(),
         "object signature invalid"
     );
     for len in 0..old.len() {
-        assert!(reader.unprotect_object(b"app", b"chat/first", &old[..len]).is_err());
+        assert!(
+            reader
+                .unprotect_object(b"app", b"chat/first", &old[..len])
+                .is_err()
+        );
     }
     assert!(
         sender
@@ -132,7 +161,9 @@ fn objects_are_independent_authenticated_and_epoch_scoped() {
     );
     let saved = sender.seal(&storage_key).unwrap();
     sender = Workspace::restore(&storage_key, sender.endpoint(), sender.id(), &saved).unwrap();
-    let next = sender.protect_object(b"app", b"after-restore", b"chat").unwrap();
+    let next = sender
+        .protect_object(b"app", b"after-restore", b"chat")
+        .unwrap();
     assert_eq!(
         reader
             .unprotect_object(b"app", b"after-restore", &next)
@@ -147,7 +178,9 @@ fn objects_are_independent_authenticated_and_epoch_scoped() {
         .protect_object(b"app", b"old-claim", b"sent before removal")
         .unwrap();
     sender = sender
-        .prepare_management(super::ManagementAction::Remove(reader.member().unwrap().id()))
+        .prepare_management(super::ManagementAction::Remove(
+            reader.member().unwrap().id(),
+        ))
         .unwrap()
         .workspace;
     let backdated = reader
@@ -161,7 +194,9 @@ fn objects_are_independent_authenticated_and_epoch_scoped() {
             "object author not current"
         );
     }
-    let recent = sender.unprotect_object(b"app", b"chat/first", &old).unwrap();
+    let recent = sender
+        .unprotect_object(b"app", b"chat/first", &old)
+        .unwrap();
     assert_eq!(recent.message.payload, b"retained chat");
     assert_eq!(recent.epoch, sender.epoch() - 1);
     let fresh = sender
@@ -174,16 +209,25 @@ fn objects_are_independent_authenticated_and_epoch_scoped() {
             .counter,
         1
     );
-    assert!(reader.unprotect_object(b"app", b"new-epoch", &fresh).is_err());
+    assert!(
+        reader
+            .unprotect_object(b"app", b"new-epoch", &fresh)
+            .is_err()
+    );
 
     let epoch = sender.epoch();
     sender.provider.storage().values.write().unwrap().insert(
         COUNTER.to_vec(),
         [epoch.to_be_bytes(), (u64::MAX - 1).to_be_bytes()].concat(),
     );
-    let last = sender.protect_object(b"app", b"last-counter", b"last").unwrap();
+    let last = sender
+        .protect_object(b"app", b"last-counter", b"last")
+        .unwrap();
     assert_eq!(
-        sender.unprotect_object(b"app", b"last-counter", &last).unwrap().counter,
+        sender
+            .unprotect_object(b"app", b"last-counter", &last)
+            .unwrap()
+            .counter,
         u64::MAX,
     );
     assert_eq!(
@@ -212,9 +256,13 @@ fn recent_epochs_stay_readable_for_receive_only_then_expire() {
     // Registering the link is one membership commit (B1).
     let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let admin = registered.workspace;
-    let pending = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
+    let pending =
+        PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
+        .prepare_admission(
+            crate::test_endpoint(2),
+            pending.admission_request().unwrap(),
+        )
         .unwrap();
     let mut proof = pending.join_proof().unwrap();
     proof
@@ -225,16 +273,26 @@ fn recent_epochs_stay_readable_for_receive_only_then_expire() {
         .unwrap();
     let mut admin = prepared.workspace;
     let start = admin.epoch();
-    let from_admin = admin.protect_object(b"app", b"ctx", b"admin at start").unwrap();
-    let from_reader = reader.protect_object(b"app", b"ctx", b"reader at start").unwrap();
+    let from_admin = admin
+        .protect_object(b"app", b"ctx", b"admin at start")
+        .unwrap();
+    let from_reader = reader
+        .protect_object(b"app", b"ctx", b"reader at start")
+        .unwrap();
     let lagging = reader.provisional_copy().unwrap();
     let both_read = |admin: &Workspace, reader: &Workspace| {
         assert_eq!(
-            admin.unprotect_object(b"app", b"ctx", &from_reader).unwrap().epoch,
+            admin
+                .unprotect_object(b"app", b"ctx", &from_reader)
+                .unwrap()
+                .epoch,
             start
         );
         assert_eq!(
-            reader.unprotect_object(b"app", b"ctx", &from_admin).unwrap().epoch,
+            reader
+                .unprotect_object(b"app", b"ctx", &from_admin)
+                .unwrap()
+                .epoch,
             start
         );
     };
@@ -250,7 +308,8 @@ fn recent_epochs_stay_readable_for_receive_only_then_expire() {
     admin = registered.workspace;
     assert_eq!(admin.epoch(), start + 1);
     both_read(&admin, &reader);
-    let third = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(3), "Third").unwrap();
+    let third =
+        PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(3), "Third").unwrap();
     let added = admin
         .prepare_admission(crate::test_endpoint(3), third.admission_request().unwrap())
         .unwrap();
@@ -258,7 +317,9 @@ fn recent_epochs_stay_readable_for_receive_only_then_expire() {
         .prepare_admission_update(&added.authorization, &added.commit)
         .unwrap();
     let mut proof = third.join_proof().unwrap();
-    proof.apply_add(&added.authorization, &added.commit).unwrap();
+    proof
+        .apply_add(&added.authorization, &added.commit)
+        .unwrap();
     let newcomer = third.prepare_workspace(&proof, &added.welcome).unwrap();
     admin = added.workspace;
     both_read(&admin, &reader);
@@ -272,11 +333,16 @@ fn recent_epochs_stay_readable_for_receive_only_then_expire() {
     // Never send with an old epoch; a lagging peer sees a future epoch.
     let fresh = admin.protect_object(b"app", b"ctx", b"newer").unwrap();
     assert_eq!(
-        admin.unprotect_object(b"app", b"ctx", &fresh).unwrap().epoch,
+        admin
+            .unprotect_object(b"app", b"ctx", &fresh)
+            .unwrap()
+            .epoch,
         start + 2
     );
     assert_eq!(
-        lagging.unprotect_object(b"app", b"ctx", &fresh).unwrap_err(),
+        lagging
+            .unprotect_object(b"app", b"ctx", &fresh)
+            .unwrap_err(),
         "object epoch ahead"
     );
 
@@ -306,8 +372,13 @@ fn recent_epochs_stay_readable_for_receive_only_then_expire() {
     }
     assert_eq!(admin.epoch(), start + RECEIVE_EPOCHS);
     let key = StorageKey::derive(&[4; 32]).unwrap();
-    let reader = Workspace::restore(&key, reader.endpoint(), reader.id(), &reader.seal(&key).unwrap())
-        .unwrap();
+    let reader = Workspace::restore(
+        &key,
+        reader.endpoint(),
+        reader.id(),
+        &reader.seal(&key).unwrap(),
+    )
+    .unwrap();
     both_read(&admin, &reader);
 
     // 4. One more epoch evicts the start secret (forward secrecy bound).
@@ -320,7 +391,10 @@ fn recent_epochs_stay_readable_for_receive_only_then_expire() {
         "object epoch expired"
     );
     assert_eq!(
-        admin.unprotect_object(b"app", b"ctx", &fresh).unwrap().epoch,
+        admin
+            .unprotect_object(b"app", b"ctx", &fresh)
+            .unwrap()
+            .epoch,
         start + 2
     );
     let storage = admin.provider.storage().values.read().unwrap();
@@ -347,9 +421,13 @@ fn objects_are_bound_to_their_application_namespace() {
     let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let admin = registered.workspace;
-    let pending = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
+    let pending =
+        PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
+        .prepare_admission(
+            crate::test_endpoint(2),
+            pending.admission_request().unwrap(),
+        )
         .unwrap();
     let mut proof = pending.join_proof().unwrap();
     proof
@@ -382,7 +460,9 @@ fn objects_are_bound_to_their_application_namespace() {
         .unwrap();
     moved[end..].copy_from_slice(&signature);
     assert_eq!(
-        reader.unprotect_object(b"feed", b"shared", &moved).unwrap_err(),
+        reader
+            .unprotect_object(b"feed", b"shared", &moved)
+            .unwrap_err(),
         "object authentication failed"
     );
     let base = sender.object_base().unwrap();
@@ -403,10 +483,9 @@ fn object_namespace_derivation_keeps_its_bytes_across_crypto_upgrades() {
     // Independently calculated with Python hashlib/hmac and RFC 5869.
     let base: [u8; 32] = std::array::from_fn(|i| i as u8);
     let expected = [
-        0x84, 0xa6, 0x79, 0x56, 0xcc, 0x9f, 0x45, 0x50,
-        0x7f, 0xd5, 0xf7, 0x8e, 0x78, 0x70, 0x7c, 0xb3,
-        0x3b, 0x77, 0xcf, 0x44, 0x92, 0x08, 0x23, 0x00,
-        0x08, 0x24, 0x11, 0x46, 0x7e, 0x07, 0xc7, 0xb1,
+        0x84, 0xa6, 0x79, 0x56, 0xcc, 0x9f, 0x45, 0x50, 0x7f, 0xd5, 0xf7, 0x8e, 0x78, 0x70, 0x7c,
+        0xb3, 0x3b, 0x77, 0xcf, 0x44, 0x92, 0x08, 0x23, 0x00, 0x08, 0x24, 0x11, 0x46, 0x7e, 0x07,
+        0xc7, 0xb1,
     ];
     assert_eq!(*namespace_key(&base, b"chat").unwrap(), expected);
 }
@@ -458,7 +537,9 @@ fn parse_window(bytes: Option<&Vec<u8>>) -> Result<Vec<(u64, [u8; 32])>, &'stati
         return Err("invalid object receive window");
     }
     let window: Vec<(u64, [u8; 32])> = bytes
-        .chunks_exact(40)
+        .as_chunks::<40>()
+        .0
+        .iter()
         .map(|entry| {
             (
                 u64::from_be_bytes(entry[..8].try_into().unwrap()),

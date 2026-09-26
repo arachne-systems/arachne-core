@@ -24,7 +24,10 @@ fn recipient_publication_survives_receiver_restart_with_object_delivery_enabled(
         sender,
         json!({"op":"create_workspace","display_name":"Publisher"}),
     );
-    let staged = call(sender, json!({"op":"stage_invitation","personal":false,"expires_at":0}));
+    let staged = call(
+        sender,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    );
     let invite = call(
         sender,
         json!({"op":"adopt_admission","candidate":staged["candidate"]}),

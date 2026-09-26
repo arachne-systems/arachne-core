@@ -1,9 +1,9 @@
 mod common;
-use common::{test_endpoint, test_key};
 use arachne_security::{
-    Invitation, ManagementAction, OrderStep, PendingJoin, PreparedManagementUpdate,
-    RevocationKind, StorageKey, Workspace,
+    Invitation, ManagementAction, OrderStep, PendingJoin, PreparedManagementUpdate, RevocationKind,
+    StorageKey, Workspace,
 };
+use common::{test_endpoint, test_key};
 
 /// A registered reusable link and the owner that holds its registration.
 fn register(owner: &Workspace) -> (Workspace, Invitation, Vec<u8>) {
@@ -17,15 +17,23 @@ fn add(
     endpoint: u8,
 ) -> (Workspace, Workspace, arachne_security::PreparedAdmission) {
     let join =
-        PendingJoin::from_invitation(invite, checkpoint, test_key(u64::from(endpoint)), "Member").unwrap();
+        PendingJoin::from_invitation(invite, checkpoint, test_key(u64::from(endpoint)), "Member")
+            .unwrap();
     let admitted = owner
-        .prepare_admission(test_endpoint(u64::from(endpoint)), join.admission_request().unwrap())
+        .prepare_admission(
+            test_endpoint(u64::from(endpoint)),
+            join.admission_request().unwrap(),
+        )
         .unwrap();
     let mut proof = join.join_proof().unwrap();
     // A reused link replays every step since its checkpoint, ending with this Add.
     for (authorization, commit) in admitted
         .workspace
-        .membership_history(test_endpoint(u64::from(endpoint)), join.admission_request().unwrap(), checkpoint)
+        .membership_history(
+            test_endpoint(u64::from(endpoint)),
+            join.admission_request().unwrap(),
+            checkpoint,
+        )
         .unwrap()
     {
         proof.apply_transition(&authorization, &commit).unwrap();

@@ -18,8 +18,8 @@ use crate::ops::recovery::{
 };
 use crate::workspace_activity::ActivityView;
 use crate::{
-    MAX_ADMISSION_WAITERS, WorkspaceActivity, WorkspacePhase, admission_waiters, committed_view, interest, membership,
-    persistence, presence, resources,
+    MAX_ADMISSION_WAITERS, WorkspaceActivity, WorkspacePhase, admission_waiters, committed_view,
+    interest, membership, persistence, presence, resources,
 };
 
 pub(crate) enum WorkspaceTransition {
@@ -352,9 +352,11 @@ pub(crate) fn commit_workspace(session: &mut Session, workspace: arachne_securit
         }
     }
     let workspace = Arc::new(workspace);
-    session
-        .committed
-        .publish(workspace.clone(), session.node.id(), membership::fork::shared_orders(session));
+    session.committed.publish(
+        workspace.clone(),
+        session.node.id(),
+        membership::fork::shared_orders(session),
+    );
     session.workspace = Some(workspace);
     // Any committed workspace change, including a name-only update, must be
     // advertised on the next native presence drain.  Otherwise peers keep
@@ -381,8 +383,10 @@ pub(crate) fn activity_value(session: &Session) -> serde_json::Value {
 /// Terminal and explicit lifecycle operations retain their own reasons.
 pub(crate) fn activity_view(session: &Session) -> ActivityView {
     let mut view = session.activity.view();
-    if matches!(view.phase, WorkspacePhase::Active | WorkspacePhase::Recovering)
-        && let Some(reason) = membership::fork::recovery_reason(session)
+    if matches!(
+        view.phase,
+        WorkspacePhase::Active | WorkspacePhase::Recovering
+    ) && let Some(reason) = membership::fork::recovery_reason(session)
     {
         view.phase = WorkspacePhase::Recovering;
         view.reason = Some(reason.to_owned());

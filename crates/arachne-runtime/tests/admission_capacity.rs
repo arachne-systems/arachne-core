@@ -3,8 +3,8 @@ use arachne_runtime::{MemoryProvider, close, describe, execute};
 use arachne_security::{Invitation, PendingJoin};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
@@ -139,7 +139,8 @@ fn public_runtime_admission_path_handles_500_authenticated_joiners() {
             let mut initial_queued = 0;
             while let Some(result) = first.join_next().await {
                 let reply = result.unwrap().unwrap();
-                let value: Value = arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
+                let value: Value =
+                    arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
                 assert_eq!(
                     value["state"], "admission_queued",
                     "unexpected admission reply: {value}"
@@ -157,7 +158,8 @@ fn public_runtime_admission_path_handles_500_authenticated_joiners() {
                 retry.spawn(async move {
                     for _ in 0..200 {
                         let reply = node.request_control(owner_peer, &packet).await?;
-                        let state: Value = arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
+                        let state: Value =
+                            arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
                         if state["state"] != "admission_queued" {
                             return Ok(reply);
                         }
@@ -169,7 +171,8 @@ fn public_runtime_admission_path_handles_500_authenticated_joiners() {
             let mut retained = 0;
             while let Some(result) = retry.join_next().await {
                 let reply = result.unwrap().unwrap();
-                let value: Value = arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
+                let value: Value =
+                    arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
                 assert!(
                     value["commit"].is_array(),
                     "unexpected retained reply: {value}"
@@ -204,10 +207,7 @@ fn public_runtime_admission_path_handles_500_authenticated_joiners() {
             )
             .unwrap();
             assert_eq!(adopted["durable"], true);
-            assert_eq!(
-                adopted["members"],
-                committed + count + 1
-            );
+            assert_eq!(adopted["members"], committed + count + 1);
             committed += count;
             batches += 1;
         } else if value["state"] == "approval_requested" {

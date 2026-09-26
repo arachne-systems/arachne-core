@@ -1,31 +1,42 @@
-> Written by Claude (AI). Handoff brief H7.
+> Handoff brief H7. Updated 2026-09-26.
 
 # H7: Final integration and cleanup
 
 ## BLUF
 
-`integrate/wave1` holds all merged work. After H1–H6, this package cleans up, runs the full suite
-once, and prepares the branch for review and merge to `main`.
+The lead merged H1, H2, H3, H4 and H6 locally. H7 qualifies their combined Core
+in `codex/night-h7-integration`, based on `ad31b97`, then imports the final
+follow-ups from `integrate/wave1`. The owner decides any merge to `main` or
+outward action.
 
-## State of `integrate/wave1`
+## Initial integrated evidence
 
-- Head `bc2a2d1`.
-- Last green full suite: 526 passed, 0 failed, 15 ignored (before the A2 runtime merge).
-- After the A2 runtime merge: the build passes, delivery tests pass, but the full suite was stopped at 26 passed, 0 failed. **Rerun it first.**
+The fresh all-target/all-feature test build passed. The first 118-executable
+run had 687 passed, 2 failed and 21 ignored. A three-member convergence case
+and a first-post-restart admission timing check failed. Unchanged focused
+reruns passed; the first failures remain in the
+[H7 report](../../evidence/h7-night-2026-09-26.md). H1 owns the deterministic
+membership-driver starvation fix. Do not treat retries as the final green run.
 
 ## Work
 
-- [ ] Rerun the full suite on `integrate/wave1` now (see README "How to merge").
-- [ ] Merge H1, H2, H3, H4, H6 as each finishes. Full suite after each large merge.
-- [ ] A3h: remove the unused `serde_json` dependency in `arachne-delivery`.
-- [ ] Run `cargo fmt --all` once, as its own commit, after all branches are merged (many files are not rustfmt-clean; formatting earlier would cause conflicts).
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`: fix or document.
-- [ ] Update `docs/integration.md`, `docs/security.md`, `README.md` for the new API (Context, storage, candidates, events, deadlines, suspend/resume).
-- [ ] Tick every box in `docs/reviews/2026-09-24-work-tracker.md` with its commit.
-- [ ] Write a short merge summary for the owner (what changed, breaking changes, test totals).
+- [x] Run the combined baseline and retain every result.
+- [x] Confirm H1, H2, H3, H4 and H6 integration ancestry; H5 has its own SDK proof.
+- [ ] Import and qualify the final H1 and general retained-tail follow-ups.
+- [ ] Finish A3h dependency removal and workspace qualification.
+- [ ] Run `cargo fmt --all` as its own commit after the code follow-ups merge.
+- [ ] Pass `cargo clippy --workspace --all-targets --all-features -- -D warnings`;
+  document each narrow lint exception.
+- [ ] Pass the final full suite and dependency policy check.
+- [x] Update Context, storage, candidates, events, deadlines and suspend/resume
+  guidance in the integration guide, security guide and root README.
+- [ ] Record final evidence and commits in the tracker. Keep unproved consumer
+  and owner gates open.
+- [ ] Finish the [owner merge summary](../h7-owner-merge-summary.md).
+- [ ] Clean this lane's rebuildable target after its last check.
 
 ## Done when
 
-- Every finding in the tracker is ticked with evidence.
-- Full suite green, `cargo deny` green, clippy clean or documented.
-- The owner has what they need to decide the push (H8).
+The final source has recorded checks, each defect has evidence or an explicit
+open status, and the owner can decide H8. No test receipt substitutes for an
+existing-data upgrade, final SDK pin check or ATAK host qualification.

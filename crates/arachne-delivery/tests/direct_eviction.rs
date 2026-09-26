@@ -29,7 +29,11 @@ fn author_and_reader() -> (Workspace, Workspace) {
     (author, reader)
 }
 
-fn direct(author: &mut Workspace, reader: [u8; 32], sequence: u64) -> (PublicationContext, Vec<u8>) {
+fn direct(
+    author: &mut Workspace,
+    reader: [u8; 32],
+    sequence: u64,
+) -> (PublicationContext, Vec<u8>) {
     let topic = Topic::new("direct/eviction").unwrap();
     let context = PublicationContext {
         workspace: author.id(),

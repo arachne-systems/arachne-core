@@ -151,13 +151,19 @@ impl StorageProvider for SqliteProvider {
     fn open(&self, scope: [u8; 32]) -> Result<Option<Box<dyn Storage>>> {
         let path = self.path(scope);
         match std::fs::metadata(&path) {
-            Ok(_) => Ok(Some(Box::new(Store::open_existing(&path, &self.root, scope)?))),
+            Ok(_) => Ok(Some(Box::new(Store::open_existing(
+                &path, &self.root, scope,
+            )?))),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
     }
     fn create(&self, scope: [u8; 32]) -> Result<Box<dyn Storage>> {
-        Ok(Box::new(Store::create(&self.path(scope), &self.root, scope)?))
+        Ok(Box::new(Store::create(
+            &self.path(scope),
+            &self.root,
+            scope,
+        )?))
     }
 }
 
@@ -217,7 +223,9 @@ impl MemoryProvider {
         if let Some(records) = self.0.stores.lock().unwrap().get(&scope) {
             let mut records = records.lock().unwrap();
             match value {
-                Some(value) => records.values.insert(name.to_vec(), Zeroizing::new(value.to_vec())),
+                Some(value) => records
+                    .values
+                    .insert(name.to_vec(), Zeroizing::new(value.to_vec())),
                 None => records.values.remove(name),
             };
         }
@@ -243,7 +251,9 @@ struct MemoryStorage {
 
 impl MemoryStorage {
     fn records(&self) -> std::sync::MutexGuard<'_, Records> {
-        self.records.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -315,7 +325,11 @@ impl Storage for MemoryStorage {
 
 impl StorageProvider for MemoryProvider {
     fn open(&self, scope: [u8; 32]) -> Result<Option<Box<dyn Storage>>> {
-        let stores = self.0.stores.lock().map_err(|_| "memory storage poisoned")?;
+        let stores = self
+            .0
+            .stores
+            .lock()
+            .map_err(|_| "memory storage poisoned")?;
         Ok(stores.get(&scope).map(|records| {
             Box::new(MemoryStorage {
                 shared: Arc::clone(&self.0),
@@ -324,7 +338,11 @@ impl StorageProvider for MemoryProvider {
         }))
     }
     fn create(&self, scope: [u8; 32]) -> Result<Box<dyn Storage>> {
-        let mut stores = self.0.stores.lock().map_err(|_| "memory storage poisoned")?;
+        let mut stores = self
+            .0
+            .stores
+            .lock()
+            .map_err(|_| "memory storage poisoned")?;
         if stores.contains_key(&scope) {
             return Err("record store already exists".into());
         }

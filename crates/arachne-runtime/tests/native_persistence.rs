@@ -22,7 +22,10 @@ fn open(root: &[u8; 32], directory: &std::path::Path) -> i64 {
     handle
 }
 fn restore(handle: i64, workspace: [u8; 32]) -> Result<Value, String> {
-    call(handle, json!({"op":"restore_workspace","workspace":workspace}))
+    call(
+        handle,
+        json!({"op":"restore_workspace","workspace":workspace}),
+    )
 }
 fn adopt(handle: i64, staged: &Value, op: &str) -> Value {
     let token = bytes(&staged["candidate"]);
@@ -54,33 +57,53 @@ fn restore_with_freshness_anchor_rejects_a_rolled_back_database() {
     std::fs::copy(&path, &old).unwrap();
 
     handle = open(&root, directory.path());
-    call(handle, json!({"op":"restore_workspace","workspace":workspace,
-        "freshness":enabled.to_bytes().to_vec()}))
+    call(
+        handle,
+        json!({"op":"restore_workspace","workspace":workspace,
+        "freshness":enabled.to_bytes().to_vec()}),
+    )
     .unwrap();
-    call(handle, json!({"op":"install_workspace_policy","revision":1})).unwrap();
+    call(
+        handle,
+        json!({"op":"install_workspace_policy","revision":1}),
+    )
+    .unwrap();
     let staged = call(
         handle,
         json!({"op":"stage_network_publication","workspace":workspace,"revision":1,
             "topic":"streams/opaque","id":vec![1;16],"payload":[1]}),
     )
     .unwrap();
-    call(handle, json!({"op":"adopt_publication","candidate":staged["candidate"]})).unwrap();
+    call(
+        handle,
+        json!({"op":"adopt_publication","candidate":staged["candidate"]}),
+    )
+    .unwrap();
     let latest = record_freshness(handle).unwrap();
     assert!(latest.revision > enabled.revision);
-    assert_eq!(FreshnessAnchor::from_bytes(&latest.to_bytes()).unwrap(), latest);
+    assert_eq!(
+        FreshnessAnchor::from_bytes(&latest.to_bytes()).unwrap(),
+        latest
+    );
     close(handle).unwrap();
 
     // Whole-database rollback: restoring would replay the sender counter.
     std::fs::copy(&old, &path).unwrap();
     handle = open(&root, directory.path());
-    let rejected = call(handle, json!({"op":"restore_workspace","workspace":workspace,
-        "freshness":latest.to_bytes().to_vec()}))
+    let rejected = call(
+        handle,
+        json!({"op":"restore_workspace","workspace":workspace,
+        "freshness":latest.to_bytes().to_vec()}),
+    )
     .unwrap_err();
     assert!(rejected.contains("freshness"), "{rejected}");
     // Rejection leaves the session empty; the matching anchor still restores.
     assert!(record_freshness(handle).is_err());
-    call(handle, json!({"op":"restore_workspace","workspace":workspace,
-        "freshness":enabled.to_bytes().to_vec()}))
+    call(
+        handle,
+        json!({"op":"restore_workspace","workspace":workspace,
+        "freshness":enabled.to_bytes().to_vec()}),
+    )
     .unwrap();
     close(handle).unwrap();
     // Without a monotonic anchor store the anchor stays optional.
@@ -187,7 +210,13 @@ fn hundred_member_runtime_commits_and_reopens() {
     close(handle).unwrap();
     handle = open(&root, directory.path());
     restore(handle, workspace).unwrap();
-    assert!(call(handle, json!({"op":"adopt_publication","candidate":abandoned["candidate"]})).is_err());
+    assert!(
+        call(
+            handle,
+            json!({"op":"adopt_publication","candidate":abandoned["candidate"]})
+        )
+        .is_err()
+    );
     call(
         handle,
         json!({"op":"install_workspace_policy","revision":revision}),
@@ -329,14 +358,17 @@ fn seeded_pending_inbox_survives_restart_and_removal_cannot_reopen_active_state(
     );
     let removal = call(handle, json!({"op":"stage_admission_update","step":step})).unwrap();
     // Adoption saves the removal first and deletes every active record.
-    assert_eq!(adopt(handle, &removal, "adopt_admission")["state"], "removed");
+    assert_eq!(
+        adopt(handle, &removal, "adopt_admission")["state"],
+        "removed"
+    );
     assert!(call(handle, json!({"op":"workspace_state"})).is_err());
     handle = open(&root, directory.path());
     assert_eq!(restore(handle, workspace).unwrap()["state"], "removed");
     handle = open(&root, directory.path());
     // A new join may reuse the store; a new workspace cannot resurrect it.
-    let store = arachne_store::Store::open_existing(&provider.path(workspace), &root, workspace)
-        .unwrap();
+    let store =
+        arachne_store::Store::open_existing(&provider.path(workspace), &root, workspace).unwrap();
     assert_eq!(store.keys(b"").count(), 4); // token, endpoint, format, removal
     assert_eq!(store.keys(b"security/").count(), 0);
     assert_eq!(store.keys(b"delivery/").count(), 0);
@@ -406,7 +438,13 @@ fn native_pending_join_keeps_identity_until_atomic_admission_commit() {
         pending["admission_request"]
     );
     let staged = call(handle, request).unwrap();
-    assert!(call(handle, json!({"op":"adopt_join","candidate":abandoned["candidate"]})).is_err());
+    assert!(
+        call(
+            handle,
+            json!({"op":"adopt_join","candidate":abandoned["candidate"]})
+        )
+        .is_err()
+    );
     adopt(handle, &staged, "adopt_join");
     close(handle).unwrap();
     handle = open(&root, directory.path());

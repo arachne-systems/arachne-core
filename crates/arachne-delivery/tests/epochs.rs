@@ -1,13 +1,13 @@
 //! A3: delivery state survives membership steps. Two members at different
 //! epochs during a partition exchange data after the partition heals.
 mod common;
-use common::{test_endpoint, test_key};
 use arachne_delivery::inbox::{InboxStage, ObjectInbox};
 use arachne_delivery::{PublisherLog, RangeQuery, RetrievalError, wire};
 use arachne_routing::{Permissions, PublicationContext, RoutingTable, Topic};
 use arachne_security::{
     ManagementAction, PendingJoin, PreparedManagementUpdate, StorageKey, Workspace,
 };
+use common::{test_endpoint, test_key};
 use std::collections::{BTreeMap, BTreeSet};
 
 const REVISION: u64 = 7;
@@ -31,7 +31,8 @@ fn admit(
     arachne_security::PreparedManagement,
     arachne_security::PreparedAdmission,
 ) {
-    let (registered, invite, checkpoint) = admin.prepare_invitation(u64::MAX, false, false).unwrap();
+    let (registered, invite, checkpoint) =
+        admin.prepare_invitation(u64::MAX, false, false).unwrap();
     let admin = registered.workspace.provisional_copy().unwrap();
     let endpoint = test_endpoint(label);
     let join = PendingJoin::from_invitation(&invite, &checkpoint, test_key(label), name).unwrap();
@@ -448,7 +449,11 @@ fn members_at_different_epochs_exchange_data_after_a_partition_heals() {
     assert_eq!(a.epoch(), start + 2);
     // A's delivery state moves forward in the same steps it would be staged.
     let middle = registered.workspace.provisional_copy().unwrap();
-    a_log = a_log.advance(&previous_a, &middle).unwrap().advance(&middle, &a).unwrap();
+    a_log = a_log
+        .advance(&previous_a, &middle)
+        .unwrap()
+        .advance(&middle, &a)
+        .unwrap();
     a_inbox = a_inbox
         .advance(&previous_a, &middle)
         .unwrap()
@@ -487,7 +492,10 @@ fn members_at_different_epochs_exchange_data_after_a_partition_heals() {
         panic!("A could not recover B's old epoch");
     };
     for packet in offer.packets() {
-        if let InboxStage::Prepared(next) = a_inbox.stage(&a, &packet.context, &packet.ciphertext).unwrap() {
+        if let InboxStage::Prepared(next) = a_inbox
+            .stage(&a, &packet.context, &packet.ciphertext)
+            .unwrap()
+        {
             a_inbox = *next;
         }
     }
@@ -495,7 +503,12 @@ fn members_at_different_epochs_exchange_data_after_a_partition_heals() {
     while let Some(pending) = a_inbox.pending(&a).unwrap() {
         received.push(pending.message.payload[0]);
         a_inbox = a_inbox
-            .acknowledge(pending.message.member, &pending.context.topic, pending.counter, pending.context.id)
+            .acknowledge(
+                pending.message.member,
+                &pending.context.topic,
+                pending.counter,
+                pending.context.id,
+            )
             .unwrap();
     }
     received.sort_unstable();
@@ -535,14 +548,19 @@ fn members_at_different_epochs_exchange_data_after_a_partition_heals() {
     // The carried state survives save and restore at the new epoch.
     let key = StorageKey::derive(&[9; 32]).unwrap();
     let sealed = b_inbox.seal(&b, &key, &b_log).unwrap();
-    let (b, b_log, b_inbox) = ObjectInbox::restore(&key, test_endpoint(2), b.id(), &sealed).unwrap();
+    let (b, b_log, b_inbox) =
+        ObjectInbox::restore(&key, test_endpoint(2), b.id(), &sealed).unwrap();
     assert_eq!(b_inbox.pending_count(), 2);
     assert_eq!(b_log.epochs(), vec![start, start + 1, start + 2]);
 
     // Who may recover: current members that were members in that epoch.
     // A still gets B's old epoch after B advanced.
     let old = range(&b, start, 2);
-    assert!(b_log.authorized_range(&b, &policy(b.id()), a.endpoint(), &old).is_ok());
+    assert!(
+        b_log
+            .authorized_range(&b, &policy(b.id()), a.endpoint(), &old)
+            .is_ok()
+    );
     // C joined after it: denied, although C is a current member.
     assert_eq!(
         b_log
@@ -568,7 +586,12 @@ fn members_at_different_epochs_exchange_data_after_a_partition_heals() {
     let a_inbox = a_inbox.advance(&a, &a_removed).unwrap();
     // Accepted before the removal, it is still delivered.
     assert_eq!(
-        a_inbox.pending(&a_removed).unwrap().unwrap().message.payload,
+        a_inbox
+            .pending(&a_removed)
+            .unwrap()
+            .unwrap()
+            .message
+            .payload,
         [23]
     );
     // After the removal, B's objects fail, also in the old epoch.
@@ -579,7 +602,11 @@ fn members_at_different_epochs_exchange_data_after_a_partition_heals() {
     );
     // B gets nothing from A's retained history; C still does.
     let a_log = a_log.advance(&a, &a_removed).unwrap();
-    let mine = range(&a_removed, a.epoch(), a_log.epoch_log(a.epoch()).unwrap().head());
+    let mine = range(
+        &a_removed,
+        a.epoch(),
+        a_log.epoch_log(a.epoch()).unwrap().head(),
+    );
     let policy = policy(a.id());
     assert_eq!(
         a_log

@@ -147,7 +147,11 @@ fn rename_preserves_legacy_and_native_pending_delivery_across_interruption() {
     arachne_runtime::harness::seed_workspace(&provider, &creator, Some(&publisher), Some(&inbox))
         .unwrap();
     let restore = |handle: i64| {
-        call(handle, json!({"op":"restore_workspace","workspace":workspace})).unwrap()
+        call(
+            handle,
+            json!({"op":"restore_workspace","workspace":workspace}),
+        )
+        .unwrap()
     };
     assert_eq!(restore(handle)["workspace_name"], "Storm Assessment");
     // A process loss after staging, before adoption, keeps the accepted name.
@@ -287,7 +291,11 @@ fn existing_control_poll_pages_names_and_discards_reply_for_old_name_head() {
         assert_eq!(adopted["epoch"], 3); // Registration and admission come first.
     }
     member = common::stored(&[176; 32], &member_storage);
-    call(member, json!({"op":"restore_workspace","workspace":created["workspace"]})).unwrap();
+    call(
+        member,
+        json!({"op":"restore_workspace","workspace":created["workspace"]}),
+    )
+    .unwrap();
     call(member, json!({"op":"add_address_hint","peer":invite["peer"],"address":invite["address"].as_str().unwrap().replace("0.0.0.0:","127.0.0.1:")})).unwrap();
     for expected in ["Valley Recovery", "Mountain Search"] {
         call(
@@ -375,7 +383,11 @@ fn rust_workspace_driver_converges_same_epoch_name_from_presence() {
         let value = call(member, json!({"op":"drive_workspace"})).unwrap();
         if value["state"] == "self_update_committed" {
             self_updated = true;
-            call(member, json!({"op":"poll_workspace_presence","announce":true})).unwrap();
+            call(
+                member,
+                json!({"op":"poll_workspace_presence","announce":true}),
+            )
+            .unwrap();
         }
         if self_updated
             && call(admin, json!({"op":"member_roster"})).unwrap()["epoch"]
@@ -383,7 +395,10 @@ fn rust_workspace_driver_converges_same_epoch_name_from_presence() {
         {
             break;
         }
-        assert!(Instant::now() < deadline, "self-update did not converge: {value}");
+        assert!(
+            Instant::now() < deadline,
+            "self-update did not converge: {value}"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     // Consume the initial announcement so the rename below must trigger its

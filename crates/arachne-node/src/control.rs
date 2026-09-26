@@ -291,16 +291,19 @@ pub(super) async fn receive(
         tracing::info!(target: "data_fabric_transport", "CONTROL_INQUIRY_ANSWERED");
         bytes
     } else {
-        inbox.offer(ControlRequest {
-            peer,
-            remote_address,
-            payload,
-            reply,
-            timing: inbox.timing.clone(),
-            queued: std::time::Instant::now(),
-            taken: None,
-            _stranger: None,
-        }, stranger)?;
+        inbox.offer(
+            ControlRequest {
+                peer,
+                remote_address,
+                payload,
+                reply,
+                timing: inbox.timing.clone(),
+                queued: std::time::Instant::now(),
+                taken: None,
+                _stranger: None,
+            },
+            stranger,
+        )?;
         tokio::select! {
             response = response => response.map_err(|_| Error::Rejected)?,
             _ = send.stopped() => return Err(Error::Rejected),
@@ -337,55 +340,55 @@ impl ControlClient {
                 return Err(Error::Cancelled);
             }
             tokio::select! {
-            _ = cancelled.changed() => Err(Error::Cancelled),
-            outcome = async {
-            let payload = payload.ok_or(Error::TooLarge)?;
-            let mut stage = "connect";
-            let mut observed = None;
-            let operation_timeout = connections.operation_timeout();
-            let outcome = tokio::time::timeout(CONTROL_TIMEOUT.max(operation_timeout), async {
-            let connection = tokio::time::timeout(operation_timeout, connections.connect(peer, ALPN))
-                .await.map_err(|_| Error::Timeout("control connect"))?
-                ?;
-            observed = Some(connection.clone());
-            settle_on_direct_path(&connection).await;
-            stage = "open stream";
-            tracing::info!(target: "data_fabric_transport", paths = ?connection.paths(), "CONTROL_CLIENT_CONNECTED");
-            let (mut send, mut recv) = connection.open_bi().await.map_err(transport)?;
-            stage = "write request";
-            send.write_all(&payload).await.map_err(transport)?;
-            send.finish().map_err(transport)?;
-            stage = "read response";
-            tracing::info!(target: "data_fabric_transport", bytes = payload.len(), "CONTROL_REQUEST_SENT");
-            let reply = recv.read_to_end(MAX_FRAME).await.map_err(transport)?;
-            tracing::info!(target: "data_fabric_transport", bytes = reply.len(), "CONTROL_REPLY_READ");
-            Ok(reply)
-        })
-        .await
-        .map_err(|_| Error::Timeout("control response")).and_then(|result| result);
-            tracing::info!(target: "data_fabric_transport", stage, success = outcome.is_ok(),
-                error = outcome.as_ref().err().map(ToString::to_string), "CONTROL_CLIENT_END");
-            if outcome.is_err()
-                && let Some(connection) = &observed
-            {
-                tracing::info!(target: "data_fabric_transport", paths = ?connection.paths(), stats = ?connection.stats(), "CONTROL_CLIENT_FAILURE");
-            }
-            // Sent but no reply: do not reuse this connection for the retry.
-            if outcome.is_err() && matches!(stage, "read response" | "write request")
-                && let Some(connection) = observed
-            {
-                connections.discard(&connection).await;
-            }
-            // No control bytes can have left before write_all is entered. Once
-            // writing starts, preserve uncertainty even for a partial write.
-            match outcome {
-                Err(_) if matches!(stage, "connect" | "open stream") => {
-                    Err(Error::ControlNotSent(stage))
+                _ = cancelled.changed() => Err(Error::Cancelled),
+                outcome = async {
+                let payload = payload.ok_or(Error::TooLarge)?;
+                let mut stage = "connect";
+                let mut observed = None;
+                let operation_timeout = connections.operation_timeout();
+                let outcome = tokio::time::timeout(CONTROL_TIMEOUT.max(operation_timeout), async {
+                let connection = tokio::time::timeout(operation_timeout, connections.connect(peer, ALPN))
+                    .await.map_err(|_| Error::Timeout("control connect"))?
+                    ?;
+                observed = Some(connection.clone());
+                settle_on_direct_path(&connection).await;
+                stage = "open stream";
+                tracing::info!(target: "data_fabric_transport", paths = ?connection.paths(), "CONTROL_CLIENT_CONNECTED");
+                let (mut send, mut recv) = connection.open_bi().await.map_err(transport)?;
+                stage = "write request";
+                send.write_all(&payload).await.map_err(transport)?;
+                send.finish().map_err(transport)?;
+                stage = "read response";
+                tracing::info!(target: "data_fabric_transport", bytes = payload.len(), "CONTROL_REQUEST_SENT");
+                let reply = recv.read_to_end(MAX_FRAME).await.map_err(transport)?;
+                tracing::info!(target: "data_fabric_transport", bytes = reply.len(), "CONTROL_REPLY_READ");
+                Ok(reply)
+            })
+            .await
+            .map_err(|_| Error::Timeout("control response")).and_then(|result| result);
+                tracing::info!(target: "data_fabric_transport", stage, success = outcome.is_ok(),
+                    error = outcome.as_ref().err().map(ToString::to_string), "CONTROL_CLIENT_END");
+                if outcome.is_err()
+                    && let Some(connection) = &observed
+                {
+                    tracing::info!(target: "data_fabric_transport", paths = ?connection.paths(), stats = ?connection.stats(), "CONTROL_CLIENT_FAILURE");
                 }
-                other => other,
-            }
-            } => outcome,
-            }
+                // Sent but no reply: do not reuse this connection for the retry.
+                if outcome.is_err() && matches!(stage, "read response" | "write request")
+                    && let Some(connection) = observed
+                {
+                    connections.discard(&connection).await;
+                }
+                // No control bytes can have left before write_all is entered. Once
+                // writing starts, preserve uncertainty even for a partial write.
+                match outcome {
+                    Err(_) if matches!(stage, "connect" | "open stream") => {
+                        Err(Error::ControlNotSent(stage))
+                    }
+                    other => other,
+                }
+                } => outcome,
+                }
         }
     }
 }
@@ -507,7 +510,10 @@ fn strangers_hold_at_most_half_the_control_queue() {
     };
     inbox.offer(request(), true).unwrap();
     inbox.offer(request(), true).unwrap();
-    assert!(matches!(inbox.offer(request(), true), Err(Error::Backpressure)));
+    assert!(matches!(
+        inbox.offer(request(), true),
+        Err(Error::Backpressure)
+    ));
     inbox.offer(request(), false).unwrap();
     // A stranger's request that leaves the queue frees its place.
     drop(queued.try_recv().unwrap());

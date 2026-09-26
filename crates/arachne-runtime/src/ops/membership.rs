@@ -45,11 +45,17 @@ pub(crate) struct OfferStagedArgs {
 }
 
 /// One presence round with the workspace's members.
-pub(crate) fn poll_presence(session: &mut Session, args: PresenceArgs) -> Result<PresenceReply, ApiError> {
+pub(crate) fn poll_presence(
+    session: &mut Session,
+    args: PresenceArgs,
+) -> Result<PresenceReply, ApiError> {
     presence::poll(session, args.announce)
 }
 
-pub(crate) fn fetch_update(session: &mut Session, args: FetchUpdateArgs) -> Result<Value, ApiError> {
+pub(crate) fn fetch_update(
+    session: &mut Session,
+    args: FetchUpdateArgs,
+) -> Result<Value, ApiError> {
     membership::reconcile(
         session,
         Reconcile::Fetch {
@@ -77,7 +83,10 @@ pub(crate) fn offer_update(session: &mut Session, args: OfferArgs) -> Result<Val
     )
 }
 
-pub(crate) fn offer_staged(session: &mut Session, args: OfferStagedArgs) -> Result<Value, ApiError> {
+pub(crate) fn offer_staged(
+    session: &mut Session,
+    args: OfferStagedArgs,
+) -> Result<Value, ApiError> {
     membership::reconcile(session, Reconcile::OfferStaged { peer: args.peer })
 }
 

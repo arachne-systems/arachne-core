@@ -145,9 +145,13 @@ fn advertises_only_an_explicit_bounded_workspace_invitation() {
     .unwrap();
     let found = discover(joiner, admin);
     assert_eq!(found["workspaces"].as_array().unwrap().len(), 2);
-    assert!(found["workspaces"].as_array().unwrap().iter().any(|row| {
-        row["invitation"] == json!(invitation) && row["mode"] == "open_joining"
-    }));
+    assert!(
+        found["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| { row["invitation"] == json!(invitation) && row["mode"] == "open_joining" })
+    );
     assert!(found["workspaces"].as_array().unwrap().iter().any(|row| {
         row["invitation"] == json!(b"arachne://join#focused-nearby-workspace-2".to_vec())
             && row["mode"] == "request_access"
@@ -184,10 +188,17 @@ fn advertises_only_an_explicit_bounded_workspace_invitation() {
         .is_err()
     );
 
-    call(admin, json!({"op":"set_nearby_workspace","mode":null,"workspace":vec![8; 32]})).unwrap();
+    call(
+        admin,
+        json!({"op":"set_nearby_workspace","mode":null,"workspace":vec![8; 32]}),
+    )
+    .unwrap();
     let remaining = discover(joiner, admin);
     assert_eq!(remaining["workspaces"].as_array().unwrap().len(), 1);
-    assert_eq!(remaining["workspaces"][0]["workspace_name"], "Second workspace");
+    assert_eq!(
+        remaining["workspaces"][0]["workspace_name"],
+        "Second workspace"
+    );
     call(admin, json!({"op":"set_nearby_workspace","mode":null})).unwrap();
     assert_eq!(discover(joiner, admin)["workspaces"], json!([]));
     close(admin).unwrap();
@@ -238,9 +249,8 @@ fn nearby_results_identify_three_workspaces_and_reject_unsafe_names() {
         std::thread::sleep(Duration::from_millis(20));
     }
     let found = loop {
-        let query = std::thread::spawn(move || {
-            call(joiner, json!({"op":"nearby_workspaces"})).unwrap()
-        });
+        let query =
+            std::thread::spawn(move || call(joiner, json!({"op":"nearby_workspaces"})).unwrap());
         while !query.is_finished() {
             for admin in &admins {
                 call(*admin, json!({"op":"poll_admission"})).unwrap();

@@ -51,10 +51,11 @@ const PARTS: u8 = 1;
 /// Parts of `name` are stored at `name`, this marker, and a u32 index.
 /// Record names never contain a NUL byte.
 const PART_MARKER: &[u8] = b"\x00part/";
-const _: () = assert!(PART_BYTES + 1 <= arachne_store::MAX_RECORD_BYTES);
+const _: () = assert!(PART_BYTES < arachne_store::MAX_RECORD_BYTES);
 
 fn is_part(name: &[u8]) -> bool {
-    name.windows(PART_MARKER.len()).any(|window| window == PART_MARKER)
+    name.windows(PART_MARKER.len())
+        .any(|window| window == PART_MARKER)
 }
 
 fn part_name(name: &[u8], index: u32) -> Vec<u8> {
@@ -69,7 +70,9 @@ fn expand(records: &SecurityRecords) -> Result<SecurityRecords, ApiError> {
     let mut stored = SecurityRecords::new();
     for (name, value) in records {
         if is_part(name) {
-            return Err(ApiError::storage_failed("record name holds the part marker"));
+            return Err(ApiError::storage_failed(
+                "record name holds the part marker",
+            ));
         }
         if value.len() <= PART_BYTES {
             let mut tagged = Zeroizing::new(Vec::with_capacity(value.len() + 1));
@@ -174,8 +177,7 @@ impl StorageConfig {
 
     /// The key that seals the pending join and removal records.
     fn record_key(&self) -> Result<arachne_security::StorageKey, ApiError> {
-        arachne_security::StorageKey::derive(&self.root)
-            .map_err(security(ErrorCode::StorageFailed))
+        arachne_security::StorageKey::derive(&self.root).map_err(security(ErrorCode::StorageFailed))
     }
 }
 
@@ -305,7 +307,9 @@ impl NativeStore {
         }
         for name in written {
             let stored = self.store.get(name).map_err(errors::store)?;
-            if stored.as_deref().map(Vec::as_slice) != records.get(name).map(|value| value.as_slice()) {
+            if stored.as_deref().map(Vec::as_slice)
+                != records.get(name).map(|value| value.as_slice())
+            {
                 return Err(ApiError::storage_failed("record did not read back"));
             }
         }
@@ -344,9 +348,9 @@ fn migrate(
     from: u32,
     migrations: &[Migration],
 ) -> Result<bool, ApiError> {
-    let pending = migrations
-        .get(from as usize - 1..)
-        .ok_or_else(|| ApiError::format_not_supported(format!("no migration from format {from}")))?;
+    let pending = migrations.get(from as usize - 1..).ok_or_else(|| {
+        ApiError::format_not_supported(format!("no migration from format {from}"))
+    })?;
     for migration in pending {
         migration(records)?;
     }
@@ -400,7 +404,10 @@ fn active_records(
     let mut records = owner
         .export_records()
         .map_err(security(ErrorCode::StorageFailed))?;
-    records.insert(ACTIVITY.to_vec(), Zeroizing::new(encode_activity(activity)?));
+    records.insert(
+        ACTIVITY.to_vec(),
+        Zeroizing::new(encode_activity(activity)?),
+    );
     match (inbox, publisher) {
         (Some(inbox), Some(publisher)) => {
             records.insert(
@@ -496,7 +503,11 @@ fn open_new(session: &Session, workspace: [u8; 32]) -> Result<NativeStore, ApiEr
     if session.records.is_some() {
         return Err(ApiError::wrong_state("session already owns a record store"));
     }
-    let provider = &session.storage.as_ref().ok_or_else(storage_required)?.provider;
+    let provider = &session
+        .storage
+        .as_ref()
+        .ok_or_else(storage_required)?
+        .provider;
     let endpoint = session.node.id();
     let config = session.storage.as_ref().ok_or_else(storage_required)?;
     if let Some(store) = provider.open(workspace).map_err(errors::store)? {
@@ -649,7 +660,10 @@ pub(super) fn reset_records(
             RESET.to_vec(),
             Zeroizing::new(vec![b'D', b'F', b'R', b'S', 1]),
         ),
-        (ACTIVITY.to_vec(), Zeroizing::new(encode_activity(activity)?)),
+        (
+            ACTIVITY.to_vec(),
+            Zeroizing::new(encode_activity(activity)?),
+        ),
     ]);
     let token = candidate_token()?;
     let store = session.records.as_mut().ok_or_else(storage_required)?;
@@ -662,7 +676,7 @@ pub(super) fn reset_records(
 /// Commits also happen inside ops, so read this after every call and
 /// persist it outside the database before releasing that call's result.
 pub fn record_freshness(handle: i64) -> Result<FreshnessAnchor, String> {
-    with_session(handle, |session| freshness(session)).map_err(errors::text)
+    with_session(handle, freshness).map_err(errors::text)
 }
 
 pub(crate) fn freshness(session: &mut Session) -> Result<FreshnessAnchor, ApiError> {
@@ -685,7 +699,11 @@ pub(crate) fn restore(
     if session.workspace.is_some() || session.join.pending.is_some() || session.records.is_some() {
         return Err(ApiError::wrong_state("session already owns a workspace"));
     }
-    let config = session.storage.as_ref().ok_or_else(storage_required)?.clone();
+    let config = session
+        .storage
+        .as_ref()
+        .ok_or_else(storage_required)?
+        .clone();
     let provider = &config.provider;
     // An absent store must never become a new empty one.
     let store = provider
@@ -771,8 +789,7 @@ pub(crate) fn restore(
     let keys = Logical(store.as_ref()).keys(b"");
     if let Some(bytes) = get(PENDING)? {
         if keys.iter().any(|name| {
-            ![PENDING, TOKEN, ENDPOINT, FORMAT, JOIN_LIFECYCLE, ACTIVITY]
-                .contains(&name.as_slice())
+            ![PENDING, TOKEN, ENDPOINT, FORMAT, JOIN_LIFECYCLE, ACTIVITY].contains(&name.as_slice())
         }) {
             return Err(corrupt("pending store contains other lifecycle state"));
         }
@@ -804,7 +821,9 @@ pub(crate) fn restore(
         session.activity = activity;
         session.join.lifecycle = lifecycle;
         session.join.pending = Some(pending);
-        session.records = Some(NativeStore::new(store, workspace, &config, endpoint, committed));
+        session.records = Some(NativeStore::new(
+            store, workspace, &config, endpoint, committed,
+        ));
         return Ok(Restored::Pending(value));
     }
     if let Some(bytes) = get(REMOVED)? {
@@ -864,13 +883,20 @@ pub(crate) fn restore(
         .map(|bytes| decode_activity(&bytes))
         .transpose()?
         .ok_or_else(|| corrupt("active store has no workspace activity"))?;
-    if !matches!(activity.phase, WorkspacePhase::Active | WorkspacePhase::Recovering) {
+    if !matches!(
+        activity.phase,
+        WorkspacePhase::Active | WorkspacePhase::Recovering
+    ) {
         return Err(corrupt("active store has invalid workspace activity"));
     }
-    let branch_records = keys.iter()
+    let branch_records = keys
+        .iter()
         .filter(|name| name.starts_with(membership::fork::PREFIX))
         .map(|name| {
-            Ok((name.clone(), get(name)?.ok_or_else(|| corrupt("missing branch record"))?))
+            Ok((
+                name.clone(),
+                get(name)?.ok_or_else(|| corrupt("missing branch record"))?,
+            ))
         })
         .collect::<Result<SecurityRecords, ApiError>>()?;
     membership::fork::restore(session, &branch_records, &owner)?;
@@ -879,7 +905,9 @@ pub(crate) fn restore(
     session.delivery.inbox = inbox;
     commit_workspace(session, owner);
     value.activity = session.activity.view();
-    session.records = Some(NativeStore::new(store, workspace, &config, endpoint, committed));
+    session.records = Some(NativeStore::new(
+        store, workspace, &config, endpoint, committed,
+    ));
     Ok(Restored::Opened(value))
 }
 
@@ -917,7 +945,10 @@ pub fn seed_workspace(
         None => provider.create(owner.id()).map_err(|e| e.to_string())?,
     };
     let mut store_records = records;
-    store_records.insert(TOKEN.to_vec(), Zeroizing::new(candidate_token().map_err(errors::text)?));
+    store_records.insert(
+        TOKEN.to_vec(),
+        Zeroizing::new(candidate_token().map_err(errors::text)?),
+    );
     store_records.insert(ENDPOINT.to_vec(), Zeroizing::new(owner.endpoint().to_vec()));
     store_records.insert(
         FORMAT.to_vec(),
@@ -935,7 +966,9 @@ pub fn seed_workspace(
         .collect();
     changes.extend(stale.iter().map(|name| (name.as_slice(), None)));
     let revision = store.revision();
-    store.commit(revision, &changes).map_err(|e| e.to_string())?;
+    store
+        .commit(revision, &changes)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -971,24 +1004,32 @@ mod tests {
         ]);
         store.commit(records, &candidate_token().unwrap()).unwrap();
         let view = Logical(store.store.as_ref());
-        assert_eq!(view.get(b"security/large").unwrap().unwrap().as_slice(), large);
-        assert_eq!(view.get(b"security/small").unwrap().unwrap().as_slice(), [1, 2, 3]);
+        assert_eq!(
+            view.get(b"security/large").unwrap().unwrap().as_slice(),
+            large
+        );
+        assert_eq!(
+            view.get(b"security/small").unwrap().unwrap().as_slice(),
+            [1, 2, 3]
+        );
         assert_eq!(
             view.keys(b"security/"),
             vec![b"security/large".to_vec(), b"security/small".to_vec()]
         );
         // Shrinking it deletes the parts it no longer needs.
-        let records = SecurityRecords::from([(
-            b"security/large".to_vec(),
-            Zeroizing::new(vec![9]),
-        )]);
+        let records =
+            SecurityRecords::from([(b"security/large".to_vec(), Zeroizing::new(vec![9]))]);
         store.commit(records, &candidate_token().unwrap()).unwrap();
         assert_eq!(store.store.keys(b"security/").len(), 1);
         assert_eq!(view_get(&store, b"security/large"), vec![9]);
     }
 
     fn view_get(store: &NativeStore, name: &[u8]) -> Vec<u8> {
-        Logical(store.store.as_ref()).get(name).unwrap().unwrap().to_vec()
+        Logical(store.store.as_ref())
+            .get(name)
+            .unwrap()
+            .unwrap()
+            .to_vec()
     }
 
     #[test]
@@ -1000,7 +1041,10 @@ mod tests {
         assert!(migrate(&mut records, 1, &[to_format_two]).unwrap());
         assert_eq!(records[b"runtime/added".as_slice()].as_slice(), [2]);
         assert!(!migrate(&mut records, 2, &[to_format_two]).unwrap());
-        assert_eq!(stored_format(None).unwrap_err().code(), ErrorCode::FormatNotSupported);
+        assert_eq!(
+            stored_format(None).unwrap_err().code(),
+            ErrorCode::FormatNotSupported
+        );
         assert_eq!(
             stored_format(Some(&2u32.to_be_bytes())).unwrap_err().code(),
             ErrorCode::FormatNotSupported
@@ -1015,7 +1059,8 @@ impl StorageConfig {
     /// 32-byte storage root. The root is validated before a provider is made.
     #[cfg_attr(feature = "uniffi", uniffi::constructor)]
     pub fn open_sqlite(directory: String, root: Vec<u8>) -> Result<Arc<Self>, ApiError> {
-        let root: [u8; 32] = root.try_into()
+        let root: [u8; 32] = root
+            .try_into()
             .map_err(|_| ApiError::invalid_input("storage_root", "must contain 32 bytes"))?;
         if directory.is_empty() {
             return Err(ApiError::invalid_input("directory", "must not be empty"));

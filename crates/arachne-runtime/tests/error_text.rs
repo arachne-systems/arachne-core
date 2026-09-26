@@ -6,7 +6,7 @@
 //! covered here.
 
 use arachne_runtime::{
-    Client, ClientConfig, ApiError, FreshnessAnchor, MemoryProvider, Network, StorageConfig,
+    ApiError, Client, ClientConfig, FreshnessAnchor, MemoryProvider, Network, StorageConfig,
 };
 use base64::Engine;
 
@@ -71,19 +71,19 @@ fn assert_no_secret(error: &ApiError, secrets: &[(&str, &[u8])]) {
 #[test]
 fn errors_from_secret_inputs_do_not_show_the_secret() {
     let provider = MemoryProvider::default();
-    let mut owner = open(SECRET, &provider);
+    let owner = open(SECRET, &provider);
     let created = owner.create_workspace("Owner", None).unwrap();
     let anchor = owner.record_freshness().unwrap();
     let candidate = owner.stage_invitation(0).unwrap();
     let invitation = owner.adopt_invitation(&candidate).unwrap();
 
     let other_provider = MemoryProvider::default();
-    let mut other = open([0x3C; 32], &other_provider);
+    let other = open([0x3C; 32], &other_provider);
     let mut errors = Vec::new();
     // This session's storage never saved anything for this workspace.
     errors.extend(other.restore_workspace(created.workspace, None).err());
     // A damaged freshness anchor against the owner's own storage.
-    let mut owner_again = open(SECRET, &provider);
+    let owner_again = open(SECRET, &provider);
     let damaged = FreshnessAnchor::from_bytes(&tampered(&anchor.to_bytes())).unwrap();
     errors.extend(
         owner_again

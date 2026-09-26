@@ -138,7 +138,8 @@ impl ConnectionBudget {
         let now = Instant::now();
         let mut arrivals = self.stranger_arrivals.lock().unwrap();
         if arrivals.len() >= MAX_STRANGER_KEYS && !arrivals.contains_key(&peer) {
-            arrivals.retain(|_, (start, _)| now.saturating_duration_since(*start) < STRANGER_WINDOW);
+            arrivals
+                .retain(|_, (start, _)| now.saturating_duration_since(*start) < STRANGER_WINDOW);
             if arrivals.len() >= MAX_STRANGER_KEYS {
                 return false;
             }
@@ -270,7 +271,10 @@ impl ConnectionBudget {
         } else {
             None
         };
-        let Some(permit) = self.acquire(&self.connections[plane], plane, stranger).await else {
+        let Some(permit) = self
+            .acquire(&self.connections[plane], plane, stranger)
+            .await
+        else {
             return refuse(b"device connection capacity");
         };
         let id = connection.stable_id();

@@ -1,8 +1,15 @@
 # Integrating Arachne Core
 
-This repository is a pre-release Rust workspace, not a stable SDK. All eight
-crates have an initial release on crates.io. APIs, wire formats, and saved
-state can change.
+## BLUF
+
+Use the typed `Client` in an owned `Context`, with storage configured before
+workspace creation or join. Core owns save, read-back and adoption. The SDK
+uses Core's types and UniFFI metadata to generate language bindings. The
+application owns its payload rules and user interface, and protects endpoint
+and storage-root secrets.
+
+This development contract is API version 6. APIs, wire formats and saved state
+can change before a stable release.
 The typed entry point is `arachne_runtime::Client`. It is synchronous and belongs to a
 `Context`, which owns or borrows its Tokio runtime. Call it from a blocking worker.
 `Client::open` returns an `Arc<Client>` in the default shared context. Foreign bindings
@@ -54,6 +61,55 @@ cargo test -p arachne-node --features tor --test tor_transport -- --ignored --no
 cargo test -p arachne-runtime --features tor --test tor_client -- --ignored --nocapture
 ```
 
+## Context, events and deadlines
+
+A `Context` owns a session table, connection budget, limits and one Tokio
+runtime. `Client::open_in(context, config)` uses that context. `Client::open`
+uses the lazy shared default. Rust hosts can supply a multi-thread Tokio
+handle through `ContextConfig`; keep that runtime alive until its clients
+close. Foreign callers can use `Context::owned(limits, power, workers)`.
+
+Use Core's `default_limits`, `default_transport_options` and
+`default_client_config` helpers instead of copying default numbers into an
+adapter. `capabilities()` reports API version, supported networks and the
+client context's limits. A stable `Network::Tor` variant is present even in a
+build that reports it as unsupported.
+
+Client methods are synchronous. Run them on a blocking worker, outside the
+UI thread and outside an async runtime worker. A client is `Send + Sync`.
+The wait methods hold no client or session lock while parked, so another
+thread can wake or close the client.
+
+| Operation | Host behavior |
+| --- | --- |
+| `next_event(timeout)` | Wait for a typed queue or job notification, then drain the matching work. `None` is no event. |
+| `wait_for_work(timeout)` | Wait for any work, then poll or use `next_event`. `false` can mean timeout, wake or close. |
+| `wake()` | Release one parked waiter without creating a work item. |
+| `drive_workspace()` | Service native membership work and read `WorkspaceProgress`, including activity and branch outcomes. |
+| `cancel()` | Interrupt the current blocking exchange. The cancellation does not remain set for the next operation. |
+| `set_deadline(...)` | Set the deadline for later blocking operations. A deadline failure leaves the session usable. |
+| `close()` | Close once, wake waiters and drain transport for at most `close_drain` (5 s by default). Repeated close is safe. |
+
+Rust timeout and deadline values are `Option<Duration>`. `None` means no
+specified timeout or deadline. `TransportOptions.deadline` also applies when
+the endpoint binds. The separate transport timeouts bound dial, exchange,
+gossip join and close drain.
+
+Queue events repeat until their work is drained. Job-ready events occur once
+per completed job. An event carries a scheduling signal; received content
+stays in the durable inbox until the application adopts an acknowledgement
+or rejection. A call made after close returns `Closed`; a wait already in
+flight can return no work. Kotlin calls the native close operation
+`shutdown`; generated `close()` releases its foreign handle.
+
+`Context::suspend()` waits for each current operation, stops background
+presence and gossip work, stops LAN discovery and closes idle connections.
+It preserves workspace state, policy and queues; explicit operations still
+work. `resume()` restarts background work and refreshes network paths. The
+`Low` power profile multiplies background timer intervals by four. It does
+not change the mDNS library's fixed announcement interval; suspend stops
+that service.
+
 ## Workspace lifecycle
 
 The typed API exposes workspace creation, join/admission staging, adoption,
@@ -69,11 +125,18 @@ conceptual steps:
 4. The joining client calls `stage_join`, then `adopt_join`.
 5. Both adapters refresh routing policy from the accepted workspace state.
 
-The stage/adopt boundary is intentional. Core does not emit network effects or
-advance live state before the candidate is saved and read back. If a save fails
-or does not read back, the outcome is uncertain: the session then refuses every
-op except `reset_workspace`, `workspace_state` and close. Close it and restore
-from storage; do not replay a cryptographic operation.
+For network joins, `drive_join` returns typed `JoinProgress`. Adopt a returned
+`JoinCandidate`; a `Joined` result is already durable. `request_admission`
+returns `AdmissionResponse`, and its opaque `AdmissionGrant` passes to
+`stage_join_grant`. `poll_membership_update` returns an opaque `MemberUpdate`
+that passes to `stage_membership_update`. These objects preserve the received
+proof and bind it to the client that received it.
+
+Publication and accepted live state wait for save, read-back and adoption.
+An explicit staged membership offer sends a proposal; its receiver sends the
+acknowledgement after durable adoption. If a save fails or does not read back,
+the outcome is uncertain. Close the session and restore from storage before
+further workspace operations; do not replay a cryptographic operation.
 
 ### Persistence contract
 
@@ -88,7 +151,9 @@ Workspace state itself is bound to the endpoint key (MLS membership), so a
 store written by one endpoint restores only under that endpoint; another
 endpoint gets `WrongState`, and the store stays intact.
 `StorageConfig::new` takes any `StorageProvider` implementation;
-`MemoryProvider` is for tests.
+`MemoryProvider` is for tests. Foreign callers use
+`StorageConfig::open_sqlite(directory, root)`, which validates a 32-byte root
+and returns an opaque configuration object.
 
 A stage op returns an opaque candidate, never state bytes. In the typed
 `Client` each kind has its own type (`WorkspaceCandidate`, `InvitationCandidate`,
@@ -107,6 +172,11 @@ and `begin_join` save their state before they return, so every reply reports
 that workspace: an active workspace, a pending join, or this member's removal
 (the session then ends). The host never saves or passes state bytes, and there
 is no import of old state: an import would be a rollback.
+
+The typed restore result distinguishes `Active`, `Joining` and `Removed`.
+A removed result ends the session. A roster can be present while branch
+recovery blocks sending: inspect the activity and reason in
+`WorkspaceProgress`, including `branch_orphaned` and `branch_send_quarantined`.
 
 The host still protects the root key and the storage directory. See
 [Security](security.md#local-persistence).
@@ -168,21 +238,52 @@ received the data. [Delivery semantics](delivery.md) states the guarantees
 of each mode: at-least-once delivery, duplicates, ordering, loss, recovery,
 retention bounds and epoch behavior.
 
-## Known integration gaps
+`RecoveryRangeRequest { after: Some(cursor), through: None }` requests the
+retained tail after a known authenticated sequence. This repair does not
+advance full-history progress or claim the omitted history. The holder and
+range proofs still need to pass validation.
 
-Before presenting this as a supported application SDK, close or explicitly
-accept these gaps:
+## Resources and retained current values
 
-- `ClientConfig` does not expose custom relay settings available in lower-level
-  transport construction.
-- Synchronous methods need a documented host threading and cancellation model
-  for each target runtime, especially Android.
-- The public API has not been declared stable. The crates have an initial
-  crates.io release, but APIs, wire formats and saved data can still change.
+The typed client exposes current-view fetch, poll, stage, adopt and cancel,
+plus direct and range recovery from authorized peers. Current-value metadata
+keeps its selector, replacement key, expiry and tombstone. A serving holder
+can differ from the authenticated author.
 
-The typed `Client` covers the record-storage lifecycle (`ClientConfig::storage`,
-`restore_workspace`, `record_freshness`) and protected receive with durable
-adoption (`poll_protected`, `adopt_protected_reception`).
+`ResourceRequest` and `ResourceStatus` expose the existing Iroh Blobs service.
+Membership, routing revision and a peer-bound read grant still apply. The
+resource root is a blob cache; it does not confine host file access. The host
+selects and validates source and destination paths and the content audience.
+Catalog metadata alone does not prove that local blob bytes are present.
 
-These are concrete implementation boundaries, not guarantees about the timing
-of future releases. Check the current API and tests before integrating.
+Automatic current-value re-publication across every normal epoch change is
+still a separate gap. Losing-branch re-publication has the bounded behavior
+in [Security](security.md#retained-data-and-local-actions).
+
+## Errors and binding contract
+
+Use `ApiError` and its stable numeric code. Do not match error text. Core
+validates supplied secret bytes; malformed custom ID values can fail binding
+conversion before a Core operation. Preserve the generated Core ID types,
+candidate objects and error values in each language adapter.
+
+Enable `arachne-runtime/uniffi` to export Core metadata. Production SDK builds
+leave `test-fixtures` and `debug-rig` disabled. The
+[Core binding contract](reviews/h4-core-sdk-migration.md) records namespaces,
+Swift packaging, defaults and the typed operation groups.
+
+## Remaining integration gates
+
+- The Core JSON dispatcher remains for existing native adapters and
+  qualification callers. New integrations use the typed Client. Removing
+  the dispatcher depends on migrating those callers.
+- Existing app databases need an authenticated, crash-safe one-time upgrade
+  before a new Core pin is deployed. Moving the database path alone does
+  not upgrade its encrypted records or inbox format. See the
+  [device upgrade gate](reviews/h4-core-sdk-migration.md#device-upgrade-gate).
+- The owner must select the SDK line and approve the ATAK host/classloader
+  qualification and release actions. Host/AAR build evidence does not
+  establish a working ATAK installation.
+
+The [work tracker](reviews/2026-09-24-work-tracker.md) records completed work,
+proof receipts and the remaining decisions.

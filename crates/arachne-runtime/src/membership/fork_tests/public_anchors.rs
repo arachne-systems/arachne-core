@@ -350,7 +350,7 @@ fn public_anchors_expire_at_the_existing_order_window() {
             .filter(|name| name.starts_with(b"runtime/branch/anchor/"))
             .count();
         assert!(count <= arachne_security::ORDER_WINDOW as usize + 1);
-        if step + 1 <= arachne_security::ORDER_WINDOW {
+        if step < arachne_security::ORDER_WINDOW {
             assert!(records.contains_key(&anchor_name(epoch)));
         } else {
             assert!(!records.contains_key(&anchor_name(epoch)));

@@ -71,7 +71,10 @@ pub(crate) struct InspectedInvitation {
 
 /// Register an invitation link in shared policy. The link is released only
 /// by adoption, after the candidate is saved.
-pub(crate) fn stage(session: &mut Session, args: StageInvitationArgs) -> Result<StagedCandidate, ApiError> {
+pub(crate) fn stage(
+    session: &mut Session,
+    args: StageInvitationArgs,
+) -> Result<StagedCandidate, ApiError> {
     check_epoch_transition(session)?;
     let owner = session
         .workspace
@@ -98,7 +101,10 @@ pub(crate) fn stage(session: &mut Session, args: StageInvitationArgs) -> Result<
 }
 
 /// Bind a personal invitation to one join request.
-pub(crate) fn stage_approval(session: &mut Session, args: DecisionArgs) -> Result<StagedCandidate, ApiError> {
+pub(crate) fn stage_approval(
+    session: &mut Session,
+    args: DecisionArgs,
+) -> Result<StagedCandidate, ApiError> {
     check_epoch_transition(session)?;
     let pending_id = pending_approval_id(session, &args.request, args.attempt_id)?;
     let prepared = session
@@ -113,7 +119,10 @@ pub(crate) fn stage_approval(session: &mut Session, args: DecisionArgs) -> Resul
 }
 
 /// Decline a personal invitation request.
-pub(crate) fn stage_decline(session: &mut Session, args: DecisionArgs) -> Result<StagedCandidate, ApiError> {
+pub(crate) fn stage_decline(
+    session: &mut Session,
+    args: DecisionArgs,
+) -> Result<StagedCandidate, ApiError> {
     check_epoch_transition(session)?;
     let pending_id = pending_approval_id(session, &args.request, args.attempt_id)?;
     let prepared = session
@@ -155,7 +164,10 @@ pub(crate) fn controls(session: &mut Session) -> Result<ControlsReply, ApiError>
     })
 }
 
-pub(crate) fn inspect(_session: &mut Session, args: InspectArgs) -> Result<InspectedInvitation, ApiError> {
+pub(crate) fn inspect(
+    _session: &mut Session,
+    args: InspectArgs,
+) -> Result<InspectedInvitation, ApiError> {
     inspected_invitation(&args.invitation, &args.checkpoint)
 }
 

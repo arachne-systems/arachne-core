@@ -88,15 +88,25 @@ pub(crate) mod tests {
     /// An owner and one early member, both grown to at least `size` members
     /// through batch admissions from one early invitation.
     pub(crate) fn grown(seed: u8, size: usize) -> (Workspace, Workspace) {
-        let owner = Workspace::create(crate::test_key(u64::from(seed)), "Large workspace owner").unwrap();
-        let (registration, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+        let owner =
+            Workspace::create(crate::test_key(u64::from(seed)), "Large workspace owner").unwrap();
+        let (registration, invitation, checkpoint) =
+            owner.prepare_invitation(0, false, false).unwrap();
         let mut owner = registration.workspace;
         let joiner = |index: usize| {
-            PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key_for(endpoint(index)), "Member").unwrap()
+            PendingJoin::from_invitation(
+                &invitation,
+                &checkpoint,
+                crate::test_key_for(endpoint(index)),
+                "Member",
+            )
+            .unwrap()
         };
         let early = joiner(0);
         let request = early.admission_request().unwrap().to_vec();
-        let AdmissionAssessment::Ready(validated) = owner.assess_admission(endpoint(0), &request).unwrap() else {
+        let AdmissionAssessment::Ready(validated) =
+            owner.assess_admission(endpoint(0), &request).unwrap()
+        else {
             panic!("open invitation needs no approval");
         };
         let prepared = owner
@@ -115,24 +125,36 @@ pub(crate) mod tests {
         while owner.member_count() < size {
             let range = next..(next + MAX_ADMISSION_BATCH);
             let joins: Vec<_> = range.clone().map(joiner).collect();
-            let requests: Vec<_> = joins.iter().map(|join| join.admission_request().unwrap().to_vec()).collect();
+            let requests: Vec<_> = joins
+                .iter()
+                .map(|join| join.admission_request().unwrap().to_vec())
+                .collect();
             let validated: Vec<_> = range
                 .clone()
                 .zip(&requests)
-                .map(|(index, request)| match owner.assess_admission(endpoint(index), request).unwrap() {
-                    AdmissionAssessment::Ready(validated) => validated,
-                    _ => panic!("open invitation needs no approval"),
+                .map(|(index, request)| {
+                    match owner.assess_admission(endpoint(index), request).unwrap() {
+                        AdmissionAssessment::Ready(validated) => validated,
+                        _ => panic!("open invitation needs no approval"),
+                    }
                 })
                 .collect();
             let entries: Vec<_> = range
                 .clone()
                 .zip(requests.iter().zip(&validated))
-                .map(|(index, (request, validated))| (endpoint(index), request.as_slice(), validated))
+                .map(|(index, (request, validated))| {
+                    (endpoint(index), request.as_slice(), validated)
+                })
                 .collect();
             let prepared = owner.prepare_validated_admission_batch(&entries).unwrap();
-            let authorizations: Vec<_> =
-                prepared.replies.iter().map(|reply| reply.authorization.clone()).collect();
-            member = member.prepare_admission_batch_update(&authorizations, &prepared.commit).unwrap();
+            let authorizations: Vec<_> = prepared
+                .replies
+                .iter()
+                .map(|reply| reply.authorization.clone())
+                .collect();
+            member = member
+                .prepare_admission_batch_update(&authorizations, &prepared.commit)
+                .unwrap();
             owner = prepared.workspace;
             next = range.end;
         }
@@ -209,7 +231,10 @@ pub(crate) mod tests {
         let PreparedManagementUpdate::Active(updated) = restored
             .prepare_step_update(&prepared.authorization, &prepared.commit)
             .unwrap_or_else(|error| {
-                panic!("restored member at {} members rejected management: {error}", restored.member_count())
+                panic!(
+                    "restored member at {} members rejected management: {error}",
+                    restored.member_count()
+                )
             })
         else {
             panic!("removal of another member removed this member")

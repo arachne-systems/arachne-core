@@ -1,35 +1,29 @@
-> Written by Claude (AI). Handoff brief H3.
+> Handoff brief H3. Updated 2026-09-26.
 
 # H3: Test speed
 
 ## BLUF
 
-Runtime tests now run in parallel (default thread count). But three tests take 12–26 minutes in
-debug builds, most likely because the crypto dependencies are not optimized. A profile experiment
-was started and not measured.
+H3 is complete. Commit `a6619db`, merged as `688946b`, optimizes dependencies
+at level 2 in development and test builds. Arachne crates remain at level 0.
+Debug assertions and overflow checks remain enabled.
 
-## Start here
+## Evidence
 
-- Branch `feat/a4-context`, worktree `~/development/worktrees/arachne-core-a4-context`.
-- WIP commit `f84acfe`: 17 lines in the root `Cargo.toml` (dependency opt-level profile). Not measured.
+The same-source comparison used Rust 1.98.0 and four build jobs. Each test ran
+on CPUs 8–11, outside the shared build lock. All four tests passed in both runs.
+The combined test time fell from 3654.565 seconds to 430.952 seconds. These are
+single runs on a shared machine.
 
-## Slow tests (debug build)
+The [development guide](../../development.md#test-speed-and-build-cache-size) has the full before/after
+table, build time, target size, profile settings and reproduction commands.
+No optimization of Arachne workspace crates was needed. Later integration
+suites retain four test threads; local Iroh fixtures must isolate their own
+identities and multicast sockets.
 
-| Test | Time |
-| --- | --- |
-| lib `membership::gossiped_names_from_a_join_wave_survive_until_their_steps_land` | ~12 min |
-| `tests/record_storage.rs` (2 tests) | 740 s |
-| `native_persistence` `hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots` | ~26 min |
+## Scope
 
-## Work
-
-- [ ] Measure the three tests before the change (same CPUs, pinned).
-- [ ] Try `[profile.dev.package."*"] opt-level = 2` (dependencies only; our crates stay debug). Measure again. Report build time and disk use too.
-- [ ] If not enough, try opt-level 1 for the crypto-heavy workspace crates.
-- [ ] Check whether `arachne-node`, `arachne-security`, `arachne-delivery` and `arachne-store` still need `--test-threads=1`. Remove any leftover need.
-- [ ] Update `README.md` and `docs/development.md` test commands.
-
-## Done when
-
-- A clear before/after table. Commit the profile only if the gain is clear.
-- The documented test commands match what works.
+This package changes the test profile and documentation. It does not change
+the production protocol, crypto settings, storage format or test assertions.
+Later native storage and branch changes can change absolute test times. Do not
+apply the old measurement to a different source revision as a benchmark.

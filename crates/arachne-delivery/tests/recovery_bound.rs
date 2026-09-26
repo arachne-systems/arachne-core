@@ -2,11 +2,11 @@
 //! the largest author-signed prefix that fits one reply, and the requester
 //! continues from it until the whole history is covered.
 mod common;
-use common::{test_endpoint, test_key};
 use arachne_delivery::inbox::{InboxStage, ObjectInbox};
 use arachne_delivery::{PublisherLog, wire};
 use arachne_routing::{Permissions, PublicationContext, RoutingTable, Topic};
 use arachne_security::{MAX_APPLICATION_PAYLOAD, PendingJoin, Workspace};
+use common::{test_endpoint, test_key};
 use std::collections::{BTreeMap, BTreeSet};
 
 const REVISION: u64 = 1;

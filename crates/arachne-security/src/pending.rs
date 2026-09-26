@@ -94,7 +94,12 @@ impl PendingJoin {
         endpoint: &dyn EndpointSigner,
         display_name: &str,
     ) -> Result<Self, &'static str> {
-        let mut pending = Self::new(invitation.workspace_id(), invitation.checkpoint_digest(), endpoint, display_name)?;
+        let mut pending = Self::new(
+            invitation.workspace_id(),
+            invitation.checkpoint_digest(),
+            endpoint,
+            display_name,
+        )?;
         pending.invitation = Some(invitation.export_secret_token());
         Ok(pending)
     }
@@ -271,8 +276,7 @@ impl PendingJoin {
         };
         if let Some(token) = &invitation {
             let parsed = super::Invitation::from_bytes(token)?;
-            if parsed.workspace_id() != workspace
-                || parsed.checkpoint_digest() != checkpoint_digest
+            if parsed.workspace_id() != workspace || parsed.checkpoint_digest() != checkpoint_digest
             {
                 return Err("saved invitation does not match pending identity");
             }
@@ -436,24 +440,38 @@ fn a_pending_join_seals_a_maximum_size_checkpoint() {
     let key = StorageKey::derive(&[10; 32]).unwrap();
     let sealed = pending.seal(&key).unwrap();
     assert!(sealed.len() <= super::MAX_SEALED_PENDING_JOIN);
-    let error = PendingJoin::restore(&key, crate::test_endpoint(9), [7; 32], &sealed).err().unwrap();
-    assert!(!matches!(error, "invalid protected snapshot" | "saved checkpoint exceeds bounds"), "{error}");
+    let error = PendingJoin::restore(&key, crate::test_endpoint(9), [7; 32], &sealed)
+        .err()
+        .unwrap();
+    assert!(
+        !matches!(
+            error,
+            "invalid protected snapshot" | "saved checkpoint exceeds bounds"
+        ),
+        "{error}"
+    );
 }
 
 #[test]
 fn compact_pending_invitation_survives_restart_and_becomes_admission_ready() {
     let admin = Workspace::create(crate::test_key(4), "Coordinator").unwrap();
     let (invitation, checkpoint) = admin.issue_invitation().unwrap();
-    let pending = PendingJoin::from_compact_invitation(&invitation, crate::test_key(5), "Field helper").unwrap();
+    let pending =
+        PendingJoin::from_compact_invitation(&invitation, crate::test_key(5), "Field helper")
+            .unwrap();
     let member = pending.member().clone();
     let key = StorageKey::derive(&[6; 32]).unwrap();
     let sealed = pending.seal(&key).unwrap();
     assert!(sealed.starts_with(LEGACY));
     drop(pending);
 
-    let mut restored = PendingJoin::restore(&key, crate::test_endpoint(5), admin.id(), &sealed).unwrap();
+    let mut restored =
+        PendingJoin::restore(&key, crate::test_endpoint(5), admin.id(), &sealed).unwrap();
     assert_eq!(restored.member(), &member);
-    assert_eq!(restored.deferred_invitation().unwrap().as_slice(), invitation.export_secret_token().as_slice());
+    assert_eq!(
+        restored.deferred_invitation().unwrap().as_slice(),
+        invitation.export_secret_token().as_slice()
+    );
     assert!(restored.admission_request().is_err());
     restored.complete_checkpoint(&checkpoint).unwrap();
     assert!(!restored.admission_request().unwrap().is_empty());
@@ -491,7 +509,15 @@ fn pending_identity_recovers_and_rejected_welcome_does_not_consume_it() {
     assert_eq!(pending.member(), &member);
     assert_eq!(pending.key_package().unwrap(), package);
     assert!(PendingJoin::restore(&key, crate::test_endpoint(9), admin.id(), &sealed).is_err());
-    assert!(PendingJoin::restore(&key, crate::test_endpoint(2), crate::test_endpoint(9), &sealed).is_err());
+    assert!(
+        PendingJoin::restore(
+            &key,
+            crate::test_endpoint(2),
+            crate::test_endpoint(9),
+            &sealed
+        )
+        .is_err()
+    );
     assert!(
         PendingJoin::restore(
             &StorageKey::derive(&[4; 32]).unwrap(),
@@ -511,7 +537,15 @@ fn pending_identity_recovers_and_rejected_welcome_does_not_consume_it() {
         .is_err()
     );
     assert!(Workspace::restore(&key, crate::test_endpoint(2), admin.id(), &sealed).is_err());
-    assert!(PendingJoin::restore(&key, crate::test_endpoint(1), admin.id(), &admin.seal(&key).unwrap()).is_err());
+    assert!(
+        PendingJoin::restore(
+            &key,
+            crate::test_endpoint(1),
+            admin.id(),
+            &admin.seal(&key).unwrap()
+        )
+        .is_err()
+    );
     for index in [0, 5, 37, 49, sealed.len() - 1] {
         let mut bad = sealed.clone();
         bad[index] ^= 1;

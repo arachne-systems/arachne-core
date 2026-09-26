@@ -599,8 +599,7 @@ fn steps(value: &Value) -> Result<Vec<(MembershipAuthorization, Vec<u8>)>, Strin
         .ok_or("admission reply has no commits".to_string())?
         .iter()
         .map(|step| {
-            arachne_security::decode_membership_step(&bytes(&step["step"])?)
-                .map_err(str::to_owned)
+            arachne_security::decode_membership_step(&bytes(&step["step"])?).map_err(str::to_owned)
         })
         .collect()
 }
@@ -639,12 +638,13 @@ async fn request_until_welcome(
 ) -> Result<Value, String> {
     loop {
         let reply = request_control(node, peer, payload, deadline).await?;
-        let value: Value = arachne_runtime::harness::decode_admission_reply(&reply).map_err(|e| {
-            format!(
-                "control reply JSON decode failed ({} bytes): {e}",
-                reply.len()
-            )
-        })?;
+        let value: Value =
+            arachne_runtime::harness::decode_admission_reply(&reply).map_err(|e| {
+                format!(
+                    "control reply JSON decode failed ({} bytes): {e}",
+                    reply.len()
+                )
+            })?;
         match value["state"].as_str() {
             Some("admission_queued") | Some("admission_waiting") => tokio::task::yield_now().await,
             Some("admission_replied") | None if value.get("welcome").is_some() => return Ok(value),
@@ -654,6 +654,8 @@ async fn request_until_welcome(
     }
 }
 
+// The qualification fixture keeps its transport, authority and timing inputs explicit.
+#[allow(clippy::too_many_arguments)]
 async fn full_join(
     node: Arc<Node>,
     owner: &OwnerData,
@@ -1078,7 +1080,10 @@ fn restore_owner(
     let handle = create_endpoint_for_profile(profile, &secret, relay)?;
     let result = (|| {
         attach_storage(handle, StorageConfig::sqlite(records.path(), secret))?;
-        call(handle, json!({"op":"restore_workspace","workspace":workspace}))?;
+        call(
+            handle,
+            json!({"op":"restore_workspace","workspace":workspace}),
+        )?;
         let info: Value = serde_json::from_str(&describe(handle)?).map_err(|e| e.to_string())?;
         let peer = array32(&info["endpoint_key"])?;
         let port = info["bound_address"]
@@ -1120,6 +1125,8 @@ async fn bind_node(
     }
 }
 
+// The qualification fixture keeps its transport, authority and timing inputs explicit.
+#[allow(clippy::too_many_arguments)]
 async fn run_nodes(
     options: Options,
     owner: OwnerData,
@@ -1632,13 +1639,9 @@ fn run_restart(options: Options) -> Result<Value, String> {
         .map_err(|error| error.to_string())?;
         let initial = Arc::new(initial);
         let parsed_invitation = Invitation::from_bytes(&invitation).map_err(str::to_owned)?;
-        let pending = PendingJoin::from_invitation(
-            &parsed_invitation,
-            &checkpoint,
-            &*initial,
-            "restarting",
-        )
-        .map_err(str::to_owned)?;
+        let pending =
+            PendingJoin::from_invitation(&parsed_invitation, &checkpoint, &*initial, "restarting")
+                .map_err(str::to_owned)?;
         let request = pending.admission_request().map_err(str::to_owned)?.to_vec();
         let payload = packet(&request, "restarting", &checkpoint);
         tokio::time::timeout(
@@ -1821,9 +1824,8 @@ fn run_partition(options: Options) -> Result<Value, String> {
         .map_err(|error| error.to_string())?;
         let node = Arc::new(node);
         let invitation = Invitation::from_bytes(&invitation).map_err(str::to_owned)?;
-        let pending =
-            PendingJoin::from_invitation(&invitation, &checkpoint, &*node, "partition")
-                .map_err(str::to_owned)?;
+        let pending = PendingJoin::from_invitation(&invitation, &checkpoint, &*node, "partition")
+            .map_err(str::to_owned)?;
         let request = pending.admission_request().map_err(str::to_owned)?.to_vec();
         let payload = packet(&request, "partition", &checkpoint);
         tokio::time::timeout(
@@ -2537,7 +2539,10 @@ mod tests {
             "\"invitation\"",
             "\"payload\"",
         ] {
-            assert!(!serialized.contains(forbidden), "receipt leaked {forbidden}");
+            assert!(
+                !serialized.contains(forbidden),
+                "receipt leaked {forbidden}"
+            );
         }
         assert!(compact["paths"]["by_route"].as_object().unwrap().len() <= 3);
     }

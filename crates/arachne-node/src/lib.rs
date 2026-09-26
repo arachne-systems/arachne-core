@@ -17,25 +17,27 @@ use std::{
 
 mod budget;
 mod connections;
+mod control;
+mod endpoint;
 #[cfg(test)]
 mod gossip_forwarding_test;
 mod mdns;
-mod control;
-mod endpoint;
 pub use endpoint::IrohEndpointSigner;
 mod overlay;
+pub mod resources;
 #[cfg(feature = "moq")]
 mod streams;
-pub mod resources;
 mod wire;
 pub use budget::{CapacityCounts, ConnectionBudget};
-pub use control::{ControlClient, ControlRequest, ControlTiming, InquiryResponder, MAX_CONTROL_REPLY, Timing};
+pub use control::{
+    ControlClient, ControlRequest, ControlTiming, InquiryResponder, MAX_CONTROL_REPLY, Timing,
+};
 #[cfg(feature = "moq")]
 pub use streams::MoqMetrics;
 
-use connections::Connections;
 use arachne_routing::RoutingTable;
 pub use arachne_routing::{PeerId, Permissions, Topic, WorkspaceId};
+use connections::Connections;
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -254,14 +256,7 @@ pub enum DeliveryClass {
     Bulk,
 }
 
-type CurrentKey = (
-    WorkspaceId,
-    u64,
-    String,
-    PeerId,
-    [u8; 32],
-    Vec<[u8; 32]>,
-);
+type CurrentKey = (WorkspaceId, u64, String, PeerId, [u8; 32], Vec<[u8; 32]>);
 
 #[derive(Default)]
 struct DeliveryState {
@@ -437,6 +432,8 @@ pub struct PeerPath {
     pub rtt_ms: u64,
 }
 
+type ParkedOverlays = BTreeMap<WorkspaceId, ([u8; overlay::TAG], u64)>;
+
 pub struct Node {
     controls: mpsc::Receiver<ControlRequest>,
     control_inbox: control::ControlInbox,
@@ -450,7 +447,7 @@ pub struct Node {
     overlays: Arc<Mutex<BTreeMap<WorkspaceId, Arc<overlay::Overlay>>>>,
     /// Overlays parked by `suspend`: workspace to (tag, revision). `Some`
     /// while suspended; `resume` rebuilds them.
-    parked: Arc<StdMutex<Option<BTreeMap<WorkspaceId, ([u8; overlay::TAG], u64)>>>>,
+    parked: Arc<StdMutex<Option<ParkedOverlays>>>,
     membership: overlay::MembershipInbox,
     #[cfg(feature = "moq")]
     streams: streams::Streams,
@@ -639,7 +636,11 @@ impl Node {
         options: NodeOptions,
         budget: ConnectionBudget,
     ) -> Result<(Self, MessageReceiver)> {
-        let alpns = vec![ALPN.to_vec(), control::ALPN.to_vec(), overlay::ALPN.to_vec()];
+        let alpns = vec![
+            ALPN.to_vec(),
+            control::ALPN.to_vec(),
+            overlay::ALPN.to_vec(),
+        ];
         #[cfg(feature = "moq")]
         let alpns = {
             let mut alpns = alpns;
@@ -1309,9 +1310,7 @@ impl Node {
                 .await?;
                 report.admitted.push(self.id());
             }
-            report.queued = overlay
-                .broadcast(&topic, delivery, payload)
-                .await?;
+            report.queued = overlay.broadcast(&topic, delivery, payload).await?;
             return Ok(report);
         }
         let peers = self
@@ -1421,11 +1420,11 @@ impl Node {
         if payload.len() > MAX_PAYLOAD {
             return Err(Error::TooLarge);
         }
-        let mut peers = self
-            .routing
-            .lock()
-            .await
-            .recipients(workspace, revision, self.id(), &topic)?;
+        let mut peers =
+            self.routing
+                .lock()
+                .await
+                .recipients(workspace, revision, self.id(), &topic)?;
         let enabled = self
             .streams
             .enabled_peers(workspace, revision, &topic)
@@ -1493,13 +1492,7 @@ impl Node {
         if enabled.is_empty() {
             return self
                 .publish_to_with_class(
-                    workspace,
-                    revision,
-                    topic,
-                    endpoints,
-                    recipients,
-                    delivery,
-                    payload,
+                    workspace, revision, topic, endpoints, recipients, delivery, payload,
                 )
                 .await;
         }
@@ -1606,13 +1599,14 @@ impl Node {
     /// connection. Later dials reconnect. Idempotent.
     pub async fn suspend(&self) {
         let overlays = std::mem::take(&mut *self.overlays.lock().await);
-        let mut parked = self.parked.lock().unwrap();
-        let parked = parked.get_or_insert_with(BTreeMap::new);
-        for (workspace, overlay) in overlays {
-            parked.insert(workspace, (overlay.tag, overlay.revision()));
-        }
-        let overlays = parked.len();
-        drop(parked);
+        let overlays = {
+            let mut parked = self.parked.lock().unwrap();
+            let parked = parked.get_or_insert_with(BTreeMap::new);
+            for (workspace, overlay) in overlays {
+                parked.insert(workspace, (overlay.tag, overlay.revision()));
+            }
+            parked.len()
+        };
         // Idle links would keep QUIC keep-alives running.
         let closed = self.connections.close_idle().await;
         // No local announcements or lookups while in the background.
@@ -1715,7 +1709,6 @@ impl Node {
         self.connections.close().await;
         self.listener.abort();
         let _ = (&mut self.listener).await;
-
     }
 }
 

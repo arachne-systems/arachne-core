@@ -32,7 +32,11 @@ pub(crate) struct StagedCandidate {
 }
 
 impl StagedCandidate {
-    pub(crate) fn new(workspace: [u8; 32], workspace_name: Option<String>, snapshot: Vec<u8>) -> Self {
+    pub(crate) fn new(
+        workspace: [u8; 32],
+        workspace_name: Option<String>,
+        snapshot: Vec<u8>,
+    ) -> Self {
         Self {
             workspace,
             workspace_name,
@@ -117,13 +121,19 @@ pub(crate) struct StateReply {
 
 /// Stage one administrator action: promote, demote, remove, or an
 /// invitation control change.
-pub(crate) fn stage(session: &mut Session, args: ManagementArgs) -> Result<StagedCandidate, ApiError> {
+pub(crate) fn stage(
+    session: &mut Session,
+    args: ManagementArgs,
+) -> Result<StagedCandidate, ApiError> {
     let action = args.action.action()?;
     membership::stage_management(session, action)
 }
 
 /// Leave through another member, who commits the departure.
-pub(crate) fn leave_via_peer(session: &mut Session, args: PeerArgs) -> Result<StagedChange, ApiError> {
+pub(crate) fn leave_via_peer(
+    session: &mut Session,
+    args: PeerArgs,
+) -> Result<StagedChange, ApiError> {
     membership::leave_via_peer(session, args.peer)
 }
 
@@ -147,7 +157,10 @@ pub(crate) fn stage_admission_update(
     membership::stage_update(session, args.step)
 }
 
-pub(crate) fn member_roster(session: &mut Session, args: RosterArgs) -> Result<RosterReply, ApiError> {
+pub(crate) fn member_roster(
+    session: &mut Session,
+    args: RosterArgs,
+) -> Result<RosterReply, ApiError> {
     membership::roster(session, &args.profiles)
 }
 

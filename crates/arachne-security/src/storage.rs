@@ -46,10 +46,9 @@ fn storage_key_derivation_keeps_its_bytes_across_crypto_upgrades() {
     // Independently calculated with Python hashlib/hmac and RFC 5869.
     let root = std::array::from_fn(|i| i as u8);
     let expected = [
-        0x7a, 0x81, 0xed, 0x72, 0xce, 0x9a, 0x3a, 0xf2,
-        0x18, 0x5d, 0xd0, 0x5b, 0x23, 0x53, 0x7b, 0xaf,
-        0x11, 0x4a, 0x26, 0xb5, 0x0d, 0xff, 0xac, 0xfb,
-        0xe5, 0x5b, 0xff, 0xbe, 0xe6, 0x73, 0xcf, 0x62,
+        0x7a, 0x81, 0xed, 0x72, 0xce, 0x9a, 0x3a, 0xf2, 0x18, 0x5d, 0xd0, 0x5b, 0x23, 0x53, 0x7b,
+        0xaf, 0x11, 0x4a, 0x26, 0xb5, 0x0d, 0xff, 0xac, 0xfb, 0xe5, 0x5b, 0xff, 0xbe, 0xe6, 0x73,
+        0xcf, 0x62,
     ];
     assert_eq!(*StorageKey::derive(&root).unwrap().0, expected);
 }
@@ -607,20 +606,50 @@ fn protected_snapshot_restores_and_rejects_wrong_context() {
     let sealed_again = restored.seal(&key).unwrap();
     assert!(Workspace::restore(&key, crate::test_endpoint(1), id, &sealed_again).is_ok());
     assert!(
-        Workspace::restore(&StorageKey::derive(&[8; 32]).unwrap(), crate::test_endpoint(1), id, &sealed).is_err()
+        Workspace::restore(
+            &StorageKey::derive(&[8; 32]).unwrap(),
+            crate::test_endpoint(1),
+            id,
+            &sealed
+        )
+        .is_err()
     );
     assert!(Workspace::restore(&key, crate::test_endpoint(2), id, &sealed).is_err());
-    assert!(Workspace::restore(&key, crate::test_endpoint(1), crate::test_endpoint(9), &sealed).is_err());
+    assert!(
+        Workspace::restore(
+            &key,
+            crate::test_endpoint(1),
+            crate::test_endpoint(9),
+            &sealed
+        )
+        .is_err()
+    );
     for index in [0, 5, 37, HEADER, sealed.len() - 1] {
         let mut bad = sealed.clone();
         bad[index] ^= 1;
         assert!(Workspace::restore(&key, crate::test_endpoint(1), id, &bad).is_err());
     }
-    assert!(Workspace::restore(&key, crate::test_endpoint(1), id, &sealed[..sealed.len() - 1]).is_err());
+    assert!(
+        Workspace::restore(
+            &key,
+            crate::test_endpoint(1),
+            id,
+            &sealed[..sealed.len() - 1]
+        )
+        .is_err()
+    );
     let mut trailing = sealed.clone();
     trailing.push(0);
     assert!(Workspace::restore(&key, crate::test_endpoint(1), id, &trailing).is_err());
-    assert!(Workspace::restore(&key, crate::test_endpoint(1), id, &vec![0; MAX_SEALED_WORKSPACE + 1]).is_err());
+    assert!(
+        Workspace::restore(
+            &key,
+            crate::test_endpoint(1),
+            id,
+            &vec![0; MAX_SEALED_WORKSPACE + 1]
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -687,8 +716,18 @@ fn combined_record_authenticates_both_parts_and_preserves_legacy_bounds() {
     assert_eq!(restored.member(), owner.member());
     assert_eq!(actual.as_slice(), attachment);
     assert!(Workspace::restore(&key, crate::test_endpoint(1), id, &sealed).is_err());
-    assert!(Workspace::restore_with_attachment(&key, crate::test_endpoint(2), id, &sealed).is_err());
-    assert!(Workspace::restore_with_attachment(&key, crate::test_endpoint(1), crate::test_endpoint(9), &sealed).is_err());
+    assert!(
+        Workspace::restore_with_attachment(&key, crate::test_endpoint(2), id, &sealed).is_err()
+    );
+    assert!(
+        Workspace::restore_with_attachment(
+            &key,
+            crate::test_endpoint(1),
+            crate::test_endpoint(9),
+            &sealed
+        )
+        .is_err()
+    );
     assert!(
         Workspace::restore_with_attachment(
             &StorageKey::derive(&[8; 32]).unwrap(),
@@ -701,26 +740,43 @@ fn combined_record_authenticates_both_parts_and_preserves_legacy_bounds() {
     for offset in [0, 5, 37, HEADER, sealed.len() - 1] {
         let mut bad = sealed.clone();
         bad[offset] ^= 1;
-        assert!(Workspace::restore_with_attachment(&key, crate::test_endpoint(1), id, &bad).is_err());
+        assert!(
+            Workspace::restore_with_attachment(&key, crate::test_endpoint(1), id, &bad).is_err()
+        );
     }
     assert!(
-        Workspace::restore_with_attachment(&key, crate::test_endpoint(1), id, &sealed[..sealed.len() - 1]).is_err()
+        Workspace::restore_with_attachment(
+            &key,
+            crate::test_endpoint(1),
+            id,
+            &sealed[..sealed.len() - 1]
+        )
+        .is_err()
     );
     let mut trailing = sealed.clone();
     trailing.push(0);
-    assert!(Workspace::restore_with_attachment(&key, crate::test_endpoint(1), id, &trailing).is_err());
+    assert!(
+        Workspace::restore_with_attachment(&key, crate::test_endpoint(1), id, &trailing).is_err()
+    );
     assert!(
         owner
             .seal_with_attachment(&key, &vec![0; MAX_WORKSPACE_ATTACHMENT + 1])
             .is_err()
     );
     assert!(
-        Workspace::restore_with_attachment(&key, crate::test_endpoint(1), id, &vec![0; MAX_SEALED_BUNDLE + 1])
-            .is_err()
+        Workspace::restore_with_attachment(
+            &key,
+            crate::test_endpoint(1),
+            id,
+            &vec![0; MAX_SEALED_BUNDLE + 1]
+        )
+        .is_err()
     );
     let legacy = owner.seal(&key).unwrap();
     assert!(Workspace::restore(&key, crate::test_endpoint(1), id, &legacy).is_ok());
-    assert!(Workspace::restore_with_attachment(&key, crate::test_endpoint(1), id, &legacy).is_err());
+    assert!(
+        Workspace::restore_with_attachment(&key, crate::test_endpoint(1), id, &legacy).is_err()
+    );
     // Valid encryption does not make malformed inner framing acceptable.
     for (security, length, tail) in [
         (legacy.as_slice(), 2u32, vec![1]),
@@ -739,7 +795,9 @@ fn combined_record_authenticates_both_parts_and_preserves_legacy_bounds() {
         let bad = key
             .protect_record(&owner.provider, BUNDLE, id, [1; 32], &plain)
             .unwrap();
-        assert!(Workspace::restore_with_attachment(&key, crate::test_endpoint(1), id, &bad).is_err());
+        assert!(
+            Workspace::restore_with_attachment(&key, crate::test_endpoint(1), id, &bad).is_err()
+        );
     }
 }
 
@@ -759,7 +817,10 @@ fn twelve_member_snapshot_capacity() {
         )
         .unwrap();
         let next = owner
-            .prepare_admission(crate::test_endpoint(u64::from(member)), pending.admission_request().unwrap())
+            .prepare_admission(
+                crate::test_endpoint(u64::from(member)),
+                pending.admission_request().unwrap(),
+            )
             .unwrap()
             .workspace;
         let state = next.provider.storage().values.read().unwrap();

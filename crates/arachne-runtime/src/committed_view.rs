@@ -39,7 +39,12 @@ impl Published {
         Arc::clone(&self.profiles)
     }
 
-    pub(super) fn publish(&self, workspace: Arc<arachne_security::Workspace>, endpoint: [u8; 32], orders: Arc<membership::transfer::Orders>) {
+    pub(super) fn publish(
+        &self,
+        workspace: Arc<arachne_security::Workspace>,
+        endpoint: [u8; 32],
+        orders: Arc<membership::transfer::Orders>,
+    ) {
         *self.view.write().unwrap_or_else(|error| error.into_inner()) =
             Some(Arc::new(CommittedView {
                 workspace,
@@ -50,7 +55,10 @@ impl Published {
 
     pub(super) fn clear(&self) {
         *self.view.write().unwrap_or_else(|error| error.into_inner()) = None;
-        *self.profiles.lock().unwrap_or_else(|error| error.into_inner()) = Default::default();
+        *self
+            .profiles
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Default::default();
     }
 
     fn current(&self) -> Option<Arc<CommittedView>> {
@@ -130,20 +138,36 @@ impl CommittedView {
             );
         }
         if payload.starts_with(ADMISSION_HISTORY_PAGE_REQUEST) {
-            let page = parse_admission_history_page_packet(payload).ok().and_then(
-                |(request, offset)| {
-                    let checkpoint = pinned_checkpoint(&self.workspace, request).ok()?;
-                    admission_reply_page(&self.workspace, peer, request, Some(&checkpoint), offset)
+            let page =
+                parse_admission_history_page_packet(payload)
+                    .ok()
+                    .and_then(|(request, offset)| {
+                        let checkpoint = pinned_checkpoint(&self.workspace, request).ok()?;
+                        admission_reply_page(
+                            &self.workspace,
+                            peer,
+                            request,
+                            Some(&checkpoint),
+                            offset,
+                        )
                         .ok()
-                },
-            );
+                    });
             return Some(page.unwrap_or_else(|| UNAVAILABLE.to_vec()));
         }
         if payload.starts_with(membership::wire::BRANCH_QUERY) {
-            return Some(membership::fork::reply(Some(&self.workspace), peer, payload));
+            return Some(membership::fork::reply(
+                Some(&self.workspace),
+                peer,
+                payload,
+            ));
         }
         if payload.starts_with(membership::transfer::QUERY) {
-            return Some(membership::transfer::reply(Some(&self.workspace), &self.orders, peer, payload));
+            return Some(membership::transfer::reply(
+                Some(&self.workspace),
+                &self.orders,
+                peer,
+                payload,
+            ));
         }
         // A range pull reads committed steps only.
         if payload.starts_with(membership::wire::RANGE_QUERY) {
@@ -178,7 +202,8 @@ fn a_membership_query_answer_is_the_host_answer() {
     let owner = Arc::new(owner);
     let mut host = membership::bare_test_session(owner.clone());
     let mut view = membership::bare_test_session(owner.clone());
-    view.committed.publish(owner.clone(), view.node.id(), Default::default());
+    view.committed
+        .publish(owner.clone(), view.node.id(), Default::default());
     let responder = view.committed.responder();
     let profiles: Vec<Vec<u8>> = members
         .iter()

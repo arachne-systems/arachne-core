@@ -273,18 +273,30 @@ fn roundtrip(provider: &dyn StorageProvider) {
     let scope = [21; 32];
     assert!(provider.open(scope).unwrap().is_none());
     let mut storage = provider.create(scope).unwrap();
-    assert!(provider.create(scope).is_err(), "create never replaces a store");
+    assert!(
+        provider.create(scope).is_err(),
+        "create never replaces a store"
+    );
     assert_eq!(storage.revision(), 0);
     storage
-        .commit(0, &[(b"runtime/a", Some(b"one")), (b"runtime/b", Some(b""))])
+        .commit(
+            0,
+            &[(b"runtime/a", Some(b"one")), (b"runtime/b", Some(b""))],
+        )
         .unwrap();
     let anchor = storage.freshness();
     assert_eq!(anchor.revision, 1);
     drop(storage);
     let storage = provider.open(scope).unwrap().expect("store exists");
     assert_eq!(storage.freshness(), anchor);
-    assert_eq!(storage.keys(b"runtime/"), vec![b"runtime/a".to_vec(), b"runtime/b".to_vec()]);
-    assert_eq!(storage.get(b"runtime/a").unwrap().unwrap().as_slice(), b"one");
+    assert_eq!(
+        storage.keys(b"runtime/"),
+        vec![b"runtime/a".to_vec(), b"runtime/b".to_vec()]
+    );
+    assert_eq!(
+        storage.get(b"runtime/a").unwrap().unwrap().as_slice(),
+        b"one"
+    );
     assert!(storage.get(b"runtime/c").unwrap().is_none());
     assert!(provider.open([22; 32]).unwrap().is_none());
 }
@@ -317,13 +329,21 @@ fn a_crash_during_creation_leaves_no_file_and_creation_retries() {
     let root = [31; 32];
     FAIL_CREATE_AFTER_FILE.with(|fail| fail.set(true));
     assert!(Store::create(&path, &root, [1; 32]).is_err());
-    assert!(!path.exists(), "a failed creation must not leave a store file");
+    assert!(
+        !path.exists(),
+        "a failed creation must not leave a store file"
+    );
     let mut store = Store::create(&path, &root, [1; 32]).unwrap();
     store.commit(0, &[(b"k", Some(b"v"))]).unwrap();
     drop(store);
     assert!(Store::create(&path, &root, [1; 32]).is_err());
     assert_eq!(
-        Store::open_existing(&path, &root, [1; 32]).unwrap().get(b"k").unwrap().unwrap().as_slice(),
+        Store::open_existing(&path, &root, [1; 32])
+            .unwrap()
+            .get(b"k")
+            .unwrap()
+            .unwrap()
+            .as_slice(),
         b"v"
     );
     // No temporary file stays behind.
@@ -343,7 +363,9 @@ fn only_the_supported_store_format_opens() {
             .unwrap();
     };
     let refused = |expected: u32| {
-        let error = Store::open_existing(&path, &root, [2; 32]).err().expect("refused");
+        let error = Store::open_existing(&path, &root, [2; 32])
+            .err()
+            .expect("refused");
         let format = error
             .downcast_ref::<FormatNotSupported>()
             .unwrap_or_else(|| panic!("not a format error: {error}"));

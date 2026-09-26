@@ -64,8 +64,8 @@ pub use invitation::{
 mod storage;
 pub use bootstrap::{
     AdmissionAuthorization, HISTORY_CHUNK_STEPS, JoinProof, MAX_CHECKPOINT, MAX_CHECKPOINT_PIN,
-    MAX_CHECKPOINT_TREE, MAX_JOIN_HISTORY_BYTES, MAX_JOIN_HISTORY_STEPS, MembershipAuthorization,
-    MAX_MEMBERSHIP_COMMIT, MembershipVerifier, admission_asserted_time, checkpoint_digest,
+    MAX_CHECKPOINT_TREE, MAX_JOIN_HISTORY_BYTES, MAX_JOIN_HISTORY_STEPS, MAX_MEMBERSHIP_COMMIT,
+    MembershipAuthorization, MembershipVerifier, admission_asserted_time, checkpoint_digest,
 };
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -196,7 +196,11 @@ pub(crate) fn test_key_for(endpoint: [u8; 32]) -> &'static EndpointKey {
     key.expect("endpoint has no test key")
 }
 
-fn endpoint_binding_message(workspace: [u8; 32], member: [u8; 32], signature_key: &[u8]) -> Vec<u8> {
+fn endpoint_binding_message(
+    workspace: [u8; 32],
+    member: [u8; 32],
+    signature_key: &[u8],
+) -> Vec<u8> {
     let mut message = ENDPOINT_BINDING_DOMAIN.to_vec();
     message.extend(workspace);
     message.extend(member);
@@ -279,11 +283,19 @@ impl Workspace {
         let mut report = MemoryReport::default();
         if let Ok(values) = self.provider.storage().values.read() {
             report.records = values.len();
-            report.record_bytes = values.iter().map(|(key, value)| key.len() + value.len()).sum();
+            report.record_bytes = values
+                .iter()
+                .map(|(key, value)| key.len() + value.len())
+                .sum();
         }
         if let Some(history) = &self.join_history {
             report.history_steps = history.steps.len();
-            report.history_bytes = history.checkpoint.len() + history.steps.iter().map(|(_, commit)| commit.len()).sum::<usize>();
+            report.history_bytes = history.checkpoint.len()
+                + history
+                    .steps
+                    .iter()
+                    .map(|(_, commit)| commit.len())
+                    .sum::<usize>();
         }
         report.admissions = self.admissions.len();
         // Shared batch bytes count once: the number is the memory held.
@@ -295,7 +307,11 @@ impl Workspace {
                 }
             }
         }
-        report.checkpoint_bytes = self.invitation_checkpoints.iter().map(|checkpoint| checkpoint.checkpoint.len()).sum();
+        report.checkpoint_bytes = self
+            .invitation_checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.checkpoint.len())
+            .sum();
         report
     }
 

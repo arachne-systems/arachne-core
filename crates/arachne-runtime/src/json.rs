@@ -13,13 +13,13 @@ use serde_json::Value;
 
 use crate::errors;
 use crate::ops::candidate::{self, AdoptArgs};
-use crate::ops::{self, Op, admission, debug, invitation, join, management, membership, nearby, policy, publication,
-    receive, recovery, workspace,
+use crate::ops::{
+    self, Op, admission, debug, invitation, join, management, membership, nearby, policy,
+    publication, receive, recovery, workspace,
 };
 
 /// Maximum JSON request or metadata size in bytes.
 pub const MAX_REQUEST: usize = 128 * 1024;
-
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -125,9 +125,6 @@ pub(crate) enum Request {
     #[cfg(feature = "test-fixtures")]
     Poll {},
 }
-
-
-
 
 /// The op of a request, for the guards.
 pub(crate) fn op(request: &Request) -> Op {
@@ -305,7 +302,9 @@ pub(crate) fn dispatch(session: &mut crate::Session, request: Request) -> Result
         Request::StageAdmissionUpdate(args) => {
             reply(management::stage_admission_update(session, args)?)
         }
-        Request::StageWorkspaceName(args) => reply(management::stage_workspace_name(session, args)?),
+        Request::StageWorkspaceName(args) => {
+            reply(management::stage_workspace_name(session, args)?)
+        }
         Request::StageWorkspaceNameUpdate(args) => {
             reply(management::stage_workspace_name_update(session, args)?)
         }
@@ -387,7 +386,10 @@ pub fn execute_stored_with_code(
     if welcome.is_empty() {
         return serde_json::to_vec(&run(handle, request)?).map_err(errors::encode);
     }
-    let Request::StageJoin(join::StageJoinArgs { welcome: target, .. }) = &mut request else {
+    let Request::StageJoin(join::StageJoinArgs {
+        welcome: target, ..
+    }) = &mut request
+    else {
         return Err(invalid("only stage_join takes a binary argument"));
     };
     if object.contains_key("welcome") {
@@ -445,9 +447,10 @@ mod tests {
         assert!(describe(0).is_err());
         assert!(close(-1).is_err());
         // The cap is the context's: this test's own context allows eight.
-        let context = crate::Context::new(crate::ContextConfig::default().with_limits(
-            arachne_api::Limits::default().with_max_sessions(8),
-        ))
+        let context = crate::Context::new(
+            crate::ContextConfig::default()
+                .with_limits(arachne_api::Limits::default().with_max_sessions(8)),
+        )
         .unwrap();
         let direct = || arachne_node::NodeOptions::new(arachne_node::NetworkProfile::Direct);
         let handles: Vec<_> = (0..8)
@@ -840,7 +843,11 @@ mod tests {
             );
         }
         // The raw MLS application ops are gone; objects are the only path.
-        for op in ["stage_publication", "stage_reception", "enable_object_delivery"] {
+        for op in [
+            "stage_publication",
+            "stage_reception",
+            "enable_object_delivery",
+        ] {
             assert!(call(joiner, json!({"op":op})).is_err());
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(4);
@@ -910,7 +917,11 @@ mod tests {
         let joiner = stored(&[42; 32], &joiner_store);
         call(joiner, restore.clone()).unwrap();
         // The acknowledged object stays acknowledged after restore.
-        assert!(call(joiner, json!({"op":"poll_pending_object"})).unwrap().is_null());
+        assert!(
+            call(joiner, json!({"op":"poll_pending_object"}))
+                .unwrap()
+                .is_null()
+        );
         // Simulate process ownership loss after staging but before adoption.
         // No filesystem/power-loss claim: the records are held in RAM.
         let publish_12 = json!({"op":"stage_network_publication","revision":17,"topic":"streams/sample","id":vec![12;16],"payload":[7]});
@@ -921,7 +932,8 @@ mod tests {
             let session = guard.as_ref().unwrap();
             assert_eq!(session.delivery.publisher.as_ref().unwrap().head(), 1);
             let log = session
-                .transition.staged
+                .transition
+                .staged
                 .as_ref()
                 .unwrap()
                 .publisher
@@ -941,7 +953,11 @@ mod tests {
         }
         // The lost token belongs to the closed session only.
         assert!(
-            call(admin, json!({"op":"adopt_publication","candidate":lost["candidate"]})).is_err()
+            call(
+                admin,
+                json!({"op":"adopt_publication","candidate":lost["candidate"]})
+            )
+            .is_err()
         );
         // Stage it again and adopt; the adopted record survives the next restart.
         // This session has no subscribers yet, so adoption sends nothing live.
@@ -998,7 +1014,8 @@ mod tests {
             let log = guard
                 .as_ref()
                 .unwrap()
-                .transition.staged
+                .transition
+                .staged
                 .as_ref()
                 .unwrap()
                 .publisher
@@ -1364,7 +1381,8 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .unwrap()
-                .recovery.ready_range
+                .recovery
+                .ready_range
                 .is_none()
         );
         // Receiver still has revision 17; current publisher policy denies it.
@@ -1434,7 +1452,8 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .unwrap()
-                .recovery.ready_range
+                .recovery
+                .ready_range
                 .is_none()
         );
         let mut cancelled_request = empty_request;
@@ -1446,7 +1465,8 @@ mod tests {
             guard
                 .as_ref()
                 .unwrap()
-                .recovery.range
+                .recovery
+                .range
                 .as_ref()
                 .unwrap()
                 .task
@@ -1483,7 +1503,14 @@ mod tests {
         let head = {
             let shared = session(admin).unwrap();
             let guard = shared.lock().unwrap();
-            guard.as_ref().unwrap().delivery.publisher.as_ref().unwrap().head()
+            guard
+                .as_ref()
+                .unwrap()
+                .delivery
+                .publisher
+                .as_ref()
+                .unwrap()
+                .head()
         };
         let recover = json!({"op":"fetch_recovery_range", "peer":peer, "revision":19,
             "topics":["streams/other"], "after":0, "through":head});
@@ -1555,7 +1582,11 @@ mod tests {
             assert_eq!(recovered["id"], json!(vec![id; 16]));
             assert_eq!(recovered["topic"], "streams/other");
         }
-        assert!(call(joiner, json!({"op":"poll_pending_object"})).unwrap().is_null());
+        assert!(
+            call(joiner, json!({"op":"poll_pending_object"}))
+                .unwrap()
+                .is_null()
+        );
         assert!(
             call(
                 joiner,
@@ -1611,7 +1642,8 @@ mod tests {
             guard
                 .as_ref()
                 .unwrap()
-                .recovery.cutoff
+                .recovery
+                .cutoff
                 .as_ref()
                 .unwrap()
                 .task
@@ -1628,7 +1660,11 @@ mod tests {
             assert!(session.delivery.publisher.as_ref().unwrap().head() > 0);
             assert_eq!(session.delivery.inbox.as_ref().unwrap().pending_count(), 0);
         }
-        assert!(call(restored, json!({"op":"poll_pending_object"})).unwrap().is_null());
+        assert!(
+            call(restored, json!({"op":"poll_pending_object"}))
+                .unwrap()
+                .is_null()
+        );
         call(
             admin,
             json!({"op":"install_member_policy", "revision":20,"topics":["streams/objects"]}),
@@ -1698,7 +1734,7 @@ mod tests {
             call(restored, json!({"op":"poll_pending_object"})).unwrap(),
             pending
         );
-        let ack =|handle, pending: &Value| {
+        let ack = |handle, pending: &Value| {
             let request = json!({"op":"stage_object_acknowledgement", "member":pending["member"],
                 "topic":pending["topic"], "id":pending["id"], "counter":pending["counter"]});
             let mut wrong = request.clone();
@@ -1916,7 +1952,8 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .unwrap()
-                .delivery.inbox
+                .delivery
+                .inbox
                 .as_ref()
                 .unwrap()
                 .pending_count()
@@ -1987,8 +2024,12 @@ mod tests {
             "Welcome must have exactly one representation"
         );
         let saved: Value = serde_json::from_slice(
-            &execute_stored(service, &serde_json::to_vec(&join_request).unwrap(), &welcome)
-                .unwrap(),
+            &execute_stored(
+                service,
+                &serde_json::to_vec(&join_request).unwrap(),
+                &welcome,
+            )
+            .unwrap(),
         )
         .unwrap();
         assert!(saved.get("snapshot").is_none());

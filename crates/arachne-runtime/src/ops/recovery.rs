@@ -167,6 +167,8 @@ pub(crate) struct CutoffArgs {
 /// Where a recovery range stands.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
+// The variant names preserve the existing serialized dispatcher states.
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum RangeStatus {
     RecoverySourceWaiting {
         accepted_progress: bool,
@@ -224,6 +226,8 @@ pub(crate) struct DirectGap {
 /// Where a direct recovery stands.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
+// The variant names preserve the existing serialized dispatcher states.
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum DirectStatus {
     DirectRecoverySourceWaiting {
         accepted_progress: bool,
@@ -259,6 +263,8 @@ pub(crate) enum DirectStatus {
 /// Where a current-view fetch stands.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
+// The variant names preserve the existing serialized dispatcher states.
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum CurrentViewStatus {
     CurrentViewSourceWaiting {
         accepted_progress: bool,
@@ -290,6 +296,8 @@ pub(crate) enum CurrentViewStatus {
 /// Where a recovery cutoff discovery stands.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
+// The variant names preserve the existing serialized dispatcher states.
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum CutoffStatus {
     RecoveryCutoffPending {
         accepted_progress: bool,
@@ -372,7 +380,11 @@ fn ask_holders(
     session: &Session,
     candidates: &[[u8; 32]],
     wire: &[u8],
-) -> (usize, mpsc::Receiver<RecoveryReply>, tokio::task::JoinHandle<()>) {
+) -> (
+    usize,
+    mpsc::Receiver<RecoveryReply>,
+    tokio::task::JoinHandle<()>,
+) {
     let requests = candidates
         .iter()
         .map(|peer| (*peer, session.node.request_control(*peer, wire)))
@@ -420,7 +432,9 @@ pub(crate) fn check_recovery_policy(
         .map_err(security(ErrorCode::Internal))?
         .contains(&peer)
     {
-        return Err(ApiError::not_member("recovery peer is not a current member"));
+        return Err(ApiError::not_member(
+            "recovery peer is not a current member",
+        ));
     }
     let author_endpoint = owner
         .endpoints_for_members(&[author])
@@ -463,7 +477,10 @@ pub(crate) fn check_recovery_policy(
 
 /// The epoch a recovery op asks for: the requested one if it is in the
 /// receive window (A3f), else the current epoch.
-fn recovery_epoch(owner: &arachne_security::Workspace, epoch: Option<u64>) -> Result<u64, ApiError> {
+fn recovery_epoch(
+    owner: &arachne_security::Workspace,
+    epoch: Option<u64>,
+) -> Result<u64, ApiError> {
     match epoch {
         None => Ok(owner.epoch()),
         Some(epoch) if owner.in_receive_window(epoch) => Ok(epoch),
@@ -481,7 +498,10 @@ fn topic_set(topics: Vec<String>) -> Result<BTreeSet<Topic>, ApiError> {
         .collect::<Result<BTreeSet<_>, _>>()
         .map_err(errors::routing)?;
     if topics.len() != count {
-        return Err(ApiError::invalid_input("topics", "duplicate recovery topic"));
+        return Err(ApiError::invalid_input(
+            "topics",
+            "duplicate recovery topic",
+        ));
     }
     Ok(topics)
 }
@@ -492,7 +512,10 @@ fn topic_set(topics: Vec<String>) -> Result<BTreeSet<Topic>, ApiError> {
 
 /// Ask for an author's range: from `peer`, or automatically from live
 /// neighbors and the author, continuing accepted progress.
-pub(crate) fn fetch_range(session: &mut Session, args: FetchRangeArgs) -> Result<RangeStatus, ApiError> {
+pub(crate) fn fetch_range(
+    session: &mut Session,
+    args: FetchRangeArgs,
+) -> Result<RangeStatus, ApiError> {
     let FetchRangeArgs {
         peer,
         author,
@@ -567,7 +590,10 @@ pub(crate) fn fetch_range(session: &mut Session, args: FetchRangeArgs) -> Result
         topics,
     };
     if query.after == query.through {
-        return Err(ApiError::invalid_input("after", "recovery cursor exhausted"));
+        return Err(ApiError::invalid_input(
+            "after",
+            "recovery cursor exhausted",
+        ));
     }
     let automatic = available.is_some() || peer.is_none();
     let mut candidates = if automatic {
@@ -831,7 +857,10 @@ pub(crate) fn next_direct_gap(session: &mut Session) -> Result<Option<DirectGap>
 }
 
 /// Ask the intended recipients (and the author) for a direct range.
-pub(crate) fn fetch_direct(session: &mut Session, args: FetchDirectArgs) -> Result<DirectStatus, ApiError> {
+pub(crate) fn fetch_direct(
+    session: &mut Session,
+    args: FetchDirectArgs,
+) -> Result<DirectStatus, ApiError> {
     let FetchDirectArgs {
         author,
         revision,
@@ -841,7 +870,9 @@ pub(crate) fn fetch_direct(session: &mut Session, args: FetchDirectArgs) -> Resu
         through,
     } = args;
     if busy(session) {
-        return Err(ApiError::wrong_state("continuity operation already pending"));
+        return Err(ApiError::wrong_state(
+            "continuity operation already pending",
+        ));
     }
     let owner = session
         .workspace
@@ -939,9 +970,10 @@ pub(crate) fn poll_direct(session: &mut Session) -> Result<Option<DirectStatus>,
             session.recovery.direct_miss = Some(pending.query.clone());
             return Ok(Some(DirectStatus::DirectRecoverySourceUnavailable {
                 attempted: pending.attempted,
-                reason: pending.reason.take().unwrap_or_else(|| {
-                    "no intended recipient supplied the missing range".into()
-                }),
+                reason: pending
+                    .reason
+                    .take()
+                    .unwrap_or_else(|| "no intended recipient supplied the missing range".into()),
                 accepted_progress: false,
             }));
         }
@@ -969,10 +1001,9 @@ pub(crate) fn poll_direct(session: &mut Session) -> Result<Option<DirectStatus>,
             arachne_delivery::wire::DirectRangeReply::Offered(packets) => {
                 Ok((reply, packets.len()))
             }
-            arachne_delivery::wire::DirectRangeReply::Unavailable => Err(from_peer(
-                peer,
-                "intended recipient has no retained range",
-            )),
+            arachne_delivery::wire::DirectRangeReply::Unavailable => {
+                Err(from_peer(peer, "intended recipient has no retained range"))
+            }
         }
     });
     match result {
@@ -1025,10 +1056,15 @@ pub(crate) fn fetch_current_view(
         selector,
     } = args;
     if busy(session) {
-        return Err(ApiError::wrong_state("continuity operation already pending"));
+        return Err(ApiError::wrong_state(
+            "continuity operation already pending",
+        ));
     }
     if peer == Some(session.node.id()) || session.delivery.inbox.is_none() {
-        return Err(ApiError::invalid_input("peer", "invalid current-view request"));
+        return Err(ApiError::invalid_input(
+            "peer",
+            "invalid current-view request",
+        ));
     }
     let owner = session
         .workspace
@@ -1115,7 +1151,9 @@ pub(crate) fn fetch_current_view(
 }
 
 /// Collect the answers; once all are in, the best verified view is ready.
-pub(crate) fn poll_current_view(session: &mut Session) -> Result<Option<CurrentViewStatus>, ApiError> {
+pub(crate) fn poll_current_view(
+    session: &mut Session,
+) -> Result<Option<CurrentViewStatus>, ApiError> {
     let Some(mut active) = session.recovery.current_view.take() else {
         return Ok(None);
     };
@@ -1142,7 +1180,9 @@ pub(crate) fn poll_current_view(session: &mut Session) -> Result<Option<CurrentV
                         .as_ref()
                         .ok_or_else(errors::no_workspace)?;
                     arachne_delivery::current::verify_wire_reply(owner, &query, &reply)
-                        .map_err(|_| from_peer(peer, "holder returned invalid current-view evidence"))
+                        .map_err(|_| {
+                            from_peer(peer, "holder returned invalid current-view evidence")
+                        })
                         .and_then(|view| {
                             view.map(|view| (reply, view))
                                 .ok_or_else(|| from_peer(peer, "holder has no current view"))
@@ -1188,9 +1228,10 @@ pub(crate) fn poll_current_view(session: &mut Session) -> Result<Option<CurrentV
     } else if automatic {
         Ok(Some(CurrentViewStatus::CurrentViewUnavailable {
             attempted: Some(attempted),
-            reason: active.reason.take().unwrap_or_else(|| {
-                "no current holder supplied an authenticated view".into()
-            }),
+            reason: active
+                .reason
+                .take()
+                .unwrap_or_else(|| "no current holder supplied an authenticated view".into()),
             automatic_source: true,
             accepted_progress: false,
         }))
@@ -1263,7 +1304,9 @@ pub(crate) fn stage_current_view(session: &mut Session) -> Result<StagedRecovery
     }
     let publisher = match &session.delivery.publisher {
         Some(publisher) => publisher.clone(),
-        None => arachne_delivery::PublisherLog::new(owner).map_err(delivery(ErrorCode::Internal))?,
+        None => {
+            arachne_delivery::PublisherLog::new(owner).map_err(delivery(ErrorCode::Internal))?
+        }
     };
     let snapshot = seal_state(session.records.is_some())?;
     let candidate = owner
@@ -1312,7 +1355,10 @@ pub(crate) fn cancel_current_view(session: &mut Session) -> Result<CurrentViewSt
 // ---------------------------------------------------------------------------
 
 /// Ask `peer` for the retained window of its own publications.
-pub(crate) fn discover_cutoff(session: &mut Session, args: CutoffArgs) -> Result<CutoffStatus, ApiError> {
+pub(crate) fn discover_cutoff(
+    session: &mut Session,
+    args: CutoffArgs,
+) -> Result<CutoffStatus, ApiError> {
     let CutoffArgs {
         peer,
         revision,
@@ -1326,7 +1372,8 @@ pub(crate) fn discover_cutoff(session: &mut Session, args: CutoffArgs) -> Result
         .workspace
         .as_ref()
         .ok_or_else(errors::no_workspace)?;
-    if peer == session.node.id() || topics.is_empty() || topics.len() > arachne_delivery::MAX_TOPICS {
+    if peer == session.node.id() || topics.is_empty() || topics.len() > arachne_delivery::MAX_TOPICS
+    {
         return Err(ApiError::invalid_input(
             "peer",
             "invalid recovery peer or selection",
@@ -1354,12 +1401,10 @@ pub(crate) fn discover_cutoff(session: &mut Session, args: CutoffArgs) -> Result
         query.policy_revision,
         &query.topics,
     )?;
-    let task = session.runtime.spawn(
-        session.node.request_control(
-            peer,
-            &query.to_wire().map_err(delivery(ErrorCode::InvalidInput))?,
-        ),
-    );
+    let task = session.runtime.spawn(session.node.request_control(
+        peer,
+        &query.to_wire().map_err(delivery(ErrorCode::InvalidInput))?,
+    ));
     session.recovery.cutoff = Some(PendingControl { query, peer, task });
     Ok(CutoffStatus::RecoveryCutoffPending {
         accepted_progress: false,
@@ -1422,7 +1467,11 @@ pub(crate) fn poll_cutoff(session: &mut Session) -> Result<Option<CutoffStatus>,
                 peer: pending.peer,
                 epoch: query.epoch,
                 revision: query.policy_revision,
-                topics: query.topics.iter().map(|topic| topic.as_str().to_owned()).collect(),
+                topics: query
+                    .topics
+                    .iter()
+                    .map(|topic| topic.as_str().to_owned())
+                    .collect(),
                 head,
                 retained_after: after,
                 accepted_through,
@@ -1448,7 +1497,10 @@ fn nothing(state: &'static str) -> RecoveryStaged {
 }
 
 /// Stage only a locally requested, verified range; no caller-supplied reply bytes.
-pub(crate) fn stage_range(session: &mut Session, args: StageRangeArgs) -> Result<RecoveryStaged, ApiError> {
+pub(crate) fn stage_range(
+    session: &mut Session,
+    args: StageRangeArgs,
+) -> Result<RecoveryStaged, ApiError> {
     let retain_until = args.retain_until;
     let ready = session
         .recovery
@@ -1541,18 +1593,25 @@ pub(crate) fn stage_range(session: &mut Session, args: StageRangeArgs) -> Result
             |live| live.metadata.authenticated_context(&packet.context),
         );
         let authenticated = owner
-            .unprotect_object(packet.context.topic.namespace().as_bytes(), &aad, ciphertext)
+            .unprotect_object(
+                packet.context.topic.namespace().as_bytes(),
+                &aad,
+                ciphertext,
+            )
             .map_err(security(ErrorCode::NotAuthorized))?;
         offer
             .verify_origin(&authenticated.message)
             .map_err(delivery(ErrorCode::NotAuthorized))?;
         let staged = match live {
-            Some(ref live) => next.stage_live_current(owner, &packet.context, live.metadata, ciphertext),
+            Some(ref live) => {
+                next.stage_live_current(owner, &packet.context, live.metadata, ciphertext)
+            }
             None => next.stage(owner, &packet.context, ciphertext),
         };
         let staged = match staged {
             Err(error)
-                if ready.track_progress && arachne_delivery::inbox::drains_with_application(error) =>
+                if ready.track_progress
+                    && arachne_delivery::inbox::drains_with_application(error) =>
             {
                 stopped = true;
                 break;
@@ -1763,23 +1822,19 @@ pub(crate) fn serve(
 ) -> Result<Value, ApiError> {
     let reply = match session.workspace.as_ref() {
         Some(owner) => {
-            let now = arachne_delivery::UnixSeconds::now().map_err(delivery(ErrorCode::Internal))?;
+            let now =
+                arachne_delivery::UnixSeconds::now().map_err(delivery(ErrorCode::Internal))?;
             session
                 .runtime
                 .block_on(session.node.with_routing_policy(|policy| {
                     if incoming.payload().starts_with(b"DFDQ") {
                         match (
                             session.delivery.inbox.as_ref(),
-                            arachne_delivery::wire::DirectRangeQuery::from_wire(
-                                incoming.payload(),
-                            ),
+                            arachne_delivery::wire::DirectRangeQuery::from_wire(incoming.payload()),
                         ) {
-                            (Some(inbox), Ok(query)) => inbox.serve_direct_range(
-                                owner,
-                                policy,
-                                incoming.peer(),
-                                &query,
-                            ),
+                            (Some(inbox), Ok(query)) => {
+                                inbox.serve_direct_range(owner, policy, incoming.peer(), &query)
+                            }
                             _ => Ok(arachne_delivery::wire::unavailable_direct_reply()),
                         }
                     } else if incoming.payload().starts_with(b"DFVQ") {
@@ -1789,21 +1844,15 @@ pub(crate) fn serve(
                                 incoming.payload(),
                             ),
                         ) {
-                            (Some(inbox), Ok(query)) => inbox.serve_current(
-                                owner,
-                                policy,
-                                incoming.peer(),
-                                &query,
-                                now,
-                            ),
+                            (Some(inbox), Ok(query)) => {
+                                inbox.serve_current(owner, policy, incoming.peer(), &query, now)
+                            }
                             _ => Ok(arachne_delivery::current::CurrentView::denied_wire()),
                         }
                     } else if incoming.payload().starts_with(b"DFCQ") {
                         match (
                             session.delivery.publisher.as_ref(),
-                            arachne_delivery::wire::CutoffQuery::from_wire(
-                                incoming.payload(),
-                            ),
+                            arachne_delivery::wire::CutoffQuery::from_wire(incoming.payload()),
                         ) {
                             (Some(log), Ok(query)) => arachne_delivery::wire::serve_cutoff(
                                 log,
@@ -1815,14 +1864,10 @@ pub(crate) fn serve(
                             _ => Ok(arachne_delivery::wire::denied_reply()),
                         }
                     } else if incoming.payload().starts_with(b"DFHQ") {
-                        let Ok(query) =
-                            arachne_delivery::wire::AvailableRangeQuery::from_wire(
-                                incoming.payload(),
-                            )
-                        else {
-                            return Ok(
-                                arachne_delivery::wire::unavailable_available_reply(),
-                            );
+                        let Ok(query) = arachne_delivery::wire::AvailableRangeQuery::from_wire(
+                            incoming.payload(),
+                        ) else {
+                            return Ok(arachne_delivery::wire::unavailable_available_reply());
                         };
                         if owner.member().map(|member| member.id()) == Some(query.author) {
                             match session.delivery.publisher.as_ref() {
@@ -1833,9 +1878,7 @@ pub(crate) fn serve(
                                     incoming.peer(),
                                     &query,
                                 ),
-                                None => Ok(
-                                    arachne_delivery::wire::unavailable_available_reply(),
-                                ),
+                                None => Ok(arachne_delivery::wire::unavailable_available_reply()),
                             }
                         } else {
                             match session.delivery.inbox.as_ref() {
@@ -1846,14 +1889,11 @@ pub(crate) fn serve(
                                     &query,
                                     now,
                                 ),
-                                None => Ok(
-                                    arachne_delivery::wire::unavailable_available_reply(),
-                                ),
+                                None => Ok(arachne_delivery::wire::unavailable_available_reply()),
                             }
                         }
                     } else {
-                        let Ok(query) =
-                            arachne_delivery::RangeQuery::from_wire(incoming.payload())
+                        let Ok(query) = arachne_delivery::RangeQuery::from_wire(incoming.payload())
                         else {
                             return Ok(arachne_delivery::wire::denied_reply());
                         };
@@ -1870,13 +1910,9 @@ pub(crate) fn serve(
                             }
                         } else {
                             match session.delivery.inbox.as_ref() {
-                                Some(inbox) => inbox.serve_range(
-                                    owner,
-                                    policy,
-                                    incoming.peer(),
-                                    &query,
-                                    now,
-                                ),
+                                Some(inbox) => {
+                                    inbox.serve_range(owner, policy, incoming.peer(), &query, now)
+                                }
                                 None => Ok(arachne_delivery::wire::denied_reply()),
                             }
                         }

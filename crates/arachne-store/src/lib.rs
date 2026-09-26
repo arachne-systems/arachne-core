@@ -135,7 +135,11 @@ impl Store {
         // Leftovers of a crashed creation are never a store.
         for entry in std::fs::read_dir(directory)? {
             let entry = entry?;
-            if entry.file_name().to_str().is_some_and(|file| file.starts_with(&prefix)) {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|file| file.starts_with(&prefix))
+            {
                 std::fs::remove_file(entry.path())?;
             }
         }

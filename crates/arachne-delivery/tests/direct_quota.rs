@@ -102,7 +102,24 @@ fn send_direct(
         workspace: setup.author.id(),
         revision: REVISION,
         topic: topic.clone(),
-        id: [tag, sequence.get() as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        id: [
+            tag,
+            sequence.get() as u8,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ],
         sequence: Some(sequence),
     };
     let object = setup
@@ -121,7 +138,12 @@ fn send_direct(
     (context, object)
 }
 
-fn send_group(setup: &mut Setup, topic: &Topic, number: u64, size: usize) -> (PublicationContext, Vec<u8>) {
+fn send_group(
+    setup: &mut Setup,
+    topic: &Topic,
+    number: u64,
+    size: usize,
+) -> (PublicationContext, Vec<u8>) {
     let context = PublicationContext {
         workspace: setup.author.id(),
         revision: REVISION,
@@ -174,7 +196,12 @@ fn recover_next_gap(
         through: gap.through,
     };
     let reply = holder
-        .serve_direct_range(&setup.author, &setup.policy, setup.reader.endpoint(), &query)
+        .serve_direct_range(
+            &setup.author,
+            &setup.policy,
+            setup.reader.endpoint(),
+            &query,
+        )
         .unwrap();
     Some(inbox.stage_direct_range(&setup.reader, &query, &reply))
 }
@@ -183,7 +210,10 @@ fn recover_next_gap(
 fn deliver_one(inbox: &mut ObjectInbox, reader: &Workspace) -> Option<(u8, u64)> {
     let pending = inbox.pending(reader).unwrap()?;
     let payload = &pending.message.payload;
-    let seen = (payload[0], u64::from_be_bytes(payload[1..9].try_into().unwrap()));
+    let seen = (
+        payload[0],
+        u64::from_be_bytes(payload[1..9].try_into().unwrap()),
+    );
     *inbox = inbox
         .acknowledge(
             pending.message.member,
@@ -213,7 +243,13 @@ fn direct_recovery_admits_the_prefix_that_fits_the_author_quota() {
     // Three 5 KiB direct objects; only the last arrives live.
     let mut last = None;
     for _ in 1..=3 {
-        last = Some(send_direct(&mut setup, &mut holder, &direct, b'a', 5 * 1024));
+        last = Some(send_direct(
+            &mut setup,
+            &mut holder,
+            &direct,
+            b'a',
+            5 * 1024,
+        ));
     }
     let (context, object) = last.unwrap();
     let recipients = setup.recipients.clone();
@@ -301,9 +337,7 @@ fn a_gap_that_holds_back_all_pending_objects_can_always_be_filled() {
     let gap = inbox.next_direct_gap(&setup.reader).unwrap().unwrap();
     assert_eq!(gap.topic, scope_b);
     assert_eq!(
-        recover_next_gap(&setup, &holder_b, &inbox)
-            .unwrap()
-            .err(),
+        recover_next_gap(&setup, &holder_b, &inbox).unwrap().err(),
         Some(AUTHOR_QUOTA_EXHAUSTED)
     );
     // The same gap filler from live traffic is also refused now.
@@ -317,10 +351,7 @@ fn a_gap_that_holds_back_all_pending_objects_can_always_be_filled() {
     for _ in 0..4 {
         delivered.push(deliver_one(&mut inbox, &setup.reader).unwrap());
     }
-    assert_eq!(
-        delivered,
-        vec![(b'a', 1), (b'a', 2), (b'a', 3), (b'a', 4)]
-    );
+    assert_eq!(delivered, vec![(b'a', 1), (b'a', 2), (b'a', 3), (b'a', 4)]);
     let (next, count) = recover_next_gap(&setup, &holder_b, &inbox)
         .unwrap()
         .unwrap();

@@ -18,7 +18,12 @@ const GOLDEN: &[(ErrorCode, u32, &str, u32)] = &[
     (ErrorCode::StorageFailed, 300, "storage_failed", 300),
     (ErrorCode::StorageCorrupt, 301, "storage_corrupt", 300),
     (ErrorCode::CandidateStale, 302, "candidate_stale", 300),
-    (ErrorCode::FormatNotSupported, 303, "format_not_supported", 300),
+    (
+        ErrorCode::FormatNotSupported,
+        303,
+        "format_not_supported",
+        300,
+    ),
     (ErrorCode::PeerUnreachable, 400, "peer_unreachable", 400),
     (ErrorCode::Timeout, 401, "timeout", 400),
     (ErrorCode::TransportFailed, 402, "transport_failed", 400),
@@ -174,18 +179,39 @@ fn every_code_has_a_checked_constructor_with_its_right_variant() {
         (ApiError::invalid_id("k", "r"), ErrorCode::InvalidId),
         (ApiError::wrong_state("d"), ErrorCode::WrongState),
         (ApiError::unsupported("d"), ErrorCode::Unsupported),
-        (ApiError::capacity_exceeded("q", 1, "d"), ErrorCode::CapacityExceeded),
-        (ApiError::limit_reached("q", 1, "d"), ErrorCode::LimitReached),
+        (
+            ApiError::capacity_exceeded("q", 1, "d"),
+            ErrorCode::CapacityExceeded,
+        ),
+        (
+            ApiError::limit_reached("q", 1, "d"),
+            ErrorCode::LimitReached,
+        ),
         (ApiError::storage_failed("d"), ErrorCode::StorageFailed),
         (ApiError::storage_corrupt("d"), ErrorCode::StorageCorrupt),
         (ApiError::candidate_stale("d"), ErrorCode::CandidateStale),
-        (ApiError::format_not_supported("d"), ErrorCode::FormatNotSupported),
-        (ApiError::peer_unreachable(peer, "d"), ErrorCode::PeerUnreachable),
+        (
+            ApiError::format_not_supported("d"),
+            ErrorCode::FormatNotSupported,
+        ),
+        (
+            ApiError::peer_unreachable(peer, "d"),
+            ErrorCode::PeerUnreachable,
+        ),
         (ApiError::timeout(peer, "d"), ErrorCode::Timeout),
-        (ApiError::transport_failed(None, "d"), ErrorCode::TransportFailed),
+        (
+            ApiError::transport_failed(None, "d"),
+            ErrorCode::TransportFailed,
+        ),
         (ApiError::not_authorized("d"), ErrorCode::NotAuthorized),
-        (ApiError::invitation_invalid("d"), ErrorCode::InvitationInvalid),
-        (ApiError::invitation_expired("d"), ErrorCode::InvitationExpired),
+        (
+            ApiError::invitation_invalid("d"),
+            ErrorCode::InvitationInvalid,
+        ),
+        (
+            ApiError::invitation_expired("d"),
+            ErrorCode::InvitationExpired,
+        ),
         (ApiError::not_member("d"), ErrorCode::NotMember),
         (ApiError::epoch_mismatch("d"), ErrorCode::EpochMismatch),
         (ApiError::policy_mismatch("d"), ErrorCode::PolicyMismatch),
@@ -194,7 +220,14 @@ fn every_code_has_a_checked_constructor_with_its_right_variant() {
     for (error, code) in named {
         assert_eq!(error.code(), code, "{error:?}");
         assert!(error.is_well_formed(), "{error:?}");
-        assert_eq!(error.message(), if code == ErrorCode::InvalidInput || code == ErrorCode::InvalidId { "r" } else { "d" });
+        assert_eq!(
+            error.message(),
+            if code == ErrorCode::InvalidInput || code == ErrorCode::InvalidId {
+                "r"
+            } else {
+                "d"
+            }
+        );
     }
 }
 
@@ -214,7 +247,10 @@ fn a_code_from_another_group_is_not_well_formed_and_does_not_deserialize() {
         ("storage", ErrorCode::WrongState),
     ] {
         let value = serde_json::json!({"error": variant, "code": code, "detail": ""});
-        assert!(serde_json::from_value::<ApiError>(value).is_err(), "{variant}");
+        assert!(
+            serde_json::from_value::<ApiError>(value).is_err(),
+            "{variant}"
+        );
     }
     let good = serde_json::json!({"error": "state", "code": 600, "detail": "x"});
     assert_eq!(

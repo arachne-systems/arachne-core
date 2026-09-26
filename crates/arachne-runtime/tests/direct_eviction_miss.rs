@@ -111,7 +111,10 @@ fn evicting_past_a_direct_gap_reports_the_miss_and_keeps_order() {
             if !value.is_null() {
                 break value;
             }
-            assert!(Instant::now() < deadline, "sequence {sequence} not received");
+            assert!(
+                Instant::now() < deadline,
+                "sequence {sequence} not received"
+            );
             std::thread::sleep(Duration::from_millis(5));
         };
         let staged_missing = staged["missing_count"].as_u64().unwrap_or(0);
@@ -131,7 +134,10 @@ fn evicting_past_a_direct_gap_reports_the_miss_and_keeps_order() {
             );
         }
     }
-    assert_eq!(missing, 1, "the skipped sequence was not reported as missed");
+    assert_eq!(
+        missing, 1,
+        "the skipped sequence was not reported as missed"
+    );
     assert_eq!(adopted_missing, 1, "the adoption did not report the miss");
     assert!(call(receiver, json!({"op":"next_direct_gap"})).is_null());
     let mut delivered = Vec::new();

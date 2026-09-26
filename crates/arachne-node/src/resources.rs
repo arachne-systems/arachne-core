@@ -13,8 +13,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::Bytes;
 use arachne_routing::RoutingTable;
+use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh_blobs::{
@@ -229,10 +229,13 @@ impl ResourceTransfers {
             .map_err(|_| Error::Backpressure)?;
         let mut changes = self.0.changed.subscribe();
         let mut token = [0; 32];
-        tokio::time::timeout(self.0.connections.operation_timeout(), recv.read_exact(&mut token))
-            .await
-            .map_err(|_| Error::Timeout("resource admission"))?
-            .map_err(transport)?;
+        tokio::time::timeout(
+            self.0.connections.operation_timeout(),
+            recv.read_exact(&mut token),
+        )
+        .await
+        .map_err(|_| Error::Timeout("resource admission"))?
+        .map_err(transport)?;
         let grant = self
             .0
             .grants
@@ -257,10 +260,11 @@ impl ResourceTransfers {
             IdleWriter(send),
             EventSender::default(),
         );
-        let request = tokio::time::timeout(self.0.connections.operation_timeout(), pair.read_request())
-            .await
-            .map_err(|_| Error::Timeout("blob request"))?
-            .map_err(transport)?;
+        let request =
+            tokio::time::timeout(self.0.connections.operation_timeout(), pair.read_request())
+                .await
+                .map_err(|_| Error::Timeout("blob request"))?
+                .map_err(transport)?;
         let Request::Get(request) = request else {
             return Err(Error::Rejected);
         };

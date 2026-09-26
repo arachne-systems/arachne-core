@@ -4,11 +4,11 @@
 //! claim transport, Android, ATAK, SQLite, or UI capacity.
 
 mod common;
-use common::{test_endpoint, test_key, test_key_for};
 use arachne_security::{
     AdmissionAssessment, AdmissionAttempt, AdmissionEnqueue, AdmissionQueue, MAX_ADMISSION_BATCH,
     PendingJoin, Workspace,
 };
+use common::{test_endpoint, test_key, test_key_for};
 use std::time::Instant;
 
 fn endpoint(index: usize) -> [u8; 32] {
@@ -27,9 +27,13 @@ fn run(member_count: usize) {
     for index in 0..member_count {
         let request_started = Instant::now();
         let remote_endpoint = endpoint(index);
-        let pending =
-            PendingJoin::from_invitation(&invitation, &checkpoint, test_key_for(remote_endpoint), "Burst member")
-                .unwrap();
+        let pending = PendingJoin::from_invitation(
+            &invitation,
+            &checkpoint,
+            test_key_for(remote_endpoint),
+            "Burst member",
+        )
+        .unwrap();
         let attempt = AdmissionAttempt::new(
             remote_endpoint,
             pending.admission_request().unwrap().to_vec(),
@@ -99,8 +103,13 @@ fn run(member_count: usize) {
     // A founding-epoch invitation must still produce verifiable history after
     // the burst and all simulated owner restarts.
     let late_endpoint = endpoint(member_count + 1);
-    let late = PendingJoin::from_invitation(&invitation, &checkpoint, test_key_for(late_endpoint), "Late member")
-        .unwrap();
+    let late = PendingJoin::from_invitation(
+        &invitation,
+        &checkpoint,
+        test_key_for(late_endpoint),
+        "Late member",
+    )
+    .unwrap();
     let history = owner
         .membership_history(
             late_endpoint,
@@ -136,9 +145,13 @@ fn run_batched(member_count: usize) {
     let request_started = Instant::now();
     for index in 0..member_count {
         let endpoint = endpoint(index + 10_000);
-        let join =
-            PendingJoin::from_invitation(&invitation, &checkpoint, test_key_for(endpoint), "Batched member")
-                .unwrap();
+        let join = PendingJoin::from_invitation(
+            &invitation,
+            &checkpoint,
+            test_key_for(endpoint),
+            "Batched member",
+        )
+        .unwrap();
         let request = join.admission_request().unwrap().to_vec();
         let assessment = owner.assess_admission(endpoint, &request).unwrap();
         let request_validation = match assessment {
@@ -303,38 +316,76 @@ fn an_existing_member_follows_batch_adds_past_three_hundred_members() {
     let (registration, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
     owner = registration.workspace;
     let joiner = |index: usize| {
-        PendingJoin::from_invitation(&invitation, &checkpoint, test_key_for(endpoint(index + 30_000)), "Member").unwrap()
+        PendingJoin::from_invitation(
+            &invitation,
+            &checkpoint,
+            test_key_for(endpoint(index + 30_000)),
+            "Member",
+        )
+        .unwrap()
     };
     // The early member: admitted alone in the first batch, then only follows.
     let early = joiner(0);
     let request = early.admission_request().unwrap().to_vec();
-    let AdmissionAssessment::Ready(validated) = owner.assess_admission(endpoint(30_000), &request).unwrap() else {
+    let AdmissionAssessment::Ready(validated) =
+        owner.assess_admission(endpoint(30_000), &request).unwrap()
+    else {
         panic!("open invitation needs no approval");
     };
-    let prepared = owner.prepare_validated_admission_batch(&[(endpoint(30_000), request.as_slice(), &validated)]).unwrap();
+    let prepared = owner
+        .prepare_validated_admission_batch(&[(endpoint(30_000), request.as_slice(), &validated)])
+        .unwrap();
     let mut proof = early.join_proof().unwrap();
-    let authorization = arachne_security::MembershipAuthorization::Admission(prepared.replies[0].authorization.clone());
-    proof.apply_transition(&authorization, &prepared.commit).unwrap();
+    let authorization = arachne_security::MembershipAuthorization::Admission(
+        prepared.replies[0].authorization.clone(),
+    );
+    proof
+        .apply_transition(&authorization, &prepared.commit)
+        .unwrap();
     let mut member = early.prepare_workspace(&proof, &prepared.welcome).unwrap();
     owner = prepared.workspace;
     let mut next = 1;
     while owner.member_count() < 310 {
         let range = next..(next + MAX_ADMISSION_BATCH);
         let joins: Vec<_> = range.clone().map(joiner).collect();
-        let requests: Vec<_> = joins.iter().map(|join| join.admission_request().unwrap().to_vec()).collect();
-        let validated: Vec<_> = range.clone().zip(&requests).map(|(index, request)| {
-            match owner.assess_admission(endpoint(index + 30_000), request).unwrap() {
-                AdmissionAssessment::Ready(validated) => validated,
-                _ => panic!("open invitation needs no approval"),
-            }
-        }).collect();
-        let entries: Vec<_> = range.clone().zip(requests.iter().zip(&validated))
-            .map(|(index, (request, validated))| (endpoint(index + 30_000), request.as_slice(), validated)).collect();
+        let requests: Vec<_> = joins
+            .iter()
+            .map(|join| join.admission_request().unwrap().to_vec())
+            .collect();
+        let validated: Vec<_> = range
+            .clone()
+            .zip(&requests)
+            .map(|(index, request)| {
+                match owner
+                    .assess_admission(endpoint(index + 30_000), request)
+                    .unwrap()
+                {
+                    AdmissionAssessment::Ready(validated) => validated,
+                    _ => panic!("open invitation needs no approval"),
+                }
+            })
+            .collect();
+        let entries: Vec<_> = range
+            .clone()
+            .zip(requests.iter().zip(&validated))
+            .map(|(index, (request, validated))| {
+                (endpoint(index + 30_000), request.as_slice(), validated)
+            })
+            .collect();
         let prepared = owner.prepare_validated_admission_batch(&entries).unwrap();
-        let authorizations: Vec<_> = prepared.replies.iter().map(|reply| reply.authorization.clone()).collect();
-        member = member.prepare_admission_batch_update(&authorizations, &prepared.commit).unwrap_or_else(|error| {
-            panic!("member at {} members could not follow the next batch: {error}", member.member_count())
-        });
+        let authorizations: Vec<_> = prepared
+            .replies
+            .iter()
+            .map(|reply| reply.authorization.clone())
+            .collect();
+        member = member
+            .prepare_admission_batch_update(&authorizations, &prepared.commit)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "member at {} members could not follow the next batch: {error}",
+                    member.member_count()
+                )
+            });
         owner = prepared.workspace;
         next = range.end;
     }
@@ -351,35 +402,70 @@ fn an_existing_member_accepts_management_past_three_hundred_members() {
     let (registered, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
     let mut owner = registered.workspace;
     let joiner = |index: usize| {
-        PendingJoin::from_invitation(&invitation, &checkpoint, test_key_for(endpoint(index + 50_000)), "Member").unwrap()
+        PendingJoin::from_invitation(
+            &invitation,
+            &checkpoint,
+            test_key_for(endpoint(index + 50_000)),
+            "Member",
+        )
+        .unwrap()
     };
     let early = joiner(0);
     let request = early.admission_request().unwrap().to_vec();
-    let AdmissionAssessment::Ready(validated) = owner.assess_admission(endpoint(50_000), &request).unwrap() else {
+    let AdmissionAssessment::Ready(validated) =
+        owner.assess_admission(endpoint(50_000), &request).unwrap()
+    else {
         panic!("open invitation needs no approval");
     };
-    let prepared = owner.prepare_validated_admission_batch(&[(endpoint(50_000), request.as_slice(), &validated)]).unwrap();
+    let prepared = owner
+        .prepare_validated_admission_batch(&[(endpoint(50_000), request.as_slice(), &validated)])
+        .unwrap();
     let mut proof = early.join_proof().unwrap();
-    let authorization = arachne_security::MembershipAuthorization::Admission(prepared.replies[0].authorization.clone());
-    proof.apply_transition(&authorization, &prepared.commit).unwrap();
+    let authorization = arachne_security::MembershipAuthorization::Admission(
+        prepared.replies[0].authorization.clone(),
+    );
+    proof
+        .apply_transition(&authorization, &prepared.commit)
+        .unwrap();
     let mut member = early.prepare_workspace(&proof, &prepared.welcome).unwrap();
     owner = prepared.workspace;
     let mut next = 1;
     while owner.member_count() < 310 {
         let range = next..(next + MAX_ADMISSION_BATCH);
         let joins: Vec<_> = range.clone().map(joiner).collect();
-        let requests: Vec<_> = joins.iter().map(|join| join.admission_request().unwrap().to_vec()).collect();
-        let validated: Vec<_> = range.clone().zip(&requests).map(|(index, request)| {
-            match owner.assess_admission(endpoint(index + 50_000), request).unwrap() {
-                AdmissionAssessment::Ready(validated) => validated,
-                _ => panic!("open invitation needs no approval"),
-            }
-        }).collect();
-        let entries: Vec<_> = range.clone().zip(requests.iter().zip(&validated))
-            .map(|(index, (request, validated))| (endpoint(index + 50_000), request.as_slice(), validated)).collect();
+        let requests: Vec<_> = joins
+            .iter()
+            .map(|join| join.admission_request().unwrap().to_vec())
+            .collect();
+        let validated: Vec<_> = range
+            .clone()
+            .zip(&requests)
+            .map(|(index, request)| {
+                match owner
+                    .assess_admission(endpoint(index + 50_000), request)
+                    .unwrap()
+                {
+                    AdmissionAssessment::Ready(validated) => validated,
+                    _ => panic!("open invitation needs no approval"),
+                }
+            })
+            .collect();
+        let entries: Vec<_> = range
+            .clone()
+            .zip(requests.iter().zip(&validated))
+            .map(|(index, (request, validated))| {
+                (endpoint(index + 50_000), request.as_slice(), validated)
+            })
+            .collect();
         let prepared = owner.prepare_validated_admission_batch(&entries).unwrap();
-        let authorizations: Vec<_> = prepared.replies.iter().map(|reply| reply.authorization.clone()).collect();
-        member = member.prepare_admission_batch_update(&authorizations, &prepared.commit).unwrap();
+        let authorizations: Vec<_> = prepared
+            .replies
+            .iter()
+            .map(|reply| reply.authorization.clone())
+            .collect();
+        member = member
+            .prepare_admission_batch_update(&authorizations, &prepared.commit)
+            .unwrap();
         owner = prepared.workspace;
         next = range.end;
     }
@@ -393,11 +479,17 @@ fn an_existing_member_accepts_management_past_three_hundred_members() {
         .id;
     let action = arachne_security::ManagementAction::Remove(target);
     let prepared = owner.prepare_management(action).unwrap();
-    member.verify_step(&prepared.authorization, &prepared.commit).unwrap_or_else(|error| {
-        panic!("member at {} members rejected the management commit: {error}", member.member_count())
-    });
-    let arachne_security::PreparedManagementUpdate::Active(member) =
-        member.prepare_step_update(&prepared.authorization, &prepared.commit).unwrap()
+    member
+        .verify_step(&prepared.authorization, &prepared.commit)
+        .unwrap_or_else(|error| {
+            panic!(
+                "member at {} members rejected the management commit: {error}",
+                member.member_count()
+            )
+        });
+    let arachne_security::PreparedManagementUpdate::Active(member) = member
+        .prepare_step_update(&prepared.authorization, &prepared.commit)
+        .unwrap()
     else {
         panic!("removal of another member removed this member")
     };
@@ -420,32 +512,73 @@ fn an_administrator_invites_past_three_hundred_members() {
     let mut next = 0;
     while owner.member_count() < 310 {
         let range = next..(next + MAX_ADMISSION_BATCH);
-        let joins: Vec<_> = range.clone()
-            .map(|index| PendingJoin::from_invitation(&invitation, &checkpoint, test_key_for(endpoint(index + 40_000)), "Member").unwrap())
+        let joins: Vec<_> = range
+            .clone()
+            .map(|index| {
+                PendingJoin::from_invitation(
+                    &invitation,
+                    &checkpoint,
+                    test_key_for(endpoint(index + 40_000)),
+                    "Member",
+                )
+                .unwrap()
+            })
             .collect();
-        let requests: Vec<_> = joins.iter().map(|join| join.admission_request().unwrap().to_vec()).collect();
-        let validated: Vec<_> = range.clone().zip(&requests).map(|(index, request)| {
-            match owner.assess_admission(endpoint(index + 40_000), request).unwrap() {
-                AdmissionAssessment::Ready(validated) => validated,
-                _ => panic!("open invitation needs no approval"),
-            }
-        }).collect();
-        let entries: Vec<_> = range.clone().zip(requests.iter().zip(&validated))
-            .map(|(index, (request, validated))| (endpoint(index + 40_000), request.as_slice(), validated)).collect();
-        owner = owner.prepare_validated_admission_batch(&entries).unwrap().workspace;
+        let requests: Vec<_> = joins
+            .iter()
+            .map(|join| join.admission_request().unwrap().to_vec())
+            .collect();
+        let validated: Vec<_> = range
+            .clone()
+            .zip(&requests)
+            .map(|(index, request)| {
+                match owner
+                    .assess_admission(endpoint(index + 40_000), request)
+                    .unwrap()
+                {
+                    AdmissionAssessment::Ready(validated) => validated,
+                    _ => panic!("open invitation needs no approval"),
+                }
+            })
+            .collect();
+        let entries: Vec<_> = range
+            .clone()
+            .zip(requests.iter().zip(&validated))
+            .map(|(index, (request, validated))| {
+                (endpoint(index + 40_000), request.as_slice(), validated)
+            })
+            .collect();
+        owner = owner
+            .prepare_validated_admission_batch(&entries)
+            .unwrap()
+            .workspace;
         next = range.end;
     }
     let (registration, late_invitation, late_checkpoint) =
         owner.prepare_invitation(0, false, false).unwrap();
     owner = registration.workspace;
-    let late = PendingJoin::from_invitation(&late_invitation, &late_checkpoint, test_key_for(endpoint(39_999)), "Late member").unwrap();
+    let late = PendingJoin::from_invitation(
+        &late_invitation,
+        &late_checkpoint,
+        test_key_for(endpoint(39_999)),
+        "Late member",
+    )
+    .unwrap();
     let request = late.admission_request().unwrap().to_vec();
-    let AdmissionAssessment::Ready(validated) = owner.assess_admission(endpoint(39_999), &request).unwrap() else {
+    let AdmissionAssessment::Ready(validated) =
+        owner.assess_admission(endpoint(39_999), &request).unwrap()
+    else {
         panic!("open invitation needs no approval");
     };
-    let prepared = owner.prepare_validated_admission_batch(&[(endpoint(39_999), request.as_slice(), &validated)]).unwrap();
+    let prepared = owner
+        .prepare_validated_admission_batch(&[(endpoint(39_999), request.as_slice(), &validated)])
+        .unwrap();
     let mut proof = late.join_proof().unwrap();
-    for (authorization, commit) in prepared.workspace.membership_history(endpoint(39_999), &request, &late_checkpoint).unwrap() {
+    for (authorization, commit) in prepared
+        .workspace
+        .membership_history(endpoint(39_999), &request, &late_checkpoint)
+        .unwrap()
+    {
         proof.apply_transition(&authorization, &commit).unwrap();
     }
     let joined = late.prepare_workspace(&proof, &prepared.welcome).unwrap();
@@ -460,19 +593,46 @@ fn grow(seed: u8, size: usize, base: usize) -> Workspace {
     let mut next = 0;
     while owner.member_count() < size {
         let range = next..(next + MAX_ADMISSION_BATCH);
-        let joins: Vec<_> = range.clone()
-            .map(|index| PendingJoin::from_invitation(&invitation, &checkpoint, test_key_for(endpoint(index + base)), "Member").unwrap())
+        let joins: Vec<_> = range
+            .clone()
+            .map(|index| {
+                PendingJoin::from_invitation(
+                    &invitation,
+                    &checkpoint,
+                    test_key_for(endpoint(index + base)),
+                    "Member",
+                )
+                .unwrap()
+            })
             .collect();
-        let requests: Vec<_> = joins.iter().map(|join| join.admission_request().unwrap().to_vec()).collect();
-        let validated: Vec<_> = range.clone().zip(&requests).map(|(index, request)| {
-            match owner.assess_admission(endpoint(index + base), request).unwrap() {
-                AdmissionAssessment::Ready(validated) => validated,
-                _ => panic!("open invitation needs no approval"),
-            }
-        }).collect();
-        let entries: Vec<_> = range.clone().zip(requests.iter().zip(&validated))
-            .map(|(index, (request, validated))| (endpoint(index + base), request.as_slice(), validated)).collect();
-        owner = owner.prepare_validated_admission_batch(&entries).unwrap().workspace;
+        let requests: Vec<_> = joins
+            .iter()
+            .map(|join| join.admission_request().unwrap().to_vec())
+            .collect();
+        let validated: Vec<_> = range
+            .clone()
+            .zip(&requests)
+            .map(|(index, request)| {
+                match owner
+                    .assess_admission(endpoint(index + base), request)
+                    .unwrap()
+                {
+                    AdmissionAssessment::Ready(validated) => validated,
+                    _ => panic!("open invitation needs no approval"),
+                }
+            })
+            .collect();
+        let entries: Vec<_> = range
+            .clone()
+            .zip(requests.iter().zip(&validated))
+            .map(|(index, (request, validated))| {
+                (endpoint(index + base), request.as_slice(), validated)
+            })
+            .collect();
+        owner = owner
+            .prepare_validated_admission_batch(&entries)
+            .unwrap()
+            .workspace;
         next = range.end;
     }
     owner
@@ -488,7 +648,10 @@ fn registered_invitation_admits_at(size: usize, seed: u8, base: usize) {
     let (prepared, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
     let mut owner = prepared.workspace;
     // The invitation pins the checkpoint's pin, and the pin alone.
-    assert_eq!(arachne_security::checkpoint_digest(&checkpoint).unwrap(), invitation.checkpoint_digest());
+    assert_eq!(
+        arachne_security::checkpoint_digest(&checkpoint).unwrap(),
+        invitation.checkpoint_digest()
+    );
     let pin = u32::from_be_bytes(checkpoint[5..9].try_into().unwrap()) as usize;
     let tree = checkpoint.len() - 13 - pin;
     println!(
@@ -496,11 +659,20 @@ fn registered_invitation_admits_at(size: usize, seed: u8, base: usize) {
         tree / members,
         checkpoint.len()
     );
-    assert!(pin <= arachne_security::MAX_CHECKPOINT_PIN && tree <= arachne_security::MAX_CHECKPOINT_TREE);
+    assert!(
+        pin <= arachne_security::MAX_CHECKPOINT_PIN
+            && tree <= arachne_security::MAX_CHECKPOINT_TREE
+    );
 
     // The joiner's pending state, with the checkpoint, survives a restart.
     let key = arachne_security::StorageKey::derive(&[seed; 32]).unwrap();
-    let late = PendingJoin::from_invitation(&invitation, &checkpoint, test_key_for(endpoint(base - 1)), "Late member").unwrap();
+    let late = PendingJoin::from_invitation(
+        &invitation,
+        &checkpoint,
+        test_key_for(endpoint(base - 1)),
+        "Late member",
+    )
+    .unwrap();
     let sealed = late.seal(&key).unwrap();
     assert!(sealed.len() <= arachne_security::MAX_SEALED_PENDING_JOIN);
     let late = PendingJoin::restore(&key, endpoint(base - 1), owner.id(), &sealed).unwrap();
@@ -516,13 +688,24 @@ fn registered_invitation_admits_at(size: usize, seed: u8, base: usize) {
     let request = late.admission_request().unwrap().to_vec();
     assert_eq!(owner.admission_checkpoint(&request).unwrap(), checkpoint);
 
-    let AdmissionAssessment::Ready(validated) = owner.assess_admission(endpoint(base - 1), &request).unwrap() else {
+    let AdmissionAssessment::Ready(validated) = owner
+        .assess_admission(endpoint(base - 1), &request)
+        .unwrap()
+    else {
         panic!("open invitation needs no approval");
     };
-    owner.check_membership_history(endpoint(base - 1), &request, &checkpoint).unwrap();
-    let prepared = owner.prepare_validated_admission_batch(&[(endpoint(base - 1), request.as_slice(), &validated)]).unwrap();
+    owner
+        .check_membership_history(endpoint(base - 1), &request, &checkpoint)
+        .unwrap();
+    let prepared = owner
+        .prepare_validated_admission_batch(&[(endpoint(base - 1), request.as_slice(), &validated)])
+        .unwrap();
     let mut proof = late.join_proof().unwrap();
-    for (authorization, commit) in prepared.workspace.membership_history(endpoint(base - 1), &request, &checkpoint).unwrap() {
+    for (authorization, commit) in prepared
+        .workspace
+        .membership_history(endpoint(base - 1), &request, &checkpoint)
+        .unwrap()
+    {
         proof.apply_transition(&authorization, &commit).unwrap();
     }
     let joined = late.prepare_workspace(&proof, &prepared.welcome).unwrap();
@@ -531,13 +714,28 @@ fn registered_invitation_admits_at(size: usize, seed: u8, base: usize) {
 }
 
 /// Admit one member through `invitation`; returns the new member count.
-fn grow_one(owner: &mut Workspace, invitation: &arachne_security::Invitation, checkpoint: &[u8], index: usize) -> usize {
-    let join = PendingJoin::from_invitation(invitation, checkpoint, test_key_for(endpoint(index)), "Filler").unwrap();
+fn grow_one(
+    owner: &mut Workspace,
+    invitation: &arachne_security::Invitation,
+    checkpoint: &[u8],
+    index: usize,
+) -> usize {
+    let join = PendingJoin::from_invitation(
+        invitation,
+        checkpoint,
+        test_key_for(endpoint(index)),
+        "Filler",
+    )
+    .unwrap();
     let request = join.admission_request().unwrap().to_vec();
-    let AdmissionAssessment::Ready(validated) = owner.assess_admission(endpoint(index), &request).unwrap() else {
+    let AdmissionAssessment::Ready(validated) =
+        owner.assess_admission(endpoint(index), &request).unwrap()
+    else {
         panic!("open invitation needs no approval");
     };
-    let prepared = owner.prepare_validated_admission_batch(&[(endpoint(index), request.as_slice(), &validated)]).unwrap();
+    let prepared = owner
+        .prepare_validated_admission_batch(&[(endpoint(index), request.as_slice(), &validated)])
+        .unwrap();
     *owner = prepared.workspace;
     owner.member_count()
 }

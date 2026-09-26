@@ -1,8 +1,8 @@
 mod common;
-use common::{test_endpoint, test_key};
 use arachne_security::{
     ManagementAction, PendingJoin, PreparedManagement, PreparedManagementUpdate, Workspace,
 };
+use common::{test_endpoint, test_key};
 
 fn apply(owner: &Workspace, change: &PreparedManagement) -> Workspace {
     let PreparedManagementUpdate::Active(owner) = owner
@@ -19,10 +19,18 @@ fn joined(
     checkpoint: &[u8],
     endpoint: u8,
 ) -> (Workspace, Workspace) {
-    let pending =
-        PendingJoin::from_invitation(invite, checkpoint, test_key(u64::from(endpoint)), "Attendee").unwrap();
+    let pending = PendingJoin::from_invitation(
+        invite,
+        checkpoint,
+        test_key(u64::from(endpoint)),
+        "Attendee",
+    )
+    .unwrap();
     let admitted = owner
-        .prepare_admission(test_endpoint(u64::from(endpoint)), pending.admission_request().unwrap())
+        .prepare_admission(
+            test_endpoint(u64::from(endpoint)),
+            pending.admission_request().unwrap(),
+        )
         .unwrap();
     let mut proof = pending.join_proof().unwrap();
     // Exercise the old-invitation history through each accepted policy change.
@@ -96,7 +104,8 @@ fn open_event_link_is_reusable_and_disable_survives_history() {
             .is_some()
     );
     // Only administrators admit (ADR A2 step 2), even through a reusable link.
-    let third = PendingJoin::from_invitation(&invite, &checkpoint, test_key(3), "Attendee").unwrap();
+    let third =
+        PendingJoin::from_invitation(&invite, &checkpoint, test_key(3), "Attendee").unwrap();
     assert_eq!(
         helper
             .prepare_admission(test_endpoint(3), third.admission_request().unwrap())
@@ -165,7 +174,8 @@ fn personal_invitation_admits_only_the_approved_request_through_another_administ
     let helper = apply(&helper, &personal);
     let intended =
         PendingJoin::from_invitation(&token, &checkpoint, test_key(3), "Invited person").unwrap();
-    let copied = PendingJoin::from_invitation(&token, &checkpoint, test_key(4), "Copied link").unwrap();
+    let copied =
+        PendingJoin::from_invitation(&token, &checkpoint, test_key(4), "Copied link").unwrap();
     assert!(
         helper
             .prepare_admission(test_endpoint(3), intended.admission_request().unwrap())
@@ -187,7 +197,11 @@ fn personal_invitation_admits_only_the_approved_request_through_another_administ
     let mut proof = intended.join_proof().unwrap();
     for (auth, commit) in accepted
         .workspace
-        .membership_history(test_endpoint(3), intended.admission_request().unwrap(), &checkpoint)
+        .membership_history(
+            test_endpoint(3),
+            intended.admission_request().unwrap(),
+            &checkpoint,
+        )
         .unwrap()
     {
         proof.apply_transition(&auth, &commit).unwrap();
@@ -218,7 +232,8 @@ fn automatic_personal_invitation_binds_only_the_first_request() {
     let (created, token, checkpoint) = admin.prepare_invitation(0, true, true).unwrap();
     let intended =
         PendingJoin::from_invitation(&token, &checkpoint, test_key(2), "Invited person").unwrap();
-    let copied = PendingJoin::from_invitation(&token, &checkpoint, test_key(3), "Copied link").unwrap();
+    let copied =
+        PendingJoin::from_invitation(&token, &checkpoint, test_key(3), "Copied link").unwrap();
     assert!(created.workspace.invitation_controls().unwrap()[0].automatic());
     assert_eq!(
         created
@@ -257,7 +272,8 @@ fn expiry_rejects_new_requests_and_roles_cannot_reset_invitation_controls() {
     let expired = admin
         .prepare_management(ManagementAction::CreateInvitation(id, 1, false))
         .unwrap();
-    let pending = PendingJoin::from_invitation(&token, &checkpoint, test_key(2), "Too late").unwrap();
+    let pending =
+        PendingJoin::from_invitation(&token, &checkpoint, test_key(2), "Too late").unwrap();
     assert_eq!(
         expired
             .workspace
@@ -290,7 +306,8 @@ fn request_access_approves_and_declines_each_saved_request_independently() {
     let (created, token, checkpoint) = admin.prepare_request_invitation(0).unwrap();
     let requests: Vec<_> = (22..=24)
         .map(|endpoint| {
-            PendingJoin::from_invitation(&token, &checkpoint, test_key(endpoint as u64), "Attendee").unwrap()
+            PendingJoin::from_invitation(&token, &checkpoint, test_key(endpoint as u64), "Attendee")
+                .unwrap()
         })
         .collect();
     let first = created
@@ -377,14 +394,17 @@ fn removed_member_cannot_rejoin_with_a_used_approval() {
         }
         .unwrap();
         let pending =
-            PendingJoin::from_invitation(&token, &checkpoint, test_key(32), "Invited person").unwrap();
+            PendingJoin::from_invitation(&token, &checkpoint, test_key(32), "Invited person")
+                .unwrap();
         let request = pending.admission_request().unwrap().to_vec();
         let approval = personal
             .workspace
             .prepare_invitation_approval(&request)
             .unwrap();
         let (admin, second) = joined(&approval.workspace, &open_token, &open_checkpoint, 33);
-        let admitted = admin.prepare_admission(test_endpoint(32), &request).unwrap();
+        let admitted = admin
+            .prepare_admission(test_endpoint(32), &request)
+            .unwrap();
         let second = second
             .prepare_admission_update(&admitted.authorization, &admitted.commit)
             .unwrap();
@@ -405,6 +425,11 @@ fn removed_member_cannot_rejoin_with_a_used_approval() {
             Some(arachne_security::INVITATION_DISABLED),
             "request_access={request_access}"
         );
-        assert!(removal.workspace.prepare_admission(test_endpoint(32), &request).is_err());
+        assert!(
+            removal
+                .workspace
+                .prepare_admission(test_endpoint(32), &request)
+                .is_err()
+        );
     }
 }

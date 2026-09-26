@@ -392,10 +392,14 @@ fn new_workspace_rejects_unregistered_admin_signed_invitation() {
     let admin = Workspace::create(crate::test_key(1), "Coordinator").unwrap();
     let (invitation, checkpoint) = admin.issue_invitation().unwrap();
     let pending =
-        super::PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(2), "Member").unwrap();
+        super::PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(2), "Member")
+            .unwrap();
     assert_eq!(
         admin
-            .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
+            .prepare_admission(
+                crate::test_endpoint(2),
+                pending.admission_request().unwrap()
+            )
             .err(),
         Some(INVITATION_DISABLED)
     );
@@ -434,8 +438,12 @@ fn full_invitation_controls_reuse_disabled_rows() {
     // The pruned link is unregistered, so admission refuses it (see the test above).
     assert!(controls.iter().all(|c| c.key != first.key() && c.enabled));
     // Its retained checkpoint went with it, so the owner still restores.
-    let restored =
-        Workspace::restore_records(crate::test_endpoint(1), admin.id(), &admin.export_records().unwrap()).unwrap();
+    let restored = Workspace::restore_records(
+        crate::test_endpoint(1),
+        admin.id(),
+        &admin.export_records().unwrap(),
+    )
+    .unwrap();
     assert_eq!(restored.invitation_controls().unwrap(), controls);
 }
 
@@ -446,9 +454,13 @@ fn admission_cannot_carry_a_policy_change_it_does_not_consume() {
     let (registration, invitation, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let mut admin = registration.workspace;
     let pending =
-        super::PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(2), "Member").unwrap();
+        super::PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(2), "Member")
+            .unwrap();
     let prepared = admin
-        .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
+        .prepare_admission(
+            crate::test_endpoint(2),
+            pending.admission_request().unwrap(),
+        )
         .unwrap();
     let package = KeyPackageIn::tls_deserialize_exact(pending.key_package().unwrap())
         .unwrap()

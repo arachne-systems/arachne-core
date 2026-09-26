@@ -33,7 +33,10 @@ pub struct PublisherLog {
 
 impl PublisherLog {
     pub fn new(owner: &arachne_security::Workspace) -> Result<Self, &'static str> {
-        let author = owner.member().ok_or("publisher requires member identity")?.id();
+        let author = owner
+            .member()
+            .ok_or("publisher requires member identity")?
+            .id();
         Ok(Self {
             workspace: owner.id(),
             author,
@@ -61,7 +64,10 @@ impl PublisherLog {
 
     /// Retained epochs, oldest first.
     pub fn epochs(&self) -> Vec<u64> {
-        self.epochs.iter().map(|retained| retained.log.epoch).collect()
+        self.epochs
+            .iter()
+            .map(|retained| retained.log.epoch)
+            .collect()
     }
 
     /// The retained log of one epoch.
@@ -193,7 +199,10 @@ impl PublisherLog {
             .iter()
             .cloned()
             .partition(|retained| retained.log.epoch <= fork.epoch());
-        if kept.last().is_none_or(|last| last.log.epoch != fork.epoch()) {
+        if kept
+            .last()
+            .is_none_or(|last| last.log.epoch != fork.epoch())
+        {
             // The fork epoch's log was evicted: start an empty one. Its
             // eviction watermark is unknown, so it serves nothing old.
             kept.push(Retained {
@@ -208,7 +217,10 @@ impl PublisherLog {
             epochs: kept,
         };
         let rebased = at_fork.advance(fork, next)?;
-        Ok((rebased, losing.into_iter().map(|retained| retained.log).collect()))
+        Ok((
+            rebased,
+            losing.into_iter().map(|retained| retained.log).collect(),
+        ))
     }
 
     /// Current-epoch selection. See `EpochLog::select`.
@@ -293,11 +305,17 @@ impl PublisherLog {
 
     /// Validates the codec and binds the current epoch to the restored owner's
     /// epoch and branch fingerprint.
-    pub fn restore(owner: &arachne_security::Workspace, bytes: &[u8]) -> Result<Self, &'static str> {
+    pub fn restore(
+        owner: &arachne_security::Workspace,
+        bytes: &[u8],
+    ) -> Result<Self, &'static str> {
         if bytes.len() > PUBLISHER_BUDGET {
             return Err("publisher snapshot exceeds bounds");
         }
-        let author = owner.member().ok_or("publisher requires member identity")?.id();
+        let author = owner
+            .member()
+            .ok_or("publisher requires member identity")?
+            .id();
         let mut input = bytes;
         if take(&mut input, 5)? != MAGIC
             || take(&mut input, 32)? != owner.id()

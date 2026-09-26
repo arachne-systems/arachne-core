@@ -11,13 +11,13 @@ use std::{
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut publisher = Client::open(ClientConfig {
+    let publisher = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some(([41; 32]).to_vec()),
         transport: Default::default(),
         storage: None,
     })?;
-    let mut subscriber = Client::open(ClientConfig {
+    let subscriber = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some(([42; 32]).to_vec()),
         transport: Default::default(),

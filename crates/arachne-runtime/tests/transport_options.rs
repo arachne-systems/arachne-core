@@ -27,7 +27,7 @@ fn wan_without_n0_uses_the_operator_relay_and_deadlines() {
         gossip_join: Duration::from_secs(9),
         close_drain: Duration::from_secs(7),
     };
-    let mut client = open(
+    let client = open(
         Network::Wan,
         61,
         TransportOptions {
@@ -50,14 +50,14 @@ fn wan_without_n0_uses_the_operator_relay_and_deadlines() {
 
 #[test]
 fn wan_only_can_turn_off_n0_lookup() {
-    let mut defaults = open(Network::WanOnly, 62, TransportOptions::default()).unwrap();
+    let defaults = open(Network::WanOnly, 62, TransportOptions::default()).unwrap();
     let transport = defaults.endpoint().unwrap().transport;
     assert!(transport.public_lookup);
     assert!(transport.peer_id_lookup);
     assert!(!transport.operator_relay);
     defaults.close().unwrap();
 
-    let mut isolated = open(
+    let isolated = open(
         Network::WanOnly,
         63,
         TransportOptions {

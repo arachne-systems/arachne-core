@@ -1066,10 +1066,7 @@ async fn write_preamble(conn: &Connection, preamble: &[u8]) -> bool {
 struct Dialer {
     endpoint: Endpoint,
     options: DialOptions,
-    pending: JoinSet<(
-        EndpointId,
-        Option<Result<Connection, DialError>>,
-    )>,
+    pending: JoinSet<(EndpointId, Option<Result<Connection, DialError>>)>,
     pending_dials: HashMap<EndpointId, CancellationToken>,
 }
 
@@ -1136,12 +1133,7 @@ impl Dialer {
 
     /// Waits for the next dial operation to complete.
     /// `None` means disconnected
-    async fn next_conn(
-        &mut self,
-    ) -> (
-        EndpointId,
-        Option<Result<Connection, DialError>>,
-    ) {
+    async fn next_conn(&mut self) -> (EndpointId, Option<Result<Connection, DialError>>) {
         match self.pending_dials.is_empty() {
             false => {
                 let (endpoint_id, res) = loop {

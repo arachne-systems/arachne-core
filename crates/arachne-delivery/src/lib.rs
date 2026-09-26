@@ -592,9 +592,13 @@ fn restored_index_builds_offer_for_selected_real_objects() {
     let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let admin = registered.workspace;
-    let pending = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
+    let pending =
+        PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
+        .prepare_admission(
+            crate::test_endpoint(2),
+            pending.admission_request().unwrap(),
+        )
         .unwrap();
     let mut proof = pending.join_proof().unwrap();
     proof
@@ -742,7 +746,14 @@ fn restored_index_builds_offer_for_selected_real_objects() {
         wire::verify_reply(&receiver, &empty_query, b"DFRP\x01\x04").unwrap(),
         wire::RangeReply::Rejected(RetrievalError::History(RangeError::Empty))
     ));
-    let denied_empty = wire::serve_range(&log, &sender, &policy, crate::test_endpoint(99), &empty_query).unwrap();
+    let denied_empty = wire::serve_range(
+        &log,
+        &sender,
+        &policy,
+        crate::test_endpoint(99),
+        &empty_query,
+    )
+    .unwrap();
     assert!(matches!(
         wire::verify_reply(&receiver, &empty_query, &denied_empty).unwrap(),
         wire::RangeReply::Rejected(RetrievalError::Denied)
@@ -820,7 +831,8 @@ fn restored_index_builds_offer_for_selected_real_objects() {
         wire::verify_reply(&receiver, &large_query, &rejected).unwrap(),
         wire::RangeReply::Rejected(RetrievalError::History(RangeError::TooLarge))
     ));
-    let denied = wire::serve_range(&log, &sender, &policy, crate::test_endpoint(99), &query).unwrap();
+    let denied =
+        wire::serve_range(&log, &sender, &policy, crate::test_endpoint(99), &query).unwrap();
     assert!(matches!(
         wire::verify_reply(&receiver, &query, &denied).unwrap(),
         wire::RangeReply::Rejected(RetrievalError::Denied)
@@ -902,4 +914,3 @@ fn restored_index_builds_offer_for_selected_real_objects() {
         Some(RetrievalError::Denied)
     );
 }
-

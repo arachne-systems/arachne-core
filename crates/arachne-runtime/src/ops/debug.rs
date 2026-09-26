@@ -5,6 +5,7 @@
 use arachne_api::ApiError;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "debug-rig")]
 use crate::errors;
 use crate::{Session, resources};
 
