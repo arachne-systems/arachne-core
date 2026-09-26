@@ -399,10 +399,7 @@ pub(crate) fn stage_settlement(session: &mut Session) -> Result<Option<Value>, A
     if branch.is_orphaned() {
         return Ok(None);
     }
-    let key = session
-        .storage_key
-        .as_ref()
-        .ok_or_else(errors::no_root_key)?;
+    let key = persistence::record_key(session)?;
     let current = EpochView::of(owner)?;
     let own = owner.member().ok_or_else(errors::no_workspace)?.id();
     let views = &mut session.membership.fork.views;
@@ -417,7 +414,7 @@ pub(crate) fn stage_settlement(session: &mut Session) -> Result<Option<Value>, A
             return Ok(None);
         };
         let snapshot =
-            Workspace::restore_branch_snapshot(key, owner.endpoint(), owner.id(), snapshot)
+            Workspace::restore_branch_snapshot(&key, owner.endpoint(), owner.id(), snapshot)
                 .map_err(security(ErrorCode::StorageCorrupt))?;
         if snapshot.epoch() != epoch {
             return Err(ApiError::storage_corrupt(

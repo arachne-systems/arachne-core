@@ -107,6 +107,14 @@ fn a_lower_key_below_the_snapshot_window_stages_orphaning_and_blocks_sends() {
     adopt_staged(&mut session);
     assert_eq!(owner(&session).epoch_fingerprint(), before);
     assert!(fork::require_send(&session).is_err());
+    assert!(
+        !start_self_update(
+            &mut session,
+            std::time::Instant::now() + self_update::SELF_UPDATE_INTERVAL,
+        )
+        .unwrap(),
+        "an orphan must not stage an automatic self-update"
+    );
 }
 
 #[test]
@@ -300,6 +308,14 @@ fn competing_removes_are_carried_and_quarantine_sends_until_both_apply() {
         fork::require_send(&session).is_err(),
         "losing Remove must quarantine sends until it is carried"
     );
+    assert!(
+        !start_self_update(
+            &mut session,
+            std::time::Instant::now() + self_update::SELF_UPDATE_INTERVAL,
+        )
+        .unwrap(),
+        "send quarantine must not stage an automatic self-update"
+    );
     // Branch records restore the quarantine before any new publication.
     let records = fork::records(&session, false).unwrap();
     let mut restored = bare_test_session(owner(&session).provisional_copy().unwrap());
@@ -411,7 +427,6 @@ fn settlement_needs_every_prior_member_on_the_same_next_chain() {
     let observer_id = observer.member().unwrap().id();
     let epoch = admin.epoch();
     let mut session = bare_test_session(admin);
-    session.storage_key = Some(StorageKey::derive(&[87; 32]).unwrap());
     stage_management(
         &mut session,
         ManagementAction::CreateInvitation([88; 32], 0, false),
@@ -473,7 +488,6 @@ fn settlement_needs_every_prior_member_on_the_same_next_chain() {
     );
     let records = fork::records(&session, false).unwrap();
     let mut restored = bare_test_session(owner(&session).provisional_copy().unwrap());
-    restored.storage_key = Some(StorageKey::derive(&[87; 32]).unwrap());
     fork::restore(&mut restored, &records).unwrap();
     assert!(
         restored
@@ -494,7 +508,6 @@ fn removal_epoch_waits_for_the_window_when_the_removed_member_cannot_report() {
     let survivor = members[1].member().unwrap().id();
     let epoch = admin.epoch();
     let mut session = bare_test_session(admin);
-    session.storage_key = Some(StorageKey::derive(&[88; 32]).unwrap());
     stage_management(&mut session, ManagementAction::Remove(removed)).unwrap();
     adopt_staged(&mut session);
     let fingerprint = owner(&session).epoch_fingerprint();
@@ -529,7 +542,6 @@ fn own_losing_publication_is_reencrypted_once_with_its_stable_id() {
             .unwrap(),
     );
     let mut session = bare_test_session(members.remove(0));
-    session.storage_key = Some(StorageKey::derive(&[89; 32]).unwrap());
     let fork_epoch = owner(&session).epoch();
     let encoded = encode_step(&losing.authorization, &losing.commit).unwrap();
     stage_update(&mut session, JoinStep::binary(encoded, None)).unwrap();
@@ -563,7 +575,6 @@ fn own_losing_publication_is_reencrypted_once_with_its_stable_id() {
     let branch_records = fork::records(&session, false).unwrap();
     assert!(branch_records.contains_key(b"runtime/branch/republications".as_slice()));
     let mut restored = bare_test_session(owner(&session).provisional_copy().unwrap());
-    restored.storage_key = Some(StorageKey::derive(&[89; 32]).unwrap());
     restored.delivery.publisher = session.delivery.publisher.clone();
     restored.delivery.inbox = session.delivery.inbox.clone();
     fork::restore(&mut restored, &branch_records).unwrap();

@@ -2951,6 +2951,7 @@ pub(crate) fn start_self_update(
     now: std::time::Instant,
 ) -> Result<bool, ApiError> {
     if crate::ops::admission_busy(session)
+        || fork::require_send(session).is_err()
         || !session.membership.steps_ahead.is_empty()
         || session.membership.range_pull.is_some()
     {

@@ -80,6 +80,7 @@ pub(crate) enum CandidateKind {
     Removal,
     Join,
     Publication,
+    Republication,
     Reception,
     Recovery,
     CurrentView,
@@ -95,6 +96,7 @@ impl CandidateKind {
             WorkspaceTransition::SelfUpdate(_) => CandidateKind::SelfUpdate,
             WorkspaceTransition::Join => CandidateKind::Join,
             WorkspaceTransition::RoutedPublication(..) => CandidateKind::Publication,
+            WorkspaceTransition::Republication(..) => CandidateKind::Republication,
             WorkspaceTransition::Inbox | WorkspaceTransition::InboxRejected => {
                 CandidateKind::Reception
             }
@@ -113,7 +115,8 @@ impl CandidateKind {
             | CandidateKind::WorkspaceName
             | CandidateKind::Invitation
             | CandidateKind::SelfUpdate
-            | CandidateKind::Removal => AdoptKind::Admission,
+            | CandidateKind::Removal
+            | CandidateKind::Republication => AdoptKind::Admission,
             CandidateKind::Join => AdoptKind::Join,
             CandidateKind::Publication => AdoptKind::Publication,
             CandidateKind::Reception => AdoptKind::Reception,
