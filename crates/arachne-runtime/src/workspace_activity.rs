@@ -1,6 +1,5 @@
 use arachne_api::ApiError;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 /// Durable lifecycle phases projected to every adapter.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -69,10 +68,6 @@ impl Activity {
         Ok(())
     }
 
-    pub(super) fn projection(&self) -> Value {
-        serde_json::to_value(self.view()).unwrap_or(Value::Null)
-    }
-
     pub(super) fn view(&self) -> ActivityView {
         ActivityView {
             phase: self.phase,
@@ -138,7 +133,13 @@ mod tests {
         activity
             .transition(Phase::Failed, Some("join_timeout"))
             .unwrap();
-        assert_eq!(activity.projection()["state"], json!("failed"));
-        assert_eq!(activity.projection()["reason"], json!("join_timeout"));
+        assert_eq!(
+            serde_json::to_value(activity.view()).unwrap()["state"],
+            json!("failed")
+        );
+        assert_eq!(
+            serde_json::to_value(activity.view()).unwrap()["reason"],
+            json!("join_timeout")
+        );
     }
 }

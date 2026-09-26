@@ -206,7 +206,8 @@ pub(crate) fn prepare_candidate(session: &mut Session) -> Result<(), ApiError> {
     Ok(())
 }
 
-pub(crate) fn adopt_candidate(session: &mut Session, token: &[u8]) -> Result<(), ApiError> {
+/// Adopt saved branch records and report whether the carried-order set changed.
+pub(crate) fn adopt_candidate(session: &mut Session, token: &[u8]) -> Result<bool, ApiError> {
     let candidate = session
         .membership
         .fork
@@ -218,6 +219,9 @@ pub(crate) fn adopt_candidate(session: &mut Session, token: &[u8]) -> Result<(),
             "branch candidate does not match workspace candidate",
         ));
     }
+    let orders_changed = !session.membership.fork.carried.iter()
+        .map(|step| step.order.digest())
+        .eq(candidate.orders.iter().map(|step| step.order.digest()));
     session.membership.fork.retained = Some(candidate.branch);
     session.membership.fork.carried = candidate.orders;
     session.membership.fork.republications = candidate.republications;
@@ -237,7 +241,7 @@ pub(crate) fn adopt_candidate(session: &mut Session, token: &[u8]) -> Result<(),
             .retain(|member, _| roster.iter().any(|row| row.id == *member));
     }
     fork.settlement_pending = true;
-    Ok(())
+    Ok(orders_changed)
 }
 
 /// Records are part of the same encrypted-store transaction as the owner.
@@ -410,7 +414,9 @@ pub(crate) fn restore(session: &mut Session, records: &SecurityRecords) -> Resul
     Ok(())
 }
 
-pub(crate) fn require_active_branch(session: &Session) -> Result<(), ApiError> {
+/// Read projection only. Accepted membership and lifecycle records stay
+/// unchanged until their own candidate is saved and adopted.
+pub(crate) fn recovery_reason(session: &Session) -> Option<&'static str> {
     if session
         .membership
         .fork
@@ -418,6 +424,22 @@ pub(crate) fn require_active_branch(session: &Session) -> Result<(), ApiError> {
         .as_ref()
         .is_some_and(BranchState::is_orphaned)
     {
+        Some("branch_orphaned")
+    } else if session
+        .membership
+        .fork
+        .carried
+        .iter()
+        .any(|order| order.order.kind.removes())
+    {
+        Some("branch_send_quarantined")
+    } else {
+        None
+    }
+}
+
+pub(crate) fn require_active_branch(session: &Session) -> Result<(), ApiError> {
+    if recovery_reason(session) == Some("branch_orphaned") {
         return Err(ApiError::wrong_state(
             "workspace branch is orphaned; administrator re-add required",
         ));
@@ -427,13 +449,7 @@ pub(crate) fn require_active_branch(session: &Session) -> Result<(), ApiError> {
 
 pub(crate) fn require_send(session: &Session) -> Result<(), ApiError> {
     require_active_branch(session)?;
-    if session
-        .membership
-        .fork
-        .carried
-        .iter()
-        .any(|order| order.order.kind.removes())
-    {
+    if recovery_reason(session).is_some() {
         return Err(ApiError::wrong_state(
             "workspace transmission waits for a carried revocation",
         ));
@@ -1130,7 +1146,11 @@ pub(crate) fn reply(owner: Option<&Workspace>, peer: [u8; 32], bytes: &[u8]) -> 
             return Err(ApiError::not_authorized("wrong workspace"));
         }
         let mut rows = Vec::new();
-        let from = query.from.max(owner.history_start().map_err(security(ErrorCode::StorageCorrupt))?);
+        let from = query.from.max(
+            owner
+                .history_start()
+                .map_err(security(ErrorCode::StorageCorrupt))?,
+        );
         for epoch in from..query.until.min(owner.epoch()) {
             let Some((auth, commit)) = owner
                 .membership_update_for(peer, epoch)
@@ -1238,7 +1258,10 @@ pub(crate) fn poll(session: &mut Session) -> Result<Option<Value>, ApiError> {
             && reply.workspace == pending.query.workspace
             && reply.from >= pending.query.from
             && reply.from <= pending.query.until
-            && reply.rows.last().is_none_or(|row| row.epoch < pending.query.until)
+            && reply
+                .rows
+                .last()
+                .is_none_or(|row| row.epoch < pending.query.until)
             && let Some(owner) = &session.workspace
         {
             let mut distinct = None;

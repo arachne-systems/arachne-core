@@ -1,7 +1,10 @@
 //! ADR A2 runtime fork regression checks. In-process MLS; no network exchange.
 use super::*;
 use crate::ops::candidate::{AdoptKind, adopt};
+use crate::session::{activity_value, activity_view};
 use arachne_security::{ManagementAction, PreparedManagementUpdate, Workspace};
+
+mod convergence;
 
 fn owner(session: &Session) -> &Workspace {
     session.workspace.as_deref().unwrap()
@@ -9,6 +12,24 @@ fn owner(session: &Session) -> &Workspace {
 fn adopt_staged(session: &mut Session) {
     let token = session.transition.staged.as_ref().unwrap().snapshot.clone();
     adopt(session, AdoptKind::Admission, token).unwrap();
+}
+
+fn assert_recovery_activity(session: &mut Session, reason: &str) {
+    let expected = json!({"state": "recovering", "reason": reason});
+    assert_eq!(activity_value(session), expected);
+    assert_eq!(
+        serde_json::to_value(activity_view(session)).unwrap(),
+        expected
+    );
+    assert_eq!(
+        serde_json::to_value(crate::ops::workspace::state(session).unwrap()).unwrap()["activity"],
+        expected,
+    );
+    assert_eq!(
+        serde_json::to_value(crate::ops::workspace::metrics(session).unwrap()).unwrap()["activity"],
+        expected,
+    );
+    assert_eq!(session.activity.phase, WorkspacePhase::Active);
 }
 
 #[test]
@@ -107,6 +128,7 @@ fn a_lower_key_below_the_snapshot_window_stages_orphaning_and_blocks_sends() {
     adopt_staged(&mut session);
     assert_eq!(owner(&session).epoch_fingerprint(), before);
     assert!(fork::require_send(&session).is_err());
+    assert_recovery_activity(&mut session, "branch_orphaned");
     assert!(
         !start_self_update(
             &mut session,
@@ -231,14 +253,23 @@ fn a_branch_reply_starts_at_the_responders_available_history() {
     let (first, second, _) = two_admins(1);
     let from = first.history_start().unwrap();
     let available = second.history_start().unwrap();
-    assert!(available > from, "the joiner starts from a later checkpoint");
+    assert!(
+        available > from,
+        "the joiner starts from a later checkpoint"
+    );
     let query = wire::encode_branch_query(&wire::BranchQuery {
-        workspace: first.id(), from, until: first.epoch(),
-    }).unwrap();
+        workspace: first.id(),
+        from,
+        until: first.epoch(),
+    })
+    .unwrap();
     let reply = fork::reply(Some(&second), first.endpoint(), &query);
     let reply = wire::decode_branch_reply(&reply).unwrap();
-    assert_eq!(reply.rows.first().map(|row| row.epoch), Some(available),
-        "an old caller cursor must not hide the responder's available branch");
+    assert_eq!(
+        reply.rows.first().map(|row| row.epoch),
+        Some(available),
+        "an old caller cursor must not hide the responder's available branch"
+    );
     assert_eq!(reply.from, available);
 }
 
@@ -324,6 +355,7 @@ fn competing_removes_are_carried_and_quarantine_sends_until_both_apply() {
         fork::require_send(&session).is_err(),
         "losing Remove must quarantine sends until it is carried"
     );
+    assert_recovery_activity(&mut session, "branch_send_quarantined");
     assert!(
         !start_self_update(
             &mut session,
@@ -337,6 +369,7 @@ fn competing_removes_are_carried_and_quarantine_sends_until_both_apply() {
     let mut restored = bare_test_session(owner(&session).provisional_copy().unwrap());
     fork::restore(&mut restored, &records).unwrap();
     assert!(fork::require_send(&restored).is_err());
+    assert_recovery_activity(&mut restored, "branch_send_quarantined");
     let (_, encoded) = records
         .iter()
         .find(|(name, _)| name.starts_with(b"runtime/branch/order/"))
@@ -378,8 +411,17 @@ fn competing_removes_are_carried_and_quarantine_sends_until_both_apply() {
     assert!(fork::require_send(&receiver).is_err());
     let staged = stage_gossiped_step(&mut session).unwrap();
     assert!(staged.is_some(), "the driver must commit a carried order");
-    adopt_staged(&mut session);
+    let token = session.transition.staged.as_ref().unwrap().snapshot.clone();
+    let adopted = adopt(&mut session, AdoptKind::Admission, token).unwrap();
+    assert_eq!(
+        serde_json::to_value(adopted).unwrap()["activity"]["state"],
+        "active"
+    );
     fork::require_send(&session).unwrap();
+    assert_eq!(
+        activity_value(&session),
+        json!({"state": "active", "reason": null})
+    );
     let roster = owner(&session).member_roster().unwrap();
     assert!(roster.iter().all(|member| !targets.contains(&member.id)));
     let staged = stage_gossiped_step(&mut restored).unwrap();

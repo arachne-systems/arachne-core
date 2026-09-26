@@ -2430,7 +2430,6 @@ pub(super) fn stage_gossiped_step(session: &mut Session) -> Result<Option<Value>
     }
     if let Some(staged) = fork::poll(session)? { return Ok(Some(staged)) }
     if let Some(staged) = fork::stage_carried(session)? { return Ok(Some(staged)) }
-    if let Some(staged) = fork::stage_settlement(session)? { return Ok(Some(staged)) }
     if let Some(staged) = fork::stage_retry(session)? { return Ok(Some(staged)) }
     if let Some(staged) = fork::stage_republication(session)? { return Ok(Some(staged)) }
     finish_range_pull(session);
@@ -2816,7 +2815,7 @@ const OFFER_PULL: u8 = 2;
 /// request goes by digest when it is committed; a staged step (an offer
 /// that must be adopted before the offerer adopts) must fit, because a
 /// staged step cannot be served from committed history.
-fn offer_packet(
+pub(super) fn offer_packet(
     owner: &arachne_security::Workspace,
     after: u64,
     authorization: &arachne_security::MembershipAuthorization,
@@ -3439,4 +3438,13 @@ fn a_self_update_stages_locally_without_an_administrator_handshake() {
     assert!(session.transition.staged.is_some());
     assert!(session.membership.offer.is_none());
     assert_eq!(session.workspace.as_ref().unwrap().epoch(), epoch);
+}
+
+#[test]
+fn the_history_byte_budget_holds_one_full_chunk_of_maximum_wire_steps() {
+    let chunk = arachne_security::MAX_CHECKPOINT
+        + arachne_security::HISTORY_CHUNK_STEPS * MAX_WIRE_STEP + 1024;
+    assert!(arachne_security::MAX_JOIN_HISTORY_BYTES >= chunk,
+        "history budget {} cannot hold a complete bounded chunk of {chunk} bytes",
+        arachne_security::MAX_JOIN_HISTORY_BYTES);
 }

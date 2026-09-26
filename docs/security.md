@@ -1,5 +1,13 @@
 # Security model and boundaries
 
+## BLUF
+
+Membership authority comes from verified MLS state. Concurrent membership
+changes use a deterministic branch choice. A node saves the winning candidate
+before it adopts it. It blocks new protected sends while a required removal
+waits, and keeps receiving. Recovery depends on a bounded set of sealed
+snapshots. A node that loses below that set needs administrator re-add.
+
 Arachne Core is pre-release software. Its tests demonstrate selected behaviors;
 they are not a formal protocol verification, independent security audit,
 certification, or authorization to use in a particular environment. Do not use
@@ -63,7 +71,9 @@ state, sealed at rest. Someone who takes the device state can decrypt captured
 objects from up to 4 past epochs, not only from the current epoch. A removed
 member who still has an old epoch base can read objects that others sent in
 that epoch, but not objects sent after its removal, because those use the new
-epoch. ADR A2 retained snapshots have the same cost and the same bound.
+epoch. The separate A2 rollback snapshots retain more secret state and can
+cover more epochs. Their limits are below; they do not use the four-epoch
+receive bound.
 
 ### Application namespaces (domain separation, not isolation)
 
@@ -102,6 +112,115 @@ The basic `publish`/`poll` API is a transport/pub-sub path, not protected MLS
 group messaging. For an admitted workspace, use the staged protected path and
 commit/adopt the candidate in the required order. See
 [Integration](integration.md#publication-paths).
+
+## Concurrent membership changes and recovery
+
+### Branch choice and authority
+
+At the first epoch where two accepted histories differ, Core compares the
+verified commit class, then SHA-256 of the exact commit bytes. The lower pair
+wins. The classes are, in order: Remove or Leave; Demote or DisableInvitation;
+other administrator changes; admission; member self-update. A longer history
+does not gain priority. Reports and branch rows are search hints until the
+receiver verifies the corresponding step and computes its key locally.
+
+The receiver opens its sealed snapshot at that parent epoch and checks its
+epoch and common history. It replays the winning step, saves the complete
+candidate, reads it back, and then adopts it. Receipt alone does not change
+accepted membership. An authenticated endpoint or gossip relay cannot grant
+membership or change a commit's class.
+
+An administrator can authorize admission and management changes. A member
+can update its own leaf and sign its own Leave. A signed revocation order can
+be carried by another member. Its proof must establish the issuer's authority
+at the anchor and bind the winning proof path to the receiver's exact group
+context. Demotion after the anchor does not cancel a valid earlier order.
+An order is single use and expires after 64 chain epochs. Local wall clocks do
+not decide that expiry.
+
+### Removal and send quarantine
+
+When a losing history contains a valid removal, the receiver carries that
+order onto the winning history. While a carried Remove or Leave waits, it
+blocks all new protected publications, including publication chunks from an
+already-open producer. Membership reception and data reception remain
+available. The guard also blocks automatic self-updates and local data
+re-publication. The activity view reports `recovering` with reason
+`branch_send_quarantined`. The accepted membership state stays intact until
+the carried step is saved and adopted.
+
+After removal, new protected data uses the accepted winning epoch. A removed
+member cannot decrypt it with retained old state. That does not erase old
+plaintext or stop disconnected peers from sending on a branch before they
+learn of the removal. Recovery needs peers to exchange the relevant verified
+steps. A lost or unavailable peer is not evidence that its branch has settled.
+
+### Snapshot retention and settlement
+
+The snapshot set holds at most 64 epochs and at most 16 MiB of sealed secret
+state in total. One snapshot can use that full byte budget. The effective
+window is whichever limit is reached first. At 2,049 members, the measured
+snapshot was 3,208,876 bytes: about five such snapshots fit. The native-store
+capacity test retained one such snapshot in seven physical records and
+restored after member 2,050 joined. This is not a 64-epoch guarantee at large
+rosters. See [H1 evidence](evidence/h1-night-2026-09-26.md).
+
+Epoch E settles only after every member in E's roster reports E+1 or later
+on the accepted chain. Core accepts signed heads and authenticated replies,
+and checks the reported fingerprint against that chain. A removed member
+cannot report the next state, so removal epochs can remain until a retention
+limit applies. Snapshot deletion uses a saved candidate. Restart can delay
+settlement because observations are volatile; it cannot create an observation.
+
+Rollback snapshots contain MLS secrets. Capture of these snapshots can expose
+traffic from their epochs, in addition to the ordinary receive window. Core
+deletes a snapshot when it settles or leaves the count or byte window. If one
+snapshot exceeds the byte budget, Core expires that recovery position instead
+of refusing a valid membership change. Other sealing or storage errors fail
+the change.
+
+If the winning fork is older than the available snapshot, the losing node
+becomes orphaned. Its activity view reports `recovering` with reason
+`branch_orphaned`. It retains local data but cannot publish or create new
+membership changes. An administrator must explicitly admit a fresh member
+state. Old state cannot perform an external commit to admit itself: a removed
+member could use the same route.
+
+### Retained data and local actions
+
+Core can re-encrypt retained, locally authored objects on the winning branch.
+It keeps the stable object ID, checks the current direct audience, and uses
+the installed routing revision. An empty direct audience or an expired current
+value is discarded. The encrypted recovery queue holds at most 4,096 objects
+and 512 KiB. When that queue is full, it drops the oldest retained data and
+reports `republication_lost`. This queue is not an application archive.
+
+Pending received plaintext remains available. Its `from_losing_branch` flag
+and author epoch identify a discarded branch. Core does not re-publish another
+member's plaintext. Objects already acknowledged to the host are outside this
+inbox update; the host controls their storage and display.
+
+Core retries a valid, locally issued non-revocation action once. It reports
+`action_lost` if the action is invalid on the winner, loses again, or issued an
+invitation link tied to the discarded checkpoint. The host must issue a new
+link in that last case. Retry state and recovery queues are in the same native
+transaction as the branch. Outcomes are drive-call results, not a separate
+acknowledged event inbox.
+
+### Current transport bounds
+
+Binary membership steps use at most 117 KiB inside a 128 KiB control reply.
+Admission batches can contain 128 members. Paged join history has both a
+4,096-step cap and a 16 MiB total byte cap; a maximum-size checkpoint plus
+64 maximum-size steps fits that byte cap. Larger steps do not bypass the
+per-step limit.
+
+A carried revocation proof must currently fit one runtime step. A large
+roster checkpoint or a long anchor proof can exceed it even when the security
+codec can verify the proof. The runtime then refuses the change. A separate
+paged proof transport is still required for those cases. The large native
+store test proves storage capacity; it does not prove large-roster fork
+recovery over the network.
 
 ## Network metadata and availability
 

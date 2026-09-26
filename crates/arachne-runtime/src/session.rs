@@ -374,12 +374,20 @@ pub(crate) fn transition_activity(
 
 /// The lifecycle phase as JSON, for replies that are still JSON values.
 pub(crate) fn activity_value(session: &Session) -> serde_json::Value {
-    session.activity.projection()
+    serde_json::to_value(activity_view(session)).unwrap_or(serde_json::Value::Null)
 }
 
-/// The lifecycle phase, typed.
+/// The lifecycle phase, with branch recovery projected for an active owner.
+/// Terminal and explicit lifecycle operations retain their own reasons.
 pub(crate) fn activity_view(session: &Session) -> ActivityView {
-    session.activity.view()
+    let mut view = session.activity.view();
+    if matches!(view.phase, WorkspacePhase::Active | WorkspacePhase::Recovering)
+        && let Some(reason) = membership::fork::recovery_reason(session)
+    {
+        view.phase = WorkspacePhase::Recovering;
+        view.reason = Some(reason.to_owned());
+    }
+    view
 }
 
 /// The opaque token of a new candidate. Staging needs record storage: the

@@ -22,9 +22,11 @@ const MAX_BYTES: usize = MAX_MEMBERSHIP_COMMIT;
 /// with the ratchet tree passes 64 KiB near 250 members (measured ~255 B per
 /// member), and members then rejected every later update.
 const MAX_LOCAL_STATE_BYTES: usize = 8 * 1024 * 1024;
-// ponytail: bounded in-memory/history replay budget. Checkpoint rollover
-// (below) removes the 64-step ceiling; this byte budget still applies.
-const MAX_HISTORY_BYTES: usize = 2 * 1024 * 1024;
+// A complete chunk of 64 maximum runtime wire steps plus a maximum pinned
+// checkpoint needs about 8.2 MiB. Keep the whole paged exchange bounded at
+// 16 MiB. The separate count ceiling permits more, smaller transitions;
+// it does not promise 4,096 maximum-size steps in one history.
+const MAX_HISTORY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Transitions one chunk of a join history carries. A branch longer than this
 /// is verified chunk by chunk: rollover adds a chunk, it never widens one, so

@@ -381,8 +381,11 @@ pub(crate) fn adopt(
             .clone()
             .transition(WorkspacePhase::Synchronizing, None)?;
     }
+    let membership_changed = session.workspace.as_ref().is_none_or(|previous| {
+        previous.epoch_fingerprint() != staged.workspace.epoch_fingerprint()
+    });
     persistence::commit_candidate(session, &snapshot)?;
-    membership::fork::adopt_candidate(session, &snapshot)?;
+    let orders_changed = membership::fork::adopt_candidate(session, &snapshot)?;
     let staged = session.transition.staged.take().unwrap();
     let mut value = Adopted {
         workspace: staged.workspace.id(),
@@ -586,8 +589,12 @@ pub(crate) fn adopt(
                     .as_ref()
                     .is_none_or(|(head, _)| *head <= owner.epoch())
         });
-    if committed_here || reached_head {
+    if membership_changed && (committed_here || reached_head) {
         membership::announce_head(session);
+    } else if orders_changed {
+        // A received carried order is durable even when membership did not
+        // move. Relay it without advertising a new membership head.
+        membership::fork::announce_orders(session);
     }
     if value.missing_count.is_none() {
         value.missing_count = missed;
