@@ -1,0 +1,195 @@
+{
+  "core_base": "94e30dab8cb4fe745f630db1c5147d942b9aea74",
+  "experiment": "Standalone Iroh Documents metadata and Blobs content qualification",
+  "documents": "0.101.0",
+  "blobs": "0.103.0",
+  "gossip": "0.101.0",
+  "iroh": "1.2.0 with Core restart patch",
+  "protocols": [
+    "Iroh Documents",
+    "Iroh Gossip",
+    "Iroh Blobs"
+  ],
+  "network": "loopback only, random UDP ports, explicit peer addresses",
+  "restart": "graceful protocol shutdown and disk store reopen in one process",
+  "core_authorization_tested": false,
+  "device_tested": false,
+  "crash_tested": false,
+  "production_source_changes": false,
+  "maximum_rss_kib_in_measured_run": 49488,
+  "runs": [
+    {
+      "run": 1,
+      "exit": 0,
+      "elapsed_seconds": 0.672,
+      "checks": {
+        "author_offline": true,
+        "core_authorization_tested": false,
+        "holder_restart": true,
+        "metadata_does_not_imply_bytes": true,
+        "metadata_entries": 2,
+        "milliseconds": 657,
+        "payload_bytes": 262144,
+        "read_only_write_rejected": true,
+        "receiver_restart": true,
+        "result": "pass"
+      }
+    },
+    {
+      "run": 2,
+      "exit": 0,
+      "elapsed_seconds": 0.869,
+      "checks": {
+        "author_offline": true,
+        "core_authorization_tested": false,
+        "holder_restart": true,
+        "metadata_does_not_imply_bytes": true,
+        "metadata_entries": 2,
+        "milliseconds": 854,
+        "payload_bytes": 262144,
+        "read_only_write_rejected": true,
+        "receiver_restart": true,
+        "result": "pass"
+      }
+    },
+    {
+      "run": 3,
+      "exit": 0,
+      "elapsed_seconds": 0.716,
+      "checks": {
+        "author_offline": true,
+        "core_authorization_tested": false,
+        "holder_restart": true,
+        "metadata_does_not_imply_bytes": true,
+        "metadata_entries": 2,
+        "milliseconds": 701,
+        "payload_bytes": 262144,
+        "read_only_write_rejected": true,
+        "receiver_restart": true,
+        "result": "pass"
+      }
+    },
+    {
+      "run": 4,
+      "exit": 0,
+      "elapsed_seconds": 0.691,
+      "checks": {
+        "author_offline": true,
+        "core_authorization_tested": false,
+        "holder_restart": true,
+        "metadata_does_not_imply_bytes": true,
+        "metadata_entries": 2,
+        "milliseconds": 677,
+        "payload_bytes": 262144,
+        "read_only_write_rejected": true,
+        "receiver_restart": true,
+        "result": "pass"
+      }
+    },
+    {
+      "run": 5,
+      "exit": 0,
+      "elapsed_seconds": 0.698,
+      "checks": {
+        "author_offline": true,
+        "core_authorization_tested": false,
+        "holder_restart": true,
+        "metadata_does_not_imply_bytes": true,
+        "metadata_entries": 2,
+        "milliseconds": 681,
+        "payload_bytes": 262144,
+        "read_only_write_rejected": true,
+        "receiver_restart": true,
+        "result": "pass"
+      }
+    },
+    {
+      "run": 6,
+      "exit": 0,
+      "elapsed_seconds": 0.676,
+      "checks": {
+        "author_offline": true,
+        "core_authorization_tested": false,
+        "holder_restart": true,
+        "metadata_does_not_imply_bytes": true,
+        "metadata_entries": 2,
+        "milliseconds": 661,
+        "payload_bytes": 262144,
+        "read_only_write_rejected": true,
+        "receiver_restart": true,
+        "result": "pass"
+      }
+    },
+    {
+      "run": 7,
+      "exit": 0,
+      "elapsed_seconds": 0.707,
+      "checks": {
+        "author_offline": true,
+        "core_authorization_tested": false,
+        "holder_restart": true,
+        "metadata_does_not_imply_bytes": true,
+        "metadata_entries": 2,
+        "milliseconds": 694,
+        "payload_bytes": 262144,
+        "read_only_write_rejected": true,
+        "receiver_restart": true,
+        "result": "pass"
+      }
+    },
+    {
+      "run": 8,
+      "exit": 0,
+      "elapsed_seconds": 0.747,
+      "checks": {
+        "author_offline": true,
+        "core_authorization_tested": false,
+        "holder_restart": true,
+        "metadata_does_not_imply_bytes": true,
+        "metadata_entries": 2,
+        "milliseconds": 732,
+        "payload_bytes": 262144,
+        "read_only_write_rejected": true,
+        "receiver_restart": true,
+        "result": "pass"
+      }
+    },
+    {
+      "run": 9,
+      "exit": 0,
+      "elapsed_seconds": 0.712,
+      "checks": {
+        "author_offline": true,
+        "core_authorization_tested": false,
+        "holder_restart": true,
+        "metadata_does_not_imply_bytes": true,
+        "metadata_entries": 2,
+        "milliseconds": 698,
+        "payload_bytes": 262144,
+        "read_only_write_rejected": true,
+        "receiver_restart": true,
+        "result": "pass"
+      }
+    },
+    {
+      "run": 10,
+      "exit": 0,
+      "elapsed_seconds": 0.864,
+      "checks": {
+        "author_offline": true,
+        "core_authorization_tested": false,
+        "holder_restart": true,
+        "metadata_does_not_imply_bytes": true,
+        "metadata_entries": 2,
+        "milliseconds": 850,
+        "payload_bytes": 262144,
+        "read_only_write_rejected": true,
+        "receiver_restart": true,
+        "result": "pass"
+      }
+    }
+  ],
+  "build_locked": "pass",
+  "rustfmt_check": "pass",
+  "clippy_all_targets_deny_warnings": "pass"
+}
