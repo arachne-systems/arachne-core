@@ -352,12 +352,18 @@ impl Streams {
         let routes = self.0.routes.lock().await.clone();
         let mut removed = Vec::new();
         for (peer, route) in routes {
-            let current = self.0.routing.lock().await.installed_revision(route.scope.workspace);
-            // The receive window permits old frames, but a live MoQ route must use the current scope.
-            if current != Some(route.scope.revision) || self
-                .authorize(route.scope, peer, &route.topic)
+            let current = self
+                .0
+                .routing
+                .lock()
                 .await
-                .is_err()
+                .installed_revision(route.scope.workspace);
+            // The receive window permits old frames, but a live MoQ route must use the current scope.
+            if current != Some(route.scope.revision)
+                || self
+                    .authorize(route.scope, peer, &route.topic)
+                    .await
+                    .is_err()
             {
                 removed.push(peer);
             }
@@ -507,11 +513,15 @@ async fn run_peer(
             continue;
         }
         if let Some(counters) = counters.upgrade() {
-            counters.interest_sync_pending.fetch_add(1, Ordering::Relaxed);
+            counters
+                .interest_sync_pending
+                .fetch_add(1, Ordering::Relaxed);
         }
         let interest = announce_interest(&connections, &routing, local, peer, scope, &topic).await;
         if let Some(counters) = counters.upgrade() {
-            counters.interest_sync_pending.fetch_sub(1, Ordering::Relaxed);
+            counters
+                .interest_sync_pending
+                .fetch_sub(1, Ordering::Relaxed);
         }
         if let Err(error) = interest {
             if let Some(counters) = counters.upgrade() {
@@ -600,7 +610,14 @@ async fn receive_session(
         .map_err(|_| Error::Timeout("subscribe MoQ broadcast"))?
         .map_err(transport)?;
     let track = broadcast.track(topic.as_str()).map_err(transport)?;
-    let mut subscriber = track.subscribe(None).await.map_err(transport)?;
+    // The zero-age default skips a group as soon as its successor arrives.
+    // Keep the publisher's bounded window so bursts do not discard adjacent frames.
+    let mut subscriber = track
+        .subscribe(Some(
+            track::Subscription::default().with_max_age(track::DEFAULT_MAX_AGE),
+        ))
+        .await
+        .map_err(transport)?;
     let closed = session.closed();
     tokio::pin!(closed);
     loop {
