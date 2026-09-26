@@ -1,5 +1,5 @@
 use arachne_runtime::{
-    Client, ClientConfig, ErrorCode, ErrorKind, JoinAdmissionStep, MemoryProvider, Network,
+    Client, ClientConfig, ErrorCode, JoinAdmissionStep, MemoryProvider, Network,
     ReceivedProtectedPublication, StorageConfig,
 };
 use std::{
@@ -18,21 +18,21 @@ fn typed_clients_persist_authenticated_inbox_objects_before_acknowledging() {
     let reader_store = common::directory();
     let owner_config = ClientConfig {
         network: Network::Direct,
-        secret: Some(owner_secret),
+        secret: Some((owner_secret).into()),
         transport: Default::default(),
-        storage: Some(StorageConfig::sqlite(owner_store.path(), owner_root)),
+        storage: Some((StorageConfig::sqlite(owner_store.path(), owner_root)).into()),
     };
     let reader_config = ClientConfig {
         network: Network::Direct,
-        secret: Some(reader_secret),
+        secret: Some((reader_secret).into()),
         transport: Default::default(),
-        storage: Some(StorageConfig::sqlite(reader_store.path(), reader_root)),
+        storage: Some((StorageConfig::sqlite(reader_store.path(), reader_root)).into()),
     };
     let owner = Client::open(owner_config.clone()).unwrap();
     let mut reader = Client::open(reader_config.clone()).unwrap();
 
     let workspace = owner
-        .create_workspace("Owner", Some("Object inbox proof"))
+        .create_workspace("Owner", Some("Object inbox proof".into()))
         .unwrap();
     let invitation = owner.stage_invitation(0).unwrap();
     let invitation = owner.adopt_invitation(&invitation).unwrap();
@@ -231,7 +231,7 @@ fn typed_clients_persist_authenticated_inbox_objects_before_acknowledging() {
 fn typed_inbox_requires_native_storage_and_survives_restart() {
     let ephemeral = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([33; 32]),
+        secret: Some(([33; 32]).into()),
         transport: Default::default(),
         storage: None,
     })
@@ -248,9 +248,9 @@ fn typed_inbox_requires_native_storage_and_survives_restart() {
     let store = common::directory();
     let config = ClientConfig {
         network: Network::Direct,
-        secret: Some([34; 32]),
+        secret: Some(([34; 32]).into()),
         transport: Default::default(),
-        storage: Some(StorageConfig::sqlite(store.path(), [134; 32])),
+        storage: Some((StorageConfig::sqlite(store.path(), [134; 32])).into()),
     };
     let durable = Client::open(config.clone()).unwrap();
     let workspace = durable.create_workspace("Durable", None).unwrap();
@@ -269,9 +269,9 @@ fn failed_object_save_prevents_adoption_and_further_publication() {
     let provider = MemoryProvider::default();
     let client = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([35; 32]),
+        secret: Some(([35; 32]).into()),
         transport: Default::default(),
-        storage: Some(StorageConfig::memory(&provider)),
+        storage: Some((StorageConfig::memory(&provider)).into()),
     })
     .unwrap();
     let workspace = client.create_workspace("Owner", None).unwrap();
@@ -283,8 +283,8 @@ fn failed_object_save_prevents_adoption_and_further_publication() {
         client
             .adopt_protected_publication(&candidate)
             .unwrap_err()
-            .kind(),
-        ErrorKind::Storage
+            .code(),
+        ErrorCode::StorageFailed
     );
     assert!(client.adopt_protected_publication(&candidate).is_err());
     assert!(

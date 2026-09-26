@@ -217,7 +217,7 @@ pub(crate) fn invitation_envelope(
             && !address.ip().is_unspecified()
         {
             routes.push(RouteHint {
-                peer,
+                peer: peer.into(),
                 address: address.to_string(),
             });
             if routes.len() == 7 {
@@ -226,15 +226,15 @@ pub(crate) fn invitation_envelope(
         }
     }
     Ok(InvitationInfo {
-        workspace: owner.id(),
+        workspace: owner.id().into(),
         workspace_name: owner
             .workspace_name()
             .map_err(security(ErrorCode::Internal))?,
         invitation: invitation.export_secret_token().as_slice().to_vec(),
-        invitation_key: invitation.key(),
+        invitation_key: invitation.key().into(),
         checkpoint,
-        peer: session.node.id(),
-        bootstrap_peers,
+        peer: session.node.id().into(),
+        bootstrap_peers: bootstrap_peers.into_iter().map(Into::into).collect(),
         address: session.node.address().to_string(),
         routes,
     })

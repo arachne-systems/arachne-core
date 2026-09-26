@@ -73,6 +73,7 @@ pub(crate) enum Request {
     /// One control request to a peer by endpoint key, with an optional
     /// address hint; returns the peer's reply bytes. No workspace authority is
     /// involved. Used by the debug rig link to dial its controller.
+    #[cfg(feature = "debug-rig")]
     ControlExchange(debug::ControlExchangeArgs),
     AdoptPublication(AdoptArgs),
     AdoptReception(AdoptArgs),
@@ -113,12 +114,15 @@ pub(crate) enum Request {
     InstallWorkspacePolicy(policy::WorkspacePolicyArgs),
     InstallMemberPolicy(policy::MemberPolicyArgs),
     // Development fixture only; rejected when the session owns a workspace.
+    #[cfg(feature = "test-fixtures")]
     InstallVerifiedPolicy(policy::VerifiedPolicyArgs),
     SetInterest(policy::InterestArgs),
     PollInterest {},
     Subscribe(policy::TopicArgs),
     Unsubscribe(policy::TopicArgs),
+    #[cfg(feature = "test-fixtures")]
     Publish(policy::PublishArgs),
+    #[cfg(feature = "test-fixtures")]
     Poll {},
 }
 
@@ -173,6 +177,7 @@ pub(crate) fn op(request: &Request) -> Op {
         Request::StageObjectRejection { .. } => Op::StageObjectRejection,
         Request::PollProtected { .. } => Op::PollProtected,
         Request::EndpointInfo { .. } => Op::EndpointInfo,
+        #[cfg(feature = "debug-rig")]
         Request::ControlExchange { .. } => Op::ControlExchange,
         Request::AdoptPublication { .. } => Op::AdoptPublication,
         Request::AdoptReception { .. } => Op::AdoptReception,
@@ -207,12 +212,15 @@ pub(crate) fn op(request: &Request) -> Op {
         Request::AddAddressHint { .. } => Op::AddAddressHint,
         Request::InstallWorkspacePolicy { .. } => Op::InstallWorkspacePolicy,
         Request::InstallMemberPolicy { .. } => Op::InstallMemberPolicy,
+        #[cfg(feature = "test-fixtures")]
         Request::InstallVerifiedPolicy { .. } => Op::InstallVerifiedPolicy,
         Request::SetInterest { .. } => Op::SetInterest,
         Request::PollInterest { .. } => Op::PollInterest,
         Request::Subscribe { .. } => Op::Subscribe,
         Request::Unsubscribe { .. } => Op::Unsubscribe,
+        #[cfg(feature = "test-fixtures")]
         Request::Publish { .. } => Op::Publish,
+        #[cfg(feature = "test-fixtures")]
         Request::Poll { .. } => Op::Poll,
     }
 }
@@ -255,8 +263,9 @@ pub(crate) fn dispatch(session: &mut crate::Session, request: Request) -> Result
         Request::WorkspaceMetrics {} => reply(workspace::metrics(session)?),
         Request::CreateWorkspace(args) => reply(workspace::create(session, args)?),
         Request::RestoreWorkspace(args) => reply(workspace::restore(session, args)?),
-        Request::Resource(args) => debug::resource(session, args),
+        Request::Resource(args) => reply(debug::resource(session, args)?),
         Request::EndpointInfo {} => reply(debug::endpoint_info(session)?),
+        #[cfg(feature = "debug-rig")]
         Request::ControlExchange(args) => reply(debug::control_exchange(session, args)?),
         Request::NetworkChange {} => reply(debug::network_change(session)?),
         Request::AddAddressHint(args) => reply(policy::add_address_hint(session, args)?),
@@ -264,6 +273,7 @@ pub(crate) fn dispatch(session: &mut crate::Session, request: Request) -> Result
             reply(policy::install_workspace_policy(session, args)?)
         }
         Request::InstallMemberPolicy(args) => reply(policy::install_member_policy(session, args)?),
+        #[cfg(feature = "test-fixtures")]
         Request::InstallVerifiedPolicy(args) => {
             reply(policy::install_verified_policy(session, args)?)
         }
@@ -271,7 +281,9 @@ pub(crate) fn dispatch(session: &mut crate::Session, request: Request) -> Result
         Request::PollInterest {} => policy::poll_interest(session),
         Request::Subscribe(args) => reply(policy::subscribe(session, args)?),
         Request::Unsubscribe(args) => reply(policy::unsubscribe(session, args)?),
+        #[cfg(feature = "test-fixtures")]
         Request::Publish(args) => reply(policy::publish(session, args)?),
+        #[cfg(feature = "test-fixtures")]
         Request::Poll {} => reply(policy::poll(session)?),
         Request::NearbyEndpoints {} => reply(nearby::endpoints(session)?),
         Request::NearbyWorkspaces {} => reply(nearby::workspaces(session)?),

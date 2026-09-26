@@ -31,6 +31,7 @@ use crate::ids::EndpointId;
 #[non_exhaustive]
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ErrorCode {
     Closed = 1,
     Cancelled = 2,
@@ -205,7 +206,6 @@ impl<'de> Deserialize<'de> for ErrorCode {
 /// hold key material, invitation tokens, snapshots, plaintext payloads or
 /// other secret bytes. Put only fixed text, lengths, counts and public IDs in
 /// them.
-// TODO(ADR A1/A4 step 7): `cfg_attr(feature = "uniffi", derive(uniffi::Error))`.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 #[serde(
@@ -213,6 +213,7 @@ impl<'de> Deserialize<'de> for ErrorCode {
     rename_all = "snake_case",
     try_from = "UncheckedApiError"
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Error))]
 pub enum ApiError {
     #[error("closed")]
     Closed,
@@ -382,7 +383,10 @@ impl ApiError {
             Self::Storage { code, .. } => {
                 matches!(
                     code,
-                    C::StorageFailed | C::StorageCorrupt | C::CandidateStale | C::FormatNotSupported
+                    C::StorageFailed
+                        | C::StorageCorrupt
+                        | C::CandidateStale
+                        | C::FormatNotSupported
                 )
             }
             Self::Transport { code, .. } => {
@@ -589,8 +593,8 @@ mod tests {
         match code {
             Closed | Cancelled | DeadlineExceeded | InvalidInput | InvalidId | WrongState
             | Unsupported | CapacityExceeded | LimitReached | StorageFailed | StorageCorrupt
-            | CandidateStale | FormatNotSupported | PeerUnreachable | Timeout | TransportFailed | NotAuthorized
-            | InvitationInvalid | InvitationExpired | NotMember | EpochMismatch
+            | CandidateStale | FormatNotSupported | PeerUnreachable | Timeout | TransportFailed
+            | NotAuthorized | InvitationInvalid | InvitationExpired | NotMember | EpochMismatch
             | PolicyMismatch | Internal => ErrorCode::ALL.contains(&code),
         }
     }
@@ -605,5 +609,14 @@ mod tests {
         }
         assert!(ErrorCode::ALL.windows(2).all(|w| w[0] < w[1]));
         assert_eq!(ErrorCode::ALL.len(), 23);
+    }
+}
+
+#[cfg(feature = "uniffi")]
+#[uniffi::export]
+impl ErrorCode {
+    /// Stable numeric code; independent of a language enum's ordinal.
+    pub fn number(&self) -> u32 {
+        self.as_u32()
     }
 }

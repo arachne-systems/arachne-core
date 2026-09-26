@@ -9,10 +9,10 @@ use arachne_runtime::{
 
 mod common;
 
-fn open(storage: StorageConfig) -> Client {
+fn open(storage: StorageConfig) -> std::sync::Arc<Client> {
     Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([91; 32]),
+        secret: Some(([91; 32]).into()),
         transport: Default::default(),
         storage: Some(storage),
     })
@@ -94,7 +94,7 @@ fn a_crash_after_commit_before_the_anchor_is_confirmed_still_restores() {
     // The commit lands; confirming its anchor fails, as a crash would.
     anchors.fail_confirmations(true);
     let error = publish(&client, created.workspace, 1).unwrap_err();
-    assert_eq!(error.code(), ErrorCode::StorageFailed, "{error:?}");
+    assert_eq!(error.code(), ErrorCode::StorageFailedFailed, "{error:?}");
     client.close().unwrap();
     anchors.fail_confirmations(false);
     // The pre-commit anchor slot names the landed commit: restore accepts it.

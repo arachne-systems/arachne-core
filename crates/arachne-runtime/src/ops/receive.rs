@@ -193,8 +193,8 @@ pub(crate) fn poll_pending(
         counter: pending.counter,
         recipients: pending.recipients,
         current: pending.current.map(|current| PublicationCurrent {
-            selector: current.selector,
-            replacement_key: current.replacement_key,
+            selector: current.selector.into(),
+            replacement_key: current.replacement_key.into(),
             expires_at: current.expires_at,
             tombstone: current.tombstone,
         }),

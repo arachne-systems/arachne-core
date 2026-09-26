@@ -6,18 +6,18 @@
 //! covered here.
 
 use arachne_runtime::{
-    Client, ClientConfig, Error, FreshnessAnchor, MemoryProvider, Network, StorageConfig,
+    Client, ClientConfig, ApiError, FreshnessAnchor, MemoryProvider, Network, StorageConfig,
 };
 use base64::Engine;
 
 const SECRET: [u8; 32] = [0xA7; 32];
 
-fn open(secret: [u8; 32], provider: &MemoryProvider) -> Client {
+fn open(secret: [u8; 32], provider: &MemoryProvider) -> std::sync::Arc<Client> {
     Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some(secret),
+        secret: Some((secret).into()),
         transport: Default::default(),
-        storage: Some(StorageConfig::memory(provider)),
+        storage: Some((StorageConfig::memory(provider)).into()),
     })
     .unwrap()
 }
@@ -49,12 +49,12 @@ fn renderings(secret: &[u8]) -> Vec<String> {
     forms
 }
 
-fn assert_no_secret(error: &Error, secrets: &[(&str, &[u8])]) {
+fn assert_no_secret(error: &ApiError, secrets: &[(&str, &[u8])]) {
     let texts = [
         error.message().to_owned(),
         format!("{error}"),
         format!("{error:?}"),
-        serde_json::to_string(error.api_error()).unwrap(),
+        serde_json::to_string(error).unwrap(),
     ];
     for (name, secret) in secrets {
         for form in renderings(secret) {
@@ -112,7 +112,7 @@ fn errors_from_secret_inputs_do_not_show_the_secret() {
     let secrets: [(&str, &[u8]); 3] = [
         ("endpoint secret", &SECRET),
         ("invitation", &invitation.invitation),
-        ("invitation key", &invitation.invitation_key),
+        ("invitation key", invitation.invitation_key.as_bytes()),
     ];
     for error in &errors {
         assert_no_secret(error, &secrets);

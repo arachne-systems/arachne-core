@@ -76,8 +76,7 @@ pub(crate) fn network_change(session: &mut Session) -> Result<Notified, ApiError
     Ok(Notified { notified: true })
 }
 
-/// One resource transfer step. The reply is the job's state (an open
-/// event, typed in ADR step 4).
-pub(crate) fn resource(session: &mut Session, args: ResourceArgs) -> Result<Value, ApiError> {
+/// One resource transfer step, shared by the typed client and JSON adapter.
+pub(crate) fn resource(session: &mut Session, args: ResourceArgs) -> Result<crate::client::ResourceStatus, ApiError> {
     resources::execute(session, args.request)
 }

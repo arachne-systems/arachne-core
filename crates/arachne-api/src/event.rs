@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum Event {
     /// Reserved; admission requests arrive as `Control`.
     AdmissionRequest,
@@ -35,4 +36,21 @@ pub enum Event {
     Control,
     /// An unprotected fixture publication (no workspace): `poll`.
     PublicationReceived,
+}
+
+impl Event {
+    /// Every event supported by this contract version.
+    pub const ALL: &'static [Self] = &[
+        Self::AdmissionRequest,
+        Self::MembershipChanged,
+        Self::ProtectedReceived,
+        Self::RecoveryReady,
+        Self::CurrentViewReady,
+        Self::InterestChanged,
+        Self::Presence,
+        Self::NearbyInvitation,
+        Self::Closed,
+        Self::Control,
+        Self::PublicationReceived,
+    ];
 }

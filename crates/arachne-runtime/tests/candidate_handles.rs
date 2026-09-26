@@ -5,12 +5,12 @@ use arachne_runtime::{
 };
 use serde_json::{Value, json};
 
-fn open(secret: u8, provider: &MemoryProvider) -> Client {
+fn open(secret: u8, provider: &MemoryProvider) -> std::sync::Arc<Client> {
     Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([secret; 32]),
+        secret: Some(([secret; 32]).into()),
         transport: Default::default(),
-        storage: Some(StorageConfig::memory(provider)),
+        storage: Some((StorageConfig::memory(provider)).into()),
     })
     .unwrap()
 }

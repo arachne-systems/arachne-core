@@ -79,6 +79,7 @@ const PRESENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30
 const LOW_POWER_FACTOR: u32 = 4;
 
 /// Owns the sessions of one host and everything they share.
+#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct Context {
     limits: Limits,
     // Held only to keep an owned runtime alive; `Drop` shuts it down.
@@ -153,22 +154,6 @@ impl Context {
         }))
     }
 
-    /// The lazy process default, for the handle API and foreign bindings.
-    pub fn default_shared() -> Result<Arc<Self>, ApiError> {
-        DEFAULT
-            .get_or_init(|| Self::new(ContextConfig::default()))
-            .clone()
-    }
-
-    pub fn limits(&self) -> Limits {
-        self.limits
-    }
-
-    /// Open a typed client in this context.
-    pub fn open(self: &Arc<Self>, config: client::ClientConfig) -> client::Result<client::Client> {
-        client::Client::open_in(self, config)
-    }
-
     /// Bind an endpoint in this context and return its session handle, for
     /// hosts that use the handle API (`execute`, `close`).
     pub fn create_with_options(
@@ -190,59 +175,12 @@ impl Context {
         self.handle.metrics().num_alive_tasks()
     }
 
-    pub fn power(&self) -> PowerProfile {
-        self.power
-    }
-
     /// How often a session starts a presence round (longer in `Low`).
     pub fn presence_interval(&self) -> std::time::Duration {
         match self.power {
             PowerProfile::Low => PRESENCE_INTERVAL * LOW_POWER_FACTOR,
             _ => PRESENCE_INTERVAL,
         }
-    }
-
-    pub fn is_suspended(&self) -> bool {
-        self.suspended.load(Ordering::Acquire)
-    }
-
-    /// Stop background work of every session for a host in the background
-    /// (Android): gossip overlays (HyParView shuffles, bootstrap retries)
-    /// are parked and presence rounds stop. Sessions, workspaces, routing
-    /// policy and queues stay; ops still run. Sessions opened while
-    /// suspended start suspended. Blocking: call it outside async code.
-    /// Each session is suspended after its op in flight ends.
-    ///
-    /// Idle connections close (the endpoint stays bound; later dials
-    /// reconnect) and the mDNS service of a LAN or nearby endpoint stops;
-    /// `resume` starts it again with the current addresses.
-    pub fn suspend(&self) -> Result<(), ApiError> {
-        self.suspended.store(true, Ordering::Release);
-        for shared in self.sessions() {
-            let mut guard = shared
-                .lock()
-                .map_err(errors::poisoned("node session unavailable"))?;
-            if let Some(session) = guard.as_mut() {
-                self.handle.block_on(session.node.suspend());
-                session.presence.cancel();
-            }
-        }
-        Ok(())
-    }
-
-    /// Restart what `suspend` stopped and rebind sockets (`network_change`).
-    pub fn resume(&self) -> Result<(), ApiError> {
-        self.suspended.store(false, Ordering::Release);
-        for shared in self.sessions() {
-            let mut guard = shared
-                .lock()
-                .map_err(errors::poisoned("node session unavailable"))?;
-            if let Some(session) = guard.as_mut() {
-                self.handle.block_on(session.node.resume());
-                session.interests.repair();
-            }
-        }
-        Ok(())
     }
 
     /// Background timer sources of all sessions: live gossip overlays and
@@ -268,7 +206,9 @@ impl Context {
         self.sessions()
             .into_iter()
             .map(|shared| {
-                let Ok(guard) = shared.lock() else { return (0, 0) };
+                let Ok(guard) = shared.lock() else {
+                    return (0, 0);
+                };
                 guard
                     .as_ref()
                     .map_or((0, 0), |session| session.node.mdns_state())
@@ -283,7 +223,9 @@ impl Context {
         self.sessions()
             .into_iter()
             .flat_map(|shared| {
-                let Ok(guard) = shared.lock() else { return Vec::new() };
+                let Ok(guard) = shared.lock() else {
+                    return Vec::new();
+                };
                 guard.as_ref().map_or_else(Vec::new, |session| {
                     self.handle.block_on(session.node.gossip_intervals())
                 })
@@ -383,6 +325,76 @@ impl Context {
     }
 }
 
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+impl Context {
+    /// The lazy process default, for the handle API and foreign bindings.
+    #[cfg_attr(feature = "uniffi", uniffi::constructor)]
+    pub fn default_shared() -> Result<Arc<Self>, ApiError> {
+        DEFAULT
+            .get_or_init(|| Self::new(ContextConfig::default()))
+            .clone()
+    }
+
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+
+    /// Open a typed client in this context.
+    pub fn open(
+        self: &Arc<Self>,
+        config: client::ClientConfig,
+    ) -> client::Result<Arc<client::Client>> {
+        client::Client::open_in(Arc::clone(self), config)
+    }
+
+    pub fn power(&self) -> PowerProfile {
+        self.power
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        self.suspended.load(Ordering::Acquire)
+    }
+
+    /// Stop background work of every session for a host in the background
+    /// (Android): gossip overlays (HyParView shuffles, bootstrap retries)
+    /// are parked and presence rounds stop. Sessions, workspaces, routing
+    /// policy and queues stay; ops still run. Sessions opened while
+    /// suspended start suspended. Blocking: call it outside async code.
+    /// Each session is suspended after its op in flight ends.
+    ///
+    /// Idle connections close (the endpoint stays bound; later dials
+    /// reconnect) and the mDNS service of a LAN or nearby endpoint stops;
+    /// `resume` starts it again with the current addresses.
+    pub fn suspend(&self) -> Result<(), ApiError> {
+        self.suspended.store(true, Ordering::Release);
+        for shared in self.sessions() {
+            let mut guard = shared
+                .lock()
+                .map_err(errors::poisoned("node session unavailable"))?;
+            if let Some(session) = guard.as_mut() {
+                self.handle.block_on(session.node.suspend());
+                session.presence.cancel();
+            }
+        }
+        Ok(())
+    }
+
+    /// Restart what `suspend` stopped and rebind sockets (`network_change`).
+    pub fn resume(&self) -> Result<(), ApiError> {
+        self.suspended.store(false, Ordering::Release);
+        for shared in self.sessions() {
+            let mut guard = shared
+                .lock()
+                .map_err(errors::poisoned("node session unavailable"))?;
+            if let Some(session) = guard.as_mut() {
+                self.handle.block_on(session.node.resume());
+                session.interests.repair();
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Drop for Context {
     fn drop(&mut self) {
         // The last reference may go away on any thread, even inside async
@@ -445,9 +457,7 @@ impl OverlayPaths {
         self.budget
             .used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current
-                    .checked_add(additional)
-                    .filter(|next| *next <= max)
+                current.checked_add(additional).filter(|next| *next <= max)
             })
             .map_err(|_| {
                 ApiError::limit_reached(
@@ -539,5 +549,22 @@ mod tests {
         let mut b = two.overlay_paths();
         a.reserve(5).unwrap();
         b.reserve(5).unwrap();
+    }
+}
+
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+impl Context {
+    /// A separate context with its own limits, runtime and session table.
+    /// Host-runtime handles stay available only through the Rust constructor.
+    #[cfg_attr(feature = "uniffi", uniffi::constructor)]
+    pub fn owned(limits: Limits, power: PowerProfile, workers: u32) -> Result<Arc<Self>, ApiError> {
+        Self::new(
+            ContextConfig::default()
+                .with_limits(limits)
+                .with_power(power)
+                .with_runtime(RuntimeConfig::Owned {
+                    workers: workers as usize,
+                }),
+        )
     }
 }

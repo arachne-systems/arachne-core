@@ -792,12 +792,12 @@ pub(crate) fn retained_reply(
         .map_err(security(ErrorCode::InvalidInput))?
         .ok_or_else(|| ApiError::wrong_state("no retained admission"))?;
     Ok(AdmissionReply {
-        workspace: workspace.id(),
+        workspace: workspace.id().into(),
         epoch: reply.epoch,
         commit: reply.commit,
         welcome: reply.welcome,
         authorization: AdmissionAuthorization {
-            invitation_key: reply.authorization.invitation_key,
+            invitation_key: reply.authorization.invitation_key.into(),
             grant_signature: reply.authorization.grant_signature.to_vec(),
             redemption_signature: reply.authorization.redemption_signature.to_vec(),
         },
@@ -896,13 +896,13 @@ fn encode_admission_page(
     };
     let paged = !(offset == 0 && next == total && welcome);
     let wire = AdmissionReplyWire {
-        workspace: reply.workspace,
+        workspace: reply.workspace.to_bytes(),
         epoch: reply.epoch,
         steps: steps[offset..next].iter().map(Vec::as_slice).collect(),
         welcome: welcome.then(|| {
             (
                 reply.welcome.as_slice(),
-                reply.authorization.invitation_key,
+                reply.authorization.invitation_key.to_bytes(),
                 reply.authorization.grant_signature.as_slice(),
                 reply.authorization.redemption_signature.as_slice(),
             )
@@ -1837,12 +1837,12 @@ mod tests {
     #[test]
     fn every_admission_history_page_fits_its_limit_at_every_fill_point() {
         let reply = AdmissionReply {
-            workspace: [7; 32],
+            workspace: [7; 32].into(),
             epoch: 42,
             commit: vec![200; 40],
             welcome: vec![9; 64],
             authorization: AdmissionAuthorization {
-                invitation_key: [1; 32],
+                invitation_key: [1; 32].into(),
                 grant_signature: vec![2; 64],
                 redemption_signature: vec![3; 64],
             },

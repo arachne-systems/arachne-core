@@ -5,12 +5,12 @@ use arachne_runtime::{
 };
 use serde_json::json;
 
-fn open(secret: u8, storage: Option<&MemoryProvider>) -> Client {
+fn open(secret: u8, storage: Option<&MemoryProvider>) -> std::sync::Arc<Client> {
     Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([secret; 32]),
+        secret: Some(([secret; 32]).into()),
         transport: Default::default(),
-        storage: storage.map(StorageConfig::memory),
+        storage: storage.map(|provider| StorageConfig::memory(provider).into()),
     })
     .unwrap()
 }
@@ -58,14 +58,14 @@ fn a_read_back_mismatch_stops_the_session_until_restore() {
         .unwrap();
     provider.corrupt_reads(true);
     let error = client.adopt_protected_publication(&staged).unwrap_err();
-    assert_eq!(error.code(), ErrorCode::StorageFailed, "{error:?}");
+    assert_eq!(error.code(), ErrorCode::StorageFailedFailed, "{error:?}");
     provider.corrupt_reads(false);
     // Live state did not move, and it cannot move now: the outcome is unknown.
     let error = client.adopt_protected_publication(&staged).unwrap_err();
-    assert_eq!(error.code(), ErrorCode::StorageFailed);
+    assert_eq!(error.code(), ErrorCode::StorageFailedFailed);
     assert_eq!(
         client.discard_workspace_candidate().unwrap_err().code(),
-        ErrorCode::StorageFailed
+        ErrorCode::StorageFailedFailed
     );
     client.close().unwrap();
     let client = open(42, Some(&provider));
@@ -87,10 +87,10 @@ fn a_failed_commit_stops_the_session_until_restore() {
         .unwrap();
     provider.fail_next_commit();
     let error = client.adopt_protected_publication(&staged).unwrap_err();
-    assert_eq!(error.code(), ErrorCode::StorageFailed);
+    assert_eq!(error.code(), ErrorCode::StorageFailedFailed);
     assert_eq!(
         client.install_workspace_policy(1).unwrap_err().code(),
-        ErrorCode::StorageFailed
+        ErrorCode::StorageFailedFailed
     );
     client.close().unwrap();
     let client = open(43, Some(&provider));
@@ -161,7 +161,7 @@ fn without_storage_a_session_cannot_hold_a_workspace() {
 fn create_workspace_is_durable_before_any_adoption() {
     let provider = MemoryProvider::default();
     let client = open(47, Some(&provider));
-    let created = client.create_workspace("Owner", Some("Team")).unwrap();
+    let created = client.create_workspace("Owner", Some("Team".into())).unwrap();
     assert!(created.durable);
     assert!(client.workspace_state().unwrap().durable);
     client.close().unwrap();

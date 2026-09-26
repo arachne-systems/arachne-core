@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use arachne_api::{ApiError, ErrorCode, Event};
+use arachne_api::{ApiError, Event};
+pub use arachne_api::{AttemptId, EndpointId, Key32, MemberId, RecordId, WorkspaceId};
+use std::sync::Arc;
 
 use crate::ops::candidate::CandidateKind;
 use crate::ops::{
@@ -18,33 +20,24 @@ const WORKSPACE_KINDS: &[CandidateKind] = &[
     CandidateKind::SelfUpdate,
 ];
 
-/// Address discovery and transport selection for a typed runtime client.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Network {
-    Direct,
-    Lan,
-    Nearby,
-    Wan,
-    RelayOnly,
-    WanOnly,
-    #[cfg(feature = "tor")]
-    Tor,
-}
+pub use arachne_api::Network;
 
 /// Configuration for one workspace-facing runtime client.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ClientConfig {
     pub network: Network,
-    pub secret: Option<[u8; 32]>,
+    pub secret: Option<Vec<u8>>,
     /// Relay, lookup and deadline overrides. `Default` keeps the profile's.
     pub transport: TransportOptions,
     /// Record storage. Required to create, join or restore a workspace.
-    pub storage: Option<StorageConfig>,
+    pub storage: Option<Arc<StorageConfig>>,
 }
 
 /// Transport overrides on top of a `Network` profile. Every field left
 /// `None` keeps the profile default.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct TransportOptions {
     /// Operator relays. They replace n0's public relays.
     pub relay: Option<OperatorRelay>,
@@ -61,6 +54,7 @@ pub struct TransportOptions {
 
 /// Relays run by the deployment operator.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct OperatorRelay {
     /// Relay URLs, for example `https://relay.example.org`.
     pub urls: Vec<String>,
@@ -70,6 +64,8 @@ pub struct OperatorRelay {
 
 /// TLS trust for operator relays.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum RelayTrust {
     /// The built-in WebPKI roots.
     WebPki,
@@ -79,6 +75,7 @@ pub enum RelayTrust {
 
 /// Transport deadlines. Each must be nonzero.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct TransportTimeouts {
     /// One data exchange or resource admission, including its dial.
     pub operation: std::time::Duration,
@@ -93,6 +90,7 @@ pub struct TransportTimeouts {
 
 /// The transport services an endpoint was bound with.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct TransportInfo {
     /// n0's public lookup is in use.
     pub public_lookup: bool,
@@ -103,40 +101,30 @@ pub struct TransportInfo {
     pub timeouts: TransportTimeouts,
 }
 
-impl Network {
-    fn profile(self) -> arachne_node::NetworkProfile {
-        use arachne_node::NetworkProfile;
-        match self {
-            Network::Direct => NetworkProfile::Direct,
-            Network::Lan => NetworkProfile::Lan,
-            Network::Nearby => NetworkProfile::Nearby,
-            Network::Wan => NetworkProfile::Wan,
-            Network::RelayOnly => NetworkProfile::RelayOnly,
-            Network::WanOnly => NetworkProfile::WanOnly,
-            #[cfg(feature = "tor")]
-            Network::Tor => NetworkProfile::Tor,
+fn network_profile(network: Network) -> Result<arachne_node::NetworkProfile> {
+    use arachne_node::NetworkProfile as P;
+    Ok(match network {
+        Network::Direct => P::Direct,
+        Network::Lan => P::Lan,
+        Network::Nearby => P::Nearby,
+        Network::Wan => P::Wan,
+        Network::RelayOnly => P::RelayOnly,
+        Network::WanOnly => P::WanOnly,
+        #[cfg(feature = "tor")]
+        Network::Tor => P::Tor,
+        _ => {
+            return Err(ApiError::unsupported(
+                "network is not supported by this build",
+            ));
         }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Network::Direct => "direct",
-            Network::Lan => "LAN",
-            Network::Nearby => "nearby",
-            Network::Wan => "WAN",
-            Network::RelayOnly => "relay-only",
-            Network::WanOnly => "WAN-only",
-            #[cfg(feature = "tor")]
-            Network::Tor => "Tor",
-        }
-    }
+    })
 }
 
 impl TransportOptions {
     /// The node options for `network` with these overrides applied.
     fn node_options(&self, network: Network) -> Result<arachne_node::NodeOptions> {
         let invalid = |message: &str| error(ErrorKind::InvalidInput, message);
-        let mut options = arachne_node::NodeOptions::new(network.profile());
+        let mut options = arachne_node::NodeOptions::new(network_profile(network)?);
         if let Some(lookup) = self.public_lookup {
             options.public_lookup = lookup;
         }
@@ -172,112 +160,42 @@ impl TransportOptions {
     }
 }
 
-/// A coarse error class. It is derived from [`Error::code`] by a fixed
-/// table (see [`ErrorKind::of`]); new code should read the code.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ErrorKind {
+// The local constructor chooses an explicit code; this is not an exported error model.
+#[derive(Clone, Copy)]
+enum ErrorKind {
     Closed,
     InvalidInput,
-    Capacity,
-    Storage,
     Transport,
-    Cancelled,
     Internal,
 }
 
-impl ErrorKind {
-    /// The class of a code. This is the whole table; there is no text guess.
-    ///
-    /// | Codes                         | Kind           |
-    /// | ----------------------------- | -------------- |
-    /// | 1 closed                      | `Closed`       |
-    /// | 2 cancelled, 3 deadline       | `Cancelled`    |
-    /// | 100-199 input and state       | `InvalidInput` |
-    /// | 200-299 capacity and limits   | `Capacity`     |
-    /// | 300-399 storage, candidates   | `Storage`      |
-    /// | 400-499 transport             | `Transport`    |
-    /// | 500-699 authorization, group  | `InvalidInput` |
-    /// | 900 internal                  | `Internal`     |
-    ///
-    /// One exception: the runtime reports an unknown session handle as
-    /// `InvalidId`; for the client's own handle that means the session was
-    /// closed, so it is `Closed`.
-    pub fn of(error: &ApiError) -> Self {
-        if *error == crate::errors::unknown_handle() {
-            return ErrorKind::Closed;
-        }
-        match error.code().as_u32() {
-            1 => ErrorKind::Closed,
-            2 | 3 => ErrorKind::Cancelled,
-            100..=199 | 500..=699 => ErrorKind::InvalidInput,
-            200..=299 => ErrorKind::Capacity,
-            300..=399 => ErrorKind::Storage,
-            400..=499 => ErrorKind::Transport,
-            _ => ErrorKind::Internal,
-        }
+pub type Result<T> = std::result::Result<T, ApiError>;
+
+// A session that disappeared during a Client call was closed. Unknown caller-supplied
+// handles in the JSON adapter remain InvalidId.
+fn client_error(error: ApiError) -> ApiError {
+    if error == crate::errors::unknown_handle() {
+        ApiError::Closed
+    } else {
+        error
     }
 }
-
-/// A client error: the runtime's typed [`ApiError`] and its coarse kind.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Error {
-    kind: ErrorKind,
-    message: String,
-    error: ApiError,
-}
-
-impl Error {
-    pub fn kind(&self) -> ErrorKind {
-        self.kind
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-
-    /// The stable code. Programs branch on this.
-    pub fn code(&self) -> ErrorCode {
-        self.error.code()
-    }
-
-    /// The typed error from the runtime.
-    pub fn api_error(&self) -> &ApiError {
-        &self.error
-    }
-}
-
-impl From<ApiError> for Error {
-    fn from(error: ApiError) -> Self {
-        Self {
-            kind: ErrorKind::of(&error),
-            message: crate::errors::legacy_text(&error),
-            error,
-        }
-    }
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for Error {}
-
-pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct EndpointInfo {
-    pub endpoint_key: [u8; 32],
+    #[serde(with = "crate::client_wire::id")]
+    pub endpoint_key: EndpointId,
     pub bound_address: String,
     pub workspace_ready: bool,
     pub transport: TransportInfo,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct WorkspaceState {
-    pub endpoint_key: [u8; 32],
-    pub workspace: Option<[u8; 32]>,
+    pub endpoint_key: EndpointId,
+    pub workspace: Option<WorkspaceId>,
     pub workspace_ready: bool,
     pub durable: bool,
     pub phase: WorkspacePhase,
@@ -285,23 +203,28 @@ pub struct WorkspaceState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct WorkspaceInfo {
-    pub workspace: [u8; 32],
+    pub workspace: WorkspaceId,
     pub workspace_name: Option<String>,
     pub epoch: u64,
-    pub member_count: usize,
+    pub member_count: u64,
     pub durable: bool,
     pub phase: WorkspacePhase,
     pub reason: Option<String>,
 }
 
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum MemberKind {
     Person,
     Service,
 }
 
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum Presence {
     SelfMember,
     Unknown,
@@ -310,9 +233,10 @@ pub enum Presence {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct MemberInfo {
-    pub id: [u8; 32],
-    pub endpoint: [u8; 32],
+    pub id: MemberId,
+    pub endpoint: EndpointId,
     pub administrator: bool,
     pub self_member: bool,
     pub display_name: Option<String>,
@@ -323,40 +247,49 @@ pub struct MemberInfo {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct MemberRoster {
-    pub workspace: [u8; 32],
+    pub workspace: WorkspaceId,
     pub workspace_name: Option<String>,
     pub workspace_name_revision: u64,
-    pub workspace_name_head: [u8; 32],
+    pub workspace_name_head: Key32,
     pub epoch: u64,
     pub members: Vec<MemberInfo>,
-    pub profile_count: usize,
+    pub profile_count: u64,
     pub profiles_retained: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct RouteHint {
-    pub peer: [u8; 32],
+    #[serde(with = "crate::client_wire::id")]
+    pub peer: EndpointId,
     pub address: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct InvitationInfo {
-    pub workspace: [u8; 32],
+    #[serde(with = "crate::client_wire::id")]
+    pub workspace: WorkspaceId,
     pub workspace_name: Option<String>,
     pub invitation: Vec<u8>,
-    pub invitation_key: [u8; 32],
+    #[serde(with = "crate::client_wire::id")]
+    pub invitation_key: Key32,
     pub checkpoint: Vec<u8>,
-    pub peer: [u8; 32],
-    pub bootstrap_peers: Vec<[u8; 32]>,
+    #[serde(with = "crate::client_wire::id")]
+    pub peer: EndpointId,
+    #[serde(with = "crate::client_wire::many")]
+    pub bootstrap_peers: Vec<EndpointId>,
     pub address: String,
     pub routes: Vec<RouteHint>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct InvitationDetails {
-    pub workspace: [u8; 32],
-    pub invitation_key: [u8; 32],
+    pub workspace: WorkspaceId,
+    pub invitation_key: Key32,
     pub workspace_name: Option<String>,
     pub epoch: u64,
     pub personal: bool,
@@ -365,29 +298,35 @@ pub struct InvitationDetails {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct JoinRequest {
-    pub workspace: [u8; 32],
-    pub member: [u8; 32],
-    pub endpoint: [u8; 32],
+    pub workspace: WorkspaceId,
+    pub member: MemberId,
+    pub endpoint: EndpointId,
     pub admission_request: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct AdmissionAuthorization {
-    pub invitation_key: [u8; 32],
+    #[serde(with = "crate::client_wire::id")]
+    pub invitation_key: Key32,
     pub grant_signature: Vec<u8>,
     pub redemption_signature: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct JoinAdmissionStep {
     pub commit: Vec<u8>,
     pub authorization: AdmissionAuthorization,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct AdmissionReply {
-    pub workspace: [u8; 32],
+    #[serde(with = "crate::client_wire::id")]
+    pub workspace: WorkspaceId,
     pub epoch: u64,
     pub commit: Vec<u8>,
     pub welcome: Vec<u8>,
@@ -397,6 +336,7 @@ pub struct AdmissionReply {
 /// The kind of invitation link to register.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum InvitationKind {
     /// Anyone with the link may join until it expires or is disabled.
     Reusable,
@@ -411,18 +351,20 @@ pub enum InvitationKind {
 /// An administrator action on a member or an invitation link.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum MemberAction {
-    Promote([u8; 32]),
-    Demote([u8; 32]),
-    Remove([u8; 32]),
-    DisableInvitation([u8; 32]),
+    Promote(MemberId),
+    Demote(MemberId),
+    Remove(MemberId),
+    DisableInvitation(Key32),
 }
 
 /// One registered invitation link and its controls.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct InvitationControl {
-    pub number: usize,
-    pub key: [u8; 32],
+    pub number: u64,
+    pub key: Key32,
     pub expires_at: u64,
     pub enabled: bool,
     pub personal: bool,
@@ -433,23 +375,26 @@ pub struct InvitationControl {
 
 /// This member's removal, adopted. The session has ended.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct RemovedMembership {
-    pub workspace: [u8; 32],
+    pub workspace: WorkspaceId,
     pub epoch: u64,
-    pub member: [u8; 32],
-    pub commit_digest: [u8; 32],
+    pub member: MemberId,
+    pub commit_digest: Key32,
 }
 
 /// A nearby endpoint and the name it announced, if it answered.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct NearbyEndpoint {
-    pub endpoint: [u8; 32],
+    pub endpoint: EndpointId,
     pub name: Option<String>,
 }
 
 /// How a nearby workspace admits people.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum NearbyMode {
     /// A person asks; an administrator approves.
     RequestAccess,
@@ -459,8 +404,9 @@ pub enum NearbyMode {
 
 /// One workspace a nearby device advertises.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct NearbyAdvertisement {
-    pub peer: [u8; 32],
+    pub peer: EndpointId,
     pub mode: NearbyMode,
     pub workspace_name: Option<String>,
     pub invitation: Vec<u8>,
@@ -468,18 +414,20 @@ pub struct NearbyAdvertisement {
 
 /// The result of one nearby workspace scan.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct NearbyScan {
     pub workspaces: Vec<NearbyAdvertisement>,
-    pub endpoints_checked: usize,
+    pub endpoints_checked: u64,
     /// The scan did not reach every nearby endpoint.
     pub limited: bool,
 }
 
 /// The outcome of one presence round.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PresenceRound {
     /// A member this round started a membership query with.
-    pub sync_peer: Option<[u8; 32]>,
+    pub sync_peer: Option<EndpointId>,
     /// Answers that failed, and the first failure's text.
     pub response_errors: u32,
     pub response_error: Option<String>,
@@ -487,17 +435,19 @@ pub struct PresenceRound {
 
 /// A verified invitation checkpoint and the member that served it.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct InvitationCheckpoint {
-    pub workspace: [u8; 32],
+    pub workspace: WorkspaceId,
     pub checkpoint: Vec<u8>,
-    pub peer: [u8; 32],
+    pub peer: EndpointId,
 }
 
 /// One admission request that waits for an administrator.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct AdmissionApproval {
-    pub attempt_id: [u8; 32],
-    pub endpoint: [u8; 32],
+    pub attempt_id: AttemptId,
+    pub endpoint: EndpointId,
     pub request: Vec<u8>,
     pub display_name: Option<String>,
     /// The invitation approves automatically once an administrator binds it.
@@ -510,16 +460,19 @@ pub struct AdmissionApproval {
 
 /// One page of pending approvals.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct AdmissionApprovalPage {
     pub approvals: Vec<AdmissionApproval>,
     /// No more rows after this page.
     pub complete: bool,
     /// Pass as `after` for the next page.
-    pub next_after: Option<[u8; 32]>,
+    pub next_after: Option<AttemptId>,
 }
 
 /// What `restore_workspace` found in record storage.
+#[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum RestoredWorkspace {
     Active(WorkspaceInfo),
     Joining(RestoredJoin),
@@ -530,10 +483,11 @@ pub enum RestoredWorkspace {
 /// A restored pending join. `admission_request` is `None` until the
 /// invitation checkpoint is known.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct RestoredJoin {
-    pub workspace: [u8; 32],
-    pub member: [u8; 32],
-    pub endpoint: [u8; 32],
+    pub workspace: WorkspaceId,
+    pub member: MemberId,
+    pub endpoint: EndpointId,
     pub admission_request: Option<Vec<u8>>,
 }
 
@@ -592,21 +546,26 @@ macro_rules! candidate_type {
         /// adopt it with its own adopt method, or `discard` it. Dropping it
         /// without adoption discards it.
         #[derive(Debug)]
+        #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
         pub struct $name {
             workspace: [u8; 32],
             staged: Staged,
         }
 
         impl $name {
-            fn new(client: i64, workspace: [u8; 32], token: Vec<u8>) -> Self {
-                Self {
+            fn new(client: i64, workspace: [u8; 32], token: Vec<u8>) -> Arc<Self> {
+                Arc::new(Self {
                     workspace,
                     staged: Staged::new(client, token),
-                }
+                })
             }
 
-            pub fn workspace(&self) -> [u8; 32] {
-                self.workspace
+        }
+
+        #[cfg_attr(feature = "uniffi", uniffi::export)]
+        impl $name {
+            pub fn workspace(&self) -> WorkspaceId {
+                self.workspace.into()
             }
 
             /// Drop the staged change. `false`: it was already used or is no
@@ -637,28 +596,32 @@ candidate_type!(
     JoinCandidate
 );
 
+#[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum RouteKind {
     Direct,
     Relay,
     Tor,
-    Custom(String),
+    Custom { name: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PeerRoute {
-    pub member: [u8; 32],
+    pub member: MemberId,
     pub route: RouteKind,
     pub rtt_ms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ConnectivityReport {
-    pub workspace: [u8; 32],
+    pub workspace: WorkspaceId,
     pub paths: Vec<PeerRoute>,
     pub paths_limited: bool,
-    pub receive_queue: usize,
-    pub repair_jobs: usize,
+    pub receive_queue: u64,
+    pub repair_jobs: u64,
 }
 
 /// A bounded, read-only snapshot for native adapters and diagnostics.
@@ -668,21 +631,22 @@ pub struct ConnectivityReport {
 /// receipts use a separate redacted projection; do not export this value as a
 /// public telemetry record because its path members are workspace-local IDs.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct WorkspaceMetrics {
-    pub workspace: [u8; 32],
+    pub workspace: WorkspaceId,
     pub phase: WorkspacePhase,
     pub reason: Option<String>,
     pub received_bytes: u64,
     pub sent_bytes: u64,
-    pub receive_queue: usize,
-    pub admission_queue: usize,
-    pub admission_queue_bytes: usize,
-    pub admission_waiters: usize,
-    pub admission_in_flight: usize,
-    pub approval_pending: usize,
-    pub pending_objects: usize,
-    pub repair_jobs: usize,
-    pub gossip_neighbors: usize,
+    pub receive_queue: u64,
+    pub admission_queue: u64,
+    pub admission_queue_bytes: u64,
+    pub admission_waiters: u64,
+    pub admission_in_flight: u64,
+    pub approval_pending: u64,
+    pub pending_objects: u64,
+    pub repair_jobs: u64,
+    pub gossip_neighbors: u64,
     pub control_timing: ControlTimingMetrics,
     pub membership_gossip: MembershipGossipMetrics,
     pub connection_capacity: ConnectionCapacityMetrics,
@@ -692,6 +656,7 @@ pub struct WorkspaceMetrics {
 
 /// A duration series measured in microseconds since the endpoint started.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct DurationSummary {
     pub count: u64,
     pub total_us: u64,
@@ -699,6 +664,7 @@ pub struct DurationSummary {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ControlTimingMetrics {
     pub inquiry: DurationSummary,
     pub host_wait: DurationSummary,
@@ -706,6 +672,7 @@ pub struct ControlTimingMetrics {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct MembershipGossipMetrics {
     pub sent: u64,
     pub no_overlay: u64,
@@ -718,27 +685,34 @@ pub struct MembershipGossipMetrics {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ConnectionCapacityMetrics {
     pub evicted: u64,
     pub refused: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PeerPolicy {
-    pub peer: [u8; 32],
+    #[serde(with = "crate::client_wire::id")]
+    pub peer: EndpointId,
     pub publish: Vec<String>,
     pub subscribe: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct DeliveryFailure {
-    pub peer: [u8; 32],
+    #[serde(with = "crate::client_wire::id")]
+    pub peer: EndpointId,
     pub error: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct DeliveryReport {
-    pub admitted: Vec<[u8; 32]>,
+    #[serde(with = "crate::client_wire::many")]
+    pub admitted: Vec<EndpointId>,
     pub queued: bool,
     pub failed: Vec<DeliveryFailure>,
 }
@@ -750,9 +724,12 @@ candidate_type!(
 
 /// Current-value metadata for a protected publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PublicationCurrent {
-    pub selector: [u8; 32],
-    pub replacement_key: [u8; 32],
+    #[serde(with = "crate::client_wire::id")]
+    pub selector: Key32,
+    #[serde(with = "crate::client_wire::id")]
+    pub replacement_key: Key32,
     /// Unix seconds (UTC), by the author's clock. Receivers and holders allow
     /// `arachne_delivery::EXPIRY_SKEW_SECONDS` of clock difference.
     pub expires_at: u64,
@@ -768,16 +745,17 @@ candidate_type!(
 
 /// An authenticated pending object from the durable inbox.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ReceivedProtectedPublication {
-    pub workspace: [u8; 32],
+    pub workspace: WorkspaceId,
     pub revision: u64,
-    pub member: [u8; 32],
-    pub endpoint: [u8; 32],
+    pub member: MemberId,
+    pub endpoint: EndpointId,
     pub topic: String,
-    pub id: [u8; 16],
+    pub id: RecordId,
     pub sequence: Option<u64>,
     pub payload: Vec<u8>,
-    pub recipients: Vec<[u8; 32]>,
+    pub recipients: Vec<MemberId>,
     /// Author sender counter; identifies the object for acknowledgement.
     pub counter: u64,
     /// Present for a latest-value (current) publication.
@@ -785,8 +763,9 @@ pub struct ReceivedProtectedPublication {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct InterestObservation {
-    pub workspace: [u8; 32],
+    pub workspace: WorkspaceId,
     pub revision: u64,
     pub topic: String,
     pub subscribed: bool,
@@ -794,18 +773,20 @@ pub struct InterestObservation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Publication {
-    pub workspace: [u8; 32],
+    pub workspace: WorkspaceId,
     pub revision: u64,
-    pub sender: [u8; 32],
+    pub sender: EndpointId,
     pub topic: String,
     pub payload: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct RecoveryRangeRequest {
-    pub peer: Option<[u8; 32]>,
-    pub author: Option<[u8; 32]>,
+    pub peer: Option<EndpointId>,
+    pub author: Option<MemberId>,
     pub revision: u64,
     pub topics: Vec<String>,
     pub after: Option<u64>,
@@ -813,24 +794,27 @@ pub struct RecoveryRangeRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct RecoveryRangeReady {
-    pub workspace: [u8; 32],
-    pub author: [u8; 32],
-    pub peer: [u8; 32],
+    pub workspace: WorkspaceId,
+    pub author: MemberId,
+    pub peer: EndpointId,
     pub epoch: u64,
     pub revision: u64,
     pub after: u64,
     pub through: u64,
-    pub packet_count: usize,
-    pub retained_bytes: usize,
+    pub packet_count: u64,
+    pub retained_bytes: u64,
     pub automatic_source: bool,
-    pub attempted: Option<usize>,
+    pub attempted: Option<u64>,
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum RecoveryRangeStatus {
     Pending {
-        candidate_count: usize,
+        candidate_count: u64,
         automatic_source: bool,
     },
     Ready(RecoveryRangeReady),
@@ -838,7 +822,7 @@ pub enum RecoveryRangeStatus {
         automatic_source: bool,
     },
     SourceUnavailable {
-        attempted: usize,
+        attempted: u64,
         reason: String,
         automatic_source: bool,
     },
@@ -850,18 +834,20 @@ pub enum RecoveryRangeStatus {
 
 /// A recovery range. Adopt it with `adopt_recovery`.
 #[derive(Debug)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct RecoveryCandidate {
-    candidate: ProtectedReceptionCandidate,
-    publication_count: usize,
+    candidate: Arc<ProtectedReceptionCandidate>,
+    publication_count: u64,
 }
 
+#[cfg_attr(feature = "uniffi", uniffi::export)]
 impl RecoveryCandidate {
-    pub fn workspace(&self) -> [u8; 32] {
+    pub fn workspace(&self) -> WorkspaceId {
         self.candidate.workspace()
     }
 
     /// Objects the range brings into the durable inbox.
-    pub fn publication_count(&self) -> usize {
+    pub fn publication_count(&self) -> u64 {
         self.publication_count
     }
 
@@ -872,8 +858,10 @@ impl RecoveryCandidate {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum RecoveryStage {
-    Candidate(RecoveryCandidate),
+    Candidate(Arc<RecoveryCandidate>),
     AlreadyCovered,
     NoNewObjects,
     /// Automatic recovery: nothing fits the pending bounds until the
@@ -883,13 +871,14 @@ pub enum RecoveryStage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct RecoveryAdoption {
-    pub workspace: [u8; 32],
+    pub workspace: WorkspaceId,
     pub epoch: u64,
-    pub member_count: usize,
+    pub member_count: u64,
     pub durable: bool,
-    pub recovered_publications: usize,
-    pub missing_publications: usize,
+    pub recovered_publications: u64,
+    pub missing_publications: u64,
 }
 
 /// Typed adopter seam over the portable runtime. The JSON dispatcher remains
@@ -897,47 +886,101 @@ pub struct RecoveryAdoption {
 ///
 /// A `Client` is `Send + Sync`. `close`, `wake`, `wait_for_work` and
 /// `next_event` may run on any thread while another thread waits.
+#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct Client {
     handle: i64,
+    context: std::sync::Arc<crate::Context>,
     closed: std::sync::atomic::AtomicBool,
 }
 
+#[cfg_attr(feature = "uniffi", uniffi::export)]
 impl Client {
     /// Open a client in the process default context
     /// ([`Context::default_shared`](crate::Context::default_shared)).
-    pub fn open(config: ClientConfig) -> Result<Self> {
+    #[cfg_attr(feature = "uniffi", uniffi::constructor)]
+    pub fn open(config: ClientConfig) -> Result<Arc<Self>> {
         let context = crate::Context::default_shared()?;
-        Self::open_in(&context, config)
+        Self::open_in(context, config)
     }
 
     /// Open a client in `context`. Storage and other per-client setup
     /// attach here, after the session is registered.
-    pub fn open_in(context: &std::sync::Arc<crate::Context>, config: ClientConfig) -> Result<Self> {
+    #[cfg_attr(feature = "uniffi", uniffi::constructor)]
+    pub fn open_in(context: Arc<crate::Context>, config: ClientConfig) -> Result<Arc<Self>> {
+        let options = config.transport.node_options(config.network)?;
         if config.network != Network::Direct && config.secret.is_none() {
             return Err(error(
                 ErrorKind::InvalidInput,
-                format!("{} requires a secret", config.network.name()),
+                format!("{:?} requires a secret", config.network),
             ));
         }
-        let options = config.transport.node_options(config.network)?;
+        let secret = config
+            .secret
+            .as_deref()
+            .map(|bytes| {
+                <[u8; 32]>::try_from(bytes)
+                    .map_err(|_| ApiError::invalid_input("secret", "secret must contain 32 bytes"))
+            })
+            .transpose()?;
         let handle = crate::registry::open(
-            context,
-            config.secret.as_ref(),
+            &context,
+            secret.as_ref(),
             options,
             config.transport.deadline,
         )?;
-        let client = Self {
+        let client = Arc::new(Self {
             handle,
+            context: Arc::clone(&context),
             closed: std::sync::atomic::AtomicBool::new(false),
-        };
+        });
         if let Some(storage) = config.storage {
-            client.stored(|session| persistence::attach(session, storage))?;
+            client.stored(|session| persistence::attach(session, storage.as_ref().clone()))?;
         }
         Ok(client)
     }
 
+    /// Features and limits of this client's context.
+    pub fn capabilities(&self) -> Result<arachne_api::Capabilities> {
+        self.handle()?;
+        let networks = Network::ALL
+            .iter()
+            .copied()
+            .filter(|network| network_profile(*network).is_ok())
+            .collect();
+        Ok(arachne_api::Capabilities::new(
+            networks,
+            vec![arachne_api::Feature::ResourceTransfer],
+            self.context.limits(),
+        ))
+    }
+
+    pub fn inspect_invitation(
+        &self,
+        invitation: &[u8],
+        checkpoint: &[u8],
+    ) -> Result<InvitationDetails> {
+        let raw = self.call(Op::InspectInvitation, |session| {
+            invitation::inspect(
+                session,
+                invitation::InspectArgs {
+                    invitation: invitation.to_vec(),
+                    checkpoint: checkpoint.to_vec(),
+                },
+            )
+        })?;
+        Ok(InvitationDetails {
+            workspace: raw.workspace.into(),
+            invitation_key: raw.invitation_key.into(),
+            workspace_name: raw.workspace_name,
+            epoch: raw.epoch,
+            personal: raw.personal_invitation,
+            automatic: raw.automatic_approval,
+            expires_at: raw.expires_at,
+        })
+    }
+
     pub fn endpoint(&self) -> Result<EndpointInfo> {
-        let description = crate::registry::endpoint_value(self.handle()?)?;
+        let description = crate::registry::endpoint_value(self.handle()?).map_err(client_error)?;
         serde_json::from_value(description).map_err(|parse_error| {
             error(
                 ErrorKind::Internal,
@@ -951,7 +994,7 @@ impl Client {
         let state = self.call(Op::WorkspaceState, ops::workspace::state)?;
         Ok(WorkspaceState {
             endpoint_key,
-            workspace: state.workspace,
+            workspace: state.workspace.map(Into::into),
             workspace_ready: state.workspace_ready,
             durable: state.durable,
             phase: state.activity.phase,
@@ -962,14 +1005,14 @@ impl Client {
     pub fn create_workspace(
         &self,
         display_name: &str,
-        workspace_name: Option<&str>,
+        workspace_name: Option<String>,
     ) -> Result<WorkspaceInfo> {
         let opened = self.call(Op::CreateWorkspace, |session| {
             ops::workspace::create(
                 session,
                 ops::workspace::CreateArgs {
                     display_name: display_name.to_owned(),
-                    workspace_name: workspace_name.map(str::to_owned),
+                    workspace_name,
                 },
             )
         })?;
@@ -981,26 +1024,26 @@ impl Client {
     /// `expected`, the store must match that saved anchor exactly.
     pub fn restore_workspace(
         &self,
-        workspace: [u8; 32],
+        workspace: WorkspaceId,
         expected: Option<FreshnessAnchor>,
     ) -> Result<RestoredWorkspace> {
         let restored = self.call(Op::RestoreWorkspace, |session| {
-            persistence::restore(session, workspace, expected)
+            persistence::restore(session, workspace.to_bytes(), expected)
         })?;
         Ok(match restored {
             persistence::Restored::Opened(opened) => RestoredWorkspace::Active(opened_info(opened)),
             persistence::Restored::Pending(pending) => RestoredWorkspace::Joining(RestoredJoin {
-                workspace: pending.workspace,
-                member: pending.member.id,
-                endpoint: pending.endpoint,
+                workspace: pending.workspace.into(),
+                member: pending.member.id.into(),
+                endpoint: pending.endpoint.into(),
                 admission_request: pending.admission_request,
             }),
             persistence::Restored::Removed(removed) => {
                 RestoredWorkspace::Removed(RemovedMembership {
-                    workspace: removed.removed.workspace,
+                    workspace: removed.removed.workspace.into(),
                     epoch: removed.removed.epoch,
-                    member: removed.removed.member.id,
-                    commit_digest: removed.removed.commit_digest,
+                    member: removed.removed.member.id.into(),
+                    commit_digest: removed.removed.commit_digest.into(),
                 })
             }
         })
@@ -1016,13 +1059,13 @@ impl Client {
     /// Members whose leaf still comes from their KeyPackage: they never
     /// self-updated. Each adds about 82 bytes to every management commit
     /// (B3c), so a host can predict commit size and nudge those members.
-    pub fn members_without_self_update(&self) -> Result<usize> {
+    pub fn members_without_self_update(&self) -> Result<u64> {
         self.call(Op::WorkspaceState, |session| {
             Ok(session
                 .workspace
                 .as_ref()
                 .ok_or_else(crate::errors::no_workspace)?
-                .members_without_self_update())
+                .members_without_self_update() as u64)
         })
     }
 
@@ -1051,7 +1094,7 @@ impl Client {
         invitation: &[u8],
         checkpoint: &[u8],
         display_name: &str,
-        peers: &[[u8; 32]],
+        peers: &[EndpointId],
     ) -> Result<JoinRequest> {
         let pending = self.call(Op::BeginJoin, |session| {
             join::begin(
@@ -1060,25 +1103,15 @@ impl Client {
                     invitation: invitation.to_vec(),
                     checkpoint: checkpoint.to_vec(),
                     display_name: display_name.to_owned(),
-                    peers: peers.to_vec(),
+                    peers: peers
+                        .to_vec()
+                        .into_iter()
+                        .map(EndpointId::to_bytes)
+                        .collect(),
                 },
             )
         })?;
         join_request(pending)
-    }
-
-    /// Advance a join restored from native record storage.
-    pub fn drive_join(&self) -> Result<Value> {
-        self.call(Op::DriveJoin, join::drive)
-    }
-
-    /// Ask one member for admission now (the host-driven path; `drive_join`
-    /// does this natively). The reply is the member's answer, passed on as
-    /// an open event (typed in ADR step 4).
-    pub fn request_admission(&self, peer: [u8; 32]) -> Result<Value> {
-        self.call(Op::RequestAdmission, |session| {
-            join::request_admission(session, join::RequestAdmissionArgs { peer })
-        })
     }
 
     /// Fetch and verify the current checkpoint of a compact invitation from
@@ -1086,35 +1119,39 @@ impl Client {
     pub fn fetch_invitation_checkpoint(
         &self,
         invitation: &[u8],
-        peers: &[[u8; 32]],
+        peers: &[EndpointId],
     ) -> Result<InvitationCheckpoint> {
         let found = self.call(Op::FetchInvitationCheckpoint, |session| {
             join::fetch_checkpoint(
                 session,
                 join::FetchCheckpointArgs {
                     peer: None,
-                    peers: peers.to_vec(),
+                    peers: peers
+                        .to_vec()
+                        .into_iter()
+                        .map(EndpointId::to_bytes)
+                        .collect(),
                     invitation: invitation.to_vec(),
                 },
             )
         })?;
         Ok(InvitationCheckpoint {
-            workspace: found.workspace,
+            workspace: found.workspace.into(),
             checkpoint: found.checkpoint,
-            peer: found.peer,
+            peer: found.peer.into(),
         })
     }
 
     pub fn stage_admission(
         &self,
-        authenticated_endpoint: [u8; 32],
+        authenticated_endpoint: EndpointId,
         request: &[u8],
-    ) -> Result<WorkspaceCandidate> {
+    ) -> Result<Arc<WorkspaceCandidate>> {
         let staged = self.call(Op::StageAdmission, |session| {
             admission::stage(
                 session,
                 admission::AdmissionArgs {
-                    authenticated_endpoint,
+                    authenticated_endpoint: authenticated_endpoint.to_bytes(),
                     request: request.to_vec(),
                 },
             )
@@ -1139,50 +1176,54 @@ impl Client {
         self.adopt(Op::AdoptAdmission, &candidate.staged, WORKSPACE_KINDS)?
             .adopted()
             .map(workspace_info)
-            .map_err(Error::from)
+            .map_err(client_error)
     }
 
     pub fn retained_admission(
         &self,
-        authenticated_endpoint: [u8; 32],
+        authenticated_endpoint: EndpointId,
         request: &[u8],
     ) -> Result<AdmissionReply> {
         self.call(Op::RetainedAdmission, |session| {
             admission::retained(
                 session,
                 admission::AdmissionArgs {
-                    authenticated_endpoint,
+                    authenticated_endpoint: authenticated_endpoint.to_bytes(),
                     request: request.to_vec(),
                 },
             )
         })
     }
 
-    /// Drive one owner transition with native record storage: serve one
-    /// queued control request, or stage, save and adopt the next admission
-    /// batch, then answer its requesters. The reply is an open event; it is
-    /// typed with `Event` in ADR step 4.
-    pub fn drive_workspace(&self) -> Result<Value> {
-        self.call(Op::DriveWorkspace, admission::drive_workspace)
-    }
-
     /// One page of admission requests that wait for an administrator,
     /// after `after` (an attempt ID), at most `limit` (1 to 64, default 64).
     pub fn admission_approvals(
         &self,
-        after: Option<[u8; 32]>,
-        limit: Option<usize>,
+        after: Option<AttemptId>,
+        limit: Option<u64>,
     ) -> Result<AdmissionApprovalPage> {
         let page = self.call(Op::ListAdmissionApprovals, |session| {
-            admission::list_approvals(session, admission::ListApprovalsArgs { after, limit })
+            admission::list_approvals(
+                session,
+                admission::ListApprovalsArgs {
+                    after: after.map(AttemptId::to_bytes),
+                    limit: limit
+                        .map(|value| {
+                            usize::try_from(value).map_err(|_| {
+                                ApiError::invalid_input("limit", "count exceeds native bound")
+                            })
+                        })
+                        .transpose()?,
+                },
+            )
         })?;
         Ok(AdmissionApprovalPage {
             approvals: page
                 .approvals
                 .into_iter()
                 .map(|row| AdmissionApproval {
-                    attempt_id: row.attempt_id,
-                    endpoint: row.endpoint,
+                    attempt_id: row.attempt_id.into(),
+                    endpoint: row.endpoint.into(),
                     request: row.request,
                     display_name: row.display_name,
                     automatic: row.automatic,
@@ -1191,16 +1232,18 @@ impl Client {
                 })
                 .collect(),
             complete: page.complete,
-            next_after: page.next_after,
+            next_after: page.next_after.map(Into::into),
         })
     }
 
     /// Mark a pending approval as seen by the administrator's UI.
-    pub fn acknowledge_admission_approval(&self, attempt_id: [u8; 32]) -> Result<()> {
+    pub fn acknowledge_admission_approval(&self, attempt_id: AttemptId) -> Result<()> {
         self.call(Op::AcknowledgeAdmissionApproval, |session| {
             admission::acknowledge_approval(
                 session,
-                admission::AcknowledgeApprovalArgs { attempt_id },
+                admission::AcknowledgeApprovalArgs {
+                    attempt_id: attempt_id.to_bytes(),
+                },
             )
         })?;
         Ok(())
@@ -1219,9 +1262,9 @@ impl Client {
         &self,
         welcome: &[u8],
         commits: &[JoinAdmissionStep],
-    ) -> Result<JoinCandidate> {
+    ) -> Result<Arc<JoinCandidate>> {
         if welcome.len() > arachne_security::MAX_WELCOME {
-            return Err(Error::from(ApiError::invalid_input(
+            return Err(client_error(ApiError::invalid_input(
                 "request",
                 "Welcome exceeds binary input bound",
             )));
@@ -1231,7 +1274,7 @@ impl Client {
             .map(|step| {
                 crate::membership::JoinStep::admission(
                     step.commit.clone(),
-                    step.authorization.invitation_key,
+                    step.authorization.invitation_key.to_bytes(),
                     step.authorization.grant_signature.clone(),
                     step.authorization.redemption_signature.clone(),
                 )
@@ -1257,28 +1300,13 @@ impl Client {
         self.adopt(Op::AdoptJoin, &candidate.staged, &[CandidateKind::Join])?
             .adopted()
             .map(workspace_info)
-            .map_err(Error::from)
+            .map_err(client_error)
     }
 
     /// Anchor after the latest record commit. Without a monotonic anchor
     /// store, read it after every call and save it outside the database.
     pub fn record_freshness(&self) -> Result<FreshnessAnchor> {
         self.stored(persistence::freshness)
-    }
-
-    /// A native storage call. These report every failure as `Storage`, as
-    /// before; `code()` gives the exact failure.
-    fn stored<T>(
-        &self,
-        body: impl FnOnce(&mut Session) -> std::result::Result<T, ApiError>,
-    ) -> Result<T> {
-        persistence::with_session(self.handle()?, body).map_err(|api| {
-            let mut error = Error::from(api);
-            if error.kind != ErrorKind::Closed {
-                error.kind = ErrorKind::Storage;
-            }
-            error
-        })
     }
 
     pub fn member_roster(&self) -> Result<MemberRoster> {
@@ -1291,13 +1319,13 @@ impl Client {
             .map(MemberInfo::try_from)
             .collect::<Result<Vec<_>>>()?;
         Ok(MemberRoster {
-            workspace: raw.workspace,
+            workspace: raw.workspace.into(),
             workspace_name: raw.workspace_name,
             workspace_name_revision: raw.workspace_name_revision,
-            workspace_name_head: raw.workspace_name_head,
+            workspace_name_head: raw.workspace_name_head.into(),
             epoch: raw.epoch,
             members,
-            profile_count: raw.profiles.len(),
+            profile_count: raw.profiles.len() as u64,
             profiles_retained: raw.profiles_retained.unwrap_or(true),
         })
     }
@@ -1311,7 +1339,7 @@ impl Client {
 
     /// Register a reusable invitation link in shared policy. The link is
     /// released only by `adopt_invitation`, after the candidate is saved.
-    pub fn stage_invitation(&self, expires_at: u64) -> Result<InvitationCandidate> {
+    pub fn stage_invitation(&self, expires_at: u64) -> Result<Arc<InvitationCandidate>> {
         self.stage_invitation_of(expires_at, InvitationKind::Reusable)
     }
 
@@ -1321,7 +1349,7 @@ impl Client {
         &self,
         expires_at: u64,
         kind: InvitationKind,
-    ) -> Result<InvitationCandidate> {
+    ) -> Result<Arc<InvitationCandidate>> {
         let (personal, automatic, request_access) = match kind {
             InvitationKind::Reusable => (false, false, false),
             InvitationKind::Personal => (true, false, false),
@@ -1351,14 +1379,14 @@ impl Client {
     pub fn stage_invitation_approval(
         &self,
         request: &[u8],
-        attempt_id: Option<[u8; 32]>,
-    ) -> Result<WorkspaceCandidate> {
+        attempt_id: Option<AttemptId>,
+    ) -> Result<Arc<WorkspaceCandidate>> {
         let staged = self.call(Op::StageInvitationApproval, |session| {
             invitation::stage_approval(
                 session,
                 invitation::DecisionArgs {
                     request: request.to_vec(),
-                    attempt_id,
+                    attempt_id: attempt_id.map(AttemptId::to_bytes),
                 },
             )
         })?;
@@ -1370,14 +1398,14 @@ impl Client {
     pub fn stage_invitation_decline(
         &self,
         request: &[u8],
-        attempt_id: Option<[u8; 32]>,
-    ) -> Result<WorkspaceCandidate> {
+        attempt_id: Option<AttemptId>,
+    ) -> Result<Arc<WorkspaceCandidate>> {
         let staged = self.call(Op::StageInvitationDecline, |session| {
             invitation::stage_decline(
                 session,
                 invitation::DecisionArgs {
                     request: request.to_vec(),
-                    attempt_id,
+                    attempt_id: attempt_id.map(AttemptId::to_bytes),
                 },
             )
         })?;
@@ -1391,8 +1419,8 @@ impl Client {
             .invitations
             .into_iter()
             .map(|row| InvitationControl {
-                number: row.number,
-                key: row.key,
+                number: row.number as u64,
+                key: row.key.into(),
                 expires_at: row.expires_at,
                 enabled: row.enabled,
                 personal: row.personal,
@@ -1404,13 +1432,15 @@ impl Client {
     }
 
     /// Stage an administrator action. Adopt it with `adopt_admission`.
-    pub fn stage_management(&self, action: MemberAction) -> Result<WorkspaceCandidate> {
+    pub fn stage_management(&self, action: MemberAction) -> Result<Arc<WorkspaceCandidate>> {
         use crate::membership::WireManagement;
         let action = match action {
-            MemberAction::Promote(member) => WireManagement::Promote(member),
-            MemberAction::Demote(member) => WireManagement::Demote(member),
-            MemberAction::Remove(member) => WireManagement::Remove(member),
-            MemberAction::DisableInvitation(key) => WireManagement::DisableInvitation(key),
+            MemberAction::Promote(member) => WireManagement::Promote(member.to_bytes()),
+            MemberAction::Demote(member) => WireManagement::Demote(member.to_bytes()),
+            MemberAction::Remove(member) => WireManagement::Remove(member.to_bytes()),
+            MemberAction::DisableInvitation(key) => {
+                WireManagement::DisableInvitation(key.to_bytes())
+            }
         };
         let staged = self.call(Op::StageManagement, |session| {
             management::stage(session, management::ManagementArgs { action })
@@ -1419,7 +1449,7 @@ impl Client {
     }
 
     /// Rename the workspace. Adopt the candidate with `adopt_admission`.
-    pub fn stage_workspace_name(&self, workspace_name: &str) -> Result<WorkspaceCandidate> {
+    pub fn stage_workspace_name(&self, workspace_name: &str) -> Result<Arc<WorkspaceCandidate>> {
         let staged = self.call(Op::StageWorkspaceName, |session| {
             management::stage_workspace_name(
                 session,
@@ -1433,9 +1463,14 @@ impl Client {
 
     /// Leave through another member, who commits the departure. Adopt the
     /// staged removal with `adopt_removal`; that ends the session.
-    pub fn leave_via_peer(&self, peer: [u8; 32]) -> Result<RemovalCandidate> {
+    pub fn leave_via_peer(&self, peer: EndpointId) -> Result<Arc<RemovalCandidate>> {
         let staged = self.call(Op::LeaveViaPeer, |session| {
-            management::leave_via_peer(session, management::PeerArgs { peer })
+            management::leave_via_peer(
+                session,
+                management::PeerArgs {
+                    peer: peer.to_bytes(),
+                },
+            )
         })?;
         match staged {
             management::StagedChange::Removal(removal) => Ok(RemovalCandidate::new(
@@ -1447,7 +1482,7 @@ impl Client {
             // member: drop it, it is not what the caller asked for.
             management::StagedChange::Candidate(candidate) => {
                 drop(self.candidate_of(candidate)?);
-                Err(Error::from(ApiError::wrong_state(
+                Err(client_error(ApiError::wrong_state(
                     "the peer's step does not remove this member",
                 )))
             }
@@ -1455,7 +1490,7 @@ impl Client {
     }
 
     /// The last member leaves alone. Adopt with `adopt_removal`.
-    pub fn stage_solo_leave(&self) -> Result<RemovalCandidate> {
+    pub fn stage_solo_leave(&self) -> Result<Arc<RemovalCandidate>> {
         let staged = self.call(Op::StageSoloLeave, management::stage_solo_leave)?;
         Ok(RemovalCandidate::new(
             self.handle()?,
@@ -1474,12 +1509,12 @@ impl Client {
         )?;
         match reply {
             candidate::AdoptReply::Removed(removed) => Ok(RemovedMembership {
-                workspace: removed.workspace,
+                workspace: removed.workspace.into(),
                 epoch: removed.epoch,
-                member: removed.member.id,
-                commit_digest: removed.commit_digest,
+                member: removed.member.id.into(),
+                commit_digest: removed.commit_digest.into(),
             }),
-            candidate::AdoptReply::Adopted(_) => Err(Error::from(ApiError::wrong_state(
+            candidate::AdoptReply::Adopted(_) => Err(client_error(ApiError::wrong_state(
                 "the candidate was not a removal",
             ))),
         }
@@ -1503,31 +1538,6 @@ impl Client {
         Ok(issued)
     }
 
-    pub fn inspect_invitation(
-        &self,
-        invitation: &[u8],
-        checkpoint: &[u8],
-    ) -> Result<InvitationDetails> {
-        let raw = self.call(Op::InspectInvitation, |session| {
-            invitation::inspect(
-                session,
-                invitation::InspectArgs {
-                    invitation: invitation.to_vec(),
-                    checkpoint: checkpoint.to_vec(),
-                },
-            )
-        })?;
-        Ok(InvitationDetails {
-            workspace: raw.workspace,
-            invitation_key: raw.invitation_key,
-            workspace_name: raw.workspace_name,
-            epoch: raw.epoch,
-            personal: raw.personal_invitation,
-            automatic: raw.automatic_approval,
-            expires_at: raw.expires_at,
-        })
-    }
-
     pub fn connectivity(&self) -> Result<ConnectivityReport> {
         let metrics = self.metrics()?;
         Ok(ConnectivityReport {
@@ -1542,20 +1552,20 @@ impl Client {
     pub fn metrics(&self) -> Result<WorkspaceMetrics> {
         let raw = self.call(Op::WorkspaceMetrics, ops::workspace::metrics)?;
         Ok(WorkspaceMetrics {
-            workspace: raw.workspace,
+            workspace: raw.workspace.into(),
             phase: raw.activity.phase,
             reason: raw.activity.reason,
             received_bytes: raw.received_bytes,
             sent_bytes: raw.sent_bytes,
-            receive_queue: raw.receive_queue,
-            admission_queue: raw.admission_queue,
-            admission_queue_bytes: raw.admission_queue_bytes,
-            admission_waiters: raw.admission_waiters,
-            admission_in_flight: raw.admission_in_flight,
-            approval_pending: raw.approval_pending,
-            pending_objects: raw.pending_objects,
-            repair_jobs: raw.repair_jobs,
-            gossip_neighbors: raw.gossip_neighbors,
+            receive_queue: raw.receive_queue as u64,
+            admission_queue: raw.admission_queue as u64,
+            admission_queue_bytes: raw.admission_queue_bytes as u64,
+            admission_waiters: raw.admission_waiters as u64,
+            admission_in_flight: raw.admission_in_flight as u64,
+            approval_pending: raw.approval_pending as u64,
+            pending_objects: raw.pending_objects as u64,
+            repair_jobs: raw.repair_jobs as u64,
+            gossip_neighbors: raw.gossip_neighbors as u64,
             control_timing: raw.control_timing,
             membership_gossip: raw.membership_gossip,
             connection_capacity: raw.connection_capacity,
@@ -1563,12 +1573,14 @@ impl Client {
                 .paths
                 .into_iter()
                 .map(|path| PeerRoute {
-                    member: path.member,
+                    member: path.member.into(),
                     route: match path.route {
                         "direct" => RouteKind::Direct,
                         "relay" => RouteKind::Relay,
                         "tor" => RouteKind::Tor,
-                        other => RouteKind::Custom(other.to_owned()),
+                        other => RouteKind::Custom {
+                            name: other.to_owned(),
+                        },
                     },
                     rtt_ms: path.rtt_ms,
                 })
@@ -1584,7 +1596,7 @@ impl Client {
             ops::membership::poll_presence(session, ops::membership::PresenceArgs { announce })
         })?;
         Ok(PresenceRound {
-            sync_peer: round.sync_peer,
+            sync_peer: round.sync_peer.map(Into::into),
             response_errors: round.response_errors,
             response_error: round.response_error,
         })
@@ -1592,24 +1604,17 @@ impl Client {
 
     /// Ask `peer` for the membership step after this node's epoch. Read the
     /// answer with `poll_membership_update`.
-    pub fn fetch_membership_update(&self, peer: [u8; 32], replace_pending: bool) -> Result<()> {
+    pub fn fetch_membership_update(&self, peer: EndpointId, replace_pending: bool) -> Result<()> {
         self.call(Op::FetchMembershipUpdate, |session| {
             ops::membership::fetch_update(
                 session,
                 ops::membership::FetchUpdateArgs {
-                    peer,
+                    peer: peer.to_bytes(),
                     replace_pending,
                 },
             )
         })?;
         Ok(())
-    }
-
-    /// The answer to `fetch_membership_update`, once it arrived. The value
-    /// is an open event (typed with `Event` in ADR step 4).
-    pub fn poll_membership_update(&self) -> Result<Option<Value>> {
-        let event = self.call(Op::PollMembershipUpdate, ops::membership::poll_update)?;
-        Ok((!event.is_null()).then_some(event))
     }
 
     /// Nearby endpoints on the local network and the names they announce.
@@ -1619,7 +1624,7 @@ impl Client {
             .endpoints
             .iter()
             .map(|endpoint| NearbyEndpoint {
-                endpoint: *endpoint,
+                endpoint: (*endpoint).into(),
                 name: found
                     .names
                     .iter()
@@ -1637,7 +1642,7 @@ impl Client {
                 .workspaces
                 .into_iter()
                 .map(|workspace| NearbyAdvertisement {
-                    peer: workspace.peer,
+                    peer: workspace.peer.into(),
                     mode: if workspace.mode == "request_access" {
                         NearbyMode::RequestAccess
                     } else {
@@ -1647,7 +1652,7 @@ impl Client {
                     invitation: workspace.invitation,
                 })
                 .collect(),
-            endpoints_checked: found.endpoints_checked,
+            endpoints_checked: found.endpoints_checked as u64,
             limited: found.limited,
         })
     }
@@ -1656,10 +1661,10 @@ impl Client {
     /// whether this device now advertises anything.
     pub fn advertise_nearby_workspace(
         &self,
-        workspace: Option<[u8; 32]>,
+        workspace: Option<WorkspaceId>,
         mode: NearbyMode,
         invitation: &[u8],
-        workspace_name: Option<&str>,
+        workspace_name: Option<String>,
     ) -> Result<bool> {
         self.nearby_advertisement(ops::nearby::AdvertiseArgs {
             mode: Some(
@@ -1670,24 +1675,17 @@ impl Client {
                 .to_owned(),
             ),
             invitation: invitation.to_vec(),
-            workspace_name: workspace_name.map(str::to_owned),
-            workspace,
+            workspace_name,
+            workspace: workspace.map(WorkspaceId::to_bytes),
         })
     }
 
     /// Stop advertising `workspace`, or every workspace for `None`.
-    pub fn withdraw_nearby_workspace(&self, workspace: Option<[u8; 32]>) -> Result<bool> {
+    pub fn withdraw_nearby_workspace(&self, workspace: Option<WorkspaceId>) -> Result<bool> {
         self.nearby_advertisement(ops::nearby::AdvertiseArgs {
-            workspace,
+            workspace: workspace.map(WorkspaceId::to_bytes),
             ..Default::default()
         })
-    }
-
-    fn nearby_advertisement(&self, args: ops::nearby::AdvertiseArgs) -> Result<bool> {
-        let state = self.call(Op::SetNearbyWorkspace, |session| {
-            ops::nearby::advertise(session, args)
-        })?;
-        Ok(state.state == "nearby_workspace_advertised")
     }
 
     /// The name this device answers to nearby identity asks.
@@ -1704,12 +1702,12 @@ impl Client {
     }
 
     /// Hand an invitation to one nearby device.
-    pub fn send_nearby_invitation(&self, peer: [u8; 32], invitation: &[u8]) -> Result<()> {
+    pub fn send_nearby_invitation(&self, peer: EndpointId, invitation: &[u8]) -> Result<()> {
         self.call(Op::SendNearbyInvitation, |session| {
             ops::nearby::send_invitation(
                 session,
                 ops::nearby::SendInvitationArgs {
-                    peer,
+                    peer: peer.to_bytes(),
                     invitation: invitation.to_vec(),
                 },
             )
@@ -1717,36 +1715,61 @@ impl Client {
         Ok(())
     }
 
-    #[cfg(feature = "moq")]
-    pub fn moq_metrics(&self) -> Result<Value> {
-        self.call(Op::MoqMetrics, |session| {
-            serde_json::to_value(session.node.moq_metrics())
-                .map_err(|error| ApiError::internal(error.to_string()))
-        })
+    pub fn moq_metrics(&self) -> Result<StreamMetrics> {
+        #[cfg(not(feature = "moq"))]
+        {
+            Err(ApiError::unsupported(
+                "stream transport is not enabled in this build",
+            ))
+        }
+        #[cfg(feature = "moq")]
+        {
+            self.call(Op::MoqMetrics, |session| {
+                let raw = session.node.moq_metrics();
+                Ok(StreamMetrics {
+                    sessions_total: raw.sessions_total,
+                    sessions_active: raw.sessions_active as u64,
+                    packets_sent: raw.packets_sent,
+                    packets_received: raw.packets_received,
+                    rejected_sessions: raw.rejected_sessions,
+                    interest_sync_pending: raw.interest_sync_pending as u64,
+                    last_error: raw.last_error,
+                })
+            })
+        }
     }
 
     /// Opt an authenticated endpoint and topic into protected MoQ delivery.
-    #[cfg(feature = "moq")]
     pub fn enable_moq_delivery(
         &self,
-        workspace: [u8; 32],
+        workspace: WorkspaceId,
         revision: u64,
-        peer_endpoint: [u8; 32],
+        peer_endpoint: EndpointId,
         topic: &str,
     ) -> Result<()> {
-        self.call(Op::EnableMoqDelivery, |session| {
-            let topic = arachne_node::Topic::new(topic.to_owned())
-                .map_err(|error| ApiError::invalid_input("topic", error.to_string()))?;
-            session
-                .runtime
-                .block_on(session.node.enable_moq_delivery(
-                    workspace,
-                    revision,
-                    peer_endpoint,
-                    topic,
-                ))
-                .map_err(crate::errors::node)
-        })
+        #[cfg(not(feature = "moq"))]
+        {
+            let _ = (workspace, revision, peer_endpoint, topic);
+            Err(ApiError::unsupported(
+                "stream transport is not enabled in this build",
+            ))
+        }
+        #[cfg(feature = "moq")]
+        {
+            self.call(Op::EnableMoqDelivery, |session| {
+                let topic = arachne_node::Topic::new(topic.to_owned())
+                    .map_err(|error| ApiError::invalid_input("topic", error.to_string()))?;
+                session
+                    .runtime
+                    .block_on(session.node.enable_moq_delivery(
+                        workspace.to_bytes(),
+                        revision,
+                        peer_endpoint.to_bytes(),
+                        topic,
+                    ))
+                    .map_err(crate::errors::node)
+            })
+        }
     }
 
     pub fn network_change(&self) -> Result<()> {
@@ -1758,7 +1781,7 @@ impl Client {
     /// exchanges). Not sticky: the latch clears when that op ends, so the
     /// next op runs normally.
     pub fn cancel(&self) -> Result<()> {
-        Ok(crate::registry::cancel_session(self.handle()?)?)
+        crate::registry::cancel_session(self.handle()?).map_err(client_error)
     }
 
     /// Park until the session may have work, up to `timeout` (`None`: no
@@ -1766,13 +1789,13 @@ impl Client {
     /// queues (or call `next_event`), then call again. `Ok(false)`: the
     /// timeout passed, `wake` was called, or the client closed.
     pub fn wait_for_work(&self, timeout: Option<std::time::Duration>) -> Result<bool> {
-        Ok(crate::registry::wait_session_for(self.handle()?, timeout)?)
+        crate::registry::wait_session_for(self.handle()?, timeout).map_err(client_error)
     }
 
     /// Release one waiter (`wait_for_work` or `next_event`) without work,
     /// for example at host shutdown.
     pub fn wake(&self) -> Result<()> {
-        Ok(crate::registry::wake_session(self.handle()?)?)
+        crate::registry::wake_session(self.handle()?).map_err(client_error)
     }
 
     /// The next event of any queue, up to `timeout` (`None`: no timeout).
@@ -1781,7 +1804,7 @@ impl Client {
     /// the queue with its poll call; a ready job reports once. After
     /// `close`, it fails with `Closed`.
     pub fn next_event(&self, timeout: Option<std::time::Duration>) -> Result<Option<Event>> {
-        Ok(crate::events::next(self.handle()?, timeout)?)
+        crate::events::next(self.handle()?, timeout).map_err(client_error)
     }
 
     /// Give each later blocking op this deadline. At the deadline the op
@@ -1794,12 +1817,6 @@ impl Client {
         }
     }
 
-    /// `set_deadline`, as a builder.
-    pub fn with_deadline(self, deadline: std::time::Duration) -> Self {
-        self.set_deadline(Some(deadline));
-        self
-    }
-
     /// Service one queued peer-control exchange and report whether one was served.
     pub fn poll_control(&self) -> Result<bool> {
         let event = self.call(Op::PollAdmission, |session| {
@@ -1808,41 +1825,13 @@ impl Client {
         Ok(!event.is_null())
     }
 
-    pub fn add_address_hint(&self, peer: [u8; 32], address: &str) -> Result<()> {
+    pub fn add_address_hint(&self, peer: EndpointId, address: &str) -> Result<()> {
         self.call(Op::AddAddressHint, |session| {
             ops::policy::add_address_hint(
                 session,
                 ops::policy::AddressHintArgs {
-                    peer,
+                    peer: peer.to_bytes(),
                     address: address.to_owned(),
-                },
-            )
-        })
-    }
-
-    /// Fixture: install a caller-made routing policy. Rejected once the
-    /// session owns a workspace.
-    pub fn install_policy(
-        &self,
-        workspace: [u8; 32],
-        revision: u64,
-        endpoints: &[PeerPolicy],
-    ) -> Result<()> {
-        let endpoints = endpoints
-            .iter()
-            .map(|policy| ops::policy::EndpointPolicy {
-                peer: policy.peer,
-                publish: policy.publish.clone(),
-                subscribe: policy.subscribe.clone(),
-            })
-            .collect();
-        self.call(Op::InstallVerifiedPolicy, |session| {
-            ops::policy::install_verified_policy(
-                session,
-                ops::policy::VerifiedPolicyArgs {
-                    workspace,
-                    revision,
-                    endpoints,
                 },
             )
         })
@@ -1860,13 +1849,13 @@ impl Client {
     }
 
     /// Route only `topics` between all members at `revision`.
-    pub fn install_member_policy(&self, revision: u64, topics: &[&str]) -> Result<()> {
+    pub fn install_member_policy(&self, revision: u64, topics: &[String]) -> Result<()> {
         self.call(Op::InstallMemberPolicy, |session| {
             ops::policy::install_member_policy(
                 session,
                 ops::policy::MemberPolicyArgs {
                     revision,
-                    topics: topics.iter().map(|topic| (*topic).to_owned()).collect(),
+                    topics: topics.to_vec(),
                 },
             )
         })?;
@@ -1875,37 +1864,37 @@ impl Client {
 
     pub fn stage_protected_publication(
         &self,
-        workspace: [u8; 32],
+        workspace: WorkspaceId,
         revision: u64,
         topic: &str,
-        id: [u8; 16],
+        id: RecordId,
         payload: Vec<u8>,
-    ) -> Result<PublicationCandidate> {
+    ) -> Result<Arc<PublicationCandidate>> {
         self.stage_protected_publication_with_current(workspace, revision, topic, id, payload, None)
     }
 
     pub fn stage_protected_publication_with_current(
         &self,
-        workspace: [u8; 32],
+        workspace: WorkspaceId,
         revision: u64,
         topic: &str,
-        id: [u8; 16],
+        id: RecordId,
         payload: Vec<u8>,
         current: Option<PublicationCurrent>,
-    ) -> Result<PublicationCandidate> {
+    ) -> Result<Arc<PublicationCandidate>> {
         let staged = self.call(Op::StageNetworkPublication, |session| {
             publication::stage(
                 session,
                 publication::StagePublicationArgs {
-                    workspace: Some(workspace),
+                    workspace: Some(workspace.to_bytes()),
                     revision,
                     topic: topic.to_owned(),
-                    id,
+                    id: id.to_bytes(),
                     payload,
                     recipients: Vec::new(),
                     current: current.map(|current| publication::CurrentPublication {
-                        selector: current.selector,
-                        replacement_key: current.replacement_key,
+                        selector: current.selector.to_bytes(),
+                        replacement_key: current.replacement_key.to_bytes(),
                         expires_at: current.expires_at,
                         tombstone: current.tombstone,
                     }),
@@ -1913,7 +1902,7 @@ impl Client {
                 },
             )
         })?;
-        if staged.workspace != workspace {
+        if staged.workspace != workspace.to_bytes() {
             return Err(error(
                 ErrorKind::Internal,
                 "publication candidate workspace mismatch",
@@ -1950,7 +1939,7 @@ impl Client {
 
     /// Stage one protected incoming publication without exposing its plaintext.
     /// Adopt it with `adopt_protected_reception`; core saves it first.
-    pub fn poll_protected(&self) -> Result<Option<ProtectedReceptionCandidate>> {
+    pub fn poll_protected(&self) -> Result<Option<Arc<ProtectedReceptionCandidate>>> {
         let staged = self.call(Op::PollProtected, receive::poll_protected)?;
         staged
             .map(|staged| {
@@ -1984,15 +1973,15 @@ impl Client {
             receive::poll_pending(session, receive::PollPendingArgs::default())
         })?;
         Ok(pending.map(|pending| ReceivedProtectedPublication {
-            workspace: pending.workspace,
+            workspace: pending.workspace.into(),
             revision: pending.revision,
-            member: pending.member,
-            endpoint: pending.endpoint,
+            member: pending.member.into(),
+            endpoint: pending.endpoint.into(),
             topic: pending.topic,
-            id: pending.id,
+            id: pending.id.into(),
             sequence: pending.sequence,
             payload: pending.payload,
-            recipients: pending.recipients,
+            recipients: pending.recipients.into_iter().map(Into::into).collect(),
             counter: pending.counter,
             current: pending.current,
         }))
@@ -2003,7 +1992,7 @@ impl Client {
     pub fn stage_object_acknowledgement(
         &self,
         object: &ReceivedProtectedPublication,
-    ) -> Result<ProtectedReceptionCandidate> {
+    ) -> Result<Arc<ProtectedReceptionCandidate>> {
         self.stage_inbox_resolution(Op::StageObjectAcknowledgement, receive::acknowledge, object)
     }
 
@@ -2012,40 +2001,13 @@ impl Client {
     pub fn stage_object_rejection(
         &self,
         object: &ReceivedProtectedPublication,
-    ) -> Result<ProtectedReceptionCandidate> {
+    ) -> Result<Arc<ProtectedReceptionCandidate>> {
         self.stage_inbox_resolution(Op::StageObjectRejection, receive::reject, object)
-    }
-
-    fn stage_inbox_resolution(
-        &self,
-        op: Op,
-        stage: fn(
-            &mut Session,
-            receive::ResolveArgs,
-        ) -> std::result::Result<publication::StagedObject, ApiError>,
-        object: &ReceivedProtectedPublication,
-    ) -> Result<ProtectedReceptionCandidate> {
-        let staged = self.call(op, |session| {
-            stage(
-                session,
-                receive::ResolveArgs {
-                    member: object.member,
-                    topic: object.topic.clone(),
-                    counter: object.counter,
-                    id: object.id,
-                },
-            )
-        })?;
-        Ok(ProtectedReceptionCandidate::new(
-            self.handle()?,
-            staged.workspace,
-            staged.snapshot,
-        ))
     }
 
     pub fn set_interest(
         &self,
-        workspace: [u8; 32],
+        workspace: WorkspaceId,
         revision: u64,
         topic: &str,
         subscribed: bool,
@@ -2054,7 +2016,7 @@ impl Client {
             ops::policy::set_interest(
                 session,
                 ops::policy::InterestArgs {
-                    workspace,
+                    workspace: workspace.to_bytes(),
                     revision,
                     topic: topic.to_owned(),
                     subscribed,
@@ -2092,45 +2054,11 @@ impl Client {
                 )
             })?;
         Ok(Some(InterestObservation {
-            workspace: raw.workspace,
+            workspace: raw.workspace.into(),
             revision: raw.revision,
             topic: raw.topic,
             subscribed: raw.subscribed,
             admission: raw.admission.into(),
-        }))
-    }
-
-    /// Fixture: an unprotected publication. Rejected once the session owns
-    /// a workspace.
-    pub fn publish(
-        &self,
-        workspace: [u8; 32],
-        revision: u64,
-        topic: &str,
-        payload: Vec<u8>,
-    ) -> Result<DeliveryReport> {
-        self.call(Op::Publish, |session| {
-            ops::policy::publish(
-                session,
-                ops::policy::PublishArgs {
-                    workspace,
-                    revision,
-                    topic: topic.to_owned(),
-                    payload,
-                },
-            )
-        })
-    }
-
-    /// Fixture: the next unprotected message.
-    pub fn poll(&self) -> Result<Option<Publication>> {
-        let message = self.call(Op::Poll, ops::policy::poll)?;
-        Ok(message.map(|message| Publication {
-            workspace: message.workspace,
-            revision: message.revision,
-            sender: message.sender,
-            topic: message.topic,
-            payload: message.payload,
         }))
     }
 
@@ -2152,8 +2080,8 @@ impl Client {
             ops::recovery::fetch_range(
                 session,
                 ops::recovery::FetchRangeArgs {
-                    peer: request.peer,
-                    author: request.author,
+                    peer: request.peer.map(EndpointId::to_bytes),
+                    author: request.author.map(MemberId::to_bytes),
                     revision: request.revision,
                     topics: request.topics,
                     after: request.after,
@@ -2182,27 +2110,7 @@ impl Client {
         let staged = self.call(Op::StageRecoveryRange, |session| {
             ops::recovery::stage_range(session, ops::recovery::StageRangeArgs { retain_until })
         })?;
-        match staged {
-            ops::recovery::RecoveryStaged::Candidate(candidate) => {
-                Ok(RecoveryStage::Candidate(RecoveryCandidate {
-                    candidate: ProtectedReceptionCandidate::new(
-                        self.handle()?,
-                        candidate.workspace,
-                        candidate.snapshot,
-                    ),
-                    publication_count: candidate.publication_count.unwrap_or(0),
-                }))
-            }
-            ops::recovery::RecoveryStaged::Nothing(nothing) => match nothing.state {
-                "recovery_already_covered" => Ok(RecoveryStage::AlreadyCovered),
-                "recovery_no_new_objects" => Ok(RecoveryStage::NoNewObjects),
-                "recovery_awaiting_application" => Ok(RecoveryStage::AwaitingApplication),
-                other => Err(error(
-                    ErrorKind::Internal,
-                    format!("unknown recovery stage: {other}"),
-                )),
-            },
-        }
+        self.recovery_stage(staged)
     }
 
     pub fn adopt_recovery(&self, candidate: &RecoveryCandidate) -> Result<RecoveryAdoption> {
@@ -2227,12 +2135,12 @@ impl Client {
             }
         };
         Ok(RecoveryAdoption {
-            workspace: adopted.workspace,
+            workspace: adopted.workspace.into(),
             epoch: adopted.epoch,
-            member_count: adopted.members,
+            member_count: adopted.members as u64,
             durable: adopted.durable,
-            recovered_publications,
-            missing_publications,
+            recovered_publications: recovered_publications as u64,
+            missing_publications: missing_publications as u64,
         })
     }
 
@@ -2245,6 +2153,122 @@ impl Client {
         }
         Ok(crate::registry::close_session(self.handle)?)
     }
+}
+
+impl Client {
+    /// A native storage call. These report every failure as `Storage`, as
+    /// before; `code()` gives the exact failure.
+    fn stored<T>(
+        &self,
+        body: impl FnOnce(&mut Session) -> std::result::Result<T, ApiError>,
+    ) -> Result<T> {
+        persistence::with_session(self.handle()?, body).map_err(client_error)
+    }
+
+    fn nearby_advertisement(&self, args: ops::nearby::AdvertiseArgs) -> Result<bool> {
+        let state = self.call(Op::SetNearbyWorkspace, |session| {
+            ops::nearby::advertise(session, args)
+        })?;
+        Ok(state.state == "nearby_workspace_advertised")
+    }
+
+    /// `set_deadline`, as a builder.
+    pub fn with_deadline(self: Arc<Self>, deadline: std::time::Duration) -> Arc<Self> {
+        self.set_deadline(Some(deadline));
+        self
+    }
+
+    /// Fixture: install a caller-made routing policy. Rejected once the
+    /// session owns a workspace.
+    #[cfg(feature = "test-fixtures")]
+    pub fn install_policy(
+        &self,
+        workspace: WorkspaceId,
+        revision: u64,
+        endpoints: &[PeerPolicy],
+    ) -> Result<()> {
+        let endpoints = endpoints
+            .iter()
+            .map(|policy| ops::policy::EndpointPolicy {
+                peer: policy.peer.to_bytes(),
+                publish: policy.publish.clone(),
+                subscribe: policy.subscribe.clone(),
+            })
+            .collect();
+        self.call(Op::InstallVerifiedPolicy, |session| {
+            ops::policy::install_verified_policy(
+                session,
+                ops::policy::VerifiedPolicyArgs {
+                    workspace: workspace.to_bytes(),
+                    revision,
+                    endpoints,
+                },
+            )
+        })
+    }
+
+    fn stage_inbox_resolution(
+        &self,
+        op: Op,
+        stage: fn(
+            &mut Session,
+            receive::ResolveArgs,
+        ) -> std::result::Result<publication::StagedObject, ApiError>,
+        object: &ReceivedProtectedPublication,
+    ) -> Result<Arc<ProtectedReceptionCandidate>> {
+        let staged = self.call(op, |session| {
+            stage(
+                session,
+                receive::ResolveArgs {
+                    member: object.member.to_bytes(),
+                    topic: object.topic.clone(),
+                    counter: object.counter,
+                    id: object.id.to_bytes(),
+                },
+            )
+        })?;
+        Ok(ProtectedReceptionCandidate::new(
+            self.handle()?,
+            staged.workspace,
+            staged.snapshot,
+        ))
+    }
+
+    /// Fixture: an unprotected publication. Rejected once the session owns
+    /// a workspace.
+    #[cfg(feature = "test-fixtures")]
+    pub fn publish(
+        &self,
+        workspace: WorkspaceId,
+        revision: u64,
+        topic: &str,
+        payload: Vec<u8>,
+    ) -> Result<DeliveryReport> {
+        self.call(Op::Publish, |session| {
+            ops::policy::publish(
+                session,
+                ops::policy::PublishArgs {
+                    workspace: workspace.to_bytes(),
+                    revision,
+                    topic: topic.to_owned(),
+                    payload,
+                },
+            )
+        })
+    }
+
+    /// Fixture: the next unprotected message.
+    #[cfg(feature = "test-fixtures")]
+    pub fn poll(&self) -> Result<Option<Publication>> {
+        let message = self.call(Op::Poll, ops::policy::poll)?;
+        Ok(message.map(|message| Publication {
+            workspace: message.workspace.into(),
+            revision: message.revision,
+            sender: message.sender.into(),
+            topic: message.topic,
+            payload: message.payload,
+        }))
+    }
 
     /// Run one typed op on this client's session (guards and wake-ups
     /// included; see `ops::run`).
@@ -2253,7 +2277,7 @@ impl Client {
         op: Op,
         body: impl FnOnce(&mut Session) -> std::result::Result<T, ApiError>,
     ) -> Result<T> {
-        ops::run(self.handle()?, op, body).map_err(Error::from)
+        ops::run(self.handle()?, op, body).map_err(client_error)
     }
 
     /// Adopt `staged` if it belongs to this client, is unused, and is one of
@@ -2265,7 +2289,7 @@ impl Client {
         kinds: &[CandidateKind],
     ) -> Result<candidate::AdoptReply> {
         if staged.client != self.handle()? {
-            return Err(Error::from(ApiError::wrong_state(
+            return Err(client_error(ApiError::wrong_state(
                 "candidate belongs to another client",
             )));
         }
@@ -2278,7 +2302,7 @@ impl Client {
         Ok(reply)
     }
 
-    fn candidate_of(&self, staged: management::StagedCandidate) -> Result<WorkspaceCandidate> {
+    fn candidate_of(&self, staged: management::StagedCandidate) -> Result<Arc<WorkspaceCandidate>> {
         Ok(WorkspaceCandidate::new(
             self.handle()?,
             staged.workspace,
@@ -2304,9 +2328,9 @@ impl Drop for Client {
 
 fn join_request(pending: join::PendingJoinInfo) -> Result<JoinRequest> {
     Ok(JoinRequest {
-        workspace: pending.workspace,
-        member: pending.member.id,
-        endpoint: pending.endpoint,
+        workspace: pending.workspace.into(),
+        member: pending.member.id.into(),
+        endpoint: pending.endpoint.into(),
         admission_request: pending.admission_request.ok_or_else(|| {
             error(
                 ErrorKind::InvalidInput,
@@ -2324,21 +2348,21 @@ fn range_status(status: ops::recovery::RangeStatus) -> RecoveryRangeStatus {
             automatic_source,
             ..
         } => RecoveryRangeStatus::Pending {
-            candidate_count,
+            candidate_count: candidate_count as u64,
             automatic_source,
         },
         S::RecoveryRangeReady(ready) => RecoveryRangeStatus::Ready(RecoveryRangeReady {
-            workspace: ready.workspace,
-            author: ready.author,
-            peer: ready.peer,
+            workspace: ready.workspace.into(),
+            author: ready.author.into(),
+            peer: ready.peer.into(),
             epoch: ready.epoch,
             revision: ready.revision,
             after: ready.after,
             through: ready.through,
-            packet_count: ready.packet_count,
-            retained_bytes: ready.retained_bytes,
+            packet_count: ready.packet_count as u64,
+            retained_bytes: ready.retained_bytes as u64,
             automatic_source: ready.automatic_source,
-            attempted: ready.attempted,
+            attempted: ready.attempted.map(|value| value as u64),
         }),
         // The runtime only waits for a source when it looks automatically.
         S::RecoverySourceWaiting { .. } => RecoveryRangeStatus::SourceWaiting {
@@ -2350,7 +2374,7 @@ fn range_status(status: ops::recovery::RangeStatus) -> RecoveryRangeStatus {
             automatic_source,
             ..
         } => RecoveryRangeStatus::SourceUnavailable {
-            attempted,
+            attempted: attempted as u64,
             reason,
             automatic_source,
         },
@@ -2361,10 +2385,10 @@ fn range_status(status: ops::recovery::RangeStatus) -> RecoveryRangeStatus {
 
 fn opened_info(opened: ops::workspace::WorkspaceOpened) -> WorkspaceInfo {
     WorkspaceInfo {
-        workspace: opened.workspace,
+        workspace: opened.workspace.into(),
         workspace_name: opened.workspace_name,
         epoch: opened.epoch,
-        member_count: opened.members,
+        member_count: opened.members as u64,
         durable: opened.durable,
         phase: opened.activity.phase,
         reason: opened.activity.reason,
@@ -2373,10 +2397,10 @@ fn opened_info(opened: ops::workspace::WorkspaceOpened) -> WorkspaceInfo {
 
 fn workspace_info(adopted: candidate::Adopted) -> WorkspaceInfo {
     WorkspaceInfo {
-        workspace: adopted.workspace,
+        workspace: adopted.workspace.into(),
         workspace_name: adopted.workspace_name,
         epoch: adopted.epoch,
-        member_count: adopted.members,
+        member_count: adopted.members as u64,
         durable: adopted.durable,
         phase: adopted.activity.phase,
         reason: adopted.activity.reason,
@@ -2384,7 +2408,7 @@ fn workspace_info(adopted: candidate::Adopted) -> WorkspaceInfo {
 }
 
 impl TryFrom<crate::membership::RosterMember> for MemberInfo {
-    type Error = Error;
+    type Error = ApiError;
 
     fn try_from(value: crate::membership::RosterMember) -> Result<Self> {
         let kind = match value.kind {
@@ -2400,8 +2424,8 @@ impl TryFrom<crate::membership::RosterMember> for MemberInfo {
             _ => return Err(error(ErrorKind::Internal, "invalid member presence")),
         };
         Ok(Self {
-            id: value.id,
-            endpoint: value.endpoint,
+            id: value.id.into(),
+            endpoint: value.endpoint.into(),
             administrator: value.administrator,
             self_member: value.self_member,
             display_name: value.display_name,
@@ -2447,13 +2471,13 @@ struct RawPublication {
 impl From<RawDeliveryReport> for DeliveryReport {
     fn from(value: RawDeliveryReport) -> Self {
         Self {
-            admitted: value.admitted,
+            admitted: value.admitted.into_iter().map(Into::into).collect(),
             queued: value.queued,
             failed: value
                 .failed
                 .into_iter()
                 .map(|failure| DeliveryFailure {
-                    peer: failure.peer,
+                    peer: failure.peer.into(),
                     error: failure.error,
                 })
                 .collect(),
@@ -2464,9 +2488,9 @@ impl From<RawDeliveryReport> for DeliveryReport {
 impl From<RawPublication> for Publication {
     fn from(value: RawPublication) -> Self {
         Self {
-            workspace: value.workspace,
+            workspace: value.workspace.into(),
             revision: value.revision,
-            sender: value.sender,
+            sender: value.sender.into(),
             topic: value.topic,
             payload: value.payload,
         }
@@ -2474,57 +2498,52 @@ impl From<RawPublication> for Publication {
 }
 
 /// An error the client itself finds (bad arguments, a reply it cannot use).
-fn error(kind: ErrorKind, message: impl Into<String>) -> Error {
+fn error(kind: ErrorKind, message: impl Into<String>) -> ApiError {
     let message = message.into();
-    let api = match kind {
+    match kind {
         ErrorKind::Closed => ApiError::Closed,
-        ErrorKind::InvalidInput => ApiError::invalid_input("", message.clone()),
-        ErrorKind::Capacity => ApiError::capacity_exceeded("", 0, message.clone()),
-        ErrorKind::Storage => ApiError::storage_failed(message.clone()),
-        ErrorKind::Transport => ApiError::transport_failed(None, message.clone()),
-        ErrorKind::Cancelled => ApiError::Cancelled,
-        ErrorKind::Internal => ApiError::internal(message.clone()),
-    };
-    Error {
-        kind,
-        message,
-        error: api,
+        ErrorKind::InvalidInput => ApiError::invalid_input("", message),
+        ErrorKind::Transport => ApiError::transport_failed(None, message),
+        ErrorKind::Internal => ApiError::internal(message),
     }
 }
 
-#[test]
-fn error_kind_comes_from_the_code_table() {
-    let cases = [
-        (ApiError::Closed, ErrorKind::Closed),
-        (crate::errors::unknown_handle(), ErrorKind::Closed),
-        (ApiError::Cancelled, ErrorKind::Cancelled),
-        (ApiError::DeadlineExceeded, ErrorKind::Cancelled),
-        (
-            ApiError::invalid_input("topic", "bad"),
-            ErrorKind::InvalidInput,
-        ),
-        (ApiError::wrong_state("busy"), ErrorKind::InvalidInput),
-        (
-            ApiError::limit_reached("sessions", 8, "node limit reached"),
-            ErrorKind::Capacity,
-        ),
-        (ApiError::candidate_stale("old"), ErrorKind::Storage),
-        (
-            crate::errors::node(arachne_node::Error::Transport(
-                "aborted by peer: connection limit for unknown endpoints".into(),
-            )),
-            ErrorKind::Transport,
-        ),
-        (
-            ApiError::invitation_expired("late"),
-            ErrorKind::InvalidInput,
-        ),
-        (ApiError::epoch_mismatch("moved"), ErrorKind::InvalidInput),
-        (ApiError::internal("bug"), ErrorKind::Internal),
-    ];
-    for (api, kind) in cases {
-        let error = Error::from(api.clone());
-        assert_eq!(error.kind(), kind, "{api:?}");
-        assert_eq!(error.code(), api.code());
+/// Counters of the stream transport. Queued data is not a remote receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct StreamMetrics {
+    pub sessions_total: u64,
+    pub sessions_active: u64,
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub rejected_sessions: u64,
+    pub interest_sync_pending: u64,
+    pub last_error: Option<String>,
+}
+
+mod recovery;
+pub use recovery::*;
+
+mod resources;
+pub use resources::*;
+
+mod progress;
+pub use progress::*;
+
+/// Native transport defaults for foreign bindings.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn default_transport_options() -> TransportOptions {
+    TransportOptions::default()
+}
+
+/// Start with the profile defaults; attach a persistent key and storage before
+/// opening a workspace client.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn default_client_config(network: Network) -> ClientConfig {
+    ClientConfig {
+        network,
+        secret: None,
+        transport: TransportOptions::default(),
+        storage: None,
     }
 }

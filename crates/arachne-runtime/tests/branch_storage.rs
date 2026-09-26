@@ -2,12 +2,12 @@
 //! next candidate. A restart must not silently discard the rollback window.
 use arachne_runtime::{Client, ClientConfig, MemoryProvider, Network, RestoredWorkspace, StorageConfig};
 
-fn open(provider: &MemoryProvider) -> Client {
+fn open(provider: &MemoryProvider) -> std::sync::Arc<Client> {
     Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([171; 32]),
+        secret: Some(([171; 32]).into()),
         transport: Default::default(),
-        storage: Some(StorageConfig::memory(provider)),
+        storage: Some((StorageConfig::memory(provider)).into()),
     })
     .unwrap()
 }

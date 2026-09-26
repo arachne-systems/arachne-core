@@ -13,6 +13,9 @@ use arachne_node::{
 };
 use serde_json::{Value, json};
 
+#[cfg(feature = "uniffi")]
+uniffi::setup_scaffolding!();
+mod client_wire;
 mod client;
 mod committed_view;
 mod context;
@@ -56,6 +59,7 @@ mod membership;
 /// permission grant: these encode/decode DFMQ frames; all authorization
 /// still happens at the receiving member.
 #[doc(hidden)]
+#[cfg(feature = "test-fixtures")]
 pub mod harness {
     pub use crate::membership::StateBasis;
     pub use crate::membership::wire::{Query, decode_reply, encode_query};
@@ -92,22 +96,25 @@ pub(crate) mod presence;
 mod resources;
 mod work_signal;
 mod workspace_activity;
-pub use arachne_api::{ApiError, ErrorCode, Event, Limits, PowerProfile};
+pub use arachne_api::{ApiError, AttemptId, EndpointId, ErrorCode, Event, Key32, Limits, MemberId, PowerProfile, RecordId, WorkspaceId};
 pub use context::{Context, ContextConfig, RuntimeConfig};
 pub use client::{
+    default_client_config, default_transport_options,
+
     AdmissionApproval, AdmissionApprovalPage, AdmissionAuthorization, InvitationCheckpoint,
     InvitationControl, InvitationKind, MemberAction, NearbyAdvertisement, NearbyEndpoint,
     NearbyMode, NearbyScan, PresenceRound, RemovedMembership, AdmissionReply, Client, ClientConfig, ConnectivityReport,
     ConnectionCapacityMetrics, ControlTimingMetrics, DeliveryFailure, DeliveryReport,
-    DurationSummary, EndpointInfo, Error, ErrorKind, InterestObservation, InvitationDetails,
+    DurationSummary, EndpointInfo, InterestObservation, InvitationDetails,
     InvitationInfo, JoinAdmissionStep, JoinRequest, MemberInfo, MemberKind,
     MembershipGossipMetrics, MemberRoster, Network, PeerPolicy, PeerRoute, Presence, Publication,
     PublicationCandidate, PublicationCurrent, ProtectedReceptionCandidate,
     ReceivedProtectedPublication, RecoveryAdoption, RecoveryCandidate, RecoveryRangeReady,
     RecoveryRangeRequest, RecoveryRangeStatus, RecoveryStage, Result as ClientResult, RouteHint,
-    RestoredJoin, RestoredWorkspace, InvitationCandidate, JoinCandidate, RemovalCandidate, RouteKind, WorkspaceCandidate, WorkspaceInfo, WorkspaceMetrics, WorkspaceState,
+    StreamMetrics, RestoredJoin, RestoredWorkspace, InvitationCandidate, JoinCandidate, RemovalCandidate, RouteKind, WorkspaceCandidate, WorkspaceInfo, WorkspaceMetrics, WorkspaceState,
 };
-pub use client::{OperatorRelay, RelayTrust, TransportInfo, TransportOptions, TransportTimeouts};
+pub use client::{
+OperatorRelay, RelayTrust, TransportInfo, TransportOptions, TransportTimeouts};
 pub use arachne_store::{
     AnchorSlots, AnchorStore, FreshnessAnchor, MemoryAnchors, MemoryProvider, SqliteProvider,
     Storage, StorageProvider,
@@ -153,13 +160,13 @@ pub mod admission_state {
 
 fn report(value: AdmissionReport) -> DeliveryReport {
     DeliveryReport {
-        admitted: value.admitted,
+        admitted: value.admitted.into_iter().map(Into::into).collect(),
         queued: value.queued,
         failed: value
             .failed
             .into_iter()
             .map(|(peer, error)| DeliveryFailure {
-                peer,
+                peer: peer.into(),
                 error: error.to_string(),
             })
             .collect(),
@@ -195,3 +202,18 @@ pub(crate) fn test_key(label: u64) -> &'static arachne_security::EndpointKey {
 pub(crate) fn test_endpoint(label: u64) -> [u8; 32] {
     arachne_security::EndpointSigner::endpoint(test_key(label))
 }
+
+pub use client::{
+CurrentViewAdoption, CurrentViewCandidate, CurrentViewRequest, CurrentViewStatus,
+    DirectRecoveryReady, DirectRecoveryRequest, DirectRecoveryStatus,
+    RecoveryCutoffRequest, RecoveryCutoffStatus};
+
+pub use client::{
+ResourceRequest, ResourceStatus, ResourceTicket};
+
+pub use client::{
+AdmissionGrant, AdmissionResponse, AdmissionStatus, AdmissionStatusKind,
+    JoinProgress, MemberUpdate, MemberUpdateState, MembershipCandidate,
+    WorkspaceProgress, WorkspaceProgressState};
+
+pub use client::AdmissionNotice;

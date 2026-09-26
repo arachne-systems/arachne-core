@@ -5,6 +5,8 @@ use serde_json::Value;
 /// Durable lifecycle phases projected to every adapter.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum Phase {
     Empty,
     Creating,
@@ -22,6 +24,7 @@ pub enum Phase {
 /// details remain separate projections; this value only answers where the
 /// workspace operation is and why it stopped.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Activity {
     pub phase: Phase,
     pub reason: Option<String>,

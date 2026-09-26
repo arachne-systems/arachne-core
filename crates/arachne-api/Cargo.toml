@@ -12,15 +12,14 @@ keywords = ["api-bindings", "p2p", "networking"]
 documentation = "https://docs.rs/arachne-api"
 publish = ["crates-io"]
 
-# TODO(ADR A1/A4 step 7): add an optional `uniffi` feature (UniFFI `=0.31.x`)
-# with `cfg_attr(feature = "uniffi", derive(uniffi::Record/Enum/Error))` on the
-# public types and `uniffi::setup_scaffolding!()` in lib.rs. Spike
-# `#[non_exhaustive]` on `uniffi::Enum`/`uniffi::Error` first.
+# Matches the supported SDK binding generator. Core has no FFI dependency by default.
 [features]
+uniffi = ["dep:uniffi"]
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
+uniffi = { version = "=0.31.2", optional = true }
 
 [dev-dependencies]
 serde_json = "1.0.151"

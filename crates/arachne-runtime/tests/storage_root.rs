@@ -5,7 +5,7 @@ use arachne_runtime::{
 
 mod common;
 
-fn open(secret: Option<[u8; 32]>, storage: StorageConfig) -> Client {
+fn open(secret: Option<[u8; 32]>, storage: StorageConfig) -> std::sync::Arc<Client> {
     Client::open(ClientConfig {
         network: Network::Direct,
         secret,

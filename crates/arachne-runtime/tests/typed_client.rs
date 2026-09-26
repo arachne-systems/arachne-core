@@ -1,5 +1,5 @@
 use arachne_runtime::{
-    Client, ClientConfig, ErrorKind, JoinAdmissionStep, MemberKind, MemoryProvider, Network,
+    Client, ClientConfig, ErrorCode, JoinAdmissionStep, MemberKind, MemoryProvider, Network,
     PeerPolicy, Presence, ReceivedProtectedPublication, RecoveryRangeRequest, RecoveryRangeStatus,
     StorageConfig, WorkspacePhase,
 };
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 fn typed_client_reports_endpoint_and_workspace_state_then_closes() {
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([7; 32]),
+        secret: Some(([7; 32]).into()),
         transport: Default::default(),
         storage: None,
     })
@@ -32,7 +32,7 @@ fn typed_client_reports_endpoint_and_workspace_state_then_closes() {
     // Close is idempotent (ADR step 4); other calls report Closed.
     client.close().unwrap();
     let error = client.endpoint().unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Closed);
+    assert_eq!(error.code(), ErrorCode::Closed);
 }
 
 #[test]
@@ -40,14 +40,14 @@ fn typed_client_creates_named_workspace_with_typed_state() {
     let provider = MemoryProvider::default();
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([10; 32]),
+        secret: Some(([10; 32]).into()),
         transport: Default::default(),
-        storage: Some(StorageConfig::memory(&provider)),
+        storage: Some((StorageConfig::memory(&provider)).into()),
     })
     .unwrap();
 
     let workspace = client
-        .create_workspace("Owner", Some("Field Team"))
+        .create_workspace("Owner", Some("Field Team".into()))
         .unwrap();
     assert_eq!(workspace.workspace_name.as_deref(), Some("Field Team"));
     assert_eq!(workspace.member_count, 1);
@@ -66,9 +66,9 @@ fn typed_client_exposes_recovery_result_without_vendor_types() {
     let provider = MemoryProvider::default();
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([11; 32]),
+        secret: Some(([11; 32]).into()),
         transport: Default::default(),
-        storage: Some(StorageConfig::memory(&provider)),
+        storage: Some((StorageConfig::memory(&provider)).into()),
     })
     .unwrap();
     client.create_workspace("Owner", None).unwrap();
@@ -83,9 +83,9 @@ fn typed_client_exposes_recovery_request_lifecycle() {
     let provider = MemoryProvider::default();
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([15; 32]),
+        secret: Some(([15; 32]).into()),
         transport: Default::default(),
-        storage: Some(StorageConfig::memory(&provider)),
+        storage: Some((StorageConfig::memory(&provider)).into()),
     })
     .unwrap();
     let workspace = client.create_workspace("Owner", None).unwrap();
@@ -117,20 +117,20 @@ fn typed_clients_recover_an_opaque_publication() {
     let reader_provider = MemoryProvider::default();
     let mut owner = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([16; 32]),
+        secret: Some(([16; 32]).into()),
         transport: Default::default(),
-        storage: Some(StorageConfig::memory(&owner_provider)),
+        storage: Some((StorageConfig::memory(&owner_provider)).into()),
     })
     .unwrap();
     let mut reader = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([17; 32]),
+        secret: Some(([17; 32]).into()),
         transport: Default::default(),
-        storage: Some(StorageConfig::memory(&reader_provider)),
+        storage: Some((StorageConfig::memory(&reader_provider)).into()),
     })
     .unwrap();
     let workspace = owner
-        .create_workspace("Owner", Some("Recovery proof"))
+        .create_workspace("Owner", Some("Recovery proof".into()))
         .unwrap();
     let candidate = owner.stage_invitation(0).unwrap();
     let invitation = owner.adopt_invitation(&candidate).unwrap();
@@ -243,9 +243,9 @@ fn typed_client_rejects_wrong_publication_workspace_before_staging() {
     let provider = MemoryProvider::default();
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([18; 32]),
+        secret: Some(([18; 32]).into()),
         transport: Default::default(),
-        storage: Some(StorageConfig::memory(&provider)),
+        storage: Some((StorageConfig::memory(&provider)).into()),
     })
     .unwrap();
     let workspace = client.create_workspace("Owner", None).unwrap();
@@ -257,7 +257,7 @@ fn typed_client_rejects_wrong_publication_workspace_before_staging() {
     let rejected = client
         .stage_protected_publication(other, revision, "streams/example", [1; 16], vec![1])
         .unwrap_err();
-    assert_eq!(rejected.kind(), ErrorKind::InvalidInput, "{rejected}");
+    assert_eq!(rejected.code(), ErrorCode::InvalidInput, "{rejected}");
 
     // Nothing was staged: the session still accepts ordinary operations.
     client.member_roster().unwrap();
@@ -281,9 +281,9 @@ fn typed_client_restores_only_with_matching_freshness_anchor() {
     let root = [19; 32];
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some(root),
+        secret: Some((root).into()),
         transport: Default::default(),
-        storage: Some(StorageConfig::sqlite(directory.path(), root)),
+        storage: Some((StorageConfig::sqlite(directory.path(), root)).into()),
     })
     .unwrap();
     let workspace = client.create_workspace("Owner", None).unwrap();
@@ -294,15 +294,15 @@ fn typed_client_restores_only_with_matching_freshness_anchor() {
     stale.revision += 1;
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some(root),
+        secret: Some((root).into()),
         transport: Default::default(),
-        storage: Some(StorageConfig::sqlite(directory.path(), root)),
+        storage: Some((StorageConfig::sqlite(directory.path(), root)).into()),
     })
     .unwrap();
     let rejected = client
         .restore_workspace(workspace.workspace, Some(stale))
         .unwrap_err();
-    assert_eq!(rejected.kind(), ErrorKind::Storage);
+    assert_eq!(rejected.code(), ErrorCode::StorageFailed);
     client
         .restore_workspace(workspace.workspace, Some(anchor))
         .unwrap();
@@ -315,9 +315,9 @@ fn typed_client_exposes_workspace_roster_and_profile_projection() {
     let provider = MemoryProvider::default();
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([12; 32]),
+        secret: Some(([12; 32]).into()),
         transport: Default::default(),
-        storage: Some(StorageConfig::memory(&provider)),
+        storage: Some((StorageConfig::memory(&provider)).into()),
     })
     .unwrap();
     let workspace = client.create_workspace("Owner", None).unwrap();
@@ -338,13 +338,13 @@ fn typed_client_issues_an_invitation_with_bounded_route_hints() {
     let provider = MemoryProvider::default();
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([13; 32]),
+        secret: Some(([13; 32]).into()),
         transport: Default::default(),
-        storage: Some(StorageConfig::memory(&provider)),
+        storage: Some((StorageConfig::memory(&provider)).into()),
     })
     .unwrap();
     let workspace = client
-        .create_workspace("Owner", Some("Field Team"))
+        .create_workspace("Owner", Some("Field Team".into()))
         .unwrap();
 
     let candidate = client.stage_invitation(0).unwrap();
@@ -370,9 +370,9 @@ fn typed_client_reports_connectivity_without_exposing_transport_types() {
     let provider = MemoryProvider::default();
     let mut client = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([14; 32]),
+        secret: Some(([14; 32]).into()),
         transport: Default::default(),
-        storage: Some(StorageConfig::memory(&provider)),
+        storage: Some((StorageConfig::memory(&provider)).into()),
     })
     .unwrap();
     let workspace = client.create_workspace("Owner", None).unwrap();
@@ -395,17 +395,18 @@ fn typed_client_reports_connectivity_without_exposing_transport_types() {
 }
 
 #[test]
+#[cfg(feature = "test-fixtures")]
 fn typed_client_routes_opaque_publication_and_reports_interest() {
     let mut publisher = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([8; 32]),
+        secret: Some(([8; 32]).into()),
         transport: Default::default(),
         storage: None,
     })
     .unwrap();
     let mut subscriber = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([9; 32]),
+        secret: Some(([9; 32]).into()),
         transport: Default::default(),
         storage: None,
     })
@@ -487,9 +488,9 @@ fn typed_admission_ops_report_codes_and_pages() {
     let provider = MemoryProvider::default();
     let mut owner = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([21; 32]),
+        secret: Some(([21; 32]).into()),
         transport: Default::default(),
-        storage: Some(StorageConfig::memory(&provider)),
+        storage: Some((StorageConfig::memory(&provider)).into()),
     })
     .unwrap();
     owner.create_workspace("Owner", None).unwrap();
@@ -499,7 +500,7 @@ fn typed_admission_ops_report_codes_and_pages() {
     assert_eq!(page.next_after, None);
     let error = owner.admission_approvals(None, Some(65)).unwrap_err();
     assert_eq!(error.code(), ErrorCode::InvalidInput);
-    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert_eq!(error.code(), ErrorCode::InvalidInput);
     assert_eq!(
         owner.acknowledge_admission_approval([1; 32]).unwrap_err().code(),
         ErrorCode::WrongState
@@ -526,12 +527,12 @@ fn typed_management_invitation_and_name_ops() {
     let provider = MemoryProvider::default();
     let mut owner = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([22; 32]),
+        secret: Some(([22; 32]).into()),
         transport: Default::default(),
-        storage: Some(StorageConfig::memory(&provider)),
+        storage: Some((StorageConfig::memory(&provider)).into()),
     })
     .unwrap();
-    let workspace = owner.create_workspace("Owner", Some("Team")).unwrap();
+    let workspace = owner.create_workspace("Owner", Some("Team".into())).unwrap();
 
     let renamed = owner.stage_workspace_name("Field Team").unwrap();
     assert_eq!(renamed.workspace(), workspace.workspace);

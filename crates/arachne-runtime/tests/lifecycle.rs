@@ -16,9 +16,9 @@ fn context() -> Arc<Context> {
 fn direct(secret: Option<[u8; 32]>) -> ClientConfig {
     ClientConfig {
         network: Network::Direct,
-        secret,
+        secret: secret.map(Into::into),
         transport: Default::default(),
-        storage: Some(StorageConfig::memory(&MemoryProvider::default())),
+        storage: Some((StorageConfig::memory(&MemoryProvider::default())).into()),
     }
 }
 
@@ -80,7 +80,7 @@ fn a_per_op_deadline_fails_the_op_and_keeps_the_session() {
     let client = context
         .open(ClientConfig {
             network: Network::Direct,
-            secret: Some([61; 32]),
+            secret: Some(([61; 32]).into()),
             transport: TransportOptions {
                 timeouts: Some(TransportTimeouts {
                     operation: Duration::from_secs(30),
@@ -90,7 +90,7 @@ fn a_per_op_deadline_fails_the_op_and_keeps_the_session() {
                 }),
                 ..Default::default()
             },
-            storage: Some(StorageConfig::memory(&MemoryProvider::default())),
+            storage: Some((StorageConfig::memory(&MemoryProvider::default())).into()),
         })
         .unwrap()
         .with_deadline(Duration::from_millis(300));
@@ -149,7 +149,7 @@ fn next_event_times_out_and_wakes_with_none() {
 fn next_event_reports_a_control_request() {
     let context = context();
     let owner = context.open(direct(Some([81; 32]))).unwrap();
-    owner.create_workspace("Event owner", Some("Events")).unwrap();
+    owner.create_workspace("Event owner", Some("Events".into())).unwrap();
     let peer = owner.endpoint().unwrap().endpoint_key;
     let address: std::net::SocketAddr = local(&owner).parse().unwrap();
     let sender = thread::spawn(move || {
@@ -176,12 +176,13 @@ fn next_event_reports_a_control_request() {
 
 /// A fixture publisher and subscriber with routes both ways and the
 /// subscriber's interest announced (not yet observed).
-fn pubsub(context: &Arc<Context>, seed: u8) -> (Client, Client, [u8; 32], &'static str) {
+#[cfg(feature = "test-fixtures")]
+fn pubsub(context: &Arc<Context>, seed: u8) -> (Arc<Client>, Arc<Client>, arachne_runtime::WorkspaceId, &'static str) {
     let publisher = context.open(direct(Some([seed; 32]))).unwrap();
     let subscriber = context.open(direct(Some([seed + 1; 32]))).unwrap();
     let publisher_key = publisher.endpoint().unwrap().endpoint_key;
     let subscriber_key = subscriber.endpoint().unwrap().endpoint_key;
-    let workspace = [seed + 2; 32];
+    let workspace = arachne_runtime::WorkspaceId::from_bytes([seed + 2; 32]);
     let topic = "streams/events";
     let policy = [
         PeerPolicy {
@@ -208,6 +209,7 @@ fn pubsub(context: &Arc<Context>, seed: u8) -> (Client, Client, [u8; 32], &'stat
 }
 
 #[test]
+#[cfg(feature = "test-fixtures")]
 fn next_event_reports_interest_and_publication() {
     let context = context();
     let (publisher, subscriber, workspace, topic) = pubsub(&context, 71);
@@ -256,7 +258,7 @@ fn next_event_reports_interest_and_publication() {
 fn suspend_stops_background_timers_and_resume_restores_them() {
     let context = context();
     let owner = context.open(direct(Some([91; 32]))).unwrap();
-    let info = owner.create_workspace("Suspend owner", Some("Suspend")).unwrap();
+    let info = owner.create_workspace("Suspend owner", Some("Suspend".into())).unwrap();
     owner.install_workspace_policy(info.epoch + 1).unwrap();
     assert_eq!(context.background_timers(), 1, "one gossip overlay");
 
@@ -333,7 +335,7 @@ fn close_while_another_thread_is_inside_an_op_is_bounded() {
         context
             .open(ClientConfig {
                 network: Network::Direct,
-                secret: Some([62; 32]),
+                secret: Some(([62; 32]).into()),
                 transport: TransportOptions {
                     timeouts: Some(TransportTimeouts {
                         operation: Duration::from_secs(30),
@@ -343,7 +345,7 @@ fn close_while_another_thread_is_inside_an_op_is_bounded() {
                     }),
                     ..Default::default()
                 },
-                storage: Some(StorageConfig::memory(&MemoryProvider::default())),
+                storage: Some((StorageConfig::memory(&MemoryProvider::default())).into()),
             })
             .unwrap(),
     );
@@ -367,6 +369,7 @@ fn close_while_another_thread_is_inside_an_op_is_bounded() {
 }
 
 #[test]
+#[cfg(feature = "test-fixtures")]
 fn suspend_closes_idle_connections_and_resume_reconnects() {
     let context = context();
     let (publisher, subscriber, workspace, topic) = pubsub(&context, 101);
@@ -407,9 +410,9 @@ fn suspend_stops_mdns_announcements_and_resume_restarts_them() {
     let client = context
         .open(ClientConfig {
             network: Network::Lan,
-            secret: Some([111; 32]),
+            secret: Some(([111; 32]).into()),
             transport: Default::default(),
-            storage: Some(StorageConfig::memory(&MemoryProvider::default())),
+            storage: Some((StorageConfig::memory(&MemoryProvider::default())).into()),
         })
         .unwrap();
     // The mDNS service runs and has the endpoint's addresses to announce.
@@ -442,7 +445,7 @@ fn a_deadline_bounds_the_endpoint_bind() {
     let error = context
         .open(ClientConfig {
             network: Network::RelayOnly,
-            secret: Some([131; 32]),
+            secret: Some(([131; 32]).into()),
             transport: TransportOptions {
                 relay: Some(arachne_runtime::OperatorRelay {
                     urls: vec!["https://relay.example.invalid".into()],
@@ -452,7 +455,7 @@ fn a_deadline_bounds_the_endpoint_bind() {
                 deadline: Some(Duration::from_millis(300)),
                 ..Default::default()
             },
-            storage: Some(StorageConfig::memory(&MemoryProvider::default())),
+            storage: Some((StorageConfig::memory(&MemoryProvider::default())).into()),
         })
         .err()
         .expect("the relay never comes online");

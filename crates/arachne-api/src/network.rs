@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum Network {
     Direct,
     Lan,

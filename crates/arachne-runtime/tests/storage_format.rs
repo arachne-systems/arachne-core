@@ -7,10 +7,10 @@ use arachne_runtime::{
 
 mod common;
 
-fn open(storage: StorageConfig) -> Client {
+fn open(storage: StorageConfig) -> std::sync::Arc<Client> {
     Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([81; 32]),
+        secret: Some(([81; 32]).into()),
         transport: Default::default(),
         storage: Some(storage),
     })
