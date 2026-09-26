@@ -9,9 +9,9 @@ use std::{
 use iroh_base::{EndpointId, TransportAddr};
 use n0_error::StackResultExt;
 use n0_future::{
-    FuturesUnordered, MaybeFuture, MergeUnbounded, Stream, StreamExt,
+    FuturesUnordered, FuturesUnorderedBounded, MaybeFuture, MergeUnbounded, Stream, StreamExt,
     boxed::BoxStream,
-    future::now_or_never,
+    future::{Boxed, now_or_never},
     task::JoinSet,
     time::{self, Duration, Instant},
 };
@@ -71,6 +71,9 @@ const UPGRADE_INTERVAL: Duration = Duration::from_secs(60);
 /// is not an issue; a timeout here serves the purpose of not stopping-and-recreating actors
 /// in a high frequency, and to keep data about previous path around for subsequent connections.
 const ACTOR_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+// QUIC retransmits dropped Initials; a blocked transport must not retain them indefinitely.
+const DATAGRAM_SEND_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_DATAGRAM_SEND_TASKS: usize = 16;
 
 /// A stream of events from all paths for all connections.
 ///
@@ -240,8 +243,9 @@ impl RemoteStateActor {
         shutdown_token: CancellationToken,
     ) -> (EndpointId, Vec<RemoteStateMessage>) {
         trace!("actor started");
+        let mut send_tasks = FuturesUnorderedBounded::new(MAX_DATAGRAM_SEND_TASKS);
         for msg in initial_msgs {
-            self.handle_message(msg).await;
+            self.handle_message(msg, &mut send_tasks);
         }
         let idle_timeout = time::sleep(ACTOR_MAX_IDLE_TIMEOUT);
         n0_future::pin!(idle_timeout);
@@ -273,9 +277,10 @@ impl RemoteStateActor {
                     trace!("actor cancelled");
                     break;
                 }
+                Some(()) = send_tasks.next(), if !send_tasks.is_empty() => {}
                 msg = inbox.recv() => {
                     match msg {
-                        Some(msg) => self.handle_message(msg).await,
+                        Some(msg) => self.handle_message(msg, &mut send_tasks),
                         None => break,
                     }
                 }
@@ -350,11 +355,16 @@ impl RemoteStateActor {
     ///
     /// Error returns are fatal and kill the actor.
     #[instrument(skip(self))]
-    async fn handle_message(&mut self, msg: RemoteStateMessage) {
+    fn handle_message(
+        &mut self,
+        msg: RemoteStateMessage,
+        send_tasks: &mut FuturesUnorderedBounded<Boxed<()>>,
+    ) {
         // trace!("handling message");
         match msg {
             RemoteStateMessage::SendDatagram(sender, transmit) => {
-                self.state.handle_msg_send_datagram(sender, transmit).await;
+                self.state
+                    .handle_msg_send_datagram(sender, transmit, send_tasks);
             }
             RemoteStateMessage::AddConnection(handle, tx) => {
                 self.handle_msg_add_connection(handle, tx);
@@ -785,10 +795,11 @@ impl RemoteStateActor {
 
 impl State {
     /// Handles [`RemoteStateMessage::SendDatagram`].
-    async fn handle_msg_send_datagram(
+    fn handle_msg_send_datagram(
         &mut self,
-        mut sender: Box<TransportsSender>,
+        sender: Box<TransportsSender>,
         transmit: OwnedTransmit,
+        send_tasks: &mut FuturesUnorderedBounded<Boxed<()>>,
     ) {
         // Sending datagrams might fail, e.g. because we don't have the right transports set
         // up to handle sending this owned transmit to.
@@ -806,6 +817,7 @@ impl State {
             warn!("Cannot send datagrams: No paths to remote endpoint known");
         }
 
+        let mut targets = Vec::new();
         for addr in self.paths.addrs() {
             // We never want to send to our local addresses.
             // The local address set is updated in the main loop so we can use `peek` here.
@@ -821,15 +833,33 @@ impl State {
             // TODO(Frando): We might want to include a local IP here in the future, if we confidently
             // know that it is the correct one.
             // See https://github.com/n0-computer/iroh/issues/4280.
-            } else if let Err(err) = send_datagram(
-                &mut sender,
-                transports::FourTuple::from_remote(addr.clone()),
-                transmit.clone(),
-            )
-            .await
-            {
-                debug!(?addr, "failed to send datagram: {err:#}");
+            } else {
+                targets.push(transports::FourTuple::from_remote(addr.clone()));
             }
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let send = Box::pin(
+            async move {
+                let send = async move {
+                    let mut sender = sender;
+                    for target in targets {
+                        if let Err(err) =
+                            send_datagram(&mut sender, target.clone(), transmit.clone()).await
+                        {
+                            debug!(?target, "failed to send datagram: {err:#}");
+                        }
+                    }
+                };
+                if time::timeout(DATAGRAM_SEND_TIMEOUT, send).await.is_err() {
+                    debug!("Datagram send timed out");
+                }
+            }
+            .instrument(Span::current()),
+        );
+        if send_tasks.try_push(send).is_err() {
+            debug!("dropping datagram: send task limit reached");
         }
         // This message is received *before* a connection is added.  So we do
         // not yet have a connection to holepunch.  Instead we trigger
