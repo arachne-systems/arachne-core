@@ -4,6 +4,7 @@ use serde_json::Value;
 use arachne_api::{ApiError, Event};
 pub use arachne_api::{AttemptId, EndpointId, Key32, MemberId, RecordId, WorkspaceId};
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 use crate::ops::candidate::CandidateKind;
 use crate::ops::{
@@ -951,25 +952,27 @@ impl Client {
     /// Open a client in `context`. Storage and other per-client setup
     /// attach here, after the session is registered.
     #[cfg_attr(feature = "uniffi", uniffi::constructor)]
-    pub fn open_in(context: Arc<crate::Context>, config: ClientConfig) -> Result<Arc<Self>> {
+    pub fn open_in(context: Arc<crate::Context>, mut config: ClientConfig) -> Result<Arc<Self>> {
+        let configured_secret = config.secret.take().map(Zeroizing::new);
         let options = config.transport.node_options(config.network)?;
-        if config.network != Network::Direct && config.secret.is_none() {
+        if config.network != Network::Direct && configured_secret.is_none() {
             return Err(error(
                 ErrorKind::InvalidInput,
                 format!("{:?} requires a secret", config.network),
             ));
         }
-        let secret = config
-            .secret
-            .as_deref()
+        let secret = configured_secret
+            .as_ref()
+            .map(|bytes| bytes.as_slice())
             .map(|bytes| {
                 <[u8; 32]>::try_from(bytes)
                     .map_err(|_| ApiError::invalid_input("secret", "secret must contain 32 bytes"))
             })
-            .transpose()?;
+            .transpose()?
+            .map(Zeroizing::new);
         let handle = crate::registry::open(
             &context,
-            secret.as_ref(),
+            secret.as_ref().map(|value| &**value),
             options,
             config.transport.deadline,
         )?;
