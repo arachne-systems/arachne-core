@@ -5,6 +5,8 @@ use crate::errors::{self, security};
 use crate::ops::management::{StagedCandidate, StagedChange, StagedRemoval};
 use arachne_api::{ApiError, ErrorCode};
 #[cfg(test)]
+mod driver_tests;
+#[cfg(test)]
 mod fork_tests;
 pub(crate) mod fork;
 pub(crate) mod self_update;
@@ -787,6 +789,17 @@ pub(super) fn send_queued_profiles(session: &Session) {
 /// The host-facing notice for queries the inquiry responder answered since
 /// the host last heard: the same event the host path returns for a query.
 pub(super) fn take_answered(session: &Session) -> Option<Value> {
+    // Process completed reconciliation before another passive reply notice.
+    // A steady stream of inquiries must not starve branch recovery. Keep the
+    // notice queued so the next host tick can report it after reconciliation.
+    if session
+        .membership
+        .update
+        .as_ref()
+        .is_some_and(|pending| pending.task.is_finished())
+    {
+        return None;
+    }
     let peer = lock_profiles(&session.membership.profiles).answered.take()?;
     let mut event = json!({"state":"membership_replied", "remote_receipt":false});
     if let Some(peer) = peer {
