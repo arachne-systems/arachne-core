@@ -114,11 +114,12 @@ pub use client::{
     MemberInfo, MemberKind, MemberRoster, MembershipGossipMetrics, NearbyAdvertisement,
     NearbyEndpoint, NearbyMode, NearbyScan, Network, PeerPolicy, PeerRoute, Presence,
     PresenceRound, ProtectedReceptionCandidate, Publication, PublicationCandidate,
-    PublicationCurrent, ReceivedProtectedPublication, RecoveryAdoption, RecoveryCandidate,
-    RecoveryRangeReady, RecoveryRangeRequest, RecoveryRangeStatus, RecoveryStage, RemovalCandidate,
-    RemovedMembership, RestoredJoin, RestoredWorkspace, Result as ClientResult, RouteHint,
-    RouteKind, StreamMetrics, WorkspaceCandidate, WorkspaceInfo, WorkspaceMetrics, WorkspaceState,
-    default_client_config, default_transport_options,
+    PublicationCurrent, PublicationMode, PublicationOptions, ReceivedProtectedPublication,
+    RecoveryAdoption, RecoveryCandidate, RecoveryRangeReady, RecoveryRangeRequest,
+    RecoveryRangeStatus, RecoveryStage, RemovalCandidate, RemovedMembership, RestoredJoin,
+    RestoredWorkspace, Result as ClientResult, RouteHint, RouteKind, StreamMetrics,
+    WorkspaceCandidate, WorkspaceInfo, WorkspaceMetrics, WorkspaceState, default_client_config,
+    default_publication_options, default_transport_options,
 };
 pub use client::{
     CurrentViewAdoption, CurrentViewCandidate, CurrentViewRequest, CurrentViewStatus,

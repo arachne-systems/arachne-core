@@ -228,6 +228,30 @@ messaging recipe. The typed facade receives with `poll_protected` and
 and resolves each object with `stage_object_acknowledgement` or
 `stage_object_rejection` (then `adopt_protected_reception`).
 
+### Publication audience and delivery mode
+
+`stage_protected_publication_with_options` accepts `PublicationOptions`:
+
+| Field or mode | Meaning |
+| --- | --- |
+| `recipients: []` | Use the workspace audience. This is the default. |
+| `recipients: [MemberId, ...]` | Use an explicit audience of at most 64 current members. Sort IDs in ascending byte order. Exclude self and duplicates. |
+| `PublicationMode::Critical` | Use the Critical queue. This is the default. |
+| `PublicationMode::Bulk` | Use the Bulk queue. |
+| `PublicationMode::Current { metadata }` | Publish a replaceable current value. Supply the existing selector, replacement key, expiry and tombstone metadata. The audience must be empty. |
+
+Generated SDK users can call `default_publication_options()` to get the native
+defaults. Rust users can call `PublicationOptions::default()`. Core rejects an
+invalid audience before it stages a candidate. It does not sort or deduplicate
+the caller's audience. A malformed member ID fails ID conversion; an unknown
+member returns `NotMember`.
+
+The mode enum permits one mode at a time. It cannot express Bulk and Current
+together. The existing `stage_protected_publication` method still uses an empty
+audience and Critical delivery. The existing `_with_current` method still uses
+an empty audience: `None` means Critical and `Some(metadata)` means Current.
+All three methods use the same validation, native storage and adoption path.
+
 ## Recovery and delivery expectations
 
 Received and recovered objects wait in a durable inbox. Read them with
