@@ -437,6 +437,8 @@ pub struct PeerPath {
     pub rtt_ms: u64,
 }
 
+type ParkedOverlays = BTreeMap<WorkspaceId, ([u8; overlay::TAG], u64)>;
+
 pub struct Node {
     controls: mpsc::Receiver<ControlRequest>,
     control_inbox: control::ControlInbox,
@@ -450,7 +452,7 @@ pub struct Node {
     overlays: Arc<Mutex<BTreeMap<WorkspaceId, Arc<overlay::Overlay>>>>,
     /// Overlays parked by `suspend`: workspace to (tag, revision). `Some`
     /// while suspended; `resume` rebuilds them.
-    parked: Arc<StdMutex<Option<BTreeMap<WorkspaceId, ([u8; overlay::TAG], u64)>>>>,
+    parked: Arc<StdMutex<Option<ParkedOverlays>>>,
     membership: overlay::MembershipInbox,
     #[cfg(feature = "moq")]
     streams: streams::Streams,
@@ -1585,13 +1587,14 @@ impl Node {
     /// connection. Later dials reconnect. Idempotent.
     pub async fn suspend(&self) {
         let overlays = std::mem::take(&mut *self.overlays.lock().await);
-        let mut parked = self.parked.lock().unwrap();
-        let parked = parked.get_or_insert_with(BTreeMap::new);
-        for (workspace, overlay) in overlays {
-            parked.insert(workspace, (overlay.tag, overlay.revision()));
-        }
-        let overlays = parked.len();
-        drop(parked);
+        let overlays = {
+            let mut parked = self.parked.lock().unwrap();
+            let parked = parked.get_or_insert_with(BTreeMap::new);
+            for (workspace, overlay) in overlays {
+                parked.insert(workspace, (overlay.tag, overlay.revision()));
+            }
+            parked.len()
+        };
         // Idle links would keep QUIC keep-alives running.
         let closed = self.connections.close_idle().await;
         // No local announcements or lookups while in the background.
