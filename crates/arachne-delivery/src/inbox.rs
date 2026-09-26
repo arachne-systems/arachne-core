@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8] = b"DFOI\x02";
 /// Binary inbox state (A6f). Earlier versions are rejected.
-const CACHE_MAGIC: &[u8] = b"DFIC\x05";
+const CACHE_MAGIC: &[u8] = b"DFIC\x06";
 /// Replay windows: one per (author, epoch) that sent to this member.
 const MAX_REPLAY_WINDOWS: usize = 4096;
 /// Accepted counters tracked above one replay floor. An author's counter is
@@ -131,13 +131,14 @@ struct Pending {
     sequence: u64,
     recipients: Vec<[u8; 32]>,
     current: Option<CurrentReceipt>,
+    from_losing_branch: bool,
     payload: Vec<u8>,
 }
 
 impl Pending {
     /// Encoded size in the inbox snapshot (see `Snapshot::encode`).
     fn weight(topic: usize, recipients: usize, current: bool, payload: usize) -> usize {
-        32 + 32 + 8 * 3 + 1 + topic + 16 + 8 + 1 + 32 * recipients + 1
+        32 + 32 + 8 * 3 + 1 + topic + 16 + 8 + 1 + 32 * recipients + 2
             + if current { 72 } else { 0 }
             + 4
             + payload
@@ -485,6 +486,7 @@ impl Snapshot {
                     codec::u64(bytes, current.expires_at);
                 }
             }
+            bytes.push(u8::from(pending.from_losing_branch));
             codec::blob(bytes, &pending.payload);
         }
         codec::count(bytes, inbox.recent.len());
@@ -570,6 +572,11 @@ impl Snapshot {
                 }),
                 _ => return Err("invalid pending current marker"),
             };
+            let from_losing_branch = match take(input, 1)?[0] {
+                0 => false,
+                1 => true,
+                _ => return Err("invalid pending branch marker"),
+            };
             let payload = codec::read_blob(input, arachne_security::MAX_APPLICATION_PAYLOAD)?;
             pending.push(Pending {
                 author,
@@ -582,6 +589,7 @@ impl Snapshot {
                 sequence,
                 recipients,
                 current,
+                from_losing_branch,
                 payload,
             });
         }
@@ -649,6 +657,8 @@ pub struct PendingObject {
     pub counter: u64,
     pub recipients: Vec<[u8; 32]>,
     pub current: Option<current::CurrentMetadata>,
+    /// The plaintext was accepted on a branch that this node later left.
+    pub from_losing_branch: bool,
 }
 
 /// This node's authenticated plaintext recovered from its retained losing
@@ -852,6 +862,9 @@ impl ObjectInbox {
         let member = |id: &[u8; 32]| next.endpoints_for_members(&[*id]).is_ok();
         let mut moved = self.clone();
         moved.epoch = next.epoch();
+        for pending in &mut moved.pending {
+            pending.from_losing_branch |= pending.epoch > fork_epoch;
+        }
         moved.replay.retain(|replay| kept(replay.epoch));
         moved.progress.retain(|progress| kept(progress.epoch));
         moved.retained_ranges.retain(|range| {
@@ -1351,6 +1364,7 @@ impl ObjectInbox {
             sequence,
             recipients: recipients.to_vec(),
             current,
+            from_losing_branch: false,
             payload: authenticated.message.payload,
         });
         if !recipients.is_empty() && context.sequence.is_some() {
@@ -1968,6 +1982,7 @@ impl ObjectInbox {
             counter: pending.counter,
             recipients: pending.recipients.clone(),
             current: pending.current.as_ref().map(Into::into),
+            from_losing_branch: pending.from_losing_branch,
         })
     }
 

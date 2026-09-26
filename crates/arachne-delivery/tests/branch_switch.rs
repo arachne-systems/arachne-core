@@ -8,7 +8,7 @@
 mod common;
 use common::{test_endpoint, test_key};
 use arachne_delivery::PublisherLog;
-use arachne_delivery::inbox::ObjectInbox;
+use arachne_delivery::inbox::{InboxStage, ObjectInbox};
 use arachne_routing::{PublicationContext, Topic};
 use arachne_security::{ManagementAction, PendingJoin, PreparedManagementUpdate, Workspace};
 
@@ -55,7 +55,7 @@ fn a_switch_keeps_the_common_epochs_and_returns_the_losing_publications() {
     let inbox = ObjectInbox::new(member.id(), member.epoch());
 
     // Two competing steps out of the fork epoch.
-    let losing = admin
+    let mut losing = admin
         .prepare_management(ManagementAction::CreateInvitation([8; 32], 0, false))
         .unwrap();
     let winning = admin
@@ -68,6 +68,14 @@ fn a_switch_keeps_the_common_epochs_and_returns_the_losing_publications() {
     );
     let mut log = log.advance(&at_fork, &on_loser).unwrap();
     let inbox = inbox.advance(&at_fork, &on_loser).unwrap();
+    let foreign = context(member.id(), 1, 3);
+    let object = losing.workspace
+        .protect_object(b"chat", &foreign.authenticated_bytes(), b"foreign losing data")
+        .unwrap();
+    let InboxStage::Prepared(inbox) = inbox.stage(&on_loser, &foreign, &object).unwrap() else {
+        panic!("foreign object was not accepted")
+    };
+    assert!(!inbox.pending(&on_loser).unwrap().unwrap().from_losing_branch);
     let lost = context(member.id(), 1, 2);
     let object = on_loser
         .protect_object(b"chat", &lost.authenticated_bytes(), b"lost")
@@ -112,6 +120,12 @@ fn a_switch_keeps_the_common_epochs_and_returns_the_losing_publications() {
 
     let moved = inbox.rebase(&on_loser, fork, &on_winner).unwrap();
     assert_eq!(moved.epoch(), on_winner.epoch());
+    let pending = moved.pending(&on_winner).unwrap().unwrap();
+    assert!(pending.from_losing_branch, "foreign plaintext must identify its losing branch");
+    assert_eq!(pending.message.payload, b"foreign losing data");
+    let snapshot = moved.snapshot_with_publisher(&on_winner, &rebased).unwrap();
+    let (_, restored) = ObjectInbox::restore_snapshot(&on_winner, &snapshot).unwrap();
+    assert!(restored.pending(&on_winner).unwrap().unwrap().from_losing_branch);
     // The inbox has no branch fingerprint; it checks the epoch only.
     assert!(inbox.rebase(&at_fork, fork, &on_winner).is_err());
     assert!(inbox.rebase(&on_loser, on_loser.epoch(), &on_winner).is_err());
