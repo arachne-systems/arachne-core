@@ -346,7 +346,9 @@ impl Streams {
         let routes = self.0.routes.lock().await.clone();
         let mut removed = Vec::new();
         for (peer, route) in routes {
-            if self
+            let current = self.0.routing.lock().await.installed_revision(route.scope.workspace);
+            // The receive window permits old frames, but a live MoQ route must use the current scope.
+            if current != Some(route.scope.revision) || self
                 .authorize(route.scope, peer, &route.topic)
                 .await
                 .is_err()
