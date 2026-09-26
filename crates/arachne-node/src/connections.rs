@@ -513,6 +513,13 @@ impl Connections {
         self.address_lookup
     }
 
+    /// A fresh authenticated transport reached us. Clear only that peer's
+    /// failed-dial schedule; retain its address and all authorization state.
+    #[cfg(feature = "moq")]
+    pub(super) async fn remember_reachable(&self, peer: PeerId) {
+        self.unreachable.lock().await.remove(&peer);
+    }
+
     pub(super) async fn remember_observed(&self, peer: PeerId, address: SocketAddr) {
         if self.tor {
             return;
