@@ -242,8 +242,6 @@ pub(crate) struct MembershipState {
     pub(crate) peer_profile_summaries: BTreeMap<[u8; 32], [u8; 32]>,
     /// When this member self-updates next (B3c).
     pub(crate) self_update: membership::self_update::SelfUpdatePolicy,
-    /// The administrator this member's pending self-update is offered to.
-    pub(crate) self_update_offered: Option<[u8; 32]>,
 }
 
 impl MembershipState {
@@ -265,7 +263,6 @@ impl MembershipState {
             profiles,
             peer_profile_summaries: BTreeMap::new(),
             self_update: membership::self_update::SelfUpdatePolicy::new(std::time::Instant::now()),
-            self_update_offered: None,
         }
     }
 }

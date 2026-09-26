@@ -1,6 +1,6 @@
 //! B3c self-update policy over real Iroh nodes with native record storage:
-//! a member that just adopted its Welcome self-updates, offers the commit to
-//! the administrator, and adopts it only after the administrator did.
+//! a member saves its own update before any peer can adopt it. Its durable
+//! history lets the administrator catch up after the member restarts.
 use arachne_runtime::{StorageConfig, attach_storage, close, create, describe, execute};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -21,11 +21,11 @@ fn address(info: &Value) -> String {
 }
 
 #[test]
-fn a_new_member_self_updates_through_its_administrator() {
+fn a_new_member_saves_its_self_update_before_administrator_adoption() {
     let directory = common::directory();
     let member_directory = common::directory();
     let admin = create(Some(&[121; 32])).unwrap();
-    let member = create(Some(&[122; 32])).unwrap();
+    let mut member = create(Some(&[122; 32])).unwrap();
     attach_storage(admin, StorageConfig::sqlite(directory.path(), [121; 32])).unwrap();
     attach_storage(member, StorageConfig::sqlite(member_directory.path(), [122; 32])).unwrap();
     call(admin, json!({"op":"create_workspace","display_name":"Admin"}));
@@ -68,9 +68,28 @@ fn a_new_member_self_updates_through_its_administrator() {
         }
     }
     let updated = updated.unwrap();
-    // The administrator adopted the step before the member did.
-    assert!(admin_epochs.contains(&updated["epoch"]), "{admin_epochs:?} {updated}");
+    // The driver returns a durable update while the admin is still behind.
+    assert!(!admin_epochs.contains(&updated["epoch"]));
+    assert_eq!(updated["durable"], true);
     assert_eq!(updated["workspace"], workspace);
+
+    close(member).unwrap();
+    member = create(Some(&[122; 32])).unwrap();
+    attach_storage(member, StorageConfig::sqlite(member_directory.path(), [122; 32])).unwrap();
+    let restored = call(member, json!({"op":"restore_workspace","workspace":workspace}));
+    assert_eq!(restored["epoch"], updated["epoch"]);
+    let member_info = info(member);
+    call(member, json!({"op":"add_address_hint","peer":admin_info["endpoint_key"],
+        "address":address(&admin_info)}));
+    call(admin, json!({"op":"add_address_hint","peer":member_info["endpoint_key"],
+        "address":address(&member_info)}));
+    call(member, json!({"op":"poll_workspace_presence","announce":true}));
+    while call(admin, json!({"op":"member_roster"}))["epoch"] != updated["epoch"] {
+        call(admin, json!({"op":"drive_workspace"}));
+        call(member, json!({"op":"drive_workspace"}));
+        assert!(Instant::now() < deadline, "administrator did not recover the saved update");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let admin_roster = call(admin, json!({"op":"member_roster"}));
     let member_roster = call(member, json!({"op":"member_roster"}));
     assert_eq!(admin_roster["epoch"], member_roster["epoch"]);

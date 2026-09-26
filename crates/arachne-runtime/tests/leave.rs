@@ -108,19 +108,22 @@ fn drive_until_work(handle: i64) -> Value {
     }
 }
 
-/// A new member's Rust driver first self-updates through its administrator
-/// (B3c policy). Serve that here, so each scenario starts settled.
+/// Let the member save its first self-update, then let the administrator
+/// catch up, so each handoff scenario starts with the same accepted epoch.
 fn settle_self_update(member: i64, admin: i64) {
     let until = Instant::now() + Duration::from_secs(10);
+    let mut committed = false;
     loop {
         let value = call(member, json!({"op":"drive_workspace"})).unwrap();
         if value["state"] == "self_update_committed" {
-            return;
+            committed = true;
         }
-        let served = call(admin, json!({"op":"poll_admission"})).unwrap();
-        if served["state"] == "awaiting_save" {
-            call(admin, json!({"op":"adopt_admission","candidate":served["candidate"]})).unwrap();
-            call(admin, json!({"op":"send_admission_reply"})).unwrap();
+        call(admin, json!({"op":"drive_workspace"})).unwrap();
+        if committed
+            && call(member, json!({"op":"member_roster"})).unwrap()["epoch"]
+                == call(admin, json!({"op":"member_roster"})).unwrap()["epoch"]
+        {
+            return;
         }
         assert!(Instant::now() < until, "no self-update: {value}");
         std::thread::sleep(Duration::from_millis(5));
@@ -300,6 +303,9 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
     .unwrap();
     let invite = issue_invitation(admin);
     join(admin, successor, &invite, "Bravo");
+    route(admin, successor);
+    route(successor, admin);
+    settle_self_update(successor, admin);
     // Registering the second invitation costs admin an epoch that successor
     // (already a member) does not automatically have. Apply that management
     // step to successor directly so it doesn't fork before the third join.
@@ -332,20 +338,10 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
     route(third, admin);
     route(successor, third);
     route(third, successor);
-    // B3c policy: the current third member self-updates through the admin
-    // (epoch 4 -> 5). The successor is stale on purpose; its own attempt is
-    // refused by the admin and then waits a minute, past this scenario.
+    // The current third member self-updates through the admin (epoch 5 -> 6).
+    // Keep the successor stale until the handoff offer below. Newer head
+    // announcements defer its self-update; no refusal handshake is required.
     settle_self_update(third, admin);
-    let until = Instant::now() + Duration::from_secs(10);
-    loop {
-        let value = call(successor, json!({"op":"drive_workspace"})).unwrap();
-        if value["state"] == "self_update_refused" {
-            break;
-        }
-        call(admin, json!({"op":"poll_admission"})).unwrap();
-        assert!(Instant::now() < until, "stale self-update not refused: {value}");
-        std::thread::sleep(Duration::from_millis(5));
-    }
 
     let successor_id = self_member_id(successor);
     let third_id = self_member_id(third);
@@ -369,19 +365,19 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
         true
     );
     assert_eq!(failed_promotion["state"], "awaiting_save");
+    let stale_roster = call(successor, json!({"op":"member_roster"})).unwrap();
+    assert_eq!(stale_roster["epoch"], 4);
+    assert_eq!(stale_roster["members"].as_array().unwrap().len(), 2);
 
     // The second join advances the creator while the first member still has
     // the previous accepted view. Reconcile that view before any management.
-    // +2 on both numbers below: registering each invitation now costs an
-    // epoch. Successor's own join lands at epoch 2 (not 1), and it is synced
-    // to epoch 3 directly above for the second invitation's registration, so
-    // only the third member's join (epoch 3 -> 4) remains to reconcile here.
-    // Admin's epoch after the second invite+join is 4 (not 2).
-    offer_and_drive(admin, successor, 3);
-    // And the third member's self-update (epoch 4 -> 5).
+    // Bravo already self-updated at epoch 3 and received the second
+    // invitation registration at epoch 4. It is missing Charlie's join
+    // (epoch 4 -> 5) and self-update (epoch 5 -> 6).
     offer_and_drive(admin, successor, 4);
+    offer_and_drive(admin, successor, 5);
     let before_promotion = call(admin, json!({"op":"member_roster"})).unwrap();
-    assert_eq!(before_promotion["epoch"], 5);
+    assert_eq!(before_promotion["epoch"], 6);
     let before_promotion_epoch = before_promotion["epoch"].as_u64().unwrap();
 
     let promotion = call(

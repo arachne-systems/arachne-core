@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 mod common;
 fn call(h: i64, v: Value) -> Value {
-    serde_json::from_slice(&execute(h, &serde_json::to_vec(&v).unwrap()).unwrap()).unwrap()
+    serde_json::from_slice(&execute(h, &serde_json::to_vec(&v).unwrap())
+        .unwrap_or_else(|error| panic!("handle={h}, request={v}: {error}"))).unwrap()
 }
 fn poll(h: i64, op: &str) -> Value {
     let end = Instant::now() + Duration::from_secs(10);
@@ -341,4 +342,57 @@ fn group_presence_announces_new_members_and_returning_peers_without_application_
     outsider.join().unwrap();
     assert_eq!(call(a, json!({"op":"member_roster"}))["members"].as_array().unwrap().len(), 3);
     for h in [a,b,c] { close(h).unwrap(); }
+}
+
+#[test]
+fn simultaneous_presence_and_self_updates_converge_and_survive_restart() {
+    let stores: [MemoryProvider; 3] = std::array::from_fn(|_| MemoryProvider::default());
+    let nodes: [i64; 3] = std::array::from_fn(|i| common::stored(&[151 + i as u8; 32], &stores[i]));
+    let [admin, existing, newer] = nodes;
+    call(admin, json!({"op":"create_workspace","display_name":"Admin"}));
+    let invite = issue(admin);
+    let first = add(admin, existing, &invite, vec![], "Existing");
+    add(admin, newer, &invite, vec![step(&first)], "Newer");
+    assert_eq!(call(existing, json!({"op":"member_roster"}))["members"].as_array().unwrap().len(), 2);
+
+    for &from in &nodes {
+        for &to in &nodes {
+            if from == to { continue; }
+            let info: Value = serde_json::from_str(&describe(to).unwrap()).unwrap();
+            call(from, json!({"op":"add_address_hint","peer":info["endpoint_key"],
+                "address":info["bound_address"].as_str().unwrap().replace("0.0.0.0:", "127.0.0.1:")}));
+        }
+        call(from, json!({"op":"poll_workspace_presence","announce":true}));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut self_updated = [false; 3];
+    let mut events = Vec::new();
+    let expected = loop {
+        for (index, &node) in nodes.iter().enumerate() {
+            call(node, json!({"op":"poll_workspace_presence"}));
+            let value = call(node, json!({"op":"drive_workspace"}));
+            if value["state"] == "self_update_committed" { self_updated[index] = true; }
+            if let Some(state) = value["state"].as_str() {
+                events.push((index, state.to_owned(), value["epoch"].clone()));
+            }
+        }
+        let rosters = nodes.map(|node| call(node, json!({"op":"member_roster"})));
+        if self_updated[1..].iter().all(|updated| *updated)
+            && rosters.iter().all(|roster| roster["members"].as_array().unwrap().len() == 3)
+            && rosters.iter().all(|roster| roster["epoch"] == rosters[0]["epoch"])
+        {
+            break rosters[0]["epoch"].clone();
+        }
+        assert!(Instant::now() < deadline, "three-member sync stalled: rosters={rosters:?}; events={events:?}");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    for node in nodes { close(node).unwrap(); }
+    for (index, store) in stores.iter().enumerate() {
+        let node = common::stored(&[151 + index as u8; 32], store);
+        let restored = call(node, json!({"op":"restore_workspace","workspace":invite["workspace"]}));
+        assert_eq!(restored["epoch"], expected);
+        assert_eq!(restored["members"], 3);
+        close(node).unwrap();
+    }
 }
