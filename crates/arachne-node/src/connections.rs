@@ -1195,6 +1195,67 @@ mod tests {
         .expect("authenticated reachability fixture timed out");
     }
 
+    #[cfg(feature = "moq")]
+    #[tokio::test]
+    async fn rejected_incoming_moq_does_not_clear_backoff() {
+        use crate::{Node, Permissions};
+        use iroh_moq::{Moq, MoqSession};
+        use std::time::Duration;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (receiver, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let (sender, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            receiver
+                .install_verified_policy(
+                    [57; 32],
+                    1,
+                    BTreeMap::from([
+                        (receiver.id(), Permissions::AllTopics),
+                        (sender.id(), Permissions::AllTopics),
+                    ]),
+                )
+                .await
+                .unwrap();
+            // Membership alone does not authorize an enabled streaming route.
+            receiver
+                .connections
+                .unreachable
+                .lock()
+                .await
+                .insert(sender.id(), (Instant::now() + Duration::from_secs(120), 6));
+            let moq = Moq::new(sender.connections.endpoint());
+            let attempt = MoqSession::connect(
+                &sender.connections.endpoint(),
+                EndpointAddr::new(PublicKey::from_bytes(&receiver.id()).unwrap())
+                    .with_ip_addr(receiver.address()),
+                moq.origin(),
+            )
+            .await;
+            let running = attempt
+                .ok()
+                .map(|(session, driver)| (session, tokio::spawn(driver.run())));
+            while receiver.moq_metrics().rejected_sessions == 0 {
+                tokio::task::yield_now().await;
+            }
+            let kept = receiver
+                .connections
+                .unreachable
+                .lock()
+                .await
+                .contains_key(&sender.id());
+            if let Some((session, driver)) = running {
+                session.close(moq_net::Error::Cancel);
+                driver.abort();
+                let _ = driver.await;
+            }
+            sender.close().await;
+            receiver.close().await;
+            assert!(kept, "rejected MoQ arrival cleared its peer's backoff");
+        })
+        .await
+        .expect("rejected reachability fixture timed out");
+    }
+
     #[test]
     fn unreachable_backoff_doubles_from_five_seconds_to_a_two_minute_cap() {
         let seconds = |failures| unreachable_backoff(failures).as_secs();
