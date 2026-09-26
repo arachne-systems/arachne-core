@@ -493,9 +493,17 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
         ));
     }
     // Gossip is ephemeral: authenticated presence also reconciles missed epochs after restart.
-    let presence = ops::nested(session, Op::PollWorkspacePresence, |session| {
-        ops::membership::poll_presence(session, ops::membership::PresenceArgs { announce: false })
-    })?;
+    // The lifecycle driver must finish pending self-updates/admission before presence can run.
+    let presence = if session.transition.staged.is_none()
+        && session.transition.inbound.is_none()
+        && session.transition.removal.is_none()
+    {
+        Some(ops::nested(session, Op::PollWorkspacePresence, |session| {
+            ops::membership::poll_presence(session, ops::membership::PresenceArgs { announce: false })
+        })?)
+    } else {
+        None
+    };
     let mut result = drive_workspace_step(session)?;
     result["presence"] =
         serde_json::to_value(presence).map_err(|error| ApiError::internal(error.to_string()))?;
