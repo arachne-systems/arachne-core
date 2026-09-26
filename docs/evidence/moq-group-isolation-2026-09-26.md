@@ -73,6 +73,28 @@ The restart integration binary passed 3/3 with one subprocess helper ignored
 in 18.37 s. It covers unannounced restart plus 12 three-peer burst restarts and
 12 paced restarts. Receipt: `/tmp/moq-group-isolation-restart-tests.log`.
 
+## Merged trace checkpoint
+
+H1 trace commit `d8a22c8` was merged at `769cf4b`. The only conflict was the
+`futures_util` import. The merged code keeps each peer, connection, publisher
+hop, sequence, and session-selection trace field. A later format-only commit
+wraps one publisher-hop expression.
+
+The merged source passed:
+
+| Gate | Result | Receipt |
+| --- | --- | --- |
+| Node library | 47 passed, 0 failed, 1 ignored; 43.45 s | `/tmp/moq-group-isolation-merged-node-tests.log` |
+| Stream integration | 4 passed, 0 failed | `/tmp/moq-group-isolation-merged-stream-tests.log` |
+| Restart integration | 3 passed, 0 failed, 1 helper ignored; 18.36 s | `/tmp/moq-group-isolation-merged-restart-tests.log` |
+| Incomplete payload/EOF and close repeats | 10 runs, 40 passed, 0 failed | `/tmp/moq-group-isolation-repeat-receipt.json` |
+| Workspace format | Passed | `/tmp/moq-group-isolation-merged-fmt-final.log` |
+
+The repeated cases use the same source and assertions. They add no delay or
+weaker delivery condition. The focused merged total is 54 passing tests plus
+40 repeated passes. The full H7 suite and strict static checks remain pending
+on the lead's final integrated source.
+
 ## Build and evidence limits
 
 The test build used Rust 1.98.0, `--locked`, the shared Cargo build lock, four
