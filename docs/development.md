@@ -111,10 +111,13 @@ certification.
 
 ## Vendored dependency patches
 
-`vendor/` contains four Arachne-maintained, publishable renamed forks:
+`vendor/` contains five Arachne-maintained, publishable renamed forks:
 `arachne-iroh-gossip`, `arachne-iroh-blobs`, `arachne-iroh-tor-transport` and
-`arachne-bao-tree`. Their Rust import names stay `iroh_gossip`, `iroh_blobs`,
-`iroh_tor_transport` and `bao_tree`; each retains
+`arachne-bao-tree`, plus the local `arachne-iroh-mdns-address-lookup` fork.
+The mDNS fork keeps a changed peer address for later lookups (see its
+[patch record](../vendor/iroh-mdns-address-lookup/ARACHNE-PATCH.md)). It is not
+published. Their Rust import names stay `iroh_gossip`, `iroh_blobs`,
+`iroh_tor_transport`, `bao_tree` and `iroh_mdns_address_lookup`; each retains
 upstream provenance, notices, and MIT/Apache-2.0 terms. They are not official
 upstream releases. Because Arachne crates depend on them directly (with
 `package = "arachne-..."`), their fixes reach every downstream consumer.
@@ -168,7 +171,8 @@ deliberately excluded from publishing.
 dev-dependencies out of `Cargo.lock`), so release-plz does not publish it.
 Publish order for a fork change: `arachne-bao-tree` (by hand, `cargo publish
 --manifest-path vendor/bao-tree/Cargo.toml`), then `arachne-iroh-blobs`,
-`arachne-iroh-gossip`, `arachne-iroh-tor-transport`, `arachne-node`,
+`arachne-iroh-gossip`, `arachne-iroh-tor-transport`,
+`arachne-iroh-mdns-address-lookup`, `arachne-node`,
 `arachne-runtime`. Until
 `arachne-bao-tree` is on crates.io, `cargo package`/`cargo publish --dry-run`
 verification of `arachne-iroh-blobs`, `arachne-node` and `arachne-runtime`
