@@ -82,6 +82,18 @@ pub mod harness {
     }
 
     pub use crate::persistence::seed_workspace;
+
+    /// Count remote cancellations observed by the owner's held admission exchanges.
+    pub fn expired_admission_waiters(handle: i64) -> Result<usize, String> {
+        let shared = crate::session(handle).map_err(crate::errors::text)?;
+        let guard = shared.lock().map_err(|_| "node session unavailable")?;
+        Ok(guard
+            .as_ref()
+            .ok_or("node is closed")?
+            .admission
+            .waiters
+            .expired_len())
+    }
 }
 mod admission_waiters;
 mod persistence;

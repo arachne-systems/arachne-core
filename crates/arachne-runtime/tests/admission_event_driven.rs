@@ -667,6 +667,16 @@ fn expired_admission_exchange_receives_a_pushed_result_without_retry() {
     expire_tx.send(()).unwrap();
     expired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
+    // Local task cancellation precedes the owner's observation of QUIC STOP.
+    // This case requires an expired exchange before the admission is adopted.
+    while arachne_runtime::harness::expired_admission_waiters(owner.handle).unwrap() != 1 {
+        assert!(
+            Instant::now() < deadline,
+            "owner did not observe the cancelled admission exchange"
+        );
+        thread::yield_now();
+    }
+
     let staged = loop {
         let value = call(owner.handle, json!({"op":"poll_admission"})).unwrap();
         if value["state"] == "awaiting_save" {
@@ -677,6 +687,8 @@ fn expired_admission_exchange_receives_a_pushed_result_without_retry() {
     };
     let committed = adopt(owner.handle, "adopt_admission", &staged);
     assert_eq!(committed["members"], 2);
+    assert_eq!(committed["results_delivered"], 0);
+    assert_eq!(committed["results_pushed"], 1);
     commit_tx.send(()).unwrap();
     let pushed = client.join().unwrap();
     let reply: Value = arachne_runtime::harness::decode_admission_reply(&pushed[9..]).unwrap();
