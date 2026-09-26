@@ -7,6 +7,10 @@
 //! peer's claimed class is never trusted). Head announcements are signed by
 //! the member's MLS key, so a relay cannot forge another member's report.
 use super::{ForkKey, MembershipAuthorization, SUITE, Workspace, bootstrap, fork_key};
+use openmls::prelude::{
+    MlsMessageBodyIn, MlsMessageIn,
+    tls_codec::{Deserialize, Serialize},
+};
 use openmls_traits::{OpenMlsProvider, crypto::OpenMlsCrypto, signatures::Signer};
 
 const ANNOUNCEMENT_DOMAIN: &[u8] = b"arachne/announcement/v1";
@@ -170,6 +174,12 @@ impl Workspace {
         authorization: &MembershipAuthorization,
         commit: &[u8],
     ) -> Result<ForkKey, &'static str> {
+        let mut verifier = self.branch_verifier(epoch)?;
+        verifier.apply_transition(authorization, commit)?;
+        Ok(fork_key(authorization, commit))
+    }
+
+    fn branch_verifier(&self, epoch: u64) -> Result<super::MembershipVerifier, &'static str> {
         let history = match &self.join_history {
             Some(history) => history.clone(),
             None => super::history::MembershipHistory::from_workspace(self)?,
@@ -187,8 +197,75 @@ impl Workspace {
         if verifier.epoch() != epoch {
             return Err("branch step is outside the retained history");
         }
-        verifier.apply_transition(authorization, commit)?;
-        Ok(fork_key(authorization, commit))
+        Ok(verifier)
+    }
+
+    /// Signed public GroupInfo without the ratchet tree. This contains no
+    /// private keys. A retained pin can prove an old accepted state after
+    /// its private rollback snapshot has been deleted.
+    pub fn public_checkpoint_pin(&self) -> Result<Vec<u8>, &'static str> {
+        let pin = self
+            .group
+            .export_group_info_with_additional_extensions(
+                self.provider.crypto(),
+                &self._signer,
+                false,
+                Vec::new(),
+            )
+            .map_err(|_| "checkpoint creation failed")?
+            .to_bytes()
+            .map_err(|_| "checkpoint encoding failed")?;
+        if pin.len() > bootstrap::MAX_CHECKPOINT_PIN {
+            return Err("checkpoint pin exceeds bounds");
+        }
+        Ok(pin)
+    }
+
+    /// Read a bounded public pin's epoch and workspace binding. Structure
+    /// only; `public_checkpoint_from_pin` verifies it against accepted history.
+    pub fn checkpoint_pin_epoch(&self, pin: &[u8]) -> Result<u64, &'static str> {
+        if pin.is_empty() || pin.len() > bootstrap::MAX_CHECKPOINT_PIN {
+            return Err("checkpoint pin exceeds bounds");
+        }
+        let message =
+            MlsMessageIn::tls_deserialize_exact(pin).map_err(|_| "invalid checkpoint pin")?;
+        let MlsMessageBodyIn::GroupInfo(info) = message.extract() else {
+            return Err("expected GroupInfo");
+        };
+        if info.group_id().as_slice() != self.id || info.ciphersuite() != SUITE {
+            return Err("wrong checkpoint workspace");
+        }
+        if info.extensions().ratchet_tree().is_some() {
+            return Err("invalid checkpoint pin");
+        }
+        Ok(info.epoch().as_u64())
+    }
+
+    /// Rebuild the public tree from accepted history, then verify the saved
+    /// pin's signature and exact GroupContext. This needs no old private key.
+    pub fn public_checkpoint_from_pin(
+        &self,
+        epoch: u64,
+        pin: &[u8],
+    ) -> Result<Vec<u8>, &'static str> {
+        if self.checkpoint_pin_epoch(pin)? != epoch {
+            return Err("checkpoint pin has the wrong epoch");
+        }
+        let verifier = self.branch_verifier(epoch)?;
+        let tree = verifier
+            .group
+            .export_ratchet_tree()
+            .tls_serialize_detached()
+            .map_err(|_| "checkpoint encoding failed")?;
+        let checkpoint =
+            bootstrap::checkpoint_from_parts(pin, &tree, bootstrap::CheckpointBound::Wire)?;
+        let checked = super::MembershipVerifier::from_proof_checkpoint(self.id, &checkpoint, 0)?;
+        if super::order::context_hash(checked.group.group_context())?
+            != super::order::context_hash(verifier.group.group_context())?
+        {
+            return Err("checkpoint pin is from another branch");
+        }
+        Ok(checkpoint)
     }
 
     /// Sign a short announcement (a membership head) with this member's MLS
@@ -416,6 +493,43 @@ mod tests {
         assert!(
             second
                 .verify_announcement([3; 32], b"head 7", &signature)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_saved_public_pin_rebuilds_only_its_accepted_branch() {
+        let (common, _) = team(2);
+        let pin = common.public_checkpoint_pin().unwrap();
+        let epoch = common.epoch();
+        let winning = common.prepare_self_update().unwrap().workspace;
+        let checkpoint = winning.public_checkpoint_from_pin(epoch, &pin).unwrap();
+        assert_eq!(checkpoint, common.public_checkpoint().unwrap());
+        assert!(winning.public_checkpoint_from_pin(epoch + 1, &pin).is_err());
+        let mut forged = pin.clone();
+        *forged.last_mut().unwrap() ^= 1;
+        assert!(winning.public_checkpoint_from_pin(epoch, &forged).is_err());
+        assert!(winning.checkpoint_pin_epoch(&[]).is_err());
+        assert!(
+            winning
+                .checkpoint_pin_epoch(&vec![0; crate::MAX_CHECKPOINT_PIN + 1])
+                .is_err()
+        );
+        let (other, _) = team(1);
+        assert!(
+            winning
+                .public_checkpoint_from_pin(epoch, &other.public_checkpoint_pin().unwrap())
+                .is_err()
+        );
+
+        let losing = common.prepare_self_update().unwrap().workspace;
+        assert_ne!(winning.epoch_fingerprint(), losing.epoch_fingerprint());
+        assert!(
+            winning
+                .public_checkpoint_from_pin(
+                    losing.epoch(),
+                    &losing.public_checkpoint_pin().unwrap()
+                )
                 .is_err()
         );
     }

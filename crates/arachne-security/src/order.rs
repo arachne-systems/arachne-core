@@ -171,7 +171,22 @@ impl super::Workspace {
         losing: &Self,
         common: &Self,
     ) -> Result<OrderStep, &'static str> {
-        if self.id() != losing.id() || self.id() != common.id() {
+        if self.id() != common.id() {
+            return Err("revocation branches have different workspaces");
+        }
+        self.rebase_revocation_from_checkpoint(step, losing, &common.public_checkpoint()?)
+    }
+
+    /// Rebase from public evidence at the common ancestor. The final order
+    /// verifier checks the checkpoint and winning path against this exact
+    /// accepted parent; the checkpoint alone grants no authority.
+    pub fn rebase_revocation_from_checkpoint(
+        &self,
+        step: &OrderStep,
+        losing: &Self,
+        checkpoint: &[u8],
+    ) -> Result<OrderStep, &'static str> {
+        if self.id() != losing.id() {
             return Err("revocation branches have different workspaces");
         }
         let path = |owner: &Self, from: u64, until: u64| {
@@ -186,10 +201,12 @@ impl super::Workspace {
                 })
                 .collect::<Result<Vec<_>, &'static str>>()
         };
-        let fork = common.epoch();
+        let fork = super::bootstrap::checkpoint_info(checkpoint)?
+            .epoch()
+            .as_u64();
         let mut proof = match &step.proof {
             None => AnchorProof {
-                checkpoint: common.public_checkpoint()?,
+                checkpoint: checkpoint.to_vec(),
                 winning: Vec::new(),
                 losing: path(losing, fork, step.order.anchor_epoch)?,
             },
@@ -213,7 +230,7 @@ impl super::Workspace {
                     let mut anchor = path(losing, fork, start)?;
                     anchor.extend(old.losing.clone());
                     AnchorProof {
-                        checkpoint: common.public_checkpoint()?,
+                        checkpoint: checkpoint.to_vec(),
                         winning: Vec::new(),
                         losing: anchor,
                     }

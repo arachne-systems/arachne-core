@@ -186,6 +186,28 @@ membership changes. An administrator must explicitly admit a fresh member
 state. Old state cannot perform an external commit to admit itself: a removed
 member could use the same route.
 
+### Public evidence after private key deletion
+
+A winner can carry a verified losing order after its private rollback
+snapshot has gone. Before each membership change, Core saves the current
+signed MLS GroupInfo pin as public metadata. It keeps at most 65 pins within
+the existing 64-epoch order window. Each pin is at most 64 KiB, so the total
+pin budget is at most 4,259,840 bytes. These pins contain no private keys.
+They do not change the private rollback or ordinary receive windows.
+
+To use a pin, Core replays accepted history to its epoch and rebuilds the
+public ratchet tree. It checks the pin's signature, workspace, epoch, tree
+hash and exact group context. It then verifies the complete order proof
+against the accepted winning parent. A pin by itself grants no authority.
+The existing 2 MiB proof and nesting-depth limits still apply.
+
+Pins are saved with the candidate. Private settlement leaves them intact;
+order expiry deletes them on the next adopted membership change. A fork
+switch drops pins from the losing suffix. Native restore checks their count,
+size, workspace and epoch before it publishes the workspace. An oversized
+pin can shorten evidence retention but cannot block a valid membership
+change. Other encoding or storage errors fail the change.
+
 ### Retained data and local actions
 
 Core can re-encrypt retained, locally authored objects on the winning branch.

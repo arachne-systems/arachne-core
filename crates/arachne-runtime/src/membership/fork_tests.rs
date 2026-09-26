@@ -6,6 +6,7 @@ use arachne_security::{ManagementAction, PreparedManagementUpdate, Workspace};
 
 mod convergence;
 mod proof_pages;
+mod public_anchors;
 
 fn owner(session: &Session) -> &Workspace {
     session.workspace.as_deref().unwrap()
@@ -368,7 +369,7 @@ fn competing_removes_are_carried_and_quarantine_sends_until_both_apply() {
     // Branch records restore the quarantine before any new publication.
     let records = fork::records(&session, false).unwrap();
     let mut restored = bare_test_session(owner(&session).provisional_copy().unwrap());
-    fork::restore(&mut restored, &records).unwrap();
+    fork::restore(&mut restored, &records, owner(&session)).unwrap();
     assert!(fork::require_send(&restored).is_err());
     assert_recovery_activity(&mut restored, "branch_send_quarantined");
     let (_, encoded) = records
@@ -547,7 +548,7 @@ fn settlement_needs_every_prior_member_on_the_same_next_chain() {
     );
     let records = fork::records(&session, false).unwrap();
     let mut restored = bare_test_session(owner(&session).provisional_copy().unwrap());
-    fork::restore(&mut restored, &records).unwrap();
+    fork::restore(&mut restored, &records, owner(&session)).unwrap();
     assert!(
         restored
             .membership
@@ -693,7 +694,7 @@ fn check_own_republication(kind: u8) {
     let mut restored = bare_test_session(owner(&session).provisional_copy().unwrap());
     restored.delivery.publisher = session.delivery.publisher.clone();
     restored.delivery.inbox = session.delivery.inbox.clone();
-    fork::restore(&mut restored, &branch_records).unwrap();
+    fork::restore(&mut restored, &branch_records, owner(&session)).unwrap();
     session = restored;
     assert!(
         fork::stage_republication(&mut session).unwrap().is_some(),
@@ -852,7 +853,7 @@ fn the_losing_administrator_retries_its_own_action_once() {
     let records = fork::records(loser, false).unwrap();
     let mut restored = bare_test_session(owner(loser).provisional_copy().unwrap());
     restored.storage = loser.storage.clone();
-    fork::restore(&mut restored, &records).unwrap();
+    fork::restore(&mut restored, &records, owner(loser)).unwrap();
     *loser = restored;
     assert!(
         fork::stage_retry(loser).unwrap().is_some(),
@@ -871,7 +872,7 @@ fn the_losing_administrator_retries_its_own_action_once() {
     let records = fork::records(loser, false).unwrap();
     let mut restored = bare_test_session(owner(loser).provisional_copy().unwrap());
     restored.storage = loser.storage.clone();
-    fork::restore(&mut restored, &records).unwrap();
+    fork::restore(&mut restored, &records, owner(loser)).unwrap();
     *loser = restored;
     // A second loss does not reset the one-retry allowance, even after restart.
     let removal = owner(winner)
