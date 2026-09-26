@@ -11,6 +11,7 @@ use arachne_api::{ApiError, ErrorCode};
 use arachne_node::{Node, Permissions, Topic};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(feature = "test-fixtures")]
 use tokio::sync::mpsc;
 
 use crate::client::DeliveryReport;

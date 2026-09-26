@@ -356,6 +356,7 @@ pub(super) async fn resolve_reply(
         .map_err(|_| Error::InvalidFrame)
 }
 
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn decode_reply(bytes: &[u8]) -> Result<Value, String> {
     decode_reply_with_limit(bytes, arachne_node::MAX_CONTROL_REPLY)
 }

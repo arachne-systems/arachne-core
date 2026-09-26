@@ -22,6 +22,7 @@ pub struct StateBasis {
     name_head: [u8; 32],
 }
 
+#[cfg(any(test, feature = "test-fixtures"))]
 impl StateBasis {
     /// Harness-seam constructor (see `crate::harness`); grants no authority.
     #[doc(hidden)]
