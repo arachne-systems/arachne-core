@@ -23,6 +23,7 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 pub(crate) struct ReadyRange {
+    pub(crate) track_progress: bool,
     pub(crate) query: arachne_delivery::RangeQuery,
     pub(crate) peer: [u8; 32],
     pub(crate) reply: Vec<u8>,
@@ -49,6 +50,7 @@ pub(crate) struct ReadyCurrentView {
 pub(crate) type RecoveryReply = ([u8; 32], Result<Vec<u8>, ApiError>);
 
 pub(crate) struct PendingRange {
+    pub(crate) track_progress: bool,
     pub(crate) query: arachne_delivery::RangeQuery,
     pub(crate) available: Option<arachne_delivery::wire::AvailableRangeQuery>,
     pub(crate) automatic: bool,
@@ -509,7 +511,7 @@ pub(crate) fn fetch_range(session: &mut Session, args: FetchRangeArgs) -> Result
         || topics.is_empty()
         || topics.len() > arachne_delivery::MAX_TOPICS
         || matches!((after, through), (Some(after), Some(through)) if after >= through)
-        || matches!((after, through), (Some(_), None) | (None, Some(_)))
+        || matches!((after, through), (None, Some(_)))
     {
         return Err(ApiError::invalid_input(
             "range",
@@ -531,6 +533,9 @@ pub(crate) fn fetch_range(session: &mut Session, args: FetchRangeArgs) -> Result
             "automatic recovery requires an original author",
         )),
     }?;
+    // An explicit cursor selects a tail without claiming the omitted history.
+    // Holder selection is independent of accepted full-history progress.
+    let track_progress = after.is_none();
     let after = match after {
         Some(after) => after,
         None => session
@@ -622,6 +627,7 @@ pub(crate) fn fetch_range(session: &mut Session, args: FetchRangeArgs) -> Result
     .map_err(delivery(ErrorCode::InvalidInput))?;
     let (candidate_count, replies, task) = ask_holders(session, &candidates, &wire);
     session.recovery.range = Some(PendingRange {
+        track_progress,
         query,
         available,
         automatic,
@@ -697,6 +703,7 @@ pub(crate) fn poll_range(session: &mut Session) -> Result<Option<RangeStatus>, A
     let query = active.query.clone();
     let available = active.available.clone();
     let automatic = active.automatic;
+    let track_progress = active.track_progress;
     let attempted = active.attempted;
     let owner = session
         .workspace
@@ -728,6 +735,7 @@ pub(crate) fn poll_range(session: &mut Session) -> Result<Option<RangeStatus>, A
                     let packet_count = range.packets().len();
                     drop(range);
                     session.recovery.ready_range = Some(ReadyRange {
+                        track_progress,
                         query,
                         peer,
                         reply,
@@ -773,6 +781,7 @@ pub(crate) fn poll_range(session: &mut Session) -> Result<Option<RangeStatus>, A
         Ok((query, reply, packet_count)) => {
             drop(session.recovery.range.take());
             session.recovery.ready_range = Some(ReadyRange {
+                track_progress,
                 query,
                 peer,
                 reply,
@@ -1480,18 +1489,16 @@ pub(crate) fn stage_range(session: &mut Session, args: StageRangeArgs) -> Result
             &fresh
         }
     };
-    if ready.automatic {
-        let progress =
-            inbox.recovery_progress(ready.query.author, ready.query.epoch, &ready.query.topics);
-        if ready.query.through <= progress {
-            session.recovery.ready_range = None;
-            return Ok(nothing("recovery_already_covered"));
-        }
-        if ready.query.after != progress {
-            return Err(ApiError::candidate_stale(
-                "recovery range does not continue accepted progress",
-            ));
-        }
+    let progress =
+        inbox.recovery_progress(ready.query.author, ready.query.epoch, &ready.query.topics);
+    if ready.automatic && ready.query.through <= progress {
+        session.recovery.ready_range = None;
+        return Ok(nothing("recovery_already_covered"));
+    }
+    if ready.track_progress && ready.query.after != progress {
+        return Err(ApiError::candidate_stale(
+            "recovery range does not continue accepted progress",
+        ));
     }
     let offer = match arachne_delivery::wire::verify_reply(owner, &ready.query, &ready.reply)
         .map_err(delivery(ErrorCode::TransportFailed))?
@@ -1557,7 +1564,7 @@ pub(crate) fn stage_range(session: &mut Session, args: StageRangeArgs) -> Result
         };
         let staged = match staged {
             Err(error)
-                if ready.automatic && arachne_delivery::inbox::drains_with_application(error) =>
+                if ready.track_progress && arachne_delivery::inbox::drains_with_application(error) =>
             {
                 stopped = true;
                 break;
@@ -1585,16 +1592,16 @@ pub(crate) fn stage_range(session: &mut Session, args: StageRangeArgs) -> Result
     if !stopped {
         covered = ready.query.through;
     }
-    if ready.automatic && covered > ready.query.after {
+    if ready.track_progress && covered > ready.query.after {
         next = next
             .accept_recovery_prefix(owner, &ready.query, &ready.reply, covered)
             .map_err(delivery(ErrorCode::InvalidInput))?;
     }
-    if count == 0 && retain_until == 0 && !ready.automatic {
+    if count == 0 && retain_until == 0 && !ready.track_progress {
         session.recovery.ready_range = None;
         return Ok(nothing("recovery_no_new_objects"));
     }
-    if ready.automatic && covered == ready.query.after && retain_until == 0 {
+    if ready.track_progress && covered == ready.query.after && retain_until == 0 {
         // Nothing fits until the application drains this author's
         // pending objects. No progress is claimed; request again later.
         session.recovery.ready_range = None;
@@ -1604,7 +1611,7 @@ pub(crate) fn stage_range(session: &mut Session, args: StageRangeArgs) -> Result
             accepted_progress: Some(false),
         }));
     }
-    let automatic = ready.automatic;
+    let track_progress = ready.track_progress;
     let snapshot = seal_state(session.records.is_some(), owner, key, Some(&publisher), Some(&next))?;
     let candidate = owner
         .provisional_copy()
@@ -1615,7 +1622,7 @@ pub(crate) fn stage_range(session: &mut Session, args: StageRangeArgs) -> Result
         state: "awaiting_recovery_save",
         publication_count: Some(count),
         missing_count: missed_since_commit(session, Some(&next)),
-        accepted_through: automatic.then_some(covered),
+        accepted_through: track_progress.then_some(covered),
         current_view: None,
         durable: false,
         accepted_progress: false,

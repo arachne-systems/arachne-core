@@ -505,8 +505,12 @@ pub(crate) fn drive_workspace(session: &mut Session) -> Result<Value, ApiError> 
         None
     };
     let mut result = drive_workspace_step(session)?;
-    result["presence"] =
-        serde_json::to_value(presence).map_err(|error| ApiError::internal(error.to_string()))?;
+    result["presence"] = presence.map_or(Value::Null, |presence| json!({
+        "state": presence.state,
+        "sync_peer": presence.sync_peer,
+        "response_errors": presence.response_errors,
+        "response_error": presence.response_error,
+    }));
     Ok(result)
 }
 

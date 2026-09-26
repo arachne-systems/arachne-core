@@ -689,7 +689,9 @@ pub struct RecoveryRangeRequest {
     pub author: Option<[u8; 32]>,
     pub revision: u64,
     pub topics: Vec<String>,
+    /// None continues saved full-history progress. Some selects an independent tail.
     pub after: Option<u64>,
+    /// None asks a holder for its bounded available range after the cursor.
     pub through: Option<u64>,
 }
 
@@ -1604,8 +1606,14 @@ impl Client {
     #[cfg(feature = "moq")]
     pub fn moq_metrics(&self) -> Result<Value> {
         self.call(Op::MoqMetrics, |session| {
-            serde_json::to_value(session.node.moq_metrics())
-                .map_err(|error| ApiError::internal(error.to_string()))
+            let metrics = session.node.moq_metrics();
+            Ok(serde_json::json!({
+                "sessions_total": metrics.sessions_total,
+                "sessions_active": metrics.sessions_active,
+                "packets_sent": metrics.packets_sent,
+                "packets_received": metrics.packets_received,
+                "rejected_sessions": metrics.rejected_sessions,
+            }))
         })
     }
 
