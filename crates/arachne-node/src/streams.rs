@@ -23,15 +23,13 @@ use crate::{
 const SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Counters for the distinct MoQ data path. A queued packet is not a remote receipt.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct MoqMetrics {
     pub sessions_total: u64,
     pub sessions_active: usize,
     pub packets_sent: u64,
     pub packets_received: u64,
     pub rejected_sessions: u64,
-    pub interest_sync_pending: usize,
-    pub last_error: Option<String>,
 }
 
 #[derive(Default)]
@@ -41,8 +39,6 @@ struct Counters {
     packets_sent: AtomicU64,
     packets_received: AtomicU64,
     rejected_sessions: AtomicU64,
-    interest_sync_pending: AtomicUsize,
-    last_error: StdMutex<Option<String>>,
 }
 
 impl Counters {
@@ -53,8 +49,6 @@ impl Counters {
             packets_sent: self.packets_sent.load(Ordering::Relaxed),
             packets_received: self.packets_received.load(Ordering::Relaxed),
             rejected_sessions: self.rejected_sessions.load(Ordering::Relaxed),
-            interest_sync_pending: self.interest_sync_pending.load(Ordering::Relaxed),
-            last_error: self.last_error.lock().unwrap().clone(),
         }
     }
 }
@@ -141,6 +135,9 @@ impl Streams {
             }
         }
 
+        // Reject a route we cannot start, while keeping connection work out of
+        // the caller's workspace pump. Later retries share the same dial budget.
+        let permit = self.0.connections.dial_capacity(iroh_moq::ALPN)?;
         let moq = Moq::new(self.0.connections.endpoint());
         // Subscribe before publishing the route. An outbound dial can complete
         // immediately after the peer installs the matching route.
@@ -171,8 +168,11 @@ impl Streams {
             route.stop().await;
             return Err(Error::Rejected);
         }
+        drop(permit);
         let worker = tokio::spawn(run_peer(
             incoming,
+            moq,
+            EndpointAddr::new(key),
             self.0.connections.clone(),
             self.0.local,
             peer,
@@ -184,41 +184,6 @@ impl Streams {
         ));
         route.workers.lock().unwrap().push(worker);
 
-        // A deterministic dialer avoids duplicate sessions when both peers opt in.
-        let mut dialed_session = None;
-        if self.0.local < peer {
-            let _permit = match self.0.connections.dial_capacity(iroh_moq::ALPN) {
-                Ok(permit) => permit,
-                Err(error) => {
-                    self.remove_route(peer).await;
-                    return Err(error);
-                }
-            };
-            let result =
-                tokio::time::timeout(SESSION_TIMEOUT, moq.connect(EndpointAddr::new(key))).await;
-            drop(_permit);
-            match result {
-                Ok(Ok(session)) => dialed_session = Some(session),
-                Ok(Err(error)) => {
-                    self.remove_route(peer).await;
-                    return Err(transport(error));
-                }
-                Err(_) => {
-                    self.remove_route(peer).await;
-                    return Err(Error::Timeout("dial MoQ"));
-                }
-            }
-        }
-        if let Some(session) = dialed_session {
-            let worker = tokio::spawn(reconnect_peer(
-                moq,
-                EndpointAddr::new(key),
-                self.0.connections.clone(),
-                session,
-                Arc::downgrade(&self.0.counters),
-            ));
-            route.workers.lock().unwrap().push(worker);
-        }
         Ok(())
     }
 
@@ -239,11 +204,10 @@ impl Streams {
                 .fetch_add(1, Ordering::Relaxed);
             return Err(Error::Rejected);
         };
-        if self.0.local < peer
-            || self
-                .authorize(route.scope, peer, &route.topic)
-                .await
-                .is_err()
+        if self
+            .authorize(route.scope, peer, &route.topic)
+            .await
+            .is_err()
         {
             self.0
                 .counters
@@ -440,53 +404,6 @@ impl Route {
     }
 }
 
-async fn reconnect_peer(
-    moq: Moq,
-    address: EndpointAddr,
-    connections: Connections,
-    mut session: MoqSession,
-    counters: Weak<Counters>,
-) {
-    let mut delay = Duration::from_millis(250);
-    loop {
-        let _reason = session.closed().await;
-        tokio::time::sleep(delay).await;
-        let permit = match connections.dial_capacity(iroh_moq::ALPN) {
-            Ok(permit) => permit,
-            Err(error) => {
-                if let Some(counters) = counters.upgrade() {
-                    *counters.last_error.lock().unwrap() =
-                        Some(format!("reconnect {}: capacity failed {error:?}", address.id));
-                }
-                delay = (delay * 2).min(Duration::from_secs(5));
-                continue;
-            }
-        };
-        let result = tokio::time::timeout(SESSION_TIMEOUT, moq.connect(address.clone())).await;
-        drop(permit);
-        match result {
-            Ok(Ok(reconnected)) => {
-                if let Some(counters) = counters.upgrade() {
-                    *counters.last_error.lock().unwrap() = Some(format!(
-                        "reconnect {}: connected; reused={}",
-                        address.id,
-                        session.conn().stable_id() == reconnected.conn().stable_id(),
-                    ));
-                }
-                session = reconnected;
-                delay = Duration::from_millis(250);
-            }
-            other => {
-                if let Some(counters) = counters.upgrade() {
-                    *counters.last_error.lock().unwrap() =
-                        Some(format!("reconnect {}: dial failed {other:?}", address.id,));
-                }
-                delay = (delay * 2).min(Duration::from_secs(5));
-            }
-        }
-    }
-}
-
 async fn authorize(
     routing: &Mutex<RoutingTable>,
     local: PeerId,
@@ -509,6 +426,8 @@ async fn authorize(
 
 async fn run_peer(
     mut incoming: iroh_moq::IncomingSessionStream,
+    moq: Moq,
+    address: EndpointAddr,
     connections: Connections,
     local: PeerId,
     peer: PeerId,
@@ -518,9 +437,38 @@ async fn run_peer(
     events: DeliveryQueue,
     counters: Weak<Counters>,
 ) {
-    while let Some(session) = incoming.next().await {
+    let mut selected = None;
+    let mut delay = Duration::ZERO;
+    loop {
+        let session = if let Some(session) = selected.take() {
+            session
+        } else {
+            let dial = async {
+                tokio::time::sleep(delay).await;
+                let _permit = connections.dial_capacity(iroh_moq::ALPN)?;
+                tokio::time::timeout(SESSION_TIMEOUT, moq.connect(address.clone()))
+                    .await
+                    .map_err(|_| Error::Timeout("dial MoQ"))?
+                    .map_err(transport)
+            };
+            tokio::select! {
+                biased;
+                session = incoming.next() => match session {
+                    Some(session) => session,
+                    None => return,
+                },
+                result = dial => match result {
+                    Ok(session) => session,
+                    Err(error) => {
+                        tracing::debug!(target: "data_fabric_transport", ?peer, ?error, "MOQ_DIAL_FAILED");
+                        delay = (delay * 2).clamp(Duration::from_millis(250), Duration::from_secs(5));
+                        continue;
+                    }
+                },
+            }
+        };
+        delay = Duration::from_millis(250);
         if *session.remote_id().as_bytes() != peer
-            || session.dialed() != (local < peer)
             || authorize(&routing, local, scope, peer, &topic)
                 .await
                 .is_err()
@@ -531,47 +479,36 @@ async fn run_peer(
             session.close(moq_net::Error::Cancel);
             continue;
         }
-        if let Some(counters) = counters.upgrade() {
-            counters
-                .interest_sync_pending
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        let interest = announce_interest(&connections, &routing, local, peer, scope, &topic).await;
-        if let Some(counters) = counters.upgrade() {
-            counters
-                .interest_sync_pending
-                .fetch_sub(1, Ordering::Relaxed);
-        }
-        if let Err(error) = interest {
-            if let Some(counters) = counters.upgrade() {
-                *counters.last_error.lock().unwrap() = Some(format!("interest: {error}"));
+        let receive = async {
+            announce_interest(&connections, &routing, local, peer, scope, &topic).await?;
+            receive_session(
+                &session, local, peer, scope, &topic, &routing, &events, &counters,
+            )
+            .await
+        };
+        tokio::pin!(receive);
+        loop {
+            tokio::select! {
+                // A restarted peer can dial us before our old QUIC session
+                // times out. Keep one receive subscription per peer. Iroh MoQ
+                // owns duplicate connection lifetime; closing an unused one
+                // here can close the session the other peer still consumes.
+                next = incoming.next() => match next {
+                    Some(next) if next.conn().stable_id() == session.conn().stable_id() => continue,
+                    Some(next) => {
+                        selected = Some(next);
+                        break;
+                    }
+                    None => return,
+                },
+                result = &mut receive => {
+                    if let Err(error) = result {
+                        tracing::info!(target: "data_fabric_transport", peer = %session.remote_id(), route = "moq", ?error, "PTT_MOQ_SESSION_CLOSED");
+                    }
+                    session.close(moq_net::Error::Cancel);
+                    break;
+                }
             }
-            tracing::warn!(
-                target: "data_fabric_transport",
-                peer = %session.remote_id(),
-                route = "moq",
-                ?error,
-                "PTT_MOQ_INTEREST_SYNC_FAILED",
-            );
-            session.close(moq_net::Error::Cancel);
-            continue;
-        }
-        if let Some(counters) = counters.upgrade() {
-            counters.sessions_total.fetch_add(1, Ordering::Relaxed);
-            counters.sessions_active.fetch_add(1, Ordering::Relaxed);
-        }
-        let _active = ActiveSession(counters.upgrade());
-        tracing::info!(target: "data_fabric_transport", peer = %session.remote_id(), workspace = %hex(&scope.workspace), revision = scope.revision, topic = topic.as_str(), route = "moq", "PTT_MOQ_SESSION_ESTABLISHED");
-        if let Err(error) = receive_session(
-            &session, local, peer, scope, &topic, &routing, &events, &counters,
-        )
-        .await
-        {
-            if let Some(counters) = counters.upgrade() {
-                *counters.last_error.lock().unwrap() = Some(format!("receive: {error}"));
-            }
-            tracing::info!(target: "data_fabric_transport", peer = %session.remote_id(), route = "moq", ?error, "PTT_MOQ_SESSION_CLOSED");
-            session.close(moq_net::Error::Cancel);
         }
     }
 }
@@ -600,6 +537,9 @@ async fn announce_interest(
         operation: Operation::Subscribe,
     };
     let bytes = wire::encode(&frame)?;
+    // The new MoQ handshake can precede expiry of a pre-restart data connection.
+    // Refresh its cache ownership without cancelling other in-flight exchanges.
+    connections.forget(peer, super::ALPN).await;
     super::send_frame(connections, routing, peer, &frame, &bytes).await
 }
 
@@ -637,6 +577,12 @@ async fn receive_session(
         ))
         .await
         .map_err(transport)?;
+    if let Some(counters) = counters.upgrade() {
+        counters.sessions_total.fetch_add(1, Ordering::Relaxed);
+        counters.sessions_active.fetch_add(1, Ordering::Relaxed);
+    }
+    let _active = ActiveSession(counters.upgrade());
+    tracing::info!(target: "data_fabric_transport", peer = %session.remote_id(), workspace = %hex(&scope.workspace), revision = scope.revision, topic = topic.as_str(), route = "moq", "PTT_MOQ_SESSION_ESTABLISHED");
     let closed = session.closed();
     tokio::pin!(closed);
     loop {

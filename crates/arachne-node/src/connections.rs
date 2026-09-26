@@ -683,16 +683,24 @@ impl Connections {
         outcome
     }
 
-    /// Close and forget the cached connection to `peer` for `alpn`. A request
-    /// was sent on it and no reply came: on tablets such a connection stayed
-    /// broken (iroh dropped the reply's packets on a path the other side did
-    /// not know) and every retry on it waited out the full deadline again. The
-    /// next dial gets a fresh connection.
-    pub(super) async fn discard(&self, peer: PeerId, alpn: &[u8]) {
-        let cached = self.outgoing.lock().await.remove(&(peer, alpn.to_vec()));
-        if let Some(connection) = cached.and_then(|cached| cached.connection.get().cloned()) {
-            connection.close(0u8.into(), b"stalled");
+    /// A new authenticated session may belong to a restarted peer. Let existing
+    /// exchanges keep their handles, but make the next exchange open a fresh one.
+    #[cfg(any(feature = "moq", test))]
+    pub(super) async fn forget(&self, peer: PeerId, alpn: &[u8]) {
+        self.outgoing.lock().await.remove(&(peer, alpn.to_vec()));
+    }
+
+    /// Close the failed connection. A late failure must not evict a newer
+    /// connection that another exchange has already put in the cache.
+    pub(super) async fn discard(&self, connection: &iroh::endpoint::Connection) {
+        let key = (*connection.remote_id().as_bytes(), connection.alpn().to_vec());
+        let mut outgoing = self.outgoing.lock().await;
+        if outgoing.get(&key).and_then(|cached| cached.connection.get())
+            .is_some_and(|cached| cached.stable_id() == connection.stable_id())
+        {
+            outgoing.remove(&key);
         }
+        connection.close(0u8.into(), b"stalled");
     }
 
     /// Close every connection with no exchange in progress (suspend). The
@@ -1155,7 +1163,7 @@ mod tests {
                 first.stable_id(),
                 "a healthy connection is reused"
             );
-            cache.discard(id, &alpn).await;
+            cache.discard(&first).await;
             assert!(
                 first.close_reason().is_some(),
                 "the discarded connection is closed"
@@ -1166,6 +1174,13 @@ mod tests {
                 first.stable_id(),
                 "the next dial is a new connection"
             );
+            cache.forget(id, &alpn).await;
+            assert!(fresh.close_reason().is_none(), "refresh cancelled an existing exchange");
+            let replacement = cache.connect(id, &alpn).await.unwrap();
+            // A late failure on the old handle must not discard its replacement.
+            cache.discard(&fresh).await;
+            assert!(replacement.close_reason().is_none(), "old failure closed the new connection");
+            assert_eq!(cache.connect(id, &alpn).await.unwrap().stable_id(), replacement.stable_id());
             cache.close().await;
             peer.close().await;
             server.abort();

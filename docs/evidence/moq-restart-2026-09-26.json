@@ -1,0 +1,164 @@
+[
+  {
+    "target": "arachne_node",
+    "exit": 0,
+    "seconds": 40.359,
+    "summary": [
+      "test result: ok. 39 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 40.31s"
+    ],
+    "log": "/tmp/core-moq-restart-suite-arachne_node.log"
+  },
+  {
+    "target": "connection_memory",
+    "exit": 0,
+    "seconds": 0.008,
+    "summary": [
+      "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    ],
+    "log": "/tmp/core-moq-restart-suite-connection_memory.log"
+  },
+  {
+    "target": "connection_reuse",
+    "exit": 0,
+    "seconds": 60.088,
+    "summary": [
+      "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 60.05s"
+    ],
+    "log": "/tmp/core-moq-restart-suite-connection_reuse.log"
+  },
+  {
+    "target": "control_burst",
+    "exit": 0,
+    "seconds": 0.008,
+    "summary": [
+      "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    ],
+    "log": "/tmp/core-moq-restart-suite-control_burst.log"
+  },
+  {
+    "target": "control_inquiry",
+    "exit": 0,
+    "seconds": 0.114,
+    "summary": [
+      "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s"
+    ],
+    "log": "/tmp/core-moq-restart-suite-control_inquiry.log"
+  },
+  {
+    "target": "control_signal",
+    "exit": 0,
+    "seconds": 0.365,
+    "summary": [
+      "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s"
+    ],
+    "log": "/tmp/core-moq-restart-suite-control_signal.log"
+  },
+  {
+    "target": "gossip_forwarding",
+    "exit": 0,
+    "seconds": 7.337,
+    "summary": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.30s"
+    ],
+    "log": "/tmp/core-moq-restart-suite-gossip_forwarding.log"
+  },
+  {
+    "target": "lan_restart",
+    "exit": 0,
+    "seconds": 1.57,
+    "summary": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.56s"
+    ],
+    "log": "/tmp/core-moq-restart-suite-lan_restart.log"
+  },
+  {
+    "target": "live_pubsub",
+    "exit": 0,
+    "seconds": 14.065,
+    "summary": [
+      "test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.03s"
+    ],
+    "log": "/tmp/core-moq-restart-suite-live_pubsub.log"
+  },
+  {
+    "target": "mdns_refresh",
+    "exit": 0,
+    "seconds": 1.569,
+    "summary": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.53s"
+    ],
+    "log": "/tmp/core-moq-restart-suite-mdns_refresh.log"
+  },
+  {
+    "target": "membership_gossip_size",
+    "exit": 0,
+    "seconds": 0.114,
+    "summary": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s"
+    ],
+    "log": "/tmp/core-moq-restart-suite-membership_gossip_size.log"
+  },
+  {
+    "target": "mixed_traffic",
+    "exit": 0,
+    "seconds": 0.064,
+    "summary": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s"
+    ],
+    "log": "/tmp/core-moq-restart-suite-mixed_traffic.log"
+  },
+  {
+    "target": "moq_restart",
+    "exit": 0,
+    "seconds": 0.315,
+    "summary": [
+      "test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.29s"
+    ],
+    "log": "/tmp/core-moq-restart-suite-moq_restart.log"
+  },
+  {
+    "target": "moq_stream",
+    "exit": 0,
+    "seconds": 3.172,
+    "summary": [
+      "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.15s"
+    ],
+    "log": "/tmp/core-moq-restart-suite-moq_stream.log"
+  },
+  {
+    "target": "overlay_bootstrap",
+    "exit": 0,
+    "seconds": 0.115,
+    "summary": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s"
+    ],
+    "log": "/tmp/core-moq-restart-suite-overlay_bootstrap.log"
+  },
+  {
+    "target": "resource_stream",
+    "exit": 0,
+    "seconds": 6.081,
+    "summary": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.05s"
+    ],
+    "log": "/tmp/core-moq-restart-suite-resource_stream.log"
+  },
+  {
+    "target": "tor_transport",
+    "exit": 0,
+    "seconds": 0.004,
+    "summary": [
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    ],
+    "log": "/tmp/core-moq-restart-suite-tor_transport.log"
+  },
+  {
+    "target": "wan_profile",
+    "exit": 0,
+    "seconds": 0.016,
+    "summary": [
+      "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+    ],
+    "log": "/tmp/core-moq-restart-suite-wan_profile.log"
+  }
+]
