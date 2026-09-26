@@ -58,6 +58,11 @@ Found with `diff -ru` against the crates.io archive
    the TLS ClientHello does not name the workspace. The accepting side reads
    the preamble before it calls `Gossip::handle_connection`; gossip itself
    never sees it.
+7. **Connection churn cleanup.** Adapt the fixes and regression checks from
+   upstream pull request #154 (commit `90a1af0`): stop a send loop when its
+   channel closes, stop the connection task when either half ends, and remove
+   closed or failed peers from the actor map. Failed dial cleanup is limited
+   to inactive peers so a concurrently accepted connection remains live.
 
 No protocol version, crypto or dependency version changes. Item 6 adds bytes
 before the gossip streams on dialed connections.
@@ -65,6 +70,11 @@ The actor still owns its peer-deduplicated queue, retries, routing and gossip
 state machine.
 
 ### Other files
+
+- `src/net/util.rs`, `src/proto/state.rs`, `src/proto/hyparview.rs`, and
+  `src/proto/plumtree.rs`: port upstream pull request #154's cleanup of stale
+  per-peer state after disconnect, timeout, or eviction. These changes do not
+  alter the wire protocol.
 
 - `src/bin/sim.rs`: remove a redundant borrow in a formatting argument for
   Rust 1.98 Clippy. This diagnostic binary keeps the same behavior.
@@ -91,9 +101,10 @@ therefore cannot delay a gossip link to a live member. An endpoint hook
 separately bounds established connections, including gossip, without keeping
 strong connection handles.
 
-Remove this patch when upstream provides equivalent cancellation-safe shared
-dial admission. A before-connect hook alone cannot release capacity after failed
-or cancelled attempts; a post-handshake hook cannot bound pending dials.
+Remove each part of this patch when upstream provides its equivalent. A
+before-connect hook alone cannot release capacity after failed or cancelled
+attempts; a post-handshake hook cannot bound pending dials. Remove the churn
+cleanup when upstream pull request #154 lands in the pinned release.
 
 The root source-archive check includes this path. Focused checks in
 `crates/arachne-node/src/budget.rs` exercise native gossip dialing, queued/active
