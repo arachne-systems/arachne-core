@@ -54,9 +54,9 @@ An incoming object is accepted when all of these are true:
 - `poll_pending_object` returns the next pending object without removing it.
   It returns the same object again until the application resolves it.
 - `stage_object_acknowledgement` (application accepted it) and
-  `stage_object_rejection` (application refuses it for good) remove it. Save
-  the candidate, then adopt it. A crash before the save offers the object
-  again after restart.
+  `stage_object_rejection` (application refuses it for good) remove it. Core
+  adoption saves the candidate and reads it back before it applies the change.
+  A crash before that save offers the object again after restart.
 - The application must be idempotent on (member, publication id): a crash
   between the application's own commit and the saved acknowledgement delivers
   the object again. Exactly once is not claimed.
@@ -137,8 +137,9 @@ Its pending objects are not delivered.
   fixed budget: `PUBLISHER_BUDGET` = 192 KiB and `INBOX_BUDGET` (the rest).
 - Saving never evicts either part to make room for the other. The operation
   that would grow the inbox past its budget fails instead.
-- The inbox is a canonical binary snapshot (`DFIC` v5). Payloads are raw
-  bytes.
+- The inbox is a canonical binary snapshot (`DFIC` v6). Payloads are raw
+  bytes. Version 5 is rejected. Existing stored data needs the authenticated
+  upgrade described in the [binding and upgrade guide](reviews/h4-core-sdk-migration.md#fixtures-and-json-removal).
 
 ## Group mode
 

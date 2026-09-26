@@ -4,12 +4,12 @@
 
 ## BLUF
 
-The first H7 qualification on `05434f86` passed all gates. The deadline
-follow-up on `2b568922` passes 710 tests, zero failed and 21 ignored across
-120 executables. Counter source `7f99bfa` compiles and formats. Finish the
-stream follow-ups before repeating the final strict checks. The first
-12.0 GiB target was cleaned; the current target stays warm at the lead's
-request. The owner decides any merge to `main` or outward action.
+Final H7 source `0d37ba9` passes 724 tests, zero failed and 22 ignored across
+120 executables. Strict Clippy, Rust 1.91 workspace/default-feature compilation,
+dependency policy, format and local documentation links pass. Earlier REDs and
+qualified runs stay separate in the report. The first 12.0 GiB target was cleaned;
+the current 7.8 GiB target stays warm until the lead's 08:30 CDT decision.
+The owner decides any merge to `main` or outward action.
 
 ## Initial integrated evidence
 
@@ -37,10 +37,12 @@ uninterrupted 706/0/21 run.
 - [x] Record final evidence and commits in the tracker. Keep unproved consumer
   and owner gates open.
 - [x] Finish the [owner merge summary](../h7-owner-merge-summary.md).
-- [x] Clean this lane's rebuildable target after its last check.
+- [x] Clean this lane's first qualification target (12.0 GiB).
 
-- [ ] Complete the later stream follow-ups, repeat final qualification and
-  clean the new target after the lead ends the investigation.
+- [x] Complete the later stream follow-ups and repeat full and strict qualification
+  on frozen source `0d37ba9` (724/0/22).
+- [ ] Clean the new target after the lead ends the warm-cache hold and all owned
+  build/test processes have exited. The next decision is at 08:30 CDT.
 
 ## Done when
 

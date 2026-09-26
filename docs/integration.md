@@ -263,6 +263,19 @@ audience and Critical delivery. The existing `_with_current` method still uses
 an empty audience: `None` means Critical and `Some(metadata)` means Current.
 All three methods use the same validation, native storage and adoption path.
 
+## Live stream ordering
+
+An enabled MoQ route reads up to eight independent groups at a time. A later
+complete group can arrive before an earlier group whose payload or end is still
+missing. Each read uses the existing five-second live replay window and frame
+size limit. Session close cancels all pending reads. The
+[group isolation proof](evidence/moq-group-isolation-2026-09-26.md) records these
+bounds and the late-completion checks.
+
+Protected-object ordering still follows the [delivery contract](delivery.md).
+Hosts that decode live stream payloads apply the payload protocol's sequence
+and lifecycle rules.
+
 ## Recovery and delivery expectations
 
 Received and recovered objects wait in a durable inbox. Read them with

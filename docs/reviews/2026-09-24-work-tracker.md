@@ -7,10 +7,10 @@ test is red → green and the crate tests pass.
 
 H1, H2, H3, H4 and H6 are merged locally on `integrate/wave1`. Core has API
 version 6, native storage, opaque candidates, generated binding metadata and
-bounded fork recovery. H5 proves SDK `0d857b7` on Core `05434f86`. H7 passes
-on the deadline follow-up `2b568922`: 710 passed, zero failed, 21 ignored.
-The receive-counter source `7f99bfa` compiles; final strict checks await the
-next source freeze. Owner decisions and unproved consumer upgrades stay open.
+bounded fork recovery. H7 source `0d37ba9` passes 724 tests, zero failed and
+22 ignored across 120 executables. All strict gates pass. H5 host SDK `2183cb3`
+uses the same Core source. The preserved Android artifacts use an older pin.
+Owner decisions and unproved consumer upgrades stay open.
 
 ## Integration evidence (2026-09-26)
 
@@ -20,14 +20,15 @@ next source freeze. Owner decisions and unproved consumer upgrades stay open.
 | H2 | `840c25a`; merge `0d5e071` | [Native storage report](../evidence/h2-night-2026-09-26.md) |
 | H3 | `a6619db`; merge `688946b` | [Measured test profile](handoff/H3-test-speed.md) |
 | H4 | `91ce5b1`; merge `e420a52` | [Core binding report](../evidence/h4-night-2026-09-26.md) |
-| H5 (SDK) | SDK `0d857b7`, Core `05434f86` | Fifteen generated files refreshed; four language flows, Rust, AAR, R8 and Android test APK passed. MoQ is forwarded as an opt-in feature; the default AAR excludes it. Device/ATAK gates remain |
+| H5 (SDK) | Host SDK `2183cb3`, Core `0d37ba9`; preserved Android SDK `853bacd`, Core `05434f86` | Fifteen generated files match fresh generation; four host language flows, Rust and opt-in metrics tests passed. Android artifacts were not rebuilt. MoQ is opt-in; the default AAR excludes it. Device/ATAK gates remain |
 | H6 | `fc06673`; merge `ad31b97` | [Crypto report](../evidence/h6-night-2026-09-26.md): 681 passed, 0 failed, 20 ignored; MSRV and deny green |
 | Typed publication options | `db57185`; merge `05434f8` | [Audience, Bulk and Current proof](2026-09-26-typed-publication-options.md); included in H7 |
-| H7 | First source `05434f86`; deadline follow-up `2b568922`; counter source `7f99bfa` | [Report](../evidence/h7-night-2026-09-26.md): first 706/0/21 plus all strict gates; later uninterrupted 710/0/21 across 120 executables. Counters compile and format green; final strict checks pending. First 12.0 GiB target cleaned; current target retained for stream diagnosis |
+| H7 | Final `0d37ba9`; earlier `05434f86` and `2b568922` | [Report](../evidence/h7-night-2026-09-26.md): final uninterrupted 724/0/22 across 120 executables; strict Clippy, Rust 1.91/default features, deny, format and 63 local links pass. Earlier 706/0/21 and 710/0/21 stay separate. First 12.0 GiB target cleaned; current 7.8 GiB target held until the lead's 08:30 decision |
 
 The H6 total includes 18 tests in 20 example harnesses. It is a corrected
 aggregate with the original failures and reruns retained in its receipts.
-The SDK report is `docs/reviews/2026-09-26-h5-sdk-completion.md` in the SDK repo.
+The latest SDK report is `docs/reviews/2026-09-26-h5-deadline-refresh.md` in the SDK repo.
+The first package report is `docs/reviews/2026-09-26-h5-sdk-completion.md`.
 
 Open gates: migrate remaining Core dispatcher callers; choose and reconcile the
 SDK line; prove the existing-data upgrade; qualify the ATAK host; approve pushes
@@ -52,6 +53,15 @@ and publication. The [H8 brief](handoff/H8-owner-decisions.md) owns outward acti
   push. Fifty corrected exact repeats and all 13 admission tests passed.
   The original combined run remains 701 passed, one failed and 21 ignored;
   the corrected full run is reported separately in the H7 evidence.
+
+- [x] Foreground deadline isolation (`ddb3f69`, integrated before `0d37ba9`):
+  a foreground timeout no longer cancels unrelated background requests. Earlier
+  and concurrent background controls, explicit cancel and close all pass. The
+  operation mutex can still delay entry beyond the requested deadline.
+- [x] Independent live groups (`ad456026`, integrated in `0d37ba9`): partial
+  payloads and missing EOF no longer block later complete groups. Eight bounded
+  readers use the existing live window; close cancels them. Malformed, oversized
+  and outsider checks pass. The actual tablet stall remains a separate issue.
 
 ## Fix-now bugs (core)
 

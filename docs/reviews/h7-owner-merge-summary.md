@@ -2,13 +2,13 @@
 
 ## BLUF
 
-Core H1, H2, H3, H4 and H6 are merged locally; H5 has a separate SDK proof.
-The H7 deadline follow-up on `2b568922` passes 710 tests, with zero failures
-and 21 ignored. The earlier `05434f86` passed all strict checks. New receive
-counters on `7f99bfa` compile. Final qualification waits for the stream fixes.
-Keep the current target warm; the first 12.0 GiB cache was removed. No branch
-has been pushed or published. Existing tablet data is not yet qualified for
-the new storage format.
+Core H1, H2, H3, H4 and H6 are merged locally. Final H7 source `0d37ba9`
+passes 724 tests, with zero failures and 22 ignored across 120 executables.
+Strict Clippy, Rust 1.91 workspace/default-feature compilation, dependency
+policy and formatting also pass. H5 host checks use the same Core source.
+The first 12.0 GiB cache was removed; the current 7.8 GiB target stays warm
+until the lead's 08:30 CDT decision. No branch has been pushed or published.
+Existing tablet data is not yet qualified for the new storage format.
 
 ## What changed
 
@@ -46,15 +46,21 @@ the new storage format.
 The [H7 report](../evidence/h7-night-2026-09-26.md) keeps the initial integrated
 RED, unchanged repetitions, fixes, final checks and their source revisions.
 The [tracker](2026-09-24-work-tracker.md) links each earlier package's proof.
-H5's SDK checkpoint `0d857b7` refreshed all 15 generated files and passed four
-language flows and Android packaging on Core `05434f86`. Its `moq` feature
-forwards to Core. The default AAR excludes streaming support. These results
-do not replace the final SDK pin check or the existing-data device upgrade gate.
+H5's SDK checkpoint `2183cb3` passes four host language flows on Core `0d37ba9`.
+All 15 generated files match fresh generation. Rust examples, default tests and
+three opt-in MoQ metrics tests also pass. Its `moq` feature forwards to Core.
+The preserved AAR, R8 and test APK use SDK `853bacd` / Core `05434f86`; this
+refresh did not rebuild them. The default AAR excludes streaming support.
+The selected mobile package still needs matching bindings, native code and
+existing-data upgrade checks.
 
-The first qualified test source is `05434f86f4297b33620502dc3385f31953ff5889`. Strict Clippy,
-Rust 1.91 workspace/default-feature compilation, dependency policy and format
-checks pass. The final 120-executable run is uninterrupted: 706 passed, zero
-failed and 21 ignored. The report retains the earlier 687/2/21 and 701/1/21
-runs separately from the corrected run. The deadline follow-up adds an uninterrupted 710/0/21 result on `2b568922`.
-The counter follow-up has compile and format evidence only; a final full
-qualification will follow the remaining stream work.
+The final qualified implementation is `0d37ba9d73385278aa7baf34a3d831d991a0686e`.
+Its uninterrupted full run has 724 passed, zero failed and 22 ignored across
+120 executables. Strict Clippy, Rust 1.91 workspace/default-feature compilation,
+dependency policy, format and 63 local documentation links pass. The group-read
+fix has separate RED evidence and 40 unchanged focused repeat passes.
+
+The report keeps the earlier 687/2/21 and 701/1/21 failed runs, first qualified
+706/0/21 on `05434f86`, and deadline follow-up 710/0/21 on `2b568922` separate.
+The new ignored case is a subprocess helper. A host proof does not close the
+current tablet stall, selected mobile package, old-data upgrade or ATAK gates.
