@@ -84,7 +84,7 @@ pub(crate) struct InvitationSent {
 /// Nearby endpoints and the names they announce (750 ms per ask).
 pub(crate) fn endpoints(session: &mut Session) -> Result<NearbyEndpoints, ApiError> {
     let peers = session.runtime.block_on(session.node.nearby_peers());
-    let names = session.runtime.block_on(async {
+    let names = async {
         let mut queries = tokio::task::JoinSet::new();
         for peer in &peers {
             let peer = *peer;
@@ -103,7 +103,10 @@ pub(crate) fn endpoints(session: &mut Session) -> Result<NearbyEndpoints, ApiErr
             names.push(name);
         }
         names
-    });
+    };
+    let names = session
+        .runtime
+        .block_on(crate::deadline::wait(session.op_deadline, names))?;
     Ok(NearbyEndpoints {
         endpoints: peers,
         names,
@@ -116,7 +119,7 @@ pub(crate) fn workspaces(session: &mut Session) -> Result<NearbyWorkspaces, ApiE
         .runtime
         .block_on(session.node.nearby_workspace_peers());
     let peer_count = peers.len();
-    let (found, checked) = session.runtime.block_on(async {
+    let queries = async {
         let mut queries = tokio::task::JoinSet::new();
         for peer in peers {
             let request = session.node.request_control(peer, NEARBY_WORKSPACE);
@@ -171,7 +174,10 @@ pub(crate) fn workspaces(session: &mut Session) -> Result<NearbyWorkspaces, ApiE
             }
         }
         (advertisements.into_values().collect::<Vec<_>>(), checked)
-    });
+    };
+    let (found, checked) = session
+        .runtime
+        .block_on(crate::deadline::wait(session.op_deadline, queries))?;
     Ok(NearbyWorkspaces {
         workspaces: found,
         endpoints_checked: checked,
@@ -275,7 +281,10 @@ pub(crate) fn send_invitation(
     packet.extend(&args.invitation);
     let reply = session
         .runtime
-        .block_on(session.node.request_control(args.peer, &packet))
+        .block_on(crate::deadline::wait(
+            session.op_deadline,
+            session.node.request_control(args.peer, &packet),
+        ))?
         .map_err(errors::node)?;
     if reply != [1] {
         return Err(ApiError::not_authorized(

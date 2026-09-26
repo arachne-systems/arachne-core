@@ -3264,7 +3264,13 @@ pub(super) fn leave_via_peer(
     let mut packet = LEAVE.to_vec();
     packet.extend(owner.epoch().to_be_bytes());
     packet.extend(order.to_bytes());
-    let bytes = session.runtime.block_on(session.node.request_control(peer, &packet)).map_err(|_| {
+    let bytes = session
+        .runtime
+        .block_on(crate::deadline::wait(
+            session.op_deadline,
+            session.node.request_control(peer, &packet),
+        ))?
+        .map_err(|_| {
         ApiError::peer_unreachable(
             Some(arachne_api::EndpointId::from_bytes(peer)),
             "Couldn't finish leaving. Resume this workspace and try again when another member is reachable.",

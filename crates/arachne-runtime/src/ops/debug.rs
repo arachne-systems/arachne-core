@@ -67,7 +67,10 @@ pub(crate) fn control_exchange(
     }
     let reply = session
         .runtime
-        .block_on(session.node.request_control(args.peer, &args.payload))
+        .block_on(crate::deadline::wait(
+            session.op_deadline,
+            session.node.request_control(args.peer, &args.payload),
+        ))?
         .map_err(errors::node)?;
     Ok(ControlReply { reply })
 }

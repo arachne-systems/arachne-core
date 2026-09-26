@@ -276,13 +276,9 @@ pub(crate) fn run<T>(
         return run_locked(handle, &entry.shared, op, None, body);
     };
     let deadline = std::time::Instant::now() + limit;
-    let timer = std::sync::Arc::clone(&entry).arm_deadline(limit);
     let result = run_locked(handle, &entry.shared, op, Some(deadline), body);
-    let fired = timer.finish();
     match result {
-        Err(_) if fired || crate::deadline::expired(Some(deadline)) => {
-            Err(ApiError::DeadlineExceeded)
-        }
+        Err(_) if crate::deadline::expired(Some(deadline)) => Err(ApiError::DeadlineExceeded),
         result => result,
     }
 }
@@ -300,9 +296,13 @@ fn run_locked<T>(
     let session = guard.as_mut().ok_or_else(errors::closed)?;
     let busy_before = admission_busy(session);
     session.op_deadline = deadline;
-    let result = admit(session, op).and_then(|()| body(session));
+    let result = if crate::deadline::expired(deadline) {
+        Err(ApiError::DeadlineExceeded)
+    } else {
+        admit(session, op).and_then(|()| body(session))
+    };
     session.op_deadline = None;
-    // Cancel and deadlines act on the op in flight only (ADR step 4). Close
+    // Explicit cancel stops node control exchanges. Close
     // removes the handle first; its cancel stays set, so an op queued on
     // this lock cannot delay the close.
     session.events.rearm_queues();
