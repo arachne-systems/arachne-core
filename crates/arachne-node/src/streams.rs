@@ -722,15 +722,103 @@ mod tests {
 
     #[tokio::test]
     async fn incomplete_group_payload_does_not_block_a_later_group() {
-        unfinished_group_does_not_block(true).await;
+        unfinished_group_does_not_block(true, false).await;
     }
 
     #[tokio::test]
     async fn incomplete_group_end_does_not_block_a_later_group() {
-        unfinished_group_does_not_block(false).await;
+        unfinished_group_does_not_block(false, false).await;
     }
 
-    async fn unfinished_group_does_not_block(partial_payload: bool) {
+    #[tokio::test]
+    async fn closing_cancels_an_incomplete_group_payload() {
+        unfinished_group_does_not_block(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn closing_cancels_an_incomplete_group_end() {
+        unfinished_group_does_not_block(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn oversized_group_header_is_rejected_before_its_body_arrives() {
+        let broadcast = broadcast::Info::new().produce();
+        let track = broadcast.create_track("bounded", None).unwrap();
+        let mut group = track.create_group(group::Info::from(1u64)).unwrap();
+        let consumer = group.consume();
+        let _unfinished = group
+            .create_frame(moq_net::frame::Info {
+                size: (super::super::MAX_FRAME + 1) as u64,
+                timestamp: Timestamp::now(),
+            })
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            read_group(consumer, &Weak::new()),
+        )
+        .await
+        .expect("oversized header waited for its body");
+        assert!(matches!(result, Err(Error::TooLarge)));
+    }
+
+    #[tokio::test]
+    async fn malformed_groups_still_fail_closed() {
+        let broadcast = broadcast::Info::new().produce();
+        let track = broadcast.create_track("malformed", None).unwrap();
+        for (index, frames) in [vec![], vec![vec![0xff]], vec![vec![0], vec![0]]]
+            .into_iter()
+            .enumerate()
+        {
+            let mut group = track.create_group(group::Info::from(index + 1)).unwrap();
+            for frame in frames {
+                group.write_frame(Timestamp::now(), frame).unwrap();
+            }
+            group.finish().unwrap();
+            assert!(read_group(group.consume(), &Weak::new()).await.is_err());
+        }
+        let mut group = track.create_group(group::Info::from(9u64)).unwrap();
+        group
+            .write_frame(
+                Timestamp::now(),
+                wire::encode(&Envelope {
+                    sequence: 10,
+                    frame: vec![],
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        group.finish().unwrap();
+        assert!(matches!(
+            read_group(group.consume(), &Weak::new()).await,
+            Err(Error::InvalidFrame)
+        ));
+    }
+
+    #[tokio::test]
+    async fn all_occupied_readers_expire_at_the_live_window() {
+        let broadcast = broadcast::Info::new().produce();
+        let track = broadcast.create_track("stalled", None).unwrap();
+        let mut producers = Vec::new();
+        let counters = Weak::new();
+        let mut pending = FuturesUnordered::new();
+        for sequence in 1..=MAX_GROUP_READS {
+            let producer = track.create_group(group::Info::from(sequence)).unwrap();
+            pending.push(read_group(producer.consume(), &counters));
+            producers.push(producer);
+        }
+        let started = std::time::Instant::now();
+        tokio::time::timeout(track::DEFAULT_MAX_AGE + Duration::from_secs(1), async {
+            while let Some(result) = pending.next().await {
+                assert!(matches!(result, Err(Error::Timeout("read MoQ group"))));
+            }
+        })
+        .await
+        .expect("stalled group readers kept their slots forever");
+        assert!(started.elapsed() >= track::DEFAULT_MAX_AGE);
+        assert_eq!(producers.len(), MAX_GROUP_READS);
+    }
+
+    async fn unfinished_group_does_not_block(partial_payload: bool, close_while_blocked: bool) {
         tokio::time::timeout(Duration::from_secs(10), async {
             let (sender, _sender_messages) =
                 Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
@@ -784,7 +872,7 @@ mod tests {
             })
             .unwrap();
             let mut blocked = route.track.create_group(group::Info::from(1u64)).unwrap();
-            let partial = if partial_payload {
+            let mut partial = if partial_payload {
                 let mut frame = blocked
                     .create_frame(moq_net::frame::Info {
                         size: envelope.len() as u64,
@@ -796,7 +884,9 @@ mod tests {
                     .unwrap();
                 Some(frame)
             } else {
-                blocked.write_frame(Timestamp::now(), envelope).unwrap();
+                blocked
+                    .write_frame(Timestamp::now(), envelope.clone())
+                    .unwrap();
                 None
             };
             while receiver.moq_metrics().groups_received != 1
@@ -805,35 +895,79 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
             assert_eq!(receiver.moq_metrics().groups_completed, 0);
-            sender
-                .publish_protected_with_class(
-                    workspace,
-                    1,
-                    topic,
-                    2,
-                    DeliveryClass::Critical,
-                    b"later complete group".to_vec(),
-                )
-                .await
-                .unwrap();
+            // A complete burst larger than the read window must drain under
+            // backpressure while the first independent group remains blocked.
+            let complete_count = MAX_GROUP_READS * 2;
+            for sequence in 2..2 + complete_count as u64 {
+                sender
+                    .publish_protected_with_class(
+                        workspace,
+                        1,
+                        topic.clone(),
+                        sequence,
+                        DeliveryClass::Critical,
+                        sequence.to_be_bytes().to_vec(),
+                    )
+                    .await
+                    .unwrap();
+            }
             let delivered = tokio::time::timeout(Duration::from_secs(1), async {
-                loop {
+                let mut sequences = std::collections::BTreeSet::new();
+                while sequences.len() < complete_count {
                     let message = messages.recv().await.unwrap();
-                    if message.sender == sender.id() && message.payload == b"later complete group" {
-                        break;
-                    }
+                    assert_eq!(message.sender, sender.id());
+                    assert_eq!(message.payload.len(), 8);
+                    let sequence =
+                        u64::from_be_bytes(message.payload.as_slice().try_into().unwrap());
+                    assert!((2..2 + complete_count as u64).contains(&sequence));
+                    assert!(sequences.insert(sequence), "duplicate complete group");
                 }
             })
             .await;
-            let metrics = receiver.moq_metrics();
-            drop(partial);
-            drop(blocked);
-            sender.close().await;
-            receiver.close().await;
             assert!(
                 delivered.is_ok(),
-                "an unfinished group blocked an independent complete group: {metrics:?}"
+                "an unfinished group blocked independent complete groups: {:?}",
+                receiver.moq_metrics()
             );
+            if close_while_blocked {
+                let counters = Arc::clone(&receiver.streams.0.counters);
+                let closing = tokio::spawn(receiver.close());
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while counters.sessions_active.load(Ordering::Relaxed) != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("close kept an incomplete receive session alive");
+                tokio::time::timeout(Duration::from_secs(6), closing)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                drop(partial);
+                drop(blocked);
+            } else {
+                if let Some(mut frame) = partial.take() {
+                    frame
+                        .write(envelope[envelope.len() / 2..].to_vec())
+                        .unwrap();
+                    frame.finish().unwrap();
+                }
+                drop(partial);
+                blocked.finish().unwrap();
+                let earlier = tokio::time::timeout(Duration::from_secs(1), messages.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(earlier.sender, sender.id());
+                assert_eq!(earlier.payload, b"unfinished");
+                assert_eq!(
+                    receiver.moq_metrics().packets_received,
+                    (complete_count + 1) as u64
+                );
+                drop(blocked);
+                receiver.close().await;
+            }
+            sender.close().await;
         })
         .await
         .expect("unfinished group fixture timed out");
