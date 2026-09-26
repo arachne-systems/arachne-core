@@ -10,7 +10,7 @@ fn open(
     network: Network,
     secret: u8,
     transport: TransportOptions,
-) -> arachne_runtime::ClientResult<Client> {
+) -> arachne_runtime::ClientResult<std::sync::Arc<Client>> {
     Client::open(ClientConfig {
         network,
         secret: Some(([secret; 32]).into()),

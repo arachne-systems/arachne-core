@@ -225,3 +225,138 @@ fn typed_admission_membership_and_holder_recovery_keep_native_authority() {
     reader.close().unwrap();
     holder.close().unwrap();
 }
+
+fn resource_done(client: &Client, started: ResourceStatus) -> ClientResult<ResourceStatus> {
+    let ResourceStatus::Started { id } = started else {
+        panic!("resource did not start: {started:?}")
+    };
+    let stop = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = client.resource(ResourceRequest::Poll { id })?;
+        if !matches!(status, ResourceStatus::Running { .. }) {
+            return Ok(status);
+        }
+        assert!(Instant::now() < stop, "resource operation did not finish");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn typed_resource_transfer_preserves_authorization_and_ticket() {
+    let owner = open(145, &MemoryProvider::default());
+    let reader = open(146, &MemoryProvider::default());
+    let observer = open(147, &MemoryProvider::default());
+    owner.create_workspace("Owner", None).unwrap();
+    let invitation = owner
+        .adopt_invitation(&owner.stage_invitation(0).unwrap())
+        .unwrap();
+    join(&owner, &reader, &invitation, "Reader");
+    join(&owner, &observer, &invitation, "Observer");
+    catch_up(&owner, &reader);
+    let revision = owner.member_roster().unwrap().epoch + 1;
+    for client in [&owner, &reader, &observer] {
+        client.install_workspace_policy(revision).unwrap();
+    }
+    let owner_member = owner
+        .member_roster()
+        .unwrap()
+        .members
+        .into_iter()
+        .find(|m| m.self_member)
+        .unwrap()
+        .id;
+    let reader_member = reader
+        .member_roster()
+        .unwrap()
+        .members
+        .into_iter()
+        .find(|m| m.self_member)
+        .unwrap()
+        .id;
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let bytes = vec![17u8; 4097];
+    std::fs::write(source.path().join("object.bin"), &bytes).unwrap();
+    let prepared = resource_done(
+        &owner,
+        owner
+            .resource(ResourceRequest::Prepare {
+                member: reader_member,
+                root: source.path().display().to_string(),
+                path: source.path().join("object.bin").display().to_string(),
+            })
+            .unwrap(),
+    )
+    .unwrap();
+    let ResourceStatus::Prepared { ticket } = prepared else {
+        panic!("resource was not prepared: {prepared:?}")
+    };
+    assert_eq!(ticket.size, bytes.len() as u64);
+    let result = resource_done(
+        &reader,
+        reader
+            .resource(ResourceRequest::Fetch {
+                member: owner_member,
+                root: destination.path().display().to_string(),
+                path: destination.path().join("copy.bin").display().to_string(),
+                ticket: ticket.clone(),
+            })
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        result,
+        ResourceStatus::Complete {
+            bytes: bytes.len() as u64
+        }
+    );
+    assert_eq!(
+        std::fs::read(destination.path().join("copy.bin")).unwrap(),
+        bytes
+    );
+    let outsider_dir = tempfile::tempdir().unwrap();
+    let refused = resource_done(
+        &observer,
+        observer
+            .resource(ResourceRequest::Fetch {
+                member: owner_member,
+                root: outsider_dir.path().display().to_string(),
+                path: outsider_dir
+                    .path()
+                    .join("forbidden.bin")
+                    .display()
+                    .to_string(),
+                ticket: ticket.clone(),
+            })
+            .unwrap(),
+    )
+    .unwrap_err();
+    assert_eq!(refused.code(), ErrorCode::TransportFailed);
+    assert!(!outsider_dir.path().join("forbidden.bin").exists());
+    assert!(
+        reader
+            .resource(ResourceRequest::Fetch {
+                member: [251; 32].into(),
+                root: destination.path().display().to_string(),
+                path: destination
+                    .path()
+                    .join("forbidden.bin")
+                    .display()
+                    .to_string(),
+                ticket,
+            })
+            .is_err()
+    );
+    let denied = owner
+        .resource(ResourceRequest::Prepare {
+            member: reader_member,
+            root: source.path().display().to_string(),
+            path: "../outside.bin".into(),
+        })
+        .unwrap();
+    let refused = resource_done(&owner, denied).unwrap_err();
+    assert_eq!(refused.code(), ErrorCode::TransportFailed);
+    observer.close().unwrap();
+    reader.close().unwrap();
+    owner.close().unwrap();
+}

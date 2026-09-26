@@ -170,7 +170,7 @@ fn typed_clients_recover_an_opaque_publication() {
             workspace.workspace,
             revision,
             "streams/example",
-            [7; 16],
+            ([7; 16]).into(),
             payload.clone(),
         )
         .unwrap();
@@ -227,11 +227,12 @@ fn typed_clients_recover_an_opaque_publication() {
     assert_eq!(recovered.workspace, workspace.workspace);
     assert_eq!(recovered.topic, "streams/example");
     assert_eq!(recovered.payload, payload);
-    assert_eq!(reader.poll_pending_object().unwrap(), Some(recovered.clone()));
+    assert_eq!(
+        reader.poll_pending_object().unwrap(),
+        Some(recovered.clone())
+    );
     let acknowledged = reader.stage_object_acknowledgement(&recovered).unwrap();
-    reader
-        .adopt_protected_reception(&acknowledged)
-        .unwrap();
+    reader.adopt_protected_reception(&acknowledged).unwrap();
     assert_eq!(reader.poll_pending_object().unwrap(), None);
 
     reader.close().unwrap();
@@ -252,10 +253,16 @@ fn typed_client_rejects_wrong_publication_workspace_before_staging() {
     let revision = workspace.epoch + 1;
     client.install_workspace_policy(revision).unwrap();
 
-    let mut other = workspace.workspace;
+    let mut other = workspace.workspace.to_bytes();
     other[0] ^= 1;
     let rejected = client
-        .stage_protected_publication(other, revision, "streams/example", [1; 16], vec![1])
+        .stage_protected_publication(
+            other.into(),
+            revision,
+            "streams/example",
+            ([1; 16]).into(),
+            vec![1],
+        )
         .unwrap_err();
     assert_eq!(rejected.code(), ErrorCode::InvalidInput, "{rejected}");
 
@@ -266,7 +273,7 @@ fn typed_client_rejects_wrong_publication_workspace_before_staging() {
             workspace.workspace,
             revision,
             "streams/example",
-            [2; 16],
+            ([2; 16]).into(),
             vec![2],
         )
         .unwrap();
@@ -302,7 +309,7 @@ fn typed_client_restores_only_with_matching_freshness_anchor() {
     let rejected = client
         .restore_workspace(workspace.workspace, Some(stale))
         .unwrap_err();
-    assert_eq!(rejected.code(), ErrorCode::StorageFailed);
+    assert_eq!(rejected.code(), ErrorCode::CandidateStale);
     client
         .restore_workspace(workspace.workspace, Some(anchor))
         .unwrap();
@@ -443,10 +450,14 @@ fn typed_client_routes_opaque_publication_and_reports_interest() {
                 .replace("0.0.0.0:", "127.0.0.1:"),
         )
         .unwrap();
-    publisher.install_policy(workspace, 1, &policy).unwrap();
-    subscriber.install_policy(workspace, 1, &policy).unwrap();
+    publisher
+        .install_policy((workspace).into(), 1, &policy)
+        .unwrap();
     subscriber
-        .set_interest(workspace, 1, "streams/live", true)
+        .install_policy((workspace).into(), 1, &policy)
+        .unwrap();
+    subscriber
+        .set_interest((workspace).into(), 1, "streams/live", true)
         .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(8);
@@ -460,14 +471,14 @@ fn typed_client_routes_opaque_publication_and_reports_interest() {
     }
 
     let report = publisher
-        .publish(workspace, 1, "streams/live", vec![7])
+        .publish((workspace).into(), 1, "streams/live", vec![7])
         .unwrap();
     assert_eq!(report.admitted, vec![subscriber_endpoint.endpoint_key]);
 
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
         if let Some(publication) = subscriber.poll().unwrap() {
-            assert_eq!(publication.workspace, workspace);
+            assert_eq!(publication.workspace, (workspace).into());
             assert_eq!(publication.topic, "streams/live");
             assert_eq!(publication.payload, vec![7]);
             break;
@@ -502,7 +513,10 @@ fn typed_admission_ops_report_codes_and_pages() {
     assert_eq!(error.code(), ErrorCode::InvalidInput);
     assert_eq!(error.code(), ErrorCode::InvalidInput);
     assert_eq!(
-        owner.acknowledge_admission_approval([1; 32]).unwrap_err().code(),
+        owner
+            .acknowledge_admission_approval(([1; 32]).into())
+            .unwrap_err()
+            .code(),
         ErrorCode::WrongState
     );
     assert_eq!(
@@ -532,7 +546,9 @@ fn typed_management_invitation_and_name_ops() {
         storage: Some((StorageConfig::memory(&provider)).into()),
     })
     .unwrap();
-    let workspace = owner.create_workspace("Owner", Some("Team".into())).unwrap();
+    let workspace = owner
+        .create_workspace("Owner", Some("Team".into()))
+        .unwrap();
 
     let renamed = owner.stage_workspace_name("Field Team").unwrap();
     assert_eq!(renamed.workspace(), workspace.workspace);
@@ -559,7 +575,9 @@ fn typed_management_invitation_and_name_ops() {
     assert!(!owner.invitation_controls().unwrap()[0].enabled);
 
     // A management action on a stranger is refused with a code.
-    let error = owner.stage_management(MemberAction::Promote([9; 32])).unwrap_err();
+    let error = owner
+        .stage_management(MemberAction::Promote(([9; 32]).into()))
+        .unwrap_err();
     assert_ne!(error.code(), ErrorCode::Internal, "{error}");
 
     // The last member leaves alone; adopting the removal ends the session.

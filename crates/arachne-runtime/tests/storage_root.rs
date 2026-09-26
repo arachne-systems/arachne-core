@@ -8,9 +8,9 @@ mod common;
 fn open(secret: Option<[u8; 32]>, storage: StorageConfig) -> std::sync::Arc<Client> {
     Client::open(ClientConfig {
         network: Network::Direct,
-        secret,
+        secret: secret.map(|key| key.to_vec()),
         transport: Default::default(),
-        storage: Some(storage),
+        storage: Some((storage).into()),
     })
     .unwrap()
 }
@@ -23,7 +23,13 @@ fn a_direct_client_without_an_endpoint_secret_persists() {
     assert!(created.durable);
     client.install_workspace_policy(1).unwrap();
     let staged = client
-        .stage_protected_publication(created.workspace, 1, "streams/opaque", [1; 16], vec![1])
+        .stage_protected_publication(
+            created.workspace,
+            1,
+            "streams/opaque",
+            ([1; 16]).into(),
+            vec![1],
+        )
         .unwrap();
     client.adopt_protected_publication(&staged).unwrap();
     let leave = client.stage_solo_leave().unwrap();
@@ -40,7 +46,9 @@ fn a_new_endpoint_identity_keeps_the_store_readable() {
 
     // The endpoint identity changes; the storage root does not.
     let rotated = open(Some([73; 32]), storage());
-    let error = rotated.restore_workspace(created.workspace, None).unwrap_err();
+    let error = rotated
+        .restore_workspace(created.workspace, None)
+        .unwrap_err();
     assert_eq!(error.code(), ErrorCode::WrongState, "{error:?}");
     assert!(error.message().contains("endpoint"), "{error:?}");
     rotated.close().unwrap();

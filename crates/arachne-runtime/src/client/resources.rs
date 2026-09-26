@@ -15,6 +15,8 @@ pub struct ResourceTicket {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ResourceRequest {
+    /// Authorize one accepted member to fetch an immutable host-selected file.
+    /// `root` and `path` must be absolute; the source can be outside the cache root.
     Prepare {
         member: MemberId,
         root: String,
@@ -76,7 +78,9 @@ impl From<ResourceTicket> for arachne_node::resources::ResourceTicket {
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 impl Client {
     /// Start, poll, cancel or revoke a resource transfer. Member authorization
-    /// and path confinement run in the existing native resource service.
+    /// and absolute-path checks run in the existing native resource service.
+    /// `root` is the blob cache directory. The host must select immutable source
+    /// files and check the content audience before it creates a grant.
     pub fn resource(&self, request: ResourceRequest) -> Result<ResourceStatus> {
         use crate::resources::Request as R;
         let request = match request {

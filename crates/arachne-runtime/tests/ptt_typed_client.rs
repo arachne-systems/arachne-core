@@ -102,7 +102,7 @@ fn typed_clients_persist_authenticated_inbox_objects_before_acknowledging() {
             workspace.workspace,
             revision,
             topic,
-            [1; 16],
+            ([1; 16]).into(),
             ordinary_payload.clone(),
         )
         .unwrap();
@@ -172,7 +172,7 @@ fn typed_clients_persist_authenticated_inbox_objects_before_acknowledging() {
             workspace.workspace,
             revision,
             topic,
-            [2; 16],
+            ([2; 16]).into(),
             payload.clone(),
         )
         .unwrap();
@@ -199,7 +199,7 @@ fn typed_clients_persist_authenticated_inbox_objects_before_acknowledging() {
     assert_eq!(pending.revision, revision);
     assert_eq!(pending.endpoint, owner.endpoint().unwrap().endpoint_key);
     assert_eq!(pending.topic, topic);
-    assert_eq!(pending.id, [2; 16]);
+    assert_eq!(pending.id, ([2; 16]).into());
     assert_eq!(pending.payload, payload);
     assert_eq!(pending.sequence, Some(2));
 
@@ -276,7 +276,13 @@ fn failed_object_save_prevents_adoption_and_further_publication() {
     .unwrap();
     let workspace = client.create_workspace("Owner", None).unwrap();
     let candidate = client
-        .stage_protected_publication(workspace.workspace, 1, "streams/example", [2; 16], vec![1])
+        .stage_protected_publication(
+            workspace.workspace,
+            1,
+            "streams/example",
+            ([2; 16]).into(),
+            vec![1],
+        )
         .unwrap();
     provider.fail_next_commit();
     assert_eq!(
@@ -293,7 +299,7 @@ fn failed_object_save_prevents_adoption_and_further_publication() {
                 workspace.workspace,
                 1,
                 "streams/example",
-                [3; 16],
+                ([3; 16]).into(),
                 vec![1]
             )
             .is_err()

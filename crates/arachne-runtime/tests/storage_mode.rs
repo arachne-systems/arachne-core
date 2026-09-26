@@ -17,8 +17,13 @@ fn open(secret: u8, storage: Option<&MemoryProvider>) -> std::sync::Arc<Client> 
 
 fn publish(client: &Client, workspace: [u8; 32], id: u8) -> arachne_runtime::ClientResult<()> {
     client.install_workspace_policy(1)?;
-    let staged =
-        client.stage_protected_publication(workspace, 1, "streams/opaque", [id; 16], vec![id])?;
+    let staged = client.stage_protected_publication(
+        (workspace).into(),
+        1,
+        "streams/opaque",
+        ([id; 16]).into(),
+        vec![id],
+    )?;
     client.adopt_protected_publication(&staged).map(|_| ())
 }
 
@@ -28,11 +33,12 @@ fn adopt_saves_and_reads_back_without_a_host_save() {
     let client = open(41, Some(&provider));
     let created = client.create_workspace("Owner", None).unwrap();
     assert!(created.durable);
-    publish(&client, created.workspace, 1).unwrap();
+    publish(&client, (created.workspace).to_bytes(), 1).unwrap();
     client.close().unwrap();
 
     let client = open(41, Some(&provider));
-    let RestoredWorkspace::Active(info) = client.restore_workspace(created.workspace, None).unwrap()
+    let RestoredWorkspace::Active(info) =
+        client.restore_workspace(created.workspace, None).unwrap()
     else {
         panic!("expected an active workspace")
     };
@@ -41,7 +47,13 @@ fn adopt_saves_and_reads_back_without_a_host_save() {
     // The sender counter came back from storage: the next sequence is 2.
     client.install_workspace_policy(1).unwrap();
     let staged = client
-        .stage_protected_publication(created.workspace, 1, "streams/opaque", [2; 16], vec![2])
+        .stage_protected_publication(
+            created.workspace,
+            1,
+            "streams/opaque",
+            ([2; 16]).into(),
+            vec![2],
+        )
         .unwrap();
     client.adopt_protected_publication(&staged).unwrap();
     client.close().unwrap();
@@ -54,18 +66,24 @@ fn a_read_back_mismatch_stops_the_session_until_restore() {
     let created = client.create_workspace("Owner", None).unwrap();
     client.install_workspace_policy(1).unwrap();
     let staged = client
-        .stage_protected_publication(created.workspace, 1, "streams/opaque", [1; 16], vec![1])
+        .stage_protected_publication(
+            created.workspace,
+            1,
+            "streams/opaque",
+            ([1; 16]).into(),
+            vec![1],
+        )
         .unwrap();
     provider.corrupt_reads(true);
     let error = client.adopt_protected_publication(&staged).unwrap_err();
-    assert_eq!(error.code(), ErrorCode::StorageFailedFailed, "{error:?}");
+    assert_eq!(error.code(), ErrorCode::StorageFailed, "{error:?}");
     provider.corrupt_reads(false);
     // Live state did not move, and it cannot move now: the outcome is unknown.
     let error = client.adopt_protected_publication(&staged).unwrap_err();
-    assert_eq!(error.code(), ErrorCode::StorageFailedFailed);
+    assert_eq!(error.code(), ErrorCode::StorageFailed);
     assert_eq!(
         client.discard_workspace_candidate().unwrap_err().code(),
-        ErrorCode::StorageFailedFailed
+        ErrorCode::StorageFailed
     );
     client.close().unwrap();
     let client = open(42, Some(&provider));
@@ -83,19 +101,25 @@ fn a_failed_commit_stops_the_session_until_restore() {
     let created = client.create_workspace("Owner", None).unwrap();
     client.install_workspace_policy(1).unwrap();
     let staged = client
-        .stage_protected_publication(created.workspace, 1, "streams/opaque", [1; 16], vec![1])
+        .stage_protected_publication(
+            created.workspace,
+            1,
+            "streams/opaque",
+            ([1; 16]).into(),
+            vec![1],
+        )
         .unwrap();
     provider.fail_next_commit();
     let error = client.adopt_protected_publication(&staged).unwrap_err();
-    assert_eq!(error.code(), ErrorCode::StorageFailedFailed);
+    assert_eq!(error.code(), ErrorCode::StorageFailed);
     assert_eq!(
         client.install_workspace_policy(1).unwrap_err().code(),
-        ErrorCode::StorageFailedFailed
+        ErrorCode::StorageFailed
     );
     client.close().unwrap();
     let client = open(43, Some(&provider));
     client.restore_workspace(created.workspace, None).unwrap();
-    publish(&client, created.workspace, 3).unwrap();
+    publish(&client, (created.workspace).to_bytes(), 3).unwrap();
     client.close().unwrap();
 }
 
@@ -161,12 +185,15 @@ fn without_storage_a_session_cannot_hold_a_workspace() {
 fn create_workspace_is_durable_before_any_adoption() {
     let provider = MemoryProvider::default();
     let client = open(47, Some(&provider));
-    let created = client.create_workspace("Owner", Some("Team".into())).unwrap();
+    let created = client
+        .create_workspace("Owner", Some("Team".into()))
+        .unwrap();
     assert!(created.durable);
     assert!(client.workspace_state().unwrap().durable);
     client.close().unwrap();
     let client = open(47, Some(&provider));
-    let RestoredWorkspace::Active(info) = client.restore_workspace(created.workspace, None).unwrap()
+    let RestoredWorkspace::Active(info) =
+        client.restore_workspace(created.workspace, None).unwrap()
     else {
         panic!("expected an active workspace")
     };
@@ -179,7 +206,11 @@ fn create_workspace_is_durable_before_any_adoption() {
 fn a_failed_first_save_does_not_block_a_retry() {
     use arachne_security::Workspace;
     let provider = MemoryProvider::default();
-    let admin = Workspace::create(&arachne_security::EndpointKey::generate().unwrap(), "Administrator").unwrap();
+    let admin = Workspace::create(
+        &arachne_security::EndpointKey::generate().unwrap(),
+        "Administrator",
+    )
+    .unwrap();
     let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     drop(registered);
     let handle = arachne_runtime::create(Some(&[49; 32])).unwrap();

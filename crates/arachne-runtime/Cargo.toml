@@ -94,3 +94,11 @@ required-features = ["test-fixtures"]
 [[test]]
 name = "workspace_name"
 required-features = ["test-fixtures"]
+
+[[example]]
+name = "typed_pubsub"
+required-features = ["test-fixtures"]
+
+[[example]]
+name = "real-iroh-qualification"
+required-features = ["test-fixtures"]

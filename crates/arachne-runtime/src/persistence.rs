@@ -888,6 +888,7 @@ pub(crate) fn restore(
 /// to build state outside the runtime and then restore it. Not an import
 /// path: nothing on a session accepts state bytes.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn seed_workspace(
     provider: &dyn StorageProvider,
     owner: &Workspace,

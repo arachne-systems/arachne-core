@@ -332,7 +332,7 @@ mod tests {
         }
         let publisher =
             PublisherLog::new(&reader).unwrap();
-        harness::seed_workspace(&provider, &reader, Some(&publisher), Some(&inbox)).unwrap();
+        crate::persistence::seed_workspace(&provider, &reader, Some(&publisher), Some(&inbox)).unwrap();
         call(json!({"op":"restore_workspace","workspace":reader.id()})).unwrap();
         let pending = call(json!({"op":"poll_pending_object"})).unwrap();
         assert_eq!(pending["id"], json!(vec![2; 16]));

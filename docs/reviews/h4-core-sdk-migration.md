@@ -6,8 +6,8 @@ Core owns the binding types and native candidate rules. The SDK can generate bin
 Core metadata and add language conveniences. It must not copy Core enums, records, error
 mapping, candidate checks, or storage commits. The public contract is API version 6.
 
-This note is a work checkpoint. The final evidence report records the tested commit and
-remaining gates. H4 does not change the deployed tablet storage.
+The evidence report records the checks and remaining release gates. H4 does not change
+the deployed tablet storage.
 
 ## Binding components
 
@@ -21,7 +21,12 @@ UniFFI 0.31.2 metadata. No spike crate is in the production workspace.
 
 The SDK builds the final library and owns library loading and packaging. Core configuration
 sets no final dynamic library name. A binding generator can apply SDK naming choices to
-methods. These choices must not copy the domain types.
+methods. These choices must not copy the domain types. Core names the Kotlin native
+`Client.close` operation `shutdown` because UniFFI owns the generated `AutoCloseable.close`.
+Generate Kotlin and Swift without a whole-config override so each Core namespace applies.
+UniFFI 0.31.2 does not insert Swift imports for these foreign records. H5 compiles both
+generated Swift components in one ArachneSDK module and keeps their separate C FFI modules.
+A top-level Swift `imports` configuration has no effect and is not included.
 
 ## Changes at the Rust boundary
 
@@ -29,12 +34,14 @@ methods. These choices must not copy the domain types.
 - `Context::owned(limits, power, workers)` creates an owned runtime. `default_shared()` uses
   the process context. A host-supplied Tokio handle remains a Rust-only option.
 - All client methods return `ApiError`. Use its variant and stable `ErrorCode`. The old
-  `client::Error` and `ErrorKind` are removed. An operation racing `close()` returns `Closed`.
+  `client::Error` and `ErrorKind` are removed. Use the exact code: for example, a mismatched
+  freshness anchor reports `CandidateStale` (302), which the old broad kind grouped as storage.
+  An operation racing `close()` returns `Closed`.
 - Use one `Network` enum from `arachne-api`. `Tor` always exists. A build without Tor returns
   `Unsupported` (103) when a caller selects it.
 - IDs use the Core ID types. `Key32` represents a fixed-length key or digest. It does not
-  identify a member. The foreign form is validated hexadecimal text. Malformed custom IDs fail binding type
-  conversion before a Core operation. They do not enter the domain error channel.
+  identify a member. The foreign form is validated hexadecimal text. Malformed custom IDs fail
+  binding type conversion before a Core operation. They do not enter the domain error channel.
 - `ClientConfig.secret` is an optional byte vector. Core validates its 32-byte length and
   returns `InvalidInput` (100) for malformed key material.
 - Counts exposed to bindings use fixed-width integers. A native collection length uses `u64`.
@@ -90,8 +97,10 @@ native operations as the current dispatcher. Current-value metadata preserves se
 replacement key, expiry and tombstone. Recovery can use an authorized holder.
 
 `ResourceRequest` and `ResourceStatus` expose the existing authenticated blob transfer
-service. Paths are strings at the foreign boundary. Native path confinement and member
-authorization still apply. No new catalog store or transfer protocol is selected in H4.
+service. Paths are strings at the foreign boundary. `root` is the blob cache directory. It does not
+confine file access. The host selects absolute source and target paths and must check the
+content audience. Native membership and revision checks and the peer-bound read grant still
+apply. No new catalog store or transfer protocol is selected in H4.
 
 The typed protected publication, durable inbox and MoQ operations remain available. Core
 has no microphone, channel, floor, or audio policy.

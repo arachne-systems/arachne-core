@@ -440,6 +440,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "test-fixtures")]
     fn real_node_lifecycle_rejects_stale_handles_and_releases_capacity() {
         assert!(describe(0).is_err());
         assert!(close(-1).is_err());

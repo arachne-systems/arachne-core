@@ -54,19 +54,3 @@ pub(crate) mod many {
             .collect()
     }
 }
-pub(crate) mod option {
-    use super::*;
-    pub fn serialize<T: WireId, S: Serializer>(
-        id: &Option<T>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        id.as_ref().map(WireId::bytes).serialize(serializer)
-    }
-    pub fn deserialize<'de, T: WireId, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<T>, D::Error> {
-        Option::<Vec<u8>>::deserialize(deserializer)?
-            .map(|bytes| T::from_wire(&bytes).map_err(serde::de::Error::custom))
-            .transpose()
-    }
-}
