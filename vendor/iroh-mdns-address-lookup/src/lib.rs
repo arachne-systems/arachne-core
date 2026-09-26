@@ -608,10 +608,15 @@ mod tests {
 
         use super::super::*;
 
+        // Cargo does not read upstream's nextest isolation rule. These tests
+        // bind the same multicast socket and must run one at a time.
+        static MDNS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
         #[tokio::test]
         #[traced_test]
         async fn mdns_publish_resolve() -> Result {
-            let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
+            let _isolation = MDNS_TEST_LOCK.lock().await;
+            let mut rng = rand_chacha::ChaCha8Rng::from_rng(&mut rand::rng());
 
             // Create Address LookupA with advertise=false (only listens)
             let (_, address_lookup_a) = make_address_lookup(&mut rng, false)?;
@@ -676,7 +681,8 @@ mod tests {
         #[tokio::test]
         #[traced_test]
         async fn mdns_publish_expire() -> Result {
-            let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
+            let _isolation = MDNS_TEST_LOCK.lock().await;
+            let mut rng = rand_chacha::ChaCha8Rng::from_rng(&mut rand::rng());
             let (_, address_lookup_a) = make_address_lookup(&mut rng, false)?;
             let (endpoint_id_b, address_lookup_b) = make_address_lookup(&mut rng, true)?;
 
@@ -733,7 +739,8 @@ mod tests {
         #[tokio::test]
         #[traced_test]
         async fn mdns_subscribe() -> Result {
-            let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
+            let _isolation = MDNS_TEST_LOCK.lock().await;
+            let mut rng = rand_chacha::ChaCha8Rng::from_rng(&mut rand::rng());
 
             let num_endpoints = 5;
             let mut endpoint_ids = BTreeSet::new();
@@ -782,7 +789,8 @@ mod tests {
         #[tokio::test]
         #[traced_test]
         async fn non_advertising_endpoint_not_discovered() -> Result {
-            let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
+            let _isolation = MDNS_TEST_LOCK.lock().await;
+            let mut rng = rand_chacha::ChaCha8Rng::from_rng(&mut rand::rng());
 
             let (_, address_lookup_a) = make_address_lookup(&mut rng, false)?;
             let (endpoint_id_b, address_lookup_b) = make_address_lookup(&mut rng, false)?;
@@ -816,7 +824,8 @@ mod tests {
         #[tokio::test]
         #[traced_test]
         async fn test_service_names() -> Result {
-            let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
+            let _isolation = MDNS_TEST_LOCK.lock().await;
+            let mut rng = rand_chacha::ChaCha8Rng::from_rng(&mut rand::rng());
 
             // Create an Address Lookupusing the default
             // service name
@@ -876,7 +885,8 @@ mod tests {
         #[tokio::test]
         #[traced_test]
         async fn mdns_publish_relay_url() -> Result {
-            let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
+            let _isolation = MDNS_TEST_LOCK.lock().await;
+            let mut rng = rand_chacha::ChaCha8Rng::from_rng(&mut rand::rng());
 
             // Create an mdns address lookup A that only listens
             let (_, mdns_a) = make_address_lookup(&mut rng, false)?;
