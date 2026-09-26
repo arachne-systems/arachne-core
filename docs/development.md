@@ -129,6 +129,19 @@ were published earlier with the plain upstream numbers. Under semver, a
 pre-release such as `0.103.0-arachne.1` sorts *below* `0.103.0`. Thus a caret
 requirement or `cargo add` picks the old release. Always use the exact `=` pin.
 
+The root also selects `vendor/iroh` 1.2.0 with a connection restart fix.
+QUIC Initial packets must try updated addresses even while an old selected
+path remains alive. Established traffic keeps Iroh's path selection. See the
+[patch record](../vendor/iroh/ARACHNE-PATCH.md) and the process-kill regression
+in `crates/arachne-node/tests/moq_restart.rs`.
+
+**Every consuming workspace must repeat the Iroh patch** with its local Core
+path. This includes the SDK and app native build roots. Cargo ignores patches
+inside dependencies. A registry-only build without this patch does not have
+this restart fix. The release gate must keep that limit explicit until an
+upstream release carries it or the dependency is published under an approved
+fork policy. No release is authorized by this local integration.
+
 The root `[patch.crates-io]` still selects local copies of
 `netlink-packet-core` and `hax-lib-macros` for this workspace only. Cargo
 ignores `[patch]` in dependencies. Both come in through third-party parents that
@@ -163,7 +176,8 @@ notices when bundling Core into a binary distribution.
 
 `arachne-node` depends on the two named Arachne Iroh forks, and
 `arachne-iroh-blobs` depends on `arachne-bao-tree`, so their required APIs and
-fixes are ordinary registry dependencies, not workspace-only patches. The
+fixes are ordinary registry dependencies. The Iroh restart fix above is still
+a root patch and must be resolved before a registry-only release. The
 other two vendor patches (`netlink-packet-core`, `hax-lib-macros`) are
 deliberately excluded from publishing.
 

@@ -1129,6 +1129,8 @@ impl Node {
     }
 
     /// Enable protected MoQ delivery for one authorized peer and topic.
+    /// The route starts connecting in the background. `moq_metrics` counts
+    /// active receive subscriptions, not pending connection attempts.
     #[cfg(feature = "moq")]
     pub async fn enable_moq_delivery(
         &self,
@@ -1808,8 +1810,9 @@ async fn send_frame(
     // stalled connection. Policy rejection alone does not break the transport.
     if matches!(result, Err(Error::Timeout(_) | Error::Transport(_)))
         && matches!(stage, "open stream" | "write frame" | "read acknowledgment")
+        && let Some(connection) = observed_connection
     {
-        connections.discard(peer, ALPN).await;
+        connections.discard(&connection).await;
     }
     result
 }

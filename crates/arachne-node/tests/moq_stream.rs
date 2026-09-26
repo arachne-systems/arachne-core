@@ -345,7 +345,7 @@ async fn opted_in_peers_exchange_packets_over_moq_and_reject_an_outsider() {
         left.subscribe(workspace, 1, topic.clone()).await.unwrap();
         right.subscribe(workspace, 1, topic.clone()).await.unwrap();
 
-        // The higher endpoint listens first; the lower endpoint is the only dialer.
+        // Both endpoints opt in; either can restore a connection after restart.
         let (sender, sender_messages, receiver, receiver_messages) =
             if left.id() < right.id() {
                 (&left, &mut left_messages, &right, &mut right_messages)

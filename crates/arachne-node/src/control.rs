@@ -366,13 +366,15 @@ impl ControlClient {
             tracing::info!(target: "data_fabric_transport", stage, success = outcome.is_ok(),
                 error = outcome.as_ref().err().map(ToString::to_string), "CONTROL_CLIENT_END");
             if outcome.is_err()
-                && let Some(connection) = observed
+                && let Some(connection) = &observed
             {
                 tracing::info!(target: "data_fabric_transport", paths = ?connection.paths(), stats = ?connection.stats(), "CONTROL_CLIENT_FAILURE");
             }
             // Sent but no reply: do not reuse this connection for the retry.
-            if outcome.is_err() && matches!(stage, "read response" | "write request") {
-                connections.discard(peer, ALPN).await;
+            if outcome.is_err() && matches!(stage, "read response" | "write request")
+                && let Some(connection) = observed
+            {
+                connections.discard(&connection).await;
             }
             // No control bytes can have left before write_all is entered. Once
             // writing starts, preserve uncertainty even for a partial write.

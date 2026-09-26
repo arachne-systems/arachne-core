@@ -13,7 +13,7 @@ members = [
     "vendor/iroh-mdns-address-lookup",
 ]
 resolver = "3"
-exclude = ["vendor/bao-tree", "vendor/netlink-packet-core", "vendor/hax-lib-macros"]
+exclude = ["vendor/iroh", "vendor/bao-tree", "vendor/netlink-packet-core", "vendor/hax-lib-macros"]
 
 [workspace.package]
 version = "0.1.0"
@@ -26,14 +26,12 @@ rust-version = "1.91"
 repository = "https://github.com/arachne-systems/arachne-core"
 homepage = "https://github.com/arachne-systems"
 
-# These two patches only apply inside this workspace; Cargo ignores [patch] in
-# dependencies. Both packages come in through third-party parents (iroh ->
-# netwatch/netdev, openmls_rust_crypto -> hpke-rs -> libcrux -> hax-lib), so a
-# renamed fork cannot replace them. They are advisory hygiene, not correctness
-# fixes: see docs/development.md ("Vendored dependency patches").
-# bao-tree is no longer patched here: arachne-iroh-blobs depends on the renamed
-# `arachne-bao-tree` fork directly.
+# Cargo ignores dependency-owned patches. Consumers must repeat the Iroh
+# restart fix so every protocol uses one corrected Iroh package identity.
+# The netlink/hax overrides remove transitive advisory warnings only.
+# See docs/development.md for provenance and downstream build requirements.
 [patch.crates-io]
+iroh = { path = "vendor/iroh" }
 netlink-packet-core = { path = "vendor/netlink-packet-core" }
 hax-lib-macros = { path = "vendor/hax-lib-macros" }
 moq-net = { git = "https://github.com/moq-dev/moq", rev = "6ab7d1a223e1949a5c2e10b68e29db2e8ab9bdd1" }
