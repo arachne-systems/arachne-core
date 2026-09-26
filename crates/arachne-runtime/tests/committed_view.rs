@@ -2,7 +2,9 @@
 // lock, no control queue. A request that asks for a membership change still
 // goes to the host.
 use arachne_node::Node;
-use arachne_runtime::{MemoryProvider, StorageConfig, attach_storage, close, create, describe, execute};
+use arachne_runtime::{
+    MemoryProvider, StorageConfig, attach_storage, close, create, describe, execute,
+};
 use arachne_security::{Invitation, PendingJoin};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -134,11 +136,14 @@ fn joiner(owner: &Owner, seed_index: u64) -> (mpsc::Sender<()>, mpsc::Receiver<V
             let invitation = Invitation::from_bytes(&invitation).unwrap();
             let pending =
                 PendingJoin::from_invitation(&invitation, &checkpoint, &node, "Joiner").unwrap();
-            let packet = admission_packet(pending.admission_request().unwrap(), "Joiner", &checkpoint);
+            let packet =
+                admission_packet(pending.admission_request().unwrap(), "Joiner", &checkpoint);
             node.add_address_hint(peer, address).await.unwrap();
             while asked.recv().is_ok() {
                 let reply = node.request_control(peer, &packet).await.unwrap();
-                replied.send(arachne_runtime::harness::decode_admission_reply(&reply).unwrap()).unwrap();
+                replied
+                    .send(arachne_runtime::harness::decode_admission_reply(&reply).unwrap())
+                    .unwrap();
             }
         })
     });
@@ -153,10 +158,14 @@ fn a_retained_result_is_answered_while_the_host_never_polls() {
     // First ask: a membership change. The host drives it, as always.
     go.send(()).unwrap();
     let mut admitted = None;
-    assert!(drive(owner.handle, Instant::now() + Duration::from_secs(20), |_| {
-        admitted = replies.try_recv().ok();
-        admitted.is_some()
-    }));
+    assert!(drive(
+        owner.handle,
+        Instant::now() + Duration::from_secs(20),
+        |_| {
+            admitted = replies.try_recv().ok();
+            admitted.is_some()
+        }
+    ));
     let admitted: Value = admitted.unwrap();
     assert!(admitted["commits"].is_array(), "{admitted}");
     let before = inquiries(owner.handle);
@@ -184,14 +193,22 @@ fn a_new_join_request_is_a_change_and_goes_to_the_host() {
 
     let mut intake = false;
     let mut reply = None;
-    assert!(drive(owner.handle, Instant::now() + Duration::from_secs(20), |value| {
-        intake |= value["intake"] == json!(true);
-        reply = replies.try_recv().ok();
-        reply.is_some()
-    }));
+    assert!(drive(
+        owner.handle,
+        Instant::now() + Duration::from_secs(20),
+        |value| {
+            intake |= value["intake"] == json!(true);
+            reply = replies.try_recv().ok();
+            reply.is_some()
+        }
+    ));
     assert!(intake, "the host never saw the join request");
     assert!(reply.unwrap()["commits"].is_array());
-    assert_eq!(inquiries(owner.handle), 0, "a membership change was answered as an inquiry");
+    assert_eq!(
+        inquiries(owner.handle),
+        0,
+        "a membership change was answered as an inquiry"
+    );
     close(owner.handle).unwrap();
 }
 
@@ -213,7 +230,11 @@ fn an_invitation_checkpoint_is_answered_while_the_host_never_polls() {
     )
     .unwrap();
     assert_eq!(bytes(&fetched["checkpoint"]), owner.checkpoint);
-    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
     assert_eq!(inquiries(owner.handle), 1);
     close(late).unwrap();
     close(owner.handle).unwrap();
@@ -230,15 +251,24 @@ fn an_invitation_checkpoint_is_answered_while_the_host_never_polls() {
 fn bench_inquiries_under_a_paced_host() {
     const JOINERS: u64 = 32;
     let owner = owner(65);
-    let joiners: Vec<_> = (0..JOINERS).map(|index| joiner(&owner, 6500 + index)).collect();
+    let joiners: Vec<_> = (0..JOINERS)
+        .map(|index| joiner(&owner, 6500 + index))
+        .collect();
     for (go, _) in &joiners {
         go.send(()).unwrap();
     }
     let mut admitted = 0;
-    assert!(drive(owner.handle, Instant::now() + Duration::from_secs(120), |_| {
-        admitted += joiners.iter().filter(|(_, replies)| replies.try_recv().is_ok()).count() as u64;
-        admitted == JOINERS
-    }));
+    assert!(drive(
+        owner.handle,
+        Instant::now() + Duration::from_secs(120),
+        |_| {
+            admitted += joiners
+                .iter()
+                .filter(|(_, replies)| replies.try_recv().is_ok())
+                .count() as u64;
+            admitted == JOINERS
+        }
+    ));
 
     let started = Instant::now();
     for (go, _) in &joiners {
@@ -247,7 +277,11 @@ fn bench_inquiries_under_a_paced_host() {
     let mut latencies: Vec<u128> = Vec::new();
     let mut answered = vec![false; joiners.len()];
     while latencies.len() < joiners.len() {
-        assert!(started.elapsed() < Duration::from_secs(120), "{} of {JOINERS} answered", latencies.len());
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "{} of {JOINERS} answered",
+            latencies.len()
+        );
         // The paced host: one control request, then a 250 ms tick.
         let _ = call(owner.handle, json!({"op":"poll_admission"})).unwrap();
         let tick = Instant::now();
@@ -262,7 +296,8 @@ fn bench_inquiries_under_a_paced_host() {
         }
     }
     latencies.sort_unstable();
-    let timing = call(owner.handle, json!({"op":"workspace_metrics"})).unwrap()["control_timing"].clone();
+    let timing =
+        call(owner.handle, json!({"op":"workspace_metrics"})).unwrap()["control_timing"].clone();
     println!(
         "BENCH {}",
         json!({"joiners":JOINERS, "p50_ms":latencies[latencies.len() / 2],
@@ -280,8 +315,11 @@ fn add_member(admin: i64, joiner: i64, name: &str) {
         json!({"op":"stage_invitation","personal":false,"expires_at":0}),
     )
     .unwrap();
-    let invite = call(admin, json!({"op":"adopt_admission","candidate":staged["candidate"]}))
-        .unwrap()["issued_invitation"]
+    let invite = call(
+        admin,
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+    )
+    .unwrap()["issued_invitation"]
         .clone();
     let begin = call(
         joiner,
@@ -293,38 +331,68 @@ fn add_member(admin: i64, joiner: i64, name: &str) {
         json!({"op":"stage_admission","authenticated_endpoint":begin["endpoint"],"request":begin["admission_request"]}),
     )
     .unwrap();
-    call(admin, json!({"op":"adopt_admission","candidate":staged["candidate"]})).unwrap();
+    call(
+        admin,
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+    )
+    .unwrap();
     let reply = call(
         admin,
         json!({"op":"retained_admission","authenticated_endpoint":begin["endpoint"],"request":begin["admission_request"]}),
     )
     .unwrap();
     let steps = json!([{"commit":reply["commit"],"authorization":reply["authorization"]}]);
-    let staged = call(joiner, json!({"op":"stage_join","welcome":reply["welcome"],"commits":steps})).unwrap();
-    call(joiner, json!({"op":"adopt_join","candidate":staged["candidate"]})).unwrap();
+    let staged = call(
+        joiner,
+        json!({"op":"stage_join","welcome":reply["welcome"],"commits":steps}),
+    )
+    .unwrap();
+    call(
+        joiner,
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
+    )
+    .unwrap();
 }
 
 #[test]
 fn a_membership_query_is_answered_while_the_host_never_polls() {
     let admin = common::stored(&[66; 32], &MemoryProvider::default());
-    call(admin, json!({"op":"create_workspace","display_name":"Owner"})).unwrap();
+    call(
+        admin,
+        json!({"op":"create_workspace","display_name":"Owner"}),
+    )
+    .unwrap();
     let member = common::stored(&[67; 32], &MemoryProvider::default());
     add_member(admin, member, "Field member");
     let info: Value = serde_json::from_str(&describe(admin).unwrap()).unwrap();
-    let address = info["bound_address"].as_str().unwrap().replace("0.0.0.0:", "127.0.0.1:");
-    call(member, json!({"op":"add_address_hint","peer":info["endpoint_key"],"address":address})).unwrap();
+    let address = info["bound_address"]
+        .as_str()
+        .unwrap()
+        .replace("0.0.0.0:", "127.0.0.1:");
+    call(
+        member,
+        json!({"op":"add_address_hint","peer":info["endpoint_key"],"address":address}),
+    )
+    .unwrap();
     let member_info: Value = serde_json::from_str(&describe(member).unwrap()).unwrap();
 
     // Nobody polls the owner. Before, this query waited in the host queue
     // until the 30 s control deadline (three tablets, 500 joiners).
     let started = Instant::now();
-    call(member, json!({"op":"fetch_membership_update","peer":info["endpoint_key"]})).unwrap();
+    call(
+        member,
+        json!({"op":"fetch_membership_update","peer":info["endpoint_key"]}),
+    )
+    .unwrap();
     let reply = loop {
         let value = call(member, json!({"op":"poll_membership_update"})).unwrap();
         if !value.is_null() {
             break value;
         }
-        assert!(started.elapsed() < Duration::from_secs(5), "no answer without a host poll");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "no answer without a host poll"
+        );
         thread::sleep(Duration::from_millis(5));
     };
     assert_eq!(reply["state"], "membership_current", "{reply}");
@@ -333,15 +401,23 @@ fn a_membership_query_is_answered_while_the_host_never_polls() {
     // The query carried the member's signed name. It is retained without
     // the host, so the owner's roster names the member at once.
     let roster = call(admin, json!({"op":"member_roster"})).unwrap();
-    let named: Vec<_> = roster["members"].as_array().unwrap().iter()
-        .filter(|entry| entry["display_name"] == "Field member").collect();
+    let named: Vec<_> = roster["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["display_name"] == "Field member")
+        .collect();
     assert_eq!(named.len(), 1, "{roster}");
 
     // The host still hears which current member asked (it picks a peer from it).
     let event = call(admin, json!({"op":"poll_admission"})).unwrap();
     assert_eq!(event["state"], "membership_replied", "{event}");
     assert_eq!(event["peer"], member_info["endpoint_key"]);
-    assert!(call(admin, json!({"op":"poll_admission"})).unwrap().is_null());
+    assert!(
+        call(admin, json!({"op":"poll_admission"}))
+            .unwrap()
+            .is_null()
+    );
     close(member).unwrap();
     close(admin).unwrap();
 }

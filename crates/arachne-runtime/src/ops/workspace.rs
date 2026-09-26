@@ -14,8 +14,7 @@ use crate::ops::candidate::MemberView;
 use crate::session::{activity_view, commit_workspace, transition_activity};
 use crate::workspace_activity::ActivityView;
 use crate::{
-    MembershipState, Session, WorkspaceActivity, WorkspacePhase, persistence, presence,
-    resources,
+    MembershipState, Session, WorkspaceActivity, WorkspacePhase, persistence, presence, resources,
 };
 
 #[derive(Clone, Debug, Deserialize)]
@@ -151,8 +150,8 @@ pub(crate) fn create(session: &mut Session, args: CreateArgs) -> Result<Workspac
         security(ErrorCode::InvalidInput)(error)
     })?;
     // Saved before it becomes the committed workspace.
-    let publisher = arachne_delivery::PublisherLog::new(&workspace)
-        .map_err(delivery(ErrorCode::Internal))?;
+    let publisher =
+        arachne_delivery::PublisherLog::new(&workspace).map_err(delivery(ErrorCode::Internal))?;
     let inbox = arachne_delivery::inbox::ObjectInbox::new(workspace.id(), workspace.epoch());
     if let Err(error) =
         persistence::commit_created(session, &workspace, Some(&publisher), Some(&inbox))
@@ -274,7 +273,13 @@ pub(crate) fn state(session: &mut Session) -> Result<StateView, ApiError> {
             .workspace
             .as_ref()
             .map(|owner| owner.id())
-            .or_else(|| session.join.pending.as_ref().map(|pending| pending.workspace_id())),
+            .or_else(|| {
+                session
+                    .join
+                    .pending
+                    .as_ref()
+                    .map(|pending| pending.workspace_id())
+            }),
     })
 }
 

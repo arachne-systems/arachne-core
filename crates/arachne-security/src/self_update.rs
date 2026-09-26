@@ -130,7 +130,10 @@ mod tests {
         let admin_after = active(admin.prepare_self_update_update(&update.commit).unwrap());
         let other = active(other.prepare_self_update_update(&update.commit).unwrap());
         for owner in [&admin_after, &other] {
-            assert_eq!(owner.epoch_fingerprint(), update.workspace.epoch_fingerprint());
+            assert_eq!(
+                owner.epoch_fingerprint(),
+                update.workspace.epoch_fingerprint()
+            );
         }
         // Replay: history and records carry the step.
         for owner in [&admin_after, &other, &update.workspace] {
@@ -199,7 +202,10 @@ mod tests {
             .unwrap()
             .try_into_protocol_message()
             .unwrap();
-        let processed = owner.group.process_message(&owner.provider, message).unwrap();
+        let processed = owner
+            .group
+            .process_message(&owner.provider, message)
+            .unwrap();
         let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
             panic!("not a commit")
         };
@@ -250,8 +256,13 @@ mod tests {
             let joins: Vec<_> = range
                 .clone()
                 .map(|i| {
-                    PendingJoin::from_invitation(invitation, checkpoint, crate::test_key_for(endpoint(i)), "Member")
-                        .unwrap()
+                    PendingJoin::from_invitation(
+                        invitation,
+                        checkpoint,
+                        crate::test_key_for(endpoint(i)),
+                        "Member",
+                    )
+                    .unwrap()
                 })
                 .collect();
             let requests: Vec<_> = joins
@@ -261,10 +272,12 @@ mod tests {
             let validated: Vec<_> = range
                 .clone()
                 .zip(&requests)
-                .map(|(i, request)| match owner.assess_admission(endpoint(i), request).unwrap() {
-                    AdmissionAssessment::Ready(validated) => validated,
-                    _ => panic!("open invitation needs no approval"),
-                })
+                .map(
+                    |(i, request)| match owner.assess_admission(endpoint(i), request).unwrap() {
+                        AdmissionAssessment::Ready(validated) => validated,
+                        _ => panic!("open invitation needs no approval"),
+                    },
+                )
                 .collect();
             let entries: Vec<_> = range
                 .clone()
@@ -276,7 +289,11 @@ mod tests {
                 MembershipAuthorization::Admission(prepared.replies[0].authorization.clone())
             } else {
                 MembershipAuthorization::AdmissionBatch(
-                    prepared.replies.iter().map(|r| r.authorization.clone()).collect(),
+                    prepared
+                        .replies
+                        .iter()
+                        .map(|r| r.authorization.clone())
+                        .collect(),
                 )
             };
             if let Some(probe) = probe.as_mut() {
@@ -285,7 +302,9 @@ mod tests {
             owner = prepared.workspace;
             let join = |join: &PendingJoin| {
                 let mut proof = join.join_proof().unwrap();
-                proof.apply_transition(&authorization, &prepared.commit).unwrap();
+                proof
+                    .apply_transition(&authorization, &prepared.commit)
+                    .unwrap();
                 join.prepare_workspace(&proof, &prepared.welcome).unwrap()
             };
             if probe.is_none() && !self_update {
@@ -360,7 +379,10 @@ mod tests {
         let without = grow(33, false);
         let with = grow(33, true);
         eprintln!("B3c 33 members: without {without:?}, with {with:?}");
-        assert!(with.registration * 2 < without.registration, "{with:?} vs {without:?}");
+        assert!(
+            with.registration * 2 < without.registration,
+            "{with:?} vs {without:?}"
+        );
         assert!(with.remove * 2 < without.remove, "{with:?} vs {without:?}");
     }
 

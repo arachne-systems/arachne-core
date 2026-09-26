@@ -142,21 +142,33 @@ fn decode_range_reply_with_limit(bytes: &[u8], limit: usize) -> Result<RangeRepl
 }
 
 pub(super) async fn resolve_range_reply(
-    client: arachne_node::ControlClient, peer: [u8; 32], bytes: &[u8],
+    client: arachne_node::ControlClient,
+    peer: [u8; 32],
+    bytes: &[u8],
 ) -> Result<Vec<u8>, arachne_node::Error> {
     let reply = decode_range_reply(bytes).map_err(|_| arachne_node::Error::InvalidFrame)?;
     for (index, step) in reply.steps.iter().enumerate() {
         if super::transfer::is_reference(step) {
             let reference = super::transfer::decode_reference(step)?;
-            if reference.object != super::transfer::Object::Step(reply.after.saturating_add(index as u64)) {
+            if reference.object
+                != super::transfer::Object::Step(reply.after.saturating_add(index as u64))
+            {
                 return Err(arachne_node::Error::InvalidFrame);
             }
         }
     }
-    let steps = super::transfer::resolve_steps(client, peer, reply.workspace, &reply.steps, true).await?;
-    encode(RANGE_REPLY, &RangeReply { workspace: reply.workspace, after: reply.after,
-        steps: steps.iter().map(Vec::as_slice).collect() }, super::transfer::RESOLVED_PAGE_BYTES)
-        .map_err(|_| arachne_node::Error::InvalidFrame)
+    let steps =
+        super::transfer::resolve_steps(client, peer, reply.workspace, &reply.steps, true).await?;
+    encode(
+        RANGE_REPLY,
+        &RangeReply {
+            workspace: reply.workspace,
+            after: reply.after,
+            steps: steps.iter().map(Vec::as_slice).collect(),
+        },
+        super::transfer::RESOLVED_PAGE_BYTES,
+    )
+    .map_err(|_| arachne_node::Error::InvalidFrame)
 }
 
 /// Bounded hints for finding the first distinct committed step. The receiver
@@ -185,23 +197,33 @@ pub(crate) struct BranchReply {
     pub rows: Vec<BranchRow>,
 }
 pub(crate) fn encode_branch_query(query: &BranchQuery) -> Result<Vec<u8>, String> {
-    if query.from >= query.until { return Err("invalid branch range".into()) }
+    if query.from >= query.until {
+        return Err("invalid branch range".into());
+    }
     encode(BRANCH_QUERY, query, MAX_RANGE_QUERY)
 }
 pub(crate) fn decode_branch_query(bytes: &[u8]) -> Result<BranchQuery, String> {
     let query: BranchQuery = decode(BRANCH_QUERY, bytes, MAX_RANGE_QUERY)?;
-    if query.from >= query.until { return Err("invalid branch range".into()) }
+    if query.from >= query.until {
+        return Err("invalid branch range".into());
+    }
     Ok(query)
 }
 pub(crate) fn encode_branch_reply(reply: &BranchReply) -> Result<Vec<u8>, String> {
-    if reply.rows.len() > MAX_BRANCH_ROWS { return Err("too many branch rows".into()) }
+    if reply.rows.len() > MAX_BRANCH_ROWS {
+        return Err("too many branch rows".into());
+    }
     encode(BRANCH_REPLY, reply, arachne_node::MAX_CONTROL_REPLY)
 }
 pub(crate) fn decode_branch_reply(bytes: &[u8]) -> Result<BranchReply, String> {
     let reply: BranchReply = decode(BRANCH_REPLY, bytes, arachne_node::MAX_CONTROL_REPLY)?;
-    if reply.rows.len() > MAX_BRANCH_ROWS || reply.rows.iter().enumerate().any(|(n, row)| {
-        reply.from.checked_add(n as u64) != Some(row.epoch) || row.epoch >= reply.head
-    }) { return Err("invalid branch rows".into()) }
+    if reply.rows.len() > MAX_BRANCH_ROWS
+        || reply.rows.iter().enumerate().any(|(n, row)| {
+            reply.from.checked_add(n as u64) != Some(row.epoch) || row.epoch >= reply.head
+        })
+    {
+        return Err("invalid branch rows".into());
+    }
     Ok(reply)
 }
 
@@ -308,8 +330,11 @@ pub(crate) fn encode_reply(value: &Value) -> Result<Vec<u8>, String> {
         let bare = decode_wire_step(&step)?.step;
         step = super::transfer::Reference::new(
             metadata.workspace.ok_or("step missing workspace")?,
-            super::transfer::Object::Step(metadata.after.ok_or("step missing epoch")?), bare,
-        ).and_then(|reference| reference.encode()).map_err(|error| error.to_string())?;
+            super::transfer::Object::Step(metadata.after.ok_or("step missing epoch")?),
+            bare,
+        )
+        .and_then(|reference| reference.encode())
+        .map_err(|error| error.to_string())?;
     }
     let record: Vec<u8> =
         serde_json::from_value(value.get("name_record").cloned().unwrap_or(json!([])))
@@ -338,22 +363,32 @@ pub(crate) fn encode_reply(value: &Value) -> Result<Vec<u8>, String> {
 }
 
 pub(super) async fn resolve_reply(
-    client: arachne_node::ControlClient, peer: [u8; 32], bytes: &[u8],
+    client: arachne_node::ControlClient,
+    peer: [u8; 32],
+    bytes: &[u8],
 ) -> Result<Vec<u8>, arachne_node::Error> {
     use arachne_node::Error;
-    let reply: Reply<'_> = decode(REPLY, bytes, arachne_node::MAX_CONTROL_REPLY).map_err(|_| Error::InvalidFrame)?;
-    if !super::transfer::is_reference(reply.records[0]) { return Ok(bytes.to_vec()); }
+    let reply: Reply<'_> =
+        decode(REPLY, bytes, arachne_node::MAX_CONTROL_REPLY).map_err(|_| Error::InvalidFrame)?;
+    if !super::transfer::is_reference(reply.records[0]) {
+        return Ok(bytes.to_vec());
+    }
     let reference = super::transfer::decode_reference(reply.records[0])?;
     if Some(reference.workspace) != reply.metadata.workspace
-        || Some(reference.object) != reply.metadata.after.map(super::transfer::Object::Step) {
+        || Some(reference.object) != reply.metadata.after.map(super::transfer::Object::Step)
+    {
         return Err(Error::InvalidFrame);
     }
     let step = super::transfer::fetch(client, peer, reference).await?;
     let step = super::wire_step(&step, None, usize::MAX).map_err(|_| Error::InvalidFrame)?;
     let mut records = reply.records;
     records[0] = &step;
-    encode(REPLY, &Reply { records, ..reply }, super::transfer::RESOLVED_PAGE_BYTES)
-        .map_err(|_| Error::InvalidFrame)
+    encode(
+        REPLY,
+        &Reply { records, ..reply },
+        super::transfer::RESOLVED_PAGE_BYTES,
+    )
+    .map_err(|_| Error::InvalidFrame)
 }
 
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -580,11 +615,19 @@ fn a_step_near_the_commit_bound_fits_one_binary_range_reply() {
         steps: vec![&wire],
     })
     .unwrap();
-    assert!(reply.len() <= arachne_node::MAX_CONTROL_REPLY, "{}", reply.len());
+    assert!(
+        reply.len() <= arachne_node::MAX_CONTROL_REPLY,
+        "{}",
+        reply.len()
+    );
     let decoded = decode_range_reply(&reply).unwrap();
     assert_eq!(decode_wire_step(decoded.steps[0]).unwrap().step, step);
     let json = serde_json::to_vec(&serde_json::json!({"commit": commit})).unwrap();
-    assert!(json.len() > arachne_node::MAX_CONTROL_REPLY, "{}", json.len());
+    assert!(
+        json.len() > arachne_node::MAX_CONTROL_REPLY,
+        "{}",
+        json.len()
+    );
 }
 
 /// B3c: the transport cap moves with the verifier bound. A step of the
@@ -598,7 +641,9 @@ fn a_step_at_the_verifier_bound_is_accepted_and_served_in_one_reply() {
         redemption_signature: [n; 64],
     };
     let authorization = arachne_security::MembershipAuthorization::AdmissionBatch(
-        (0..arachne_security::MAX_ADMISSION_BATCH as u8).map(auth).collect(),
+        (0..arachne_security::MAX_ADMISSION_BATCH as u8)
+            .map(auth)
+            .collect(),
     );
     let commit = vec![3; arachne_security::MAX_MEMBERSHIP_COMMIT];
     let step = super::encode_step(&authorization, &commit).unwrap();
@@ -610,6 +655,12 @@ fn a_step_at_the_verifier_bound_is_accepted_and_served_in_one_reply() {
         steps: vec![&wire],
     })
     .unwrap();
-    assert!(reply.len() <= arachne_node::MAX_CONTROL_REPLY, "{}", reply.len());
-    const { assert!(arachne_security::MAX_MEMBERSHIP_COMMIT > 64 * 1024); }
+    assert!(
+        reply.len() <= arachne_node::MAX_CONTROL_REPLY,
+        "{}",
+        reply.len()
+    );
+    const {
+        assert!(arachne_security::MAX_MEMBERSHIP_COMMIT > 64 * 1024);
+    }
 }

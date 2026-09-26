@@ -112,7 +112,10 @@ impl Replay {
 
     fn valid(&self) -> bool {
         self.lost_through <= self.floor
-            && self.seen.first().is_none_or(|first| *first > self.floor + 1)
+            && self
+                .seen
+                .first()
+                .is_none_or(|first| *first > self.floor + 1)
             && self.seen.len() <= REPLAY_ENTRIES
     }
 }
@@ -138,7 +141,15 @@ struct Pending {
 impl Pending {
     /// Encoded size in the inbox snapshot (see `Snapshot::encode`).
     fn weight(topic: usize, recipients: usize, current: bool, payload: usize) -> usize {
-        32 + 32 + 8 * 3 + 1 + topic + 16 + 8 + 1 + 32 * recipients + 2
+        32 + 32
+            + 8 * 3
+            + 1
+            + topic
+            + 16
+            + 8
+            + 1
+            + 32 * recipients
+            + 2
             + if current { 72 } else { 0 }
             + 4
             + payload
@@ -440,7 +451,13 @@ impl DirectStream {
     }
 
     fn encoded_len(&self) -> usize {
-        32 + 8 + 1 + self.topic.len() + 1 + 32 * self.recipients.len() + 24 + 4
+        32 + 8
+            + 1
+            + self.topic.len()
+            + 1
+            + 32 * self.recipients.len()
+            + 24
+            + 4
             + self
                 .records
                 .iter()
@@ -671,18 +688,29 @@ pub struct OwnPublication {
 }
 
 impl OwnPublication {
-    fn open(owner: &arachne_security::Workspace, context: PublicationContext, ciphertext: &[u8],
-        recipients: Vec<[u8; 32]>, current: Option<current::CurrentMetadata>) -> Result<Self, &'static str> {
+    fn open(
+        owner: &arachne_security::Workspace,
+        context: PublicationContext,
+        ciphertext: &[u8],
+        recipients: Vec<[u8; 32]>,
+        current: Option<current::CurrentMetadata>,
+    ) -> Result<Self, &'static str> {
         let aad = match current {
             Some(metadata) => metadata.authenticated_context(&context),
             None if recipients.is_empty() => context.authenticated_bytes(),
             None => context.direct_authenticated_bytes(&recipients)?,
         };
-        let object = owner.unprotect_object(context.topic.namespace().as_bytes(), &aad, ciphertext)?;
+        let object =
+            owner.unprotect_object(context.topic.namespace().as_bytes(), &aad, ciphertext)?;
         if owner.member().map(|member| member.id()) != Some(object.message.member) {
             return Err("only an object's author can re-publish it");
         }
-        Ok(Self { context, payload: object.message.payload, recipients, current })
+        Ok(Self {
+            context,
+            payload: object.message.payload,
+            recipients,
+            current,
+        })
     }
 }
 
@@ -801,7 +829,9 @@ impl ObjectInbox {
         let mut advanced = self.clone();
         advanced.epoch = next.epoch();
         advanced.replay.retain(|replay| replay.epoch >= oldest);
-        advanced.progress.retain(|progress| progress.epoch >= oldest);
+        advanced
+            .progress
+            .retain(|progress| progress.epoch >= oldest);
         // Retained third-party ranges: only from current members, and none
         // from before a join (a holder never serves pre-join history).
         advanced.retained_ranges.retain(|range| {
@@ -817,7 +847,8 @@ impl ObjectInbox {
         let mut missed = 0;
         for stream in &mut advanced.direct {
             while let Some(record) = stream.records.first() {
-                if arachne_security::object_epoch(&record.object).is_some_and(|epoch| epoch >= oldest)
+                if arachne_security::object_epoch(&record.object)
+                    .is_some_and(|epoch| epoch >= oldest)
                 {
                     break;
                 }
@@ -853,7 +884,9 @@ impl ObjectInbox {
         next: &arachne_security::Workspace,
     ) -> Result<Self, &'static str> {
         self.validate_owner(current)?;
-        if next.id() != self.workspace || fork_epoch >= current.epoch() || next.epoch() <= fork_epoch
+        if next.id() != self.workspace
+            || fork_epoch >= current.epoch()
+            || next.epoch() <= fork_epoch
         {
             return Err("inbox cannot rebase to this owner");
         }
@@ -878,17 +911,24 @@ impl ObjectInbox {
             // Direct scopes span epochs. Rewind their sequence frontier with
             // the discarded suffix, or re-publication starts behind a hole
             // that only existed on the losing branch.
-            if let Some(first_lost) = stream.records.iter().filter(|record| {
-                arachne_security::object_epoch(&record.object).is_some_and(|epoch| epoch > fork_epoch)
-            }).map(|record| record.sequence).min() {
+            if let Some(first_lost) = stream
+                .records
+                .iter()
+                .filter(|record| {
+                    arachne_security::object_epoch(&record.object)
+                        .is_some_and(|epoch| epoch > fork_epoch)
+                })
+                .map(|record| record.sequence)
+                .min()
+            {
                 let through = first_lost.saturating_sub(1);
                 stream.known_head = stream.known_head.min(through);
                 stream.floor = stream.floor.min(through);
                 stream.recovery_floor = stream.recovery_floor.min(through);
             }
-            stream.records.retain(|record| {
-                arachne_security::object_epoch(&record.object).is_some_and(kept)
-            });
+            stream
+                .records
+                .retain(|record| arachne_security::object_epoch(&record.object).is_some_and(kept));
         }
         moved.direct.retain(|stream| {
             (!stream.records.is_empty() || stream.known_head != 0)
@@ -901,41 +941,98 @@ impl ObjectInbox {
 
     /// Recover only this author's retained objects above the fork epoch.
     /// Foreign pending plaintext is never a source for re-publication.
-    pub fn own_losing_publications(&self, owner: &arachne_security::Workspace,
-        publisher: &PublisherLog, fork_epoch: u64) -> Result<Vec<OwnPublication>, &'static str> {
+    pub fn own_losing_publications(
+        &self,
+        owner: &arachne_security::Workspace,
+        publisher: &PublisherLog,
+        fork_epoch: u64,
+    ) -> Result<Vec<OwnPublication>, &'static str> {
         self.validate_owner(owner)?;
         publisher.validate_owner(owner)?;
         let mut own = Vec::new();
-        for epoch in publisher.epochs().into_iter().filter(|epoch| *epoch > fork_epoch) {
-            for record in publisher.epoch_log(epoch).ok_or("missing publisher epoch")?.publications() {
-                let publication = if let Ok(live) = current::LiveCurrentPacket::from_wire(&record.ciphertext) {
-                    let (context, ciphertext) = PublicationContext::unpack(record.context.workspace,
-                        record.context.revision, record.context.topic.clone(), &live.packet)?;
-                    if context != record.context { return Err("retained current context mismatch") }
-                    OwnPublication::open(owner, context, ciphertext, Vec::new(), Some(live.metadata))?
-                } else {
-                    OwnPublication::open(owner, record.context.clone(), &record.ciphertext, Vec::new(), None)?
-                };
+        for epoch in publisher
+            .epochs()
+            .into_iter()
+            .filter(|epoch| *epoch > fork_epoch)
+        {
+            for record in publisher
+                .epoch_log(epoch)
+                .ok_or("missing publisher epoch")?
+                .publications()
+            {
+                let publication =
+                    if let Ok(live) = current::LiveCurrentPacket::from_wire(&record.ciphertext) {
+                        let (context, ciphertext) = PublicationContext::unpack(
+                            record.context.workspace,
+                            record.context.revision,
+                            record.context.topic.clone(),
+                            &live.packet,
+                        )?;
+                        if context != record.context {
+                            return Err("retained current context mismatch");
+                        }
+                        OwnPublication::open(
+                            owner,
+                            context,
+                            ciphertext,
+                            Vec::new(),
+                            Some(live.metadata),
+                        )?
+                    } else {
+                        OwnPublication::open(
+                            owner,
+                            record.context.clone(),
+                            &record.ciphertext,
+                            Vec::new(),
+                            None,
+                        )?
+                    };
                 own.push(publication);
             }
         }
-        let author = owner.member().ok_or("publisher requires member identity")?.id();
+        let author = owner
+            .member()
+            .ok_or("publisher requires member identity")?
+            .id();
         for stream in self.direct.iter().filter(|stream| stream.author == author) {
             for record in &stream.records {
-                if arachne_security::object_epoch(&record.object).is_none_or(|epoch| epoch <= fork_epoch) { continue }
-                let context = PublicationContext { workspace: self.workspace, revision: record.revision,
-                    topic: Topic::new(&stream.topic).map_err(|_| "invalid direct topic")?, id: record.id,
-                    sequence: std::num::NonZeroU64::new(record.sequence) };
-                own.push(OwnPublication::open(owner, context, &record.object, stream.recipients.clone(), None)?);
+                if arachne_security::object_epoch(&record.object)
+                    .is_none_or(|epoch| epoch <= fork_epoch)
+                {
+                    continue;
+                }
+                let context = PublicationContext {
+                    workspace: self.workspace,
+                    revision: record.revision,
+                    topic: Topic::new(&stream.topic).map_err(|_| "invalid direct topic")?,
+                    id: record.id,
+                    sequence: std::num::NonZeroU64::new(record.sequence),
+                };
+                own.push(OwnPublication::open(
+                    owner,
+                    context,
+                    &record.object,
+                    stream.recipients.clone(),
+                    None,
+                )?);
             }
         }
         // A current index can outlive the publisher log's byte budget.
         if let Some(current) = &self.current {
             for (context, metadata, ciphertext) in current.publications()? {
-                if !own.iter().any(|publication| publication.context.id == context.id)
-                    && arachne_security::object_epoch(&ciphertext).is_some_and(|epoch| epoch > fork_epoch)
+                if !own
+                    .iter()
+                    .any(|publication| publication.context.id == context.id)
+                    && arachne_security::object_epoch(&ciphertext)
+                        .is_some_and(|epoch| epoch > fork_epoch)
                 {
-                    own.push(OwnPublication::open(owner, context, &ciphertext, Vec::new(), Some(metadata))?);
+                    own.push(OwnPublication::open(
+                        owner,
+                        context,
+                        &ciphertext,
+                        Vec::new(),
+                        Some(metadata),
+                    )?);
                 }
             }
         }
@@ -1304,11 +1401,17 @@ impl ObjectInbox {
         }
         let identity = publication_identity(author, context.id);
         if self.recent.contains(&identity) {
-            if recipients.is_empty() || sequence == 0 || self.direct.iter().any(|stream| {
-                stream.author == author && stream.revision == context.revision
-                    && stream.topic == context.topic.as_str() && stream.recipients == recipients
-                    && (stream.closed(sequence) || stream.records.iter().any(|record| record.id == context.id))
-            }) {
+            if recipients.is_empty()
+                || sequence == 0
+                || self.direct.iter().any(|stream| {
+                    stream.author == author
+                        && stream.revision == context.revision
+                        && stream.topic == context.topic.as_str()
+                        && stream.recipients == recipients
+                        && (stream.closed(sequence)
+                            || stream.records.iter().any(|record| record.id == context.id))
+                })
+            {
                 return Ok(InboxStage::Duplicate);
             }
             // The app already accepted this id on another branch or scope.
@@ -1656,7 +1759,11 @@ impl ObjectInbox {
             self.missed += stream.evict_first();
         }
         // The encoded size is the persisted byte budget.
-        while self.direct.iter().map(DirectStream::encoded_len).sum::<usize>()
+        while self
+            .direct
+            .iter()
+            .map(DirectStream::encoded_len)
+            .sum::<usize>()
             > MAX_DIRECT_RETAINED_BYTES
         {
             let stream = self
@@ -1835,7 +1942,9 @@ impl ObjectInbox {
     fn behind_direct_gap(&self, pending: &Pending) -> bool {
         // Already authenticated losing plaintext remains deliverable even
         // though its ciphertext sequence has left the accepted branch.
-        if pending.from_losing_branch { return false; }
+        if pending.from_losing_branch {
+            return false;
+        }
         if pending.recipients.is_empty() || pending.sequence == 0 {
             return false;
         }
@@ -2592,9 +2701,10 @@ impl ObjectInbox {
             }
         }
         if inbox.progress.len() > MAX_RECOVERY_SELECTIONS
-            || inbox.progress.iter().any(|progress| {
-                progress.through == 0 || !owner.in_receive_window(progress.epoch)
-            })
+            || inbox
+                .progress
+                .iter()
+                .any(|progress| progress.through == 0 || !owner.in_receive_window(progress.epoch))
             || inbox.progress.windows(2).any(|pair| {
                 (pair[0].author, pair[0].epoch, pair[0].selection)
                     >= (pair[1].author, pair[1].epoch, pair[1].selection)
@@ -2706,7 +2816,8 @@ fn current_value_survives_authenticated_delivery_bundle() {
 
     let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     let (admin, invite, checkpoint) = issue_registered_invitation(admin);
-    let join = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
+    let join =
+        PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
         .prepare_admission(crate::test_endpoint(2), join.admission_request().unwrap())
         .unwrap();
@@ -2776,7 +2887,13 @@ fn current_value_survives_authenticated_delivery_bundle() {
         )
         .unwrap();
     let reply = restored
-        .serve_current(&restored_owner, &policy, crate::test_endpoint(2), &query, UnixSeconds(50))
+        .serve_current(
+            &restored_owner,
+            &policy,
+            crate::test_endpoint(2),
+            &query,
+            UnixSeconds(50),
+        )
         .unwrap();
     let verified = current::verify_wire_reply(&reader, &query, &reply)
         .unwrap()
@@ -2798,8 +2915,7 @@ fn current_value_survives_authenticated_delivery_bundle() {
             .1,
         0
     );
-    let reader_publisher =
-        PublisherLog::new(&reader).unwrap();
+    let reader_publisher = PublisherLog::new(&reader).unwrap();
     let accepted_sealed = accepted.seal(&reader, &key, &reader_publisher).unwrap();
     let (restored_reader, _, restored_accepted) =
         ObjectInbox::restore(&key, crate::test_endpoint(2), reader.id(), &accepted_sealed).unwrap();
@@ -2822,7 +2938,12 @@ fn current_value_survives_authenticated_delivery_bundle() {
         .unwrap();
     assert_eq!((pending_count, stale_count), (1, 0));
     let (_, pending_count, stale_count) = ObjectInbox::new(reader.id(), reader.epoch())
-        .accept_current_view(&reader, &query, &reply, UnixSeconds(100 + EXPIRY_SKEW_SECONDS))
+        .accept_current_view(
+            &reader,
+            &query,
+            &reply,
+            UnixSeconds(100 + EXPIRY_SKEW_SECONDS),
+        )
         .unwrap();
     assert_eq!((pending_count, stale_count), (0, 1));
     let (received_context, ciphertext) = PublicationContext::unpack(
@@ -2856,7 +2977,8 @@ fn repeated_direct_transfers_fit_storage_without_losing_pending_or_sequence() {
 
     let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     let (admin, invite, checkpoint) = issue_registered_invitation(admin);
-    let join = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
+    let join =
+        PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
         .prepare_admission(crate::test_endpoint(2), join.admission_request().unwrap())
         .unwrap();
@@ -2884,7 +3006,11 @@ fn repeated_direct_transfers_fit_storage_without_losing_pending_or_sequence() {
             sequence.into(),
         );
         let object = sender
-            .protect_object(ctx.topic.namespace().as_bytes(), &ctx.authenticated_bytes(), &vec![5; 12 * 1024])
+            .protect_object(
+                ctx.topic.namespace().as_bytes(),
+                &ctx.authenticated_bytes(),
+                &vec![5; 12 * 1024],
+            )
             .unwrap();
         log.append(ctx, object).unwrap();
     }
@@ -2934,14 +3060,19 @@ fn repeated_direct_transfers_fit_storage_without_losing_pending_or_sequence() {
             .stage_sent_direct(&sender, &ctx, &recipients, &object)
             .unwrap();
         let saved = inbox.seal(&sender, &key, &log).unwrap();
-        (sender, log, inbox) = ObjectInbox::restore(&key, crate::test_endpoint(1), sender.id(), &saved).unwrap();
+        (sender, log, inbox) =
+            ObjectInbox::restore(&key, crate::test_endpoint(1), sender.id(), &saved).unwrap();
         assert_eq!(log.head(), 64);
         assert_eq!(
             inbox.pending(&sender).unwrap().unwrap().message.payload,
             b"keep pending"
         );
         assert!(
-            inbox.direct.iter().map(DirectStream::encoded_len).sum::<usize>()
+            inbox
+                .direct
+                .iter()
+                .map(DirectStream::encoded_len)
+                .sum::<usize>()
                 <= MAX_DIRECT_RETAINED_BYTES
         );
     }
@@ -2977,7 +3108,8 @@ fn deferred_streams_preserve_order_identity_and_restart() {
 
     let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     let (admin, invite, checkpoint) = issue_registered_invitation(admin);
-    let join = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
+    let join =
+        PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
         .prepare_admission(crate::test_endpoint(2), join.admission_request().unwrap())
         .unwrap();
@@ -3101,7 +3233,8 @@ fn permanent_rejection_is_durable_and_unblocks_the_next_object() {
 
     let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     let (admin, invite, checkpoint) = issue_registered_invitation(admin);
-    let join = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
+    let join =
+        PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
         .prepare_admission(crate::test_endpoint(2), join.admission_request().unwrap())
         .unwrap();
@@ -3189,7 +3322,8 @@ fn durable_pending_objects_and_bounded_topic_replay() {
     };
     let admin = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     let (admin, invite, checkpoint) = issue_registered_invitation(admin);
-    let join = PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
+    let join =
+        PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
     let prepared = admin
         .prepare_admission(crate::test_endpoint(2), join.admission_request().unwrap())
         .unwrap();
@@ -3384,7 +3518,11 @@ fn durable_pending_objects_and_bounded_topic_replay() {
     for number in 10_003..11_027 {
         let ctx = context(number, chat.clone());
         let object = sender
-            .protect_object(ctx.topic.namespace().as_bytes(), &ctx.authenticated_bytes(), b"chat")
+            .protect_object(
+                ctx.topic.namespace().as_bytes(),
+                &ctx.authenticated_bytes(),
+                b"chat",
+            )
             .unwrap();
         inbox = prepared(&inbox, &ctx, &object);
         let pending = inbox.pending(&reader).unwrap().unwrap();
@@ -3429,14 +3567,22 @@ fn durable_pending_objects_and_bounded_topic_replay() {
     for number in 20_001..20_032 {
         let ctx = context(number, feed.clone());
         let object = sender
-            .protect_object(ctx.topic.namespace().as_bytes(), &ctx.authenticated_bytes(), b"pending")
+            .protect_object(
+                ctx.topic.namespace().as_bytes(),
+                &ctx.authenticated_bytes(),
+                b"pending",
+            )
             .unwrap();
         inbox = prepared(&inbox, &ctx, &object);
     }
     // No per-topic receipt window: pending objects never displace each other.
     let ctx = context(20_032, feed.clone());
     let object = sender
-        .protect_object(ctx.topic.namespace().as_bytes(), &ctx.authenticated_bytes(), b"33rd")
+        .protect_object(
+            ctx.topic.namespace().as_bytes(),
+            &ctx.authenticated_bytes(),
+            b"33rd",
+        )
         .unwrap();
     inbox = prepared(&inbox, &ctx, &object);
     assert_eq!(inbox.pending_count(), 33);
@@ -3479,7 +3625,10 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
     let holder_join =
         PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Holder").unwrap();
     let prepared = admin
-        .prepare_admission(crate::test_endpoint(2), holder_join.admission_request().unwrap())
+        .prepare_admission(
+            crate::test_endpoint(2),
+            holder_join.admission_request().unwrap(),
+        )
         .unwrap();
     let mut holder_proof = holder_join.join_proof().unwrap();
     holder_proof
@@ -3504,7 +3653,10 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
     let reader_join =
         PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(3), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission(crate::test_endpoint(3), reader_join.admission_request().unwrap())
+        .prepare_admission(
+            crate::test_endpoint(3),
+            reader_join.admission_request().unwrap(),
+        )
         .unwrap();
     let mut reader_proof = reader_join.join_proof().unwrap();
     reader_proof
@@ -3557,8 +3709,7 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
             b"retained",
         )
         .unwrap();
-    let mut author_log =
-        PublisherLog::new(&author).unwrap();
+    let mut author_log = PublisherLog::new(&author).unwrap();
     author_log.append(context, ciphertext).unwrap();
     let query = RangeQuery {
         workspace: author.id(),
@@ -3569,7 +3720,14 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         through: 1,
         topics: BTreeSet::from([topic.clone()]),
     };
-    let reply = wire::serve_range(&author_log, &author, &policy, crate::test_endpoint(2), &query).unwrap();
+    let reply = wire::serve_range(
+        &author_log,
+        &author,
+        &policy,
+        crate::test_endpoint(2),
+        &query,
+    )
+    .unwrap();
     let inbox = ObjectInbox::new(holder.id(), holder.epoch())
         .retain_range(&holder, &query, &reply, 200, UnixSeconds(100))
         .unwrap();
@@ -3580,7 +3738,13 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         ObjectInbox::restore(&key, holder.endpoint(), holder.id(), &saved).unwrap();
 
     let relayed = inbox
-        .serve_range(&holder, &policy, crate::test_endpoint(3), &query, UnixSeconds(150))
+        .serve_range(
+            &holder,
+            &policy,
+            crate::test_endpoint(3),
+            &query,
+            UnixSeconds(150),
+        )
         .unwrap();
     assert_eq!(relayed, reply);
     assert!(matches!(
@@ -3648,7 +3812,13 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         selector: metadata.selector,
     };
     let current_reply = author_inbox
-        .serve_current(&author, &policy, crate::test_endpoint(2), &current_query, UnixSeconds(100))
+        .serve_current(
+            &author,
+            &policy,
+            crate::test_endpoint(2),
+            &current_query,
+            UnixSeconds(100),
+        )
         .unwrap();
     let inbox = inbox
         .retain_current_view(&holder, &current_query, &current_reply, UnixSeconds(100))
@@ -3657,7 +3827,13 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
     let (holder, _, inbox) =
         ObjectInbox::restore(&key, holder.endpoint(), holder.id(), &saved).unwrap();
     let relayed = inbox
-        .serve_current(&holder, &policy, crate::test_endpoint(3), &current_query, UnixSeconds(150))
+        .serve_current(
+            &holder,
+            &policy,
+            crate::test_endpoint(3),
+            &current_query,
+            UnixSeconds(150),
+        )
         .unwrap();
     assert_eq!(relayed, current_reply);
     let (_, pending, stale) = ObjectInbox::new(reader.id(), reader.epoch())
@@ -3680,7 +3856,13 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
     assert_eq!(
         inbox
             // The holder's own retention limit (200): no skew.
-            .serve_range(&holder, &policy, crate::test_endpoint(3), &query, UnixSeconds(200))
+            .serve_range(
+                &holder,
+                &policy,
+                crate::test_endpoint(3),
+                &query,
+                UnixSeconds(200)
+            )
             .unwrap(),
         wire::unavailable_reply()
     );
@@ -3689,12 +3871,21 @@ fn retained_publisher_proof_survives_holder_restart_and_expires() {
         .install_verified_policy(
             holder.id(),
             1,
-            BTreeMap::from([(crate::test_endpoint(1), permissions(false)), (crate::test_endpoint(2), permissions(true))]),
+            BTreeMap::from([
+                (crate::test_endpoint(1), permissions(false)),
+                (crate::test_endpoint(2), permissions(true)),
+            ]),
         )
         .unwrap();
     assert_eq!(
         inbox
-            .serve_range(&holder, &removed_reader_policy, crate::test_endpoint(3), &query, UnixSeconds(150))
+            .serve_range(
+                &holder,
+                &removed_reader_policy,
+                crate::test_endpoint(3),
+                &query,
+                UnixSeconds(150)
+            )
             .unwrap(),
         wire::denied_reply()
     );

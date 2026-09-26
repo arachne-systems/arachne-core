@@ -42,11 +42,17 @@ pub(crate) struct Entry {
 
 impl Entry {
     pub(crate) fn deadline(&self) -> Option<Duration> {
-        *self.deadline.lock().unwrap_or_else(|error| error.into_inner())
+        *self
+            .deadline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     pub(crate) fn set_deadline(&self, deadline: Option<Duration>) {
-        *self.deadline.lock().unwrap_or_else(|error| error.into_inner()) = deadline;
+        *self
+            .deadline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = deadline;
     }
 
     /// Start a deadline for one op: at `deadline` it interrupts the op's
@@ -186,14 +192,14 @@ pub fn create_tor(secret: &[u8; 32]) -> Result<i64, String> {
 
 /// Create an endpoint session with explicit node options: the profile, an
 /// operator relay, n0 lookup on or off, and transport deadlines.
-pub fn create_with_options(
-    secret: Option<&[u8; 32]>,
-    options: NodeOptions,
-) -> Result<i64, String> {
+pub fn create_with_options(secret: Option<&[u8; 32]>, options: NodeOptions) -> Result<i64, String> {
     create_endpoint(secret, options)
 }
 
-pub(crate) fn create_endpoint(secret: Option<&[u8; 32]>, options: NodeOptions) -> Result<i64, String> {
+pub(crate) fn create_endpoint(
+    secret: Option<&[u8; 32]>,
+    options: NodeOptions,
+) -> Result<i64, String> {
     default_context()
         .and_then(|context| open(&context, secret, options, None))
         .map_err(errors::text)
@@ -261,13 +267,7 @@ pub(crate) fn open(
     });
     let cancellation = node.control_cancellation();
     let presence = presence::Presence::new()?;
-    let mut session = Session::new(
-        node,
-        receiver,
-        Arc::clone(context),
-        committed,
-        presence,
-    );
+    let mut session = Session::new(node, receiver, Arc::clone(context), committed, presence);
     session.tasks.push(forwarder.abort_handle());
     let entry = Arc::new(Entry {
         context: Arc::clone(context),

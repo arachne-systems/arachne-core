@@ -5,17 +5,15 @@ use std::{
     time::Instant,
 };
 
+use super::mdns::PausableMdns;
 use iroh::{
     Endpoint, EndpointAddr, PublicKey,
     address_lookup::memory::MemoryLookup,
     endpoint::{AfterHandshakeOutcome, BeforeConnectOutcome, EndpointHooks, presets},
 };
-use super::mdns::PausableMdns;
 use tokio::sync::{Mutex, OnceCell};
 
-use super::{
-    ConnectionBudget, Error, NodeOptions, PeerId, Result, Timeouts, transport,
-};
+use super::{ConnectionBudget, Error, NodeOptions, PeerId, Result, Timeouts, transport};
 
 const MAX_ADDRESS_HINTS: usize = 4096;
 const MAX_CACHED_CONNECTIONS: usize = 32;
@@ -381,7 +379,12 @@ impl Connections {
             .iter()
             .filter_map(|weak| weak.upgrade())
             .filter(|connection| connection.close_reason().is_none())
-            .map(|connection| (*connection.remote_id().as_bytes(), connection.alpn().to_vec()))
+            .map(|connection| {
+                (
+                    *connection.remote_id().as_bytes(),
+                    connection.alpn().to_vec(),
+                )
+            })
             .collect()
     }
 
@@ -693,9 +696,14 @@ impl Connections {
     /// Close the failed connection. A late failure must not evict a newer
     /// connection that another exchange has already put in the cache.
     pub(super) async fn discard(&self, connection: &iroh::endpoint::Connection) {
-        let key = (*connection.remote_id().as_bytes(), connection.alpn().to_vec());
+        let key = (
+            *connection.remote_id().as_bytes(),
+            connection.alpn().to_vec(),
+        );
         let mut outgoing = self.outgoing.lock().await;
-        if outgoing.get(&key).and_then(|cached| cached.connection.get())
+        if outgoing
+            .get(&key)
+            .and_then(|cached| cached.connection.get())
             .is_some_and(|cached| cached.stable_id() == connection.stable_id())
         {
             outgoing.remove(&key);
@@ -796,13 +804,20 @@ mod tests {
     #[test]
     fn tor_profile_uses_endpoint_id_resolution_without_ip_hints() {
         let (mdns, wan_lookup, relay_only, use_ip_hints) = NetworkProfile::Tor.settings();
-        assert_eq!((mdns, wan_lookup, relay_only, use_ip_hints), (None, false, true, false));
+        assert_eq!(
+            (mdns, wan_lookup, relay_only, use_ip_hints),
+            (None, false, true, false)
+        );
         assert!(NetworkProfile::Tor.uses_tor());
     }
 
     fn operator_relay() -> RelayOptions {
         RelayOptions::new(
-            iroh::RelayMap::from("https://relay.example.invalid".parse::<iroh::RelayUrl>().unwrap()),
+            iroh::RelayMap::from(
+                "https://relay.example.invalid"
+                    .parse::<iroh::RelayUrl>()
+                    .unwrap(),
+            ),
             iroh::tls::CaTlsConfig::embedded(),
         )
     }
@@ -837,7 +852,11 @@ mod tests {
             ..wan
         };
         assert_eq!(plan(&isolated).relays, Relays::None);
-        for profile in [NetworkProfile::Direct, NetworkProfile::Lan, NetworkProfile::Nearby] {
+        for profile in [
+            NetworkProfile::Direct,
+            NetworkProfile::Lan,
+            NetworkProfile::Nearby,
+        ] {
             assert_eq!(
                 plan(&NodeOptions::new(profile)),
                 TransportPlan {
@@ -1175,12 +1194,21 @@ mod tests {
                 "the next dial is a new connection"
             );
             cache.forget(id, &alpn).await;
-            assert!(fresh.close_reason().is_none(), "refresh cancelled an existing exchange");
+            assert!(
+                fresh.close_reason().is_none(),
+                "refresh cancelled an existing exchange"
+            );
             let replacement = cache.connect(id, &alpn).await.unwrap();
             // A late failure on the old handle must not discard its replacement.
             cache.discard(&fresh).await;
-            assert!(replacement.close_reason().is_none(), "old failure closed the new connection");
-            assert_eq!(cache.connect(id, &alpn).await.unwrap().stable_id(), replacement.stable_id());
+            assert!(
+                replacement.close_reason().is_none(),
+                "old failure closed the new connection"
+            );
+            assert_eq!(
+                cache.connect(id, &alpn).await.unwrap().stable_id(),
+                replacement.stable_id()
+            );
             cache.close().await;
             peer.close().await;
             server.abort();

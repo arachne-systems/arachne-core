@@ -303,13 +303,24 @@ impl CurrentViewIndex {
     }
 
     pub(crate) fn publications(&self) -> Result<Vec<CurrentPublication>, &'static str> {
-        self.values.iter().map(|((revision, topic, selector, replacement_key), entry)| {
-            let (context, ciphertext) = PublicationContext::unpack(self.workspace, *revision,
-                topic.clone(), &entry.value.packet)?;
-            let metadata = CurrentMetadata { selector: *selector, replacement_key: *replacement_key,
-                expires_at: entry.value.expires_at, tombstone: entry.value.tombstone };
-            Ok((context, metadata, ciphertext.to_vec()))
-        }).collect()
+        self.values
+            .iter()
+            .map(|((revision, topic, selector, replacement_key), entry)| {
+                let (context, ciphertext) = PublicationContext::unpack(
+                    self.workspace,
+                    *revision,
+                    topic.clone(),
+                    &entry.value.packet,
+                )?;
+                let metadata = CurrentMetadata {
+                    selector: *selector,
+                    replacement_key: *replacement_key,
+                    expires_at: entry.value.expires_at,
+                    tombstone: entry.value.tombstone,
+                };
+                Ok((context, metadata, ciphertext.to_vec()))
+            })
+            .collect()
     }
 
     /// Caller stores these bytes inside the authenticated workspace record.
@@ -892,9 +903,13 @@ mod tests {
         let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
         let admin = registered.workspace;
         let pending =
-            PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader").unwrap();
+            PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Reader")
+                .unwrap();
         let prepared = admin
-            .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
+            .prepare_admission(
+                crate::test_endpoint(2),
+                pending.admission_request().unwrap(),
+            )
             .unwrap();
         let mut proof = pending.join_proof().unwrap();
         proof
@@ -1065,11 +1080,27 @@ mod tests {
         let mut index = CurrentViewIndex::new(publisher.id(), authority, publisher.epoch());
         let (first, first_packet) = packet(&mut publisher, 1, 1, b"old");
         index
-            .insert(first, [8; 32], [1; 32], 20, false, first_packet, UnixSeconds(0))
+            .insert(
+                first,
+                [8; 32],
+                [1; 32],
+                20,
+                false,
+                first_packet,
+                UnixSeconds(0),
+            )
             .unwrap();
         let (other, other_packet) = packet(&mut publisher, 2, 2, b"other selector");
         index
-            .insert(other, [9; 32], [2; 32], 30, false, other_packet, UnixSeconds(0))
+            .insert(
+                other,
+                [9; 32],
+                [2; 32],
+                30,
+                false,
+                other_packet,
+                UnixSeconds(0),
+            )
             .unwrap();
         let (newer, newer_packet) = packet(&mut publisher, 3, 3, b"new");
         index
@@ -1084,7 +1115,15 @@ mod tests {
             )
             .unwrap();
         index
-            .insert(newer, [8; 32], [1; 32], 30, false, newer_packet, UnixSeconds(0))
+            .insert(
+                newer,
+                [8; 32],
+                [1; 32],
+                30,
+                false,
+                newer_packet,
+                UnixSeconds(0),
+            )
             .unwrap();
         let revision_eight = PublicationContext {
             workspace: publisher.id(),
@@ -1163,7 +1202,9 @@ mod tests {
                 ]),
             )
             .unwrap();
-        let served = index.serve(&publisher, &policy, crate::test_endpoint(2), &query).unwrap();
+        let served = index
+            .serve(&publisher, &policy, crate::test_endpoint(2), &query)
+            .unwrap();
         assert_eq!(
             verify_wire_reply(&reader, &query, &served)
                 .unwrap()

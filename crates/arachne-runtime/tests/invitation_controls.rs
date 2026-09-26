@@ -30,9 +30,7 @@ fn begin(h: i64, invite: &Value) -> Value {
 #[test]
 fn overlapping_open_admissions_queue_while_membership_commit_is_pending() {
     let admin = session(121);
-    let people: Vec<_> = (122..=124)
-        .map(session)
-        .collect();
+    let people: Vec<_> = (122..=124).map(session).collect();
     call(
         admin,
         json!({"op":"create_workspace","display_name":"Incident lead","workspace_name":"Wildfire response"}),
@@ -49,7 +47,10 @@ fn overlapping_open_admissions_queue_while_membership_commit_is_pending() {
         .as_str()
         .unwrap()
         .replace("0.0.0.0:", "127.0.0.1:");
-    let pending: Vec<_> = people.iter().map(|person| begin(*person, &invite)).collect();
+    let pending: Vec<_> = people
+        .iter()
+        .map(|person| begin(*person, &invite))
+        .collect();
     let admin_peer = admin_info["endpoint_key"].clone();
     for (person, request) in people.iter().zip(&pending) {
         call(
@@ -102,7 +103,10 @@ fn overlapping_open_admissions_queue_while_membership_commit_is_pending() {
             "unexpected busy admission result: {value}"
         );
         queued += usize::from(value["state"] == "admission_queued");
-        assert!(Instant::now() < deadline, "later admissions were not queued promptly");
+        assert!(
+            Instant::now() < deadline,
+            "later admissions were not queued promptly"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
 
@@ -116,7 +120,10 @@ fn overlapping_open_admissions_queue_while_membership_commit_is_pending() {
             held_batches.push(value["admissions"].as_u64().unwrap());
             adopt(admin, &value);
         }
-        assert!(Instant::now() < deadline, "held admissions were not delivered");
+        assert!(
+            Instant::now() < deadline,
+            "held admissions were not delivered"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     for waiter in queued_waiters {
@@ -129,7 +136,8 @@ fn overlapping_open_admissions_queue_while_membership_commit_is_pending() {
             let peer = admin_info["endpoint_key"].clone();
             std::thread::spawn(move || {
                 for _ in 0..200 {
-                    let reply = call(person, json!({"op":"request_admission","peer":peer})).unwrap();
+                    let reply =
+                        call(person, json!({"op":"request_admission","peer":peer})).unwrap();
                     if reply.get("welcome").is_some() {
                         return reply;
                     }
@@ -155,7 +163,10 @@ fn overlapping_open_admissions_queue_while_membership_commit_is_pending() {
                 "unexpected concurrent admission result: {value}"
             );
         }
-        assert!(Instant::now() < deadline, "concurrent admissions did not finish");
+        assert!(
+            Instant::now() < deadline,
+            "concurrent admissions did not finish"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     // With held exchanges the two queued admissions commit together before
@@ -164,7 +175,10 @@ fn overlapping_open_admissions_queue_while_membership_commit_is_pending() {
         held_batches.contains(&2) || staged_admissions.contains(&2),
         "queued admissions were not batched: held {held_batches:?}, retried {staged_admissions:?}"
     );
-    let replies: Vec<_> = retries.into_iter().map(|retry| retry.join().unwrap()).collect();
+    let replies: Vec<_> = retries
+        .into_iter()
+        .map(|retry| retry.join().unwrap())
+        .collect();
     assert_eq!(replies[1]["commit"], replies[2]["commit"]);
     assert_eq!(replies[1]["epoch"], replies[2]["epoch"]);
     for (person, reply) in people.iter().zip(replies) {
@@ -247,18 +261,28 @@ fn overlapping_manual_approval_is_queued_until_the_owner_is_ready() {
         if value["state"] == "awaiting_save" {
             break value;
         }
-        assert!(Instant::now() < deadline, "ordinary admission was not staged");
+        assert!(
+            Instant::now() < deadline,
+            "ordinary admission was not staged"
+        );
         std::thread::sleep(Duration::from_millis(5));
     };
 
     let requester_peer = info["endpoint_key"].clone();
     let waiting_call = std::thread::spawn(move || {
-        call(requester, json!({"op":"request_admission","peer":requester_peer})).unwrap()
+        call(
+            requester,
+            json!({"op":"request_admission","peer":requester_peer}),
+        )
+        .unwrap()
     });
     let deadline = Instant::now() + Duration::from_secs(5);
     while !waiting_call.is_finished() {
         let _ = call(admin, json!({"op":"poll_admission"})).unwrap();
-        assert!(Instant::now() < deadline, "manual approval was not queued promptly");
+        assert!(
+            Instant::now() < deadline,
+            "manual approval was not queued promptly"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(
@@ -276,16 +300,27 @@ fn overlapping_manual_approval_is_queued_until_the_owner_is_ready() {
         if value["state"] == "approval_requested" {
             break value;
         }
-        assert!(Instant::now() < deadline, "queued manual approval was not surfaced");
+        assert!(
+            Instant::now() < deadline,
+            "queued manual approval was not surfaced"
+        );
         std::thread::sleep(Duration::from_millis(5));
     };
     assert_eq!(approval["request"], waiting["admission_request"]);
     let listed = call(admin, json!({"op":"list_admission_approvals","limit":1})).unwrap();
     assert_eq!(listed["approvals"].as_array().unwrap().len(), 1);
-    assert_eq!(listed["approvals"][0]["request"], waiting["admission_request"]);
-    let attempt_id: [u8; 32] = serde_json::from_value(listed["approvals"][0]["attempt_id"].clone()).unwrap();
     assert_eq!(
-        call(admin, json!({"op":"acknowledge_admission_approval","attempt_id":attempt_id})).unwrap()["acknowledged"],
+        listed["approvals"][0]["request"],
+        waiting["admission_request"]
+    );
+    let attempt_id: [u8; 32] =
+        serde_json::from_value(listed["approvals"][0]["attempt_id"].clone()).unwrap();
+    assert_eq!(
+        call(
+            admin,
+            json!({"op":"acknowledge_admission_approval","attempt_id":attempt_id})
+        )
+        .unwrap()["acknowledged"],
         true
     );
     let staged = call(
@@ -297,7 +332,11 @@ fn overlapping_manual_approval_is_queued_until_the_owner_is_ready() {
 
     let retry_peer = info["endpoint_key"].clone();
     let retry = std::thread::spawn(move || {
-        call(requester, json!({"op":"request_admission","peer":retry_peer})).unwrap()
+        call(
+            requester,
+            json!({"op":"request_admission","peer":retry_peer}),
+        )
+        .unwrap()
     });
     let deadline = Instant::now() + Duration::from_secs(10);
     let staged = loop {
@@ -305,7 +344,10 @@ fn overlapping_manual_approval_is_queued_until_the_owner_is_ready() {
         if value["state"] == "awaiting_save" {
             break value;
         }
-        assert!(Instant::now() < deadline, "approved request was not admitted");
+        assert!(
+            Instant::now() < deadline,
+            "approved request was not admitted"
+        );
         std::thread::sleep(Duration::from_millis(5));
     };
     adopt(admin, &staged);
@@ -314,7 +356,11 @@ fn overlapping_manual_approval_is_queued_until_the_owner_is_ready() {
     assert!(retry.join().unwrap()["commits"].is_array());
     let retry_peer = info["endpoint_key"].clone();
     let final_retry = std::thread::spawn(move || {
-        call(requester, json!({"op":"request_admission","peer":retry_peer})).unwrap()
+        call(
+            requester,
+            json!({"op":"request_admission","peer":retry_peer}),
+        )
+        .unwrap()
     });
     // The result is retained, so this retry is an inquiry: the
     // committed view answers it and the host sees no event.
@@ -365,13 +411,7 @@ fn approved_personal_join_survives_restart_and_uses_peer_while_admin_is_closed()
     // Adoption saves the exact staged candidate: a changed token is refused.
     let mut altered: Vec<u8> = serde_json::from_value(staged["candidate"].clone()).unwrap();
     altered[36] ^= 1;
-    assert!(
-        call(
-            admin,
-            json!({"op":"adopt_admission","candidate":altered})
-        )
-        .is_err()
-    );
+    assert!(call(admin, json!({"op":"adopt_admission","candidate":altered})).is_err());
     let open = adopt(admin, &staged)["issued_invitation"].clone();
     let early = begin(helper, &open);
     let staged = call(admin, json!({"op":"stage_admission","authenticated_endpoint":early["endpoint"],"request":early["admission_request"]})).unwrap();
@@ -457,10 +497,7 @@ fn approved_personal_join_survives_restart_and_uses_peer_while_admin_is_closed()
         std::thread::sleep(Duration::from_millis(10));
     }
     let denied = waiting.join().unwrap().unwrap();
-    assert_eq!(
-        denied,
-        json!({"state":"admission_queued"})
-    );
+    assert_eq!(denied, json!({"state":"admission_queued"}));
     assert_eq!(
         call(helper, json!({"op":"member_roster"})).unwrap()["members"]
             .as_array()
@@ -492,10 +529,7 @@ fn approved_personal_join_survives_restart_and_uses_peer_while_admin_is_closed()
     call(person, json!({"op":"add_address_hint","peer":helper_node["endpoint_key"],"address":helper_node["bound_address"].as_str().unwrap().replace("0.0.0.0:","127.0.0.1:")})).unwrap();
     let helper_peer = helper_node["endpoint_key"].clone();
     let waiting = std::thread::spawn(move || {
-        call(
-            person,
-            json!({"op":"request_admission","peer":helper_peer}),
-        )
+        call(person, json!({"op":"request_admission","peer":helper_peer}))
     });
     let until = Instant::now() + Duration::from_secs(15);
     loop {
@@ -534,7 +568,11 @@ fn approved_personal_join_survives_restart_and_uses_peer_while_admin_is_closed()
     close(helper).unwrap();
     close(copied).unwrap();
     let admin = common::stored(&[91; 32], &admin_storage);
-    call(admin, json!({"op":"restore_workspace","workspace":workspace})).unwrap();
+    call(
+        admin,
+        json!({"op":"restore_workspace","workspace":workspace}),
+    )
+    .unwrap();
     assert_eq!(
         call(admin, json!({"op":"invitation_controls"})).unwrap()["invitations"][1]["approved"],
         true
@@ -590,9 +628,7 @@ fn declining_a_personal_request_disables_its_invitation_without_admitting_it() {
 #[test]
 fn reusable_request_access_keeps_native_commands_and_catalog_scoped() {
     let admin = session(151);
-    let people: Vec<_> = (152..=154)
-        .map(session)
-        .collect();
+    let people: Vec<_> = (152..=154).map(session).collect();
     call(
         admin,
         json!({"op":"create_workspace","display_name":"Organizer","workspace_name":"Team"}),
@@ -631,7 +667,10 @@ fn reusable_request_access_keeps_native_commands_and_catalog_scoped() {
             json!({"op":"stage_admission","authenticated_endpoint":request["endpoint"],"request":request["admission_request"]}),
         );
         if index == 1 {
-            assert_eq!(admission.unwrap_err(), arachne_security::INVITATION_DISABLED);
+            assert_eq!(
+                admission.unwrap_err(),
+                arachne_security::INVITATION_DISABLED
+            );
         } else {
             adopt(admin, &admission.unwrap());
         }

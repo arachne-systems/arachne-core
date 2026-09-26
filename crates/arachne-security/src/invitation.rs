@@ -372,9 +372,17 @@ type SharedReplyParts = (std::sync::Arc<[u8]>, std::sync::Arc<[u8]>);
 pub(super) struct SharedReplies(std::collections::HashMap<u64, SharedReplyParts>);
 
 impl SharedReplies {
-    pub fn reply(&mut self, epoch: u64, commit: Vec<u8>, welcome: Vec<u8>, authorization: AdmissionAuthorization) -> RetainedReply {
+    pub fn reply(
+        &mut self,
+        epoch: u64,
+        commit: Vec<u8>,
+        welcome: Vec<u8>,
+        authorization: AdmissionAuthorization,
+    ) -> RetainedReply {
         let (commit, welcome) = match self.0.get(&epoch) {
-            Some((shared_commit, shared_welcome)) if **shared_commit == *commit && **shared_welcome == *welcome => {
+            Some((shared_commit, shared_welcome))
+                if **shared_commit == *commit && **shared_welcome == *welcome =>
+            {
                 (shared_commit.clone(), shared_welcome.clone())
             }
             _ => {
@@ -383,7 +391,12 @@ impl SharedReplies {
                 pair
             }
         };
-        RetainedReply { epoch, commit, welcome, authorization }
+        RetainedReply {
+            epoch,
+            commit,
+            welcome,
+            authorization,
+        }
     }
 }
 // Legacy inline snapshot format only; not a membership or incremental-store limit.
@@ -441,7 +454,10 @@ impl Workspace {
     /// request bound at any roster size. The request itself is authorized
     /// separately by the membership-history calls.
     pub fn admission_checkpoint(&self, request: &[u8]) -> Result<Vec<u8>, &'static str> {
-        if request.len() <= REQUEST_HEADER || request.len() > MAX_REQUEST || !request.starts_with(REQUEST) {
+        if request.len() <= REQUEST_HEADER
+            || request.len() > MAX_REQUEST
+            || !request.starts_with(REQUEST)
+        {
             return Err("invalid admission request");
         }
         let grant = &request[5..5 + PUBLIC];
@@ -623,8 +639,7 @@ impl Workspace {
     ) -> Result<Option<u64>, &'static str> {
         let Some(saved) = self.invitation_checkpoints.iter().find(|saved| {
             saved.checkpoint == checkpoint
-                && bootstrap::checkpoint_digest(&saved.checkpoint)
-                    == Ok(request.checkpoint_digest)
+                && bootstrap::checkpoint_digest(&saved.checkpoint) == Ok(request.checkpoint_digest)
                 && saved.grant[69..101] == request.issuer
                 && saved.grant[101..133] == request.authorization.invitation_key
         }) else {
@@ -1087,10 +1102,7 @@ impl Workspace {
     /// Return the next locally retained admission for an existing member's epoch.
     /// None means this owner has no such retained step, not that the requester is current.
     /// The host must authorize the requester before sharing workspace metadata.
-    pub fn admission_update_after(
-        &self,
-        epoch: u64,
-    ) -> Option<(MembershipAuthorization, Vec<u8>)> {
+    pub fn admission_update_after(&self, epoch: u64) -> Option<(MembershipAuthorization, Vec<u8>)> {
         let next = epoch.checked_add(1)?;
         let entries: Vec<_> = self
             .admissions
@@ -1220,13 +1232,11 @@ impl Workspace {
         remote_endpoint: [u8; 32],
         bytes: &[u8],
     ) -> Result<AdmissionAssessment, &'static str> {
-        let trusted_grant = bytes
-            .get(5..5 + PUBLIC)
-            .is_some_and(|grant| {
-                self.invitation_checkpoints
-                    .iter()
-                    .any(|saved| saved.grant.as_slice() == grant)
-            });
+        let trusted_grant = bytes.get(5..5 + PUBLIC).is_some_and(|grant| {
+            self.invitation_checkpoints
+                .iter()
+                .any(|saved| saved.grant.as_slice() == grant)
+        });
         let mut request = decode_request_with_grant_check(&self.provider, bytes, !trusted_grant)?;
         request.endpoint = remote_endpoint;
         if request.workspace != self.id() {
@@ -1238,7 +1248,9 @@ impl Workspace {
             super::invitation_controls::now()?,
         ) {
             return match error {
-                super::INVITATION_APPROVAL_REQUIRED => Ok(AdmissionAssessment::ApprovalRequired(request)),
+                super::INVITATION_APPROVAL_REQUIRED => {
+                    Ok(AdmissionAssessment::ApprovalRequired(request))
+                }
                 super::INVITATION_AUTOMATIC_APPROVAL_REQUIRED => {
                     Ok(AdmissionAssessment::AutomaticApprovalRequired(request))
                 }
@@ -1256,10 +1268,10 @@ impl Workspace {
         let request = match self.assess_admission(remote_endpoint, bytes)? {
             AdmissionAssessment::Ready(request) => request,
             AdmissionAssessment::ApprovalRequired(_) => {
-                return Err(super::INVITATION_APPROVAL_REQUIRED)
+                return Err(super::INVITATION_APPROVAL_REQUIRED);
             }
             AdmissionAssessment::AutomaticApprovalRequired(_) => {
-                return Err(super::INVITATION_AUTOMATIC_APPROVAL_REQUIRED)
+                return Err(super::INVITATION_AUTOMATIC_APPROVAL_REQUIRED);
             }
         };
         self.prepare_validated_admission(remote_endpoint, bytes, &request)
@@ -1274,7 +1286,8 @@ impl Workspace {
         bytes: &[u8],
         request: &ValidatedAdmission,
     ) -> Result<PreparedAdmission, &'static str> {
-        let prepared = self.prepare_validated_admission_batch(&[(remote_endpoint, bytes, request)])?;
+        let prepared =
+            self.prepare_validated_admission_batch(&[(remote_endpoint, bytes, request)])?;
         let reply = prepared.replies.into_iter().next().unwrap();
         Ok(PreparedAdmission {
             workspace: prepared.workspace,
@@ -1314,7 +1327,9 @@ impl Workspace {
                 return Err("validated admission does not match request");
             }
             self.check_validated_admission(*remote_endpoint, request, now)?;
-            if !bindings.insert(bootstrap::binding(request.package.leaf_node().credential())?) {
+            if !bindings.insert(bootstrap::binding(
+                request.package.leaf_node().credential(),
+            )?) {
                 return Err("duplicate member binding");
             }
             packages.push(request.package.clone());
@@ -1457,7 +1472,9 @@ fn checkpoint_request_keeps_the_bearer_secret_local_and_binds_both_endpoints() {
     let admin = Workspace::create(crate::test_key(1), "Coordinator").unwrap();
     let (invitation, checkpoint) = admin.issue_invitation().unwrap();
     let token = invitation.export_secret_token();
-    let request = invitation.checkpoint_request(crate::test_endpoint(2), crate::test_endpoint(1)).unwrap();
+    let request = invitation
+        .checkpoint_request(crate::test_endpoint(2), crate::test_endpoint(1))
+        .unwrap();
     assert_eq!(request.len(), CHECKPOINT_REQUEST_SIZE);
     assert_eq!(&request[..PUBLIC], &token[..PUBLIC]);
     assert!(!request.windows(32).any(|part| part == &token[PUBLIC..]));
@@ -1517,7 +1534,8 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
             .is_err()
     );
     let pending =
-        PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(2), "Field helper").unwrap();
+        PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(2), "Field helper")
+            .unwrap();
     let key = StorageKey::derive(&[7; 32]).unwrap();
     let request = pending.admission_request().unwrap().to_vec();
     let member = pending.member().clone();
@@ -1528,17 +1546,35 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
     assert_eq!(pending.admission_request().unwrap(), request);
     assert_eq!(pending.member(), &member);
     let mut proof = pending.join_proof().unwrap();
-    assert!(admin.prepare_admission(crate::test_endpoint(3), &request).is_err());
-    assert!(other.prepare_admission(crate::test_endpoint(2), &request).is_err());
+    assert!(
+        admin
+            .prepare_admission(crate::test_endpoint(3), &request)
+            .is_err()
+    );
+    assert!(
+        other
+            .prepare_admission(crate::test_endpoint(2), &request)
+            .is_err()
+    );
     for index in [0, 5, 42, 106, 202, 266, request.len() - 1] {
         let mut bad = request.clone();
         bad[index] ^= 1;
-        assert!(admin.prepare_admission(crate::test_endpoint(2), &bad).is_err());
+        assert!(
+            admin
+                .prepare_admission(crate::test_endpoint(2), &bad)
+                .is_err()
+        );
     }
     let mut extra = request.clone();
     extra.push(0);
-    assert!(admin.prepare_admission(crate::test_endpoint(2), &extra).is_err());
-    let first = admin.prepare_admission(crate::test_endpoint(2), &request).unwrap();
+    assert!(
+        admin
+            .prepare_admission(crate::test_endpoint(2), &extra)
+            .is_err()
+    );
+    let first = admin
+        .prepare_admission(crate::test_endpoint(2), &request)
+        .unwrap();
     assert_eq!(admin.epoch(), 1); // Only the invitation registration.
     assert_eq!(admin.member_count(), 1);
     assert!(
@@ -1565,7 +1601,13 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
         let mut invalid = plain.clone();
         invalid[count_offset..count_offset + 4].copy_from_slice(&count.to_be_bytes());
         let sealed = key
-            .protect(&admin.provider, b"DFWS\x05", admin.id(), crate::test_endpoint(1), &invalid)
+            .protect(
+                &admin.provider,
+                b"DFWS\x05",
+                admin.id(),
+                crate::test_endpoint(1),
+                &invalid,
+            )
             .unwrap();
         assert!(Workspace::restore(&key, crate::test_endpoint(1), admin.id(), &sealed).is_err());
     }
@@ -1573,17 +1615,28 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
     let epoch_offset = count_offset + 4 + 96;
     invalid[epoch_offset..epoch_offset + 8].copy_from_slice(&3u64.to_be_bytes());
     let sealed = key
-        .protect(&admin.provider, b"DFWS\x05", admin.id(), crate::test_endpoint(1), &invalid)
+        .protect(
+            &admin.provider,
+            b"DFWS\x05",
+            admin.id(),
+            crate::test_endpoint(1),
+            &invalid,
+        )
         .unwrap();
     assert!(Workspace::restore(&key, crate::test_endpoint(1), admin.id(), &sealed).is_err());
     let expected_commit = first.commit.clone();
     let expected_welcome = first.welcome.clone();
     drop(first);
     // The candidate and reply survive together; recovery does not run Add again.
-    let recovered = Workspace::restore(&key, crate::test_endpoint(1), admin.id(), &snapshot).unwrap();
+    let recovered =
+        Workspace::restore(&key, crate::test_endpoint(1), admin.id(), &snapshot).unwrap();
     assert_eq!(recovered.epoch(), 2);
     assert_eq!(recovered.member_count(), 2);
-    assert!(recovered.retained_admission(crate::test_endpoint(3), &request).is_err());
+    assert!(
+        recovered
+            .retained_admission(crate::test_endpoint(3), &request)
+            .is_err()
+    );
     let mut changed_request = request.clone();
     *changed_request.last_mut().unwrap() ^= 1;
     assert!(
@@ -1607,7 +1660,13 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
     *tampered.last_mut().unwrap() ^= 1;
     assert!(Workspace::restore(&key, crate::test_endpoint(1), admin.id(), &tampered).is_err());
     assert!(
-        Workspace::restore(&key, crate::test_endpoint(1), admin.id(), &snapshot[..snapshot.len() - 1]).is_err()
+        Workspace::restore(
+            &key,
+            crate::test_endpoint(1),
+            admin.id(),
+            &snapshot[..snapshot.len() - 1]
+        )
+        .is_err()
     );
     assert_eq!(helper.member(), Some(&member));
     assert!(helper.issue_invitation().is_err());
@@ -1627,7 +1686,8 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
     assert!(JoinProof::from_history(admin.id(), invitation.checkpoint_digest(), &altered).is_err());
     // ADR A2 step 2: an ordinary member cannot admit. Promote the helper so
     // the link still works while the issuer is offline.
-    let early = PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(3), "Early").unwrap();
+    let early = PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(3), "Early")
+        .unwrap();
     assert_eq!(
         helper
             .prepare_admission(crate::test_endpoint(3), early.admission_request().unwrap())
@@ -1650,14 +1710,16 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
     let helper_snapshot = helper.seal(&key).unwrap();
     assert!(helper_snapshot.starts_with(b"DFWS\x04"));
     drop(helper);
-    let helper = Workspace::restore(&key, crate::test_endpoint(2), admin.id(), &helper_snapshot).unwrap();
+    let helper =
+        Workspace::restore(&key, crate::test_endpoint(2), admin.id(), &helper_snapshot).unwrap();
     let admin_state = recovered.seal(&key).unwrap();
     let workspace_id = admin.id();
     drop(recovered);
     drop(admin);
     // The issuer is gone. The same preissued token works through another administrator.
     let newcomer =
-        PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(3), "Jordan Lee").unwrap();
+        PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(3), "Jordan Lee")
+            .unwrap();
     let request = newcomer.admission_request().unwrap();
     assert_eq!(
         helper
@@ -1685,7 +1747,13 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
             .membership_history(crate::test_endpoint(3), &bad_request, &checkpoint)
             .is_err()
     );
-    let mut missing = Workspace::restore(&key, crate::test_endpoint(2), workspace_id, &helper_snapshot).unwrap();
+    let mut missing = Workspace::restore(
+        &key,
+        crate::test_endpoint(2),
+        workspace_id,
+        &helper_snapshot,
+    )
+    .unwrap();
     missing.join_history = None;
     assert_eq!(
         missing
@@ -1696,7 +1764,10 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
     assert_eq!(missing.epoch(), 3);
     assert_eq!(missing.member_count(), 2);
     let second = helper
-        .prepare_admission(crate::test_endpoint(3), newcomer.admission_request().unwrap())
+        .prepare_admission(
+            crate::test_endpoint(3),
+            newcomer.admission_request().unwrap(),
+        )
         .unwrap();
     assert_eq!(helper.epoch(), 3);
     assert_eq!(helper.member_count(), 2);
@@ -1709,24 +1780,32 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
     assert_eq!(
         second
             .workspace
-            .prepare_admission(crate::test_endpoint(3), newcomer.admission_request().unwrap())
+            .prepare_admission(
+                crate::test_endpoint(3),
+                newcomer.admission_request().unwrap()
+            )
             .err(),
         Some("member already admitted")
     );
     assert_eq!(
         second
             .workspace
-            .prepare_admission(crate::test_endpoint(4), newcomer.admission_request().unwrap())
+            .prepare_admission(
+                crate::test_endpoint(4),
+                newcomer.admission_request().unwrap()
+            )
             .err(),
         Some("admission endpoint mismatch")
     );
     // Durability/response retention must prevent retry from becoming another Add.
     let joined_state = joined.seal(&key).unwrap();
-    let mut joined = Workspace::restore(&key, crate::test_endpoint(3), workspace_id, &joined_state).unwrap();
-    let updated_admin = Workspace::restore(&key, crate::test_endpoint(1), workspace_id, &admin_state)
-        .unwrap()
-        .prepare_admission_update(&second.authorization, &second.commit)
-        .unwrap();
+    let mut joined =
+        Workspace::restore(&key, crate::test_endpoint(3), workspace_id, &joined_state).unwrap();
+    let updated_admin =
+        Workspace::restore(&key, crate::test_endpoint(1), workspace_id, &admin_state)
+            .unwrap()
+            .prepare_admission_update(&second.authorization, &second.commit)
+            .unwrap();
     let mut helper = second.workspace;
     let encrypted = joined
         .group
@@ -1744,7 +1823,8 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
         panic!("not application data")
     };
     assert_eq!(message.into_bytes(), b"generic fabric payload");
-    let returning = Workspace::restore(&key, crate::test_endpoint(1), workspace_id, &admin_state).unwrap();
+    let returning =
+        Workspace::restore(&key, crate::test_endpoint(1), workspace_id, &admin_state).unwrap();
     assert_eq!(returning.epoch(), 3);
     let mut bad = second.authorization.clone();
     bad.grant_signature[0] ^= 1;
@@ -1767,7 +1847,8 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
             .is_err()
     );
     let stored_update = updated_admin.seal(&key).unwrap();
-    let mut returning = Workspace::restore(&key, crate::test_endpoint(1), workspace_id, &stored_update).unwrap();
+    let mut returning =
+        Workspace::restore(&key, crate::test_endpoint(1), workspace_id, &stored_update).unwrap();
     assert_eq!(returning.epoch(), 4);
     assert_eq!(returning.member_count(), 3);
     // A restored creator must relay the helper's accepted Add, not only Adds
@@ -1784,10 +1865,15 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
             .is_none()
     );
     let later =
-        PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(8), "Later member").unwrap();
+        PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(8), "Later member")
+            .unwrap();
     assert_eq!(
         returning
-            .membership_history(crate::test_endpoint(8), later.admission_request().unwrap(), &checkpoint,)
+            .membership_history(
+                crate::test_endpoint(8),
+                later.admission_request().unwrap(),
+                &checkpoint,
+            )
             .unwrap()
             .len(),
         3
@@ -1826,9 +1912,13 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
     else {
         panic!("invitation registration removed helper")
     };
-    let fourth =
-        PendingJoin::from_invitation(&next_invite, &next_checkpoint, crate::test_key(4), "Second service")
-            .unwrap();
+    let fourth = PendingJoin::from_invitation(
+        &next_invite,
+        &next_checkpoint,
+        crate::test_key(4),
+        "Second service",
+    )
+    .unwrap();
     let fourth_add = returning
         .prepare_admission(crate::test_endpoint(4), fourth.admission_request().unwrap())
         .unwrap();
@@ -1836,7 +1926,8 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
         .prepare_admission_update(&fourth_add.authorization, &fourth_add.commit)
         .unwrap();
     let helper_saved = helper_updated.seal(&key).unwrap();
-    let helper_updated = Workspace::restore(&key, crate::test_endpoint(2), workspace_id, &helper_saved).unwrap();
+    let helper_updated =
+        Workspace::restore(&key, crate::test_endpoint(2), workspace_id, &helper_saved).unwrap();
     assert_eq!(helper_updated.member_count(), 4);
     let mut fourth_proof = fourth.join_proof().unwrap();
     fourth_proof
@@ -1857,11 +1948,18 @@ fn signed_invitation_survives_pending_restart_and_offline_issuer() {
         b"fourth member sample"
     );
     // A different valid admission from the same parent must not merge silently.
-    let competing =
-        PendingJoin::from_invitation(&next_invite, &next_checkpoint, crate::test_key(5), "Competing service")
-            .unwrap();
+    let competing = PendingJoin::from_invitation(
+        &next_invite,
+        &next_checkpoint,
+        crate::test_key(5),
+        "Competing service",
+    )
+    .unwrap();
     let fork = helper
-        .prepare_admission(crate::test_endpoint(5), competing.admission_request().unwrap())
+        .prepare_admission(
+            crate::test_endpoint(5),
+            competing.admission_request().unwrap(),
+        )
         .unwrap();
     assert!(
         helper_updated
@@ -1878,14 +1976,19 @@ fn retained_checkpoint_rejects_conflicting_admission_index() {
     let admin = Workspace::create(crate::test_key(1), "Organizer").unwrap();
     let (created, invitation, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let base = created.workspace;
-    let first = PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(2), "First").unwrap();
+    let first = PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(2), "First")
+        .unwrap();
     let accepted = base
         .prepare_admission(crate::test_endpoint(2), first.admission_request().unwrap())
         .unwrap();
     let competing =
-        PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(3), "Competing").unwrap();
+        PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(3), "Competing")
+            .unwrap();
     let competing = base
-        .prepare_admission(crate::test_endpoint(3), competing.admission_request().unwrap())
+        .prepare_admission(
+            crate::test_endpoint(3),
+            competing.admission_request().unwrap(),
+        )
         .unwrap();
     assert_ne!(accepted.commit, competing.commit);
 
@@ -1918,17 +2021,25 @@ fn retained_checkpoint_preflight_matches_full_verification_and_survives_restore(
 
     // Grow the accepted branch so a full replay has real work to do.
     for endpoint in 2..6u8 {
-        let pending =
-            PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(u64::from(endpoint)), "Attendee")
-                .unwrap();
+        let pending = PendingJoin::from_invitation(
+            &invitation,
+            &checkpoint,
+            crate::test_key(u64::from(endpoint)),
+            "Attendee",
+        )
+        .unwrap();
         owner = owner
-            .prepare_admission(crate::test_endpoint(u64::from(endpoint)), pending.admission_request().unwrap())
+            .prepare_admission(
+                crate::test_endpoint(u64::from(endpoint)),
+                pending.admission_request().unwrap(),
+            )
             .unwrap()
             .workspace;
     }
 
     let later =
-        PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(9), "Later member").unwrap();
+        PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(9), "Later member")
+            .unwrap();
     let request = later.admission_request().unwrap();
     let fast = owner
         .membership_history(crate::test_endpoint(9), request, &checkpoint)
@@ -1981,7 +2092,8 @@ fn retained_checkpoint_preflight_matches_full_verification_and_survives_restore(
     let owner = other.workspace;
     let outsider = PendingJoin::from_invitation(
         &other_invitation,
-        &other_checkpoint,crate::test_key(10),
+        &other_checkpoint,
+        crate::test_key(10),
         "Other link",
     )
     .unwrap();
@@ -2003,17 +2115,26 @@ fn batch_replies_share_one_commit_and_welcome_across_copies_and_restores() {
     let owner = registration.workspace;
     let mut requests = Vec::new();
     for endpoint in 2..5u8 {
-        let pending =
-            PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(u64::from(endpoint)), "Attendee")
-                .unwrap();
-        requests.push((crate::test_endpoint(u64::from(endpoint)), pending.admission_request().unwrap().to_vec()));
+        let pending = PendingJoin::from_invitation(
+            &invitation,
+            &checkpoint,
+            crate::test_key(u64::from(endpoint)),
+            "Attendee",
+        )
+        .unwrap();
+        requests.push((
+            crate::test_endpoint(u64::from(endpoint)),
+            pending.admission_request().unwrap().to_vec(),
+        ));
     }
     let validated: Vec<_> = requests
         .iter()
-        .map(|(endpoint, request)| match owner.assess_admission(*endpoint, request).unwrap() {
-            AdmissionAssessment::Ready(validated) => validated,
-            _ => panic!("invitation unexpectedly needs approval"),
-        })
+        .map(
+            |(endpoint, request)| match owner.assess_admission(*endpoint, request).unwrap() {
+                AdmissionAssessment::Ready(validated) => validated,
+                _ => panic!("invitation unexpectedly needs approval"),
+            },
+        )
         .collect();
     let entries: Vec<_> = requests
         .iter()
@@ -2047,13 +2168,23 @@ fn batch_replies_share_one_commit_and_welcome_across_copies_and_restores() {
     // The record format is unchanged: a restored owner exports the same bytes
     // and shares the batch again.
     let records = owner.export_records().unwrap();
-    let restored = Workspace::restore_records(crate::test_endpoint(1), owner.id(), &records).unwrap();
+    let restored =
+        Workspace::restore_records(crate::test_endpoint(1), owner.id(), &records).unwrap();
     assert_shared(&restored);
     assert_eq!(restored.export_records().unwrap(), records);
     for (endpoint, request) in &requests {
-        let before = owner.retained_admission(*endpoint, request).unwrap().unwrap();
-        let after = restored.retained_admission(*endpoint, request).unwrap().unwrap();
-        assert_eq!((before.epoch, &before.commit, &before.welcome), (after.epoch, &after.commit, &after.welcome));
+        let before = owner
+            .retained_admission(*endpoint, request)
+            .unwrap()
+            .unwrap();
+        let after = restored
+            .retained_admission(*endpoint, request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (before.epoch, &before.commit, &before.welcome),
+            (after.epoch, &after.commit, &after.welcome)
+        );
     }
 
     // The sealed snapshot is unchanged too: seal, restore, and seal again give
@@ -2063,9 +2194,13 @@ fn batch_replies_share_one_commit_and_welcome_across_copies_and_restores() {
         single.prepare_invitation(0, false, false).unwrap();
     let single = registration.workspace;
     let pending =
-        PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(2), "Attendee").unwrap();
+        PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(2), "Attendee")
+            .unwrap();
     let single = single
-        .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
+        .prepare_admission(
+            crate::test_endpoint(2),
+            pending.admission_request().unwrap(),
+        )
         .unwrap()
         .workspace;
     let key = StorageKey::derive(&[7; 32]).unwrap();
@@ -2074,7 +2209,8 @@ fn batch_replies_share_one_commit_and_welcome_across_copies_and_restores() {
     let resealed = reopened.seal(&key).unwrap();
     let plain = |bytes: &[u8]| {
         let magic: &[u8; 5] = bytes[..5].try_into().unwrap();
-        key.unprotect(magic, single.id(), crate::test_endpoint(1), bytes).unwrap()
+        key.unprotect(magic, single.id(), crate::test_endpoint(1), bytes)
+            .unwrap()
     };
     assert_eq!(resealed[..5], sealed[..5]);
     assert_eq!(plain(&resealed), plain(&sealed));
@@ -2088,26 +2224,37 @@ fn only_administrators_admit_and_the_add_carries_the_checked_time() {
     let owner = Workspace::create(crate::test_key(1), "Organizer").unwrap();
     let (registration, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
     let owner = registration.workspace;
-    let first = PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(2), "Member").unwrap();
+    let first =
+        PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(2), "Member")
+            .unwrap();
     let before = super::invitation_controls::now().unwrap();
     let admitted = owner
         .prepare_admission(crate::test_endpoint(2), first.admission_request().unwrap())
         .unwrap();
     let after = super::invitation_controls::now().unwrap();
     let asserted = super::admission_asserted_time(&admitted.commit).unwrap();
-    assert!((before..=after).contains(&asserted), "{before} <= {asserted} <= {after}");
+    assert!(
+        (before..=after).contains(&asserted),
+        "{before} <= {asserted} <= {after}"
+    );
     let mut proof = first.join_proof().unwrap();
     proof
         .apply_add(&admitted.authorization, &admitted.commit)
         .unwrap();
     let member = first.prepare_workspace(&proof, &admitted.welcome).unwrap();
-    let second = PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(3), "Member").unwrap();
+    let second =
+        PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(3), "Member")
+            .unwrap();
     let request = second.admission_request().unwrap();
     assert_eq!(
-        member.prepare_admission(crate::test_endpoint(3), request).err(),
+        member
+            .prepare_admission(crate::test_endpoint(3), request)
+            .err(),
         Some("only an administrator may admit members")
     );
-    let AdmissionAssessment::Ready(validated) = member.assess_admission(crate::test_endpoint(3), request).unwrap()
+    let AdmissionAssessment::Ready(validated) = member
+        .assess_admission(crate::test_endpoint(3), request)
+        .unwrap()
     else {
         panic!("open invitation needs no approval");
     };

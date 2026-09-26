@@ -72,8 +72,18 @@ fn old_invitation_redeems_through_another_administrator_with_issuer_closed() {
     .unwrap();
     close(helper).unwrap();
     helper = common::stored(&[82; 32], &helper_storage);
-    call(helper, json!({"op":"restore_workspace","workspace":invite["workspace"]})).unwrap();
-    assert!(call(helper, json!({"op":"stage_invitation","personal":false,"expires_at":0})).is_err());
+    call(
+        helper,
+        json!({"op":"restore_workspace","workspace":invite["workspace"]}),
+    )
+    .unwrap();
+    assert!(
+        call(
+            helper,
+            json!({"op":"stage_invitation","personal":false,"expires_at":0})
+        )
+        .is_err()
+    );
     let node: Value = serde_json::from_str(&describe(helper).unwrap()).unwrap();
     let helper_address = node["bound_address"]
         .as_str()
@@ -133,7 +143,11 @@ fn old_invitation_redeems_through_another_administrator_with_issuer_closed() {
         json!({"op":"stage_admission_update","step":promoted["step"]}),
     )
     .unwrap();
-    call(helper, json!({"op":"adopt_admission","candidate":s["candidate"]})).unwrap();
+    call(
+        helper,
+        json!({"op":"adopt_admission","candidate":s["candidate"]}),
+    )
+    .unwrap();
     close(admin).unwrap();
     assert!(describe(admin).is_err());
     begin(late, "Late arrival");

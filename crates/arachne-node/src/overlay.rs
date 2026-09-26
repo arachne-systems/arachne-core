@@ -63,7 +63,10 @@ struct MembershipQueues {
 impl MembershipQueues {
     /// Take the next step of the first author in turn that matches.
     fn take(&mut self, matches: impl Fn(&WorkspaceId) -> bool) -> Option<(WorkspaceId, Vec<u8>)> {
-        let index = self.turn.iter().position(|(workspace, _)| matches(workspace))?;
+        let index = self
+            .turn
+            .iter()
+            .position(|(workspace, _)| matches(workspace))?;
         let key = self.turn.remove(index)?;
         let queue = self.by_sender.get_mut(&key)?;
         let (_, payload) = queue.pop_front()?;
@@ -198,7 +201,8 @@ fn open(bytes: &[u8]) -> Result<Envelope> {
         .ok_or(Error::InvalidFrame)?;
     let (body, signature) = bytes.split_at(split);
     let envelope: Envelope = wire::decode(body)?;
-    let signature = iroh::Signature::from_bytes(signature.try_into().map_err(|_| Error::InvalidFrame)?);
+    let signature =
+        iroh::Signature::from_bytes(signature.try_into().map_err(|_| Error::InvalidFrame)?);
     iroh::PublicKey::from_bytes(&envelope.sender)
         .map_err(|_| Error::InvalidFrame)?
         .verify(&[SIGNATURE_DOMAIN, body].concat(), &signature)
@@ -316,7 +320,8 @@ impl Overlay {
             .collect();
         let mut reachable = Vec::new();
         for peer in &ordered {
-            if connections.can_dial_by_peer_id() || connections.address_hint(*peer).await.is_some() {
+            if connections.can_dial_by_peer_id() || connections.address_hint(*peer).await.is_some()
+            {
                 reachable.push(*peer);
             }
         }
@@ -372,7 +377,12 @@ impl Overlay {
                         // epoch must still hear the step that moves it on.
                         if envelope.topic == MEMBERSHIP_TOPIC {
                             tracing::info!(target: "data_fabric_transport", bytes = envelope.payload.len(), from = %message.delivered_from.fmt_short(), "GOSSIP_MEMBERSHIP_RECEIVED");
-                            membership.offer(envelope.workspace, envelope.sender, envelope.revision, envelope.payload);
+                            membership.offer(
+                                envelope.workspace,
+                                envelope.sender,
+                                envelope.revision,
+                                envelope.payload,
+                            );
                             continue;
                         }
                         // Only membership messages may use the frame-sized bound.
@@ -506,10 +516,7 @@ impl Overlay {
         Ok(true)
     }
 
-    pub(super) async fn broadcast_membership(
-        &self,
-        payload: Vec<u8>,
-    ) -> Result<bool> {
+    pub(super) async fn broadcast_membership(&self, payload: Vec<u8>) -> Result<bool> {
         if payload.len() > wire::envelope_payload::MAX {
             return Err(Error::TooLarge);
         }
@@ -811,7 +818,9 @@ mod tests {
                 (a.id(), Permissions::AllTopics),
                 (b.id(), Permissions::AllTopics),
             ]);
-            a.install_verified_policy(workspace, 2, current).await.unwrap();
+            a.install_verified_policy(workspace, 2, current)
+                .await
+                .unwrap();
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             while gossip_link(&a, c.id()) {
                 assert!(
@@ -906,7 +915,11 @@ fn a_flooding_member_cannot_crowd_out_another_members_step() {
     // Authors are served in turn, and one author holds a bounded share.
     assert_eq!(drained[1].1, b"from-b");
     assert_eq!(drained.len(), MAX_MEMBERSHIP_PER_SENDER + 1);
-    assert!(drained.iter().any(|(_, payload)| payload == b"next-revision"));
+    assert!(
+        drained
+            .iter()
+            .any(|(_, payload)| payload == b"next-revision")
+    );
 }
 
 /// Many authors together still hold a bounded inbox: at most 64 steps of

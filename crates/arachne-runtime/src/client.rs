@@ -1109,11 +1109,7 @@ impl Client {
                     invitation: invitation.to_vec(),
                     checkpoint: checkpoint.to_vec(),
                     display_name: display_name.to_owned(),
-                    peers: peers
-                        .iter()
-                        .copied()
-                        .map(EndpointId::to_bytes)
-                        .collect(),
+                    peers: peers.iter().copied().map(EndpointId::to_bytes).collect(),
                 },
             )
         })?;
@@ -1132,11 +1128,7 @@ impl Client {
                 session,
                 join::FetchCheckpointArgs {
                     peer: None,
-                    peers: peers
-                        .iter()
-                        .copied()
-                        .map(EndpointId::to_bytes)
-                        .collect(),
+                    peers: peers.iter().copied().map(EndpointId::to_bytes).collect(),
                     invitation: invitation.to_vec(),
                 },
             )

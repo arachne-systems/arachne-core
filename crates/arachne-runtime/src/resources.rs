@@ -1,9 +1,9 @@
 //! Metadata-only host operations. File work runs on native tasks, never while
 //! holding the session/journal lock. Peer identity comes from accepted membership.
+use crate::client::ResourceStatus;
+use arachne_api::{ApiError, ErrorCode};
 use arachne_node::resources::ResourceTicket;
 use serde::Deserialize;
-use arachne_api::{ApiError, ErrorCode};
-use crate::client::ResourceStatus;
 
 use crate::errors::{self, security};
 use std::{collections::BTreeMap, path::PathBuf};
@@ -53,7 +53,10 @@ pub(super) struct Jobs {
     jobs: BTreeMap<u64, Job>,
 }
 
-pub(super) fn execute(session: &mut super::Session, request: Request) -> Result<ResourceStatus, ApiError> {
+pub(super) fn execute(
+    session: &mut super::Session,
+    request: Request,
+) -> Result<ResourceStatus, ApiError> {
     let resources = session.node.resources();
     match request {
         Request::Poll { id } => {
@@ -63,7 +66,9 @@ pub(super) fn execute(session: &mut super::Session, request: Request) -> Result<
                 .get(&id)
                 .ok_or_else(|| ApiError::invalid_input("id", "unknown resource operation"))?;
             if !job.task.is_finished() {
-                return Ok(ResourceStatus::Running { bytes: *job.progress.borrow() });
+                return Ok(ResourceStatus::Running {
+                    bytes: *job.progress.borrow(),
+                });
             }
             let mut job = session.resources.jobs.remove(&id).unwrap();
             return session
@@ -112,7 +117,9 @@ pub(super) fn execute(session: &mut super::Session, request: Request) -> Result<
                     .prepare(&root, &path, workspace, revision, peer)
                     .await
                     .map_err(|error| error.to_string())?;
-                Ok(ResourceStatus::Prepared { ticket: ticket.into() })
+                Ok(ResourceStatus::Prepared {
+                    ticket: ticket.into(),
+                })
             })
         }
         Request::Fetch {

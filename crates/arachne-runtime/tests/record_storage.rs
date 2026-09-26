@@ -75,7 +75,8 @@ fn hundred_members_save_as_records_and_follower_crosses_old_history_ceiling() {
     let late_key = arachne_security::EndpointKey::generate().unwrap();
     let late_endpoint = arachne_security::EndpointSigner::endpoint(&late_key);
     let first_member = arachne_security::EndpointSigner::endpoint(&member_keys[1]);
-    let (registered, old_invitation, old_checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let (registered, old_invitation, old_checkpoint) =
+        admin.prepare_invitation(0, false, false).unwrap();
     admin = registered.workspace;
     let admin_path = directory.path().join("admin.db");
     let follower_path = directory.path().join("follower.db");
@@ -184,7 +185,11 @@ fn hundred_members_save_as_records_and_follower_crosses_old_history_ceiling() {
         .unwrap();
     save(&mut admin_store, &admin); // Persist the sender counter before delivery.
     for reader in [follower.as_ref().unwrap(), &joined] {
-        assert!(reader.unprotect_object(b"streams", b"streams/opaque", &sample).is_ok());
+        assert!(
+            reader
+                .unprotect_object(b"streams", b"streams/opaque", &sample)
+                .is_ok()
+        );
     }
     // Native storage metadata is scope-bound; missing provider state fails closed.
     let mut records = admin.export_records().unwrap();

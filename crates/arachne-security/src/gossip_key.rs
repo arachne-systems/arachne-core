@@ -127,8 +127,13 @@ mod tests {
         checkpoint: &[u8],
         endpoint: [u8; 32],
     ) -> (Workspace, Workspace) {
-        let pending =
-            PendingJoin::from_invitation(invitation, checkpoint, crate::test_key_for(endpoint), "Joiner").unwrap();
+        let pending = PendingJoin::from_invitation(
+            invitation,
+            checkpoint,
+            crate::test_key_for(endpoint),
+            "Joiner",
+        )
+        .unwrap();
         let mut proof = pending.join_proof().unwrap();
         let prepared = by
             .prepare_admission(endpoint, pending.admission_request().unwrap())
@@ -181,17 +186,24 @@ mod tests {
         else {
             panic!("registration removed the helper")
         };
-        let (_, third) = admit(&registration.workspace, &invitation, &checkpoint, crate::test_endpoint(3));
+        let (_, third) = admit(
+            &registration.workspace,
+            &invitation,
+            &checkpoint,
+            crate::test_endpoint(3),
+        );
         assert_eq!(third.gossip_tag_key().unwrap(), key);
         assert_eq!(helper.gossip_tag_key().unwrap(), key);
 
         // Seal/restore and record export/restore keep it.
         let storage = StorageKey::derive(&[7; 32]).unwrap();
         let sealed = third.seal(&storage).unwrap();
-        let restored = Workspace::restore(&storage, crate::test_endpoint(3), third.id(), &sealed).unwrap();
+        let restored =
+            Workspace::restore(&storage, crate::test_endpoint(3), third.id(), &sealed).unwrap();
         assert_eq!(restored.gossip_tag_key().unwrap(), key);
         let records = restored.export_records().unwrap();
-        let restored = Workspace::restore_records(crate::test_endpoint(3), third.id(), &records).unwrap();
+        let restored =
+            Workspace::restore_records(crate::test_endpoint(3), third.id(), &records).unwrap();
         assert_eq!(restored.gossip_tag_key().unwrap(), key);
     }
 
@@ -202,7 +214,8 @@ mod tests {
             admin.prepare_invitation(0, false, false).unwrap();
         let admin = registration.workspace;
         let pending =
-            PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(2), "Joiner").unwrap();
+            PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(2), "Joiner")
+                .unwrap();
         let proof = pending.join_proof().unwrap();
         // An issuer whose state lost the key cannot produce a keyless Add.
         admin
@@ -214,7 +227,10 @@ mod tests {
             .remove(super::LABEL);
         assert_eq!(
             admin
-                .prepare_admission(crate::test_endpoint(2), pending.admission_request().unwrap())
+                .prepare_admission(
+                    crate::test_endpoint(2),
+                    pending.admission_request().unwrap()
+                )
                 .err(),
             Some("workspace has no gossip key")
         );

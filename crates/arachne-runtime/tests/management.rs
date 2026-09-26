@@ -10,8 +10,17 @@ fn call(handle: i64, request: Value) -> Result<Value, String> {
 }
 
 fn issue(h: i64) -> Value {
-    let staged = call(h, json!({"op":"stage_invitation","personal":false,"expires_at":0})).unwrap();
-    call(h, json!({"op":"adopt_admission","candidate":staged["candidate"]})).unwrap()["issued_invitation"].clone()
+    let staged = call(
+        h,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    )
+    .unwrap();
+    call(
+        h,
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+    )
+    .unwrap()["issued_invitation"]
+        .clone()
 }
 
 #[test]
@@ -65,7 +74,11 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
     .unwrap();
     close(helper).unwrap();
     helper = common::stored(&[82; 32], &helper_provider);
-    call(helper, json!({"op":"restore_workspace","workspace":invite["workspace"]})).unwrap();
+    call(
+        helper,
+        json!({"op":"restore_workspace","workspace":invite["workspace"]}),
+    )
+    .unwrap();
     assert!(
         call(
             helper,
@@ -150,7 +163,10 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
         let current = call(helper, json!({"op":"poll_membership_update"})).unwrap();
         if current != Value::Null {
             assert_eq!(current["state"], "membership_current");
-            assert!(current.get("profiles").is_none(), "equal verified sets need no profile transfer");
+            assert!(
+                current.get("profiles").is_none(),
+                "equal verified sets need no profile transfer"
+            );
             break;
         }
         assert!(Instant::now() < deadline, "Membership profile timed out");
@@ -159,7 +175,11 @@ fn management_save_adopt_old_invitation_and_removal_over_iroh() {
     let saved_profiles = call(helper, json!({"op":"member_roster"})).unwrap()["profiles"].clone();
     close(helper).unwrap();
     helper = common::stored(&[82; 32], &helper_provider);
-    call(helper, json!({"op":"restore_workspace","workspace":invite["workspace"]})).unwrap();
+    call(
+        helper,
+        json!({"op":"restore_workspace","workspace":invite["workspace"]}),
+    )
+    .unwrap();
     call(
         helper,
         json!({"op":"member_roster","profiles":saved_profiles}),
@@ -401,7 +421,11 @@ fn a_member_that_is_not_an_administrator_refuses_admissions() {
     let admin = common::stored(&[84; 32], &MemoryProvider::default());
     let member = common::stored(&[85; 32], &MemoryProvider::default());
     let late = common::stored(&[86; 32], &MemoryProvider::default());
-    call(admin, json!({"op":"create_workspace","display_name":"Coordinator"})).unwrap();
+    call(
+        admin,
+        json!({"op":"create_workspace","display_name":"Coordinator"}),
+    )
+    .unwrap();
     let invite = issue(admin);
     let begin = |handle, name| {
         call(
@@ -418,7 +442,11 @@ fn a_member_that_is_not_an_administrator_refuses_admissions() {
             "request":joined["admission_request"]}),
     )
     .unwrap();
-    call(admin, json!({"op":"adopt_admission","candidate":staged["candidate"]})).unwrap();
+    call(
+        admin,
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+    )
+    .unwrap();
     let reply = call(
         admin,
         json!({"op":"retained_admission","authenticated_endpoint":joined["endpoint"],
@@ -431,7 +459,11 @@ fn a_member_that_is_not_an_administrator_refuses_admissions() {
             "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}),
     )
     .unwrap();
-    call(member, json!({"op":"adopt_join","candidate":staged["candidate"]})).unwrap();
+    call(
+        member,
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
+    )
+    .unwrap();
 
     let asking = begin(late, "Late joiner");
     let refused = execute(
@@ -441,12 +473,21 @@ fn a_member_that_is_not_an_administrator_refuses_admissions() {
         .unwrap(),
     )
     .unwrap_err();
-    assert!(refused.contains("Only an administrator can admit members"), "{refused}");
+    assert!(
+        refused.contains("Only an administrator can admit members"),
+        "{refused}"
+    );
 
     let info: Value = serde_json::from_str(&describe(member).unwrap()).unwrap();
-    let address = info["bound_address"].as_str().unwrap().replace("0.0.0.0:", "127.0.0.1:");
-    call(late, json!({"op":"add_address_hint","peer":info["endpoint_key"],"address":address}))
-        .unwrap();
+    let address = info["bound_address"]
+        .as_str()
+        .unwrap()
+        .replace("0.0.0.0:", "127.0.0.1:");
+    call(
+        late,
+        json!({"op":"add_address_hint","peer":info["endpoint_key"],"address":address}),
+    )
+    .unwrap();
     let peer = info["endpoint_key"].clone();
     let asked = std::thread::spawn(move || {
         call(late, json!({"op":"request_admission","peer":peer})).unwrap()
@@ -457,7 +498,10 @@ fn a_member_that_is_not_an_administrator_refuses_admissions() {
         if value != Value::Null {
             break value;
         }
-        assert!(Instant::now() < deadline, "the member never saw the request");
+        assert!(
+            Instant::now() < deadline,
+            "the member never saw the request"
+        );
         std::thread::sleep(Duration::from_millis(10));
     };
     assert_eq!(served["accepted"], false, "{served}");

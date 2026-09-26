@@ -43,8 +43,8 @@ use arachne_security::{Invitation, PendingJoin};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
@@ -180,8 +180,8 @@ async fn bind_joiner(seed_index: u64, invitation: &Invitation, checkpoint: &[u8]
     let node = Arc::new(node);
     let peer = node.id();
     let _ = peer;
-    let pending = PendingJoin::from_invitation(invitation, checkpoint, &*node, "Staging member")
-        .unwrap();
+    let pending =
+        PendingJoin::from_invitation(invitation, checkpoint, &*node, "Staging member").unwrap();
     let packet = admission_packet(
         pending.admission_request().unwrap(),
         "Staging member",
@@ -298,7 +298,8 @@ fn admission_batch_staging_keeps_committing_under_continuous_intake() {
                         let Ok(reply) = node.request_control(owner_peer, &packet).await else {
                             continue;
                         };
-                        let value: Value = arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
+                        let value: Value =
+                            arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
                         // A retry here (after a lost/timed-out reply to a
                         // send that the owner actually processed) can land
                         // after the request was already staged and
@@ -330,12 +331,15 @@ fn admission_batch_staging_keeps_committing_under_continuous_intake() {
                         if Instant::now() >= overall_deadline {
                             return;
                         }
-                        let Ok(reply) =
-                            joiner.node.request_control(owner_peer, &joiner.packet).await
+                        let Ok(reply) = joiner
+                            .node
+                            .request_control(owner_peer, &joiner.packet)
+                            .await
                         else {
                             continue;
                         };
-                        let value: Value = arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
+                        let value: Value =
+                            arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
                         if value["state"] != "admission_queued" {
                             // Retained: nothing further to do for this joiner.
                             return;
@@ -408,7 +412,10 @@ fn admission_batch_staging_keeps_committing_under_continuous_intake() {
     }
 
     let committed: usize = batch_sizes.iter().sum();
-    assert_eq!(committed, PRIORITY, "committed count does not match priority count");
+    assert_eq!(
+        committed, PRIORITY,
+        "committed count does not match priority count"
+    );
 
     let roster = call(owner, json!({"op":"member_roster"})).unwrap();
     assert_eq!(
@@ -527,7 +534,11 @@ fn admission_batch_staging_keeps_committing_under_continuous_intake() {
     close(owner).unwrap();
     let owner = common::stored(&[31; 32], &provider);
     let workspace: [u8; 32] = endpoint(&invitation["workspace"]);
-    call(owner, json!({"op":"restore_workspace","workspace":workspace})).unwrap();
+    call(
+        owner,
+        json!({"op":"restore_workspace","workspace":workspace}),
+    )
+    .unwrap();
     let restarted_info: Value = serde_json::from_str(&describe(owner).unwrap()).unwrap();
     let restarted_peer = endpoint(&restarted_info["endpoint_key"]);
     let restarted_port = restarted_info["bound_address"]

@@ -39,17 +39,22 @@ fn grown(endpoint: &dyn arachne_security::EndpointSigner, size: usize) -> Worksp
         let validated: Vec<_> = keys
             .iter()
             .zip(&requests)
-            .map(|(key, request)| match owner.assess_admission(key.endpoint(), request).unwrap() {
-                AdmissionAssessment::Ready(validated) => validated,
-                _ => panic!("open invitation needs no approval"),
-            })
+            .map(
+                |(key, request)| match owner.assess_admission(key.endpoint(), request).unwrap() {
+                    AdmissionAssessment::Ready(validated) => validated,
+                    _ => panic!("open invitation needs no approval"),
+                },
+            )
             .collect();
         let entries: Vec<_> = keys
             .iter()
             .zip(requests.iter().zip(&validated))
             .map(|(key, (request, validated))| (key.endpoint(), request.as_slice(), validated))
             .collect();
-        owner = owner.prepare_validated_admission_batch(&entries).unwrap().workspace;
+        owner = owner
+            .prepare_validated_admission_batch(&entries)
+            .unwrap()
+            .workspace;
     }
     owner
 }
@@ -82,7 +87,10 @@ fn a_joiner_redeems_an_invitation_past_three_hundred_members_over_the_runtime() 
     let _owner = Closing(owner);
     let info: Value = serde_json::from_str(&describe(owner).unwrap()).unwrap();
     let owner_peer: [u8; 32] = serde_json::from_value(info["endpoint_key"].clone()).unwrap();
-    let address = info["bound_address"].as_str().unwrap().replace("0.0.0.0:", "127.0.0.1:");
+    let address = info["bound_address"]
+        .as_str()
+        .unwrap()
+        .replace("0.0.0.0:", "127.0.0.1:");
 
     // Past 500 members, so the checkpoint spans more than one control reply.
     let secret = iroh::SecretKey::from_bytes(&[241; 32]);
@@ -100,16 +108,34 @@ fn a_joiner_redeems_an_invitation_past_three_hundred_members_over_the_runtime() 
     )
     .unwrap();
     attach_storage(owner, owner_storage).unwrap();
-    call(owner, json!({"op":"restore_workspace","workspace":workspace.id()})).unwrap();
-    let staged =
-        call(owner, json!({"op":"stage_invitation","personal":false,"expires_at":0})).unwrap();
-    let adopted = call(owner, json!({"op":"adopt_admission","candidate":staged["candidate"]})).unwrap();
+    call(
+        owner,
+        json!({"op":"restore_workspace","workspace":workspace.id()}),
+    )
+    .unwrap();
+    let staged = call(
+        owner,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    )
+    .unwrap();
+    let adopted = call(
+        owner,
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+    )
+    .unwrap();
     let invitation = adopted["issued_invitation"].clone();
     let checkpoint: Vec<u8> = serde_json::from_value(invitation["checkpoint"].clone()).unwrap();
     // The regime under test: the old single 64 KiB checkpoint bound, and one
     // control reply, are both too small for this checkpoint.
-    assert!(checkpoint.len() > crate::ops::join::CHECKPOINT_PAGE_BYTES, "checkpoint is only {} bytes", checkpoint.len());
-    eprintln!("B3a runtime: {members} members, checkpoint {} bytes", checkpoint.len());
+    assert!(
+        checkpoint.len() > crate::ops::join::CHECKPOINT_PAGE_BYTES,
+        "checkpoint is only {} bytes",
+        checkpoint.len()
+    );
+    eprintln!(
+        "B3a runtime: {members} members, checkpoint {} bytes",
+        checkpoint.len()
+    );
 
     let joiner = create(Some(&[242; 32])).unwrap();
     let _joiner = Closing(joiner);
@@ -125,7 +151,11 @@ fn a_joiner_redeems_an_invitation_past_three_hundred_members_over_the_runtime() 
     )
     .unwrap();
     let workspace_id: [u8; 32] = serde_json::from_value(pending["workspace"].clone()).unwrap();
-    call(joiner, json!({"op":"add_address_hint","peer":owner_peer,"address":address})).unwrap();
+    call(
+        joiner,
+        json!({"op":"add_address_hint","peer":owner_peer,"address":address}),
+    )
+    .unwrap();
 
     // The owner is driven on its own thread, so a joiner failure surfaces
     // here instead of leaving the owner waiting for work forever.
@@ -134,7 +164,9 @@ fn a_joiner_redeems_an_invitation_past_three_hundred_members_over_the_runtime() 
             return;
         }
         loop {
-            let Ok(value) = call(owner, json!({"op":"drive_workspace"})) else { return };
+            let Ok(value) = call(owner, json!({"op":"drive_workspace"})) else {
+                return;
+            };
             if value["state"] != "admission_queued" {
                 assert_eq!(value["state"], "workspace_committed", "{value}");
                 return;

@@ -37,7 +37,8 @@ fn three_authors_and_reader() -> (Vec<Workspace>, Workspace) {
         let (registered, invite, checkpoint) =
             admin.prepare_invitation(u64::MAX, false, false).unwrap();
         let invited = registered.workspace.provisional_copy().unwrap();
-        let join = PendingJoin::from_invitation(&invite, &checkpoint, test_key(label), name).unwrap();
+        let join =
+            PendingJoin::from_invitation(&invite, &checkpoint, test_key(label), name).unwrap();
         let admission = invited
             .prepare_admission(test_endpoint(label), join.admission_request().unwrap())
             .unwrap();
@@ -142,9 +143,8 @@ fn gap_blocked_objects_of_three_authors_never_stall_the_global_bound() {
                     if inbox.pending(&reader).unwrap().is_none() && inbox.pending_count() > 0 {
                         all_blocked_max = all_blocked_max.max(inbox.pending_count());
                         for (_, (context, object)) in &fillers {
-                            let result = inbox.stage_with_recipients(
-                                &reader, context, &recipient, object,
-                            );
+                            let result =
+                                inbox.stage_with_recipients(&reader, context, &recipient, object);
                             assert!(
                                 !matches!(result, Err(error) if error == PENDING_INBOX_FULL),
                                 "size {size}: {} pending objects all wait behind gaps, \

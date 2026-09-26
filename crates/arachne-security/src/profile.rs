@@ -120,11 +120,17 @@ fn profiles_bind_names_to_current_workspace_members() {
     }
     let (registration, invitation, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     admin = registration.workspace;
-    let pending =
-        super::PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(93), "Alex Morgan")
-            .unwrap();
+    let pending = super::PendingJoin::from_invitation(
+        &invitation,
+        &checkpoint,
+        crate::test_key(93),
+        "Alex Morgan",
+    )
+    .unwrap();
     let request = pending.admission_request().unwrap();
-    let prepared = admin.prepare_admission(crate::test_endpoint(93), request).unwrap();
+    let prepared = admin
+        .prepare_admission(crate::test_endpoint(93), request)
+        .unwrap();
     admin = prepared.workspace;
     let reply = admin
         .retained_admission(crate::test_endpoint(93), request)

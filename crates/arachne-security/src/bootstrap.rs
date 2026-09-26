@@ -114,7 +114,9 @@ pub fn checkpoint_digest(bytes: &[u8]) -> Result<[u8; 32], &'static str> {
 }
 
 /// The signed GroupInfo a checkpoint pins. Structure only.
-pub(super) fn checkpoint_info(bytes: &[u8]) -> Result<openmls::messages::group_info::VerifiableGroupInfo, &'static str> {
+pub(super) fn checkpoint_info(
+    bytes: &[u8],
+) -> Result<openmls::messages::group_info::VerifiableGroupInfo, &'static str> {
     let parts = checkpoint_parts(bytes, CheckpointBound::Local)?;
     let message =
         MlsMessageIn::tls_deserialize_exact(parts.pin).map_err(|_| "invalid checkpoint")?;
@@ -1118,7 +1120,8 @@ mod tests {
                     .into(),
                 signature_key: signer.to_public_vec().into(),
             };
-            let mut builder = KeyPackage::builder().leaf_node_capabilities(crate::leaf_capabilities());
+            let mut builder =
+                KeyPackage::builder().leaf_node_capabilities(crate::leaf_capabilities());
             if let Some((workspace, binder)) = binding {
                 builder = builder.leaf_node_extensions(
                     crate::endpoint_binding(binder, workspace, profile.id(), signer.public())
@@ -1177,7 +1180,11 @@ mod tests {
         owner.group.set_aad(asserted_time_aad(time));
         let (commit, welcome, _) = owner
             .group
-            .add_members(&owner.provider, &owner._signer, std::slice::from_ref(package))
+            .add_members(
+                &owner.provider,
+                &owner._signer,
+                std::slice::from_ref(package),
+            )
             .unwrap();
         (commit.to_bytes().unwrap(), welcome)
     }
@@ -1211,7 +1218,10 @@ mod tests {
                 .try_into()
                 .unwrap(),
             redemption_signature: invite
-                .sign(&redemption(admin.group.group_id(), &invitation_key, &candidate.package).unwrap())
+                .sign(
+                    &redemption(admin.group.group_id(), &invitation_key, &candidate.package)
+                        .unwrap(),
+                )
                 .unwrap()
                 .try_into()
                 .unwrap(),
@@ -1224,22 +1234,30 @@ mod tests {
             .unwrap();
         let (in_time, _) = add_raw(&mut admin, &candidate.package, expires_at - 1);
         for _ in 0..2 {
-            let mut joiner = JoinProof::from_trusted_checkpoint(admin.id(), digest, &checkpoint).unwrap();
+            let mut joiner =
+                JoinProof::from_trusted_checkpoint(admin.id(), digest, &checkpoint).unwrap();
             let mut member =
-                MembershipVerifier::from_trusted_checkpoint(admin.id(), digest, &checkpoint).unwrap();
+                MembershipVerifier::from_trusted_checkpoint(admin.id(), digest, &checkpoint)
+                    .unwrap();
             assert_eq!(
                 joiner.apply_add(&authorization, &late),
                 Err(crate::INVITATION_EXPIRED)
             );
             assert_eq!(
-                member.apply_transition(&MembershipAuthorization::Admission(authorization.clone()), &late),
+                member.apply_transition(
+                    &MembershipAuthorization::Admission(authorization.clone()),
+                    &late
+                ),
                 Err(crate::INVITATION_EXPIRED)
             );
             // Before expiry by the committer's time: accepted, although every
             // local clock is long past the expiry.
             joiner.apply_add(&authorization, &in_time).unwrap();
             member
-                .apply_transition(&MembershipAuthorization::Admission(authorization.clone()), &in_time)
+                .apply_transition(
+                    &MembershipAuthorization::Admission(authorization.clone()),
+                    &in_time,
+                )
                 .unwrap();
             assert_eq!(joiner.epoch(), 2);
             assert_eq!(member.epoch(), 2);
@@ -1302,13 +1320,15 @@ mod tests {
                 .group
                 .clear_pending_commit(admin.provider.storage())
                 .unwrap();
-            let mut proof = JoinProof::from_trusted_checkpoint(admin.id(), digest, &checkpoint).unwrap();
+            let mut proof =
+                JoinProof::from_trusted_checkpoint(admin.id(), digest, &checkpoint).unwrap();
             assert_eq!(proof.apply_add(&authorization, &commit), Err(error));
         }
         let good = Candidate::new(10, admin.id());
         let authorization = authorize(&admin, &good.package);
         let (commit, _) = add_raw(&mut admin, &good.package, now_for_test());
-        let mut proof = JoinProof::from_trusted_checkpoint(admin.id(), digest, &checkpoint).unwrap();
+        let mut proof =
+            JoinProof::from_trusted_checkpoint(admin.id(), digest, &checkpoint).unwrap();
         proof.apply_add(&authorization, &commit).unwrap();
     }
 
@@ -1445,7 +1465,10 @@ mod tests {
         // An independent copy of the administrator at the same epoch.
         let mut fork = admin.provisional_copy().unwrap();
         let (commit, welcome) = add_raw(&mut admin, &joined.package, now_for_test());
-        let mismatched = authorize(admin.group.group_id(), &Candidate::new(5, admin.id()).package);
+        let mismatched = authorize(
+            admin.group.group_id(),
+            &Candidate::new(5, admin.id()).package,
+        );
         assert!(proof.apply_add(&mismatched, &commit).is_err());
         assert_eq!(proof.epoch(), 2);
         proof.apply_add(&joined_auth, &commit).unwrap();

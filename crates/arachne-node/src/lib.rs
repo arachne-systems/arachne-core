@@ -17,25 +17,27 @@ use std::{
 
 mod budget;
 mod connections;
+mod control;
+mod endpoint;
 #[cfg(test)]
 mod gossip_forwarding_test;
 mod mdns;
-mod control;
-mod endpoint;
 pub use endpoint::IrohEndpointSigner;
 mod overlay;
+pub mod resources;
 #[cfg(feature = "moq")]
 mod streams;
-pub mod resources;
 mod wire;
 pub use budget::{CapacityCounts, ConnectionBudget};
-pub use control::{ControlClient, ControlRequest, ControlTiming, InquiryResponder, MAX_CONTROL_REPLY, Timing};
+pub use control::{
+    ControlClient, ControlRequest, ControlTiming, InquiryResponder, MAX_CONTROL_REPLY, Timing,
+};
 #[cfg(feature = "moq")]
 pub use streams::MoqMetrics;
 
-use connections::Connections;
 use arachne_routing::RoutingTable;
 pub use arachne_routing::{PeerId, Permissions, Topic, WorkspaceId};
+use connections::Connections;
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -254,14 +256,7 @@ pub enum DeliveryClass {
     Bulk,
 }
 
-type CurrentKey = (
-    WorkspaceId,
-    u64,
-    String,
-    PeerId,
-    [u8; 32],
-    Vec<[u8; 32]>,
-);
+type CurrentKey = (WorkspaceId, u64, String, PeerId, [u8; 32], Vec<[u8; 32]>);
 
 #[derive(Default)]
 struct DeliveryState {
@@ -641,7 +636,11 @@ impl Node {
         options: NodeOptions,
         budget: ConnectionBudget,
     ) -> Result<(Self, MessageReceiver)> {
-        let alpns = vec![ALPN.to_vec(), control::ALPN.to_vec(), overlay::ALPN.to_vec()];
+        let alpns = vec![
+            ALPN.to_vec(),
+            control::ALPN.to_vec(),
+            overlay::ALPN.to_vec(),
+        ];
         #[cfg(feature = "moq")]
         let alpns = {
             let mut alpns = alpns;
@@ -1311,9 +1310,7 @@ impl Node {
                 .await?;
                 report.admitted.push(self.id());
             }
-            report.queued = overlay
-                .broadcast(&topic, delivery, payload)
-                .await?;
+            report.queued = overlay.broadcast(&topic, delivery, payload).await?;
             return Ok(report);
         }
         let peers = self
@@ -1423,11 +1420,11 @@ impl Node {
         if payload.len() > MAX_PAYLOAD {
             return Err(Error::TooLarge);
         }
-        let mut peers = self
-            .routing
-            .lock()
-            .await
-            .recipients(workspace, revision, self.id(), &topic)?;
+        let mut peers =
+            self.routing
+                .lock()
+                .await
+                .recipients(workspace, revision, self.id(), &topic)?;
         let enabled = self
             .streams
             .enabled_peers(workspace, revision, &topic)
@@ -1495,13 +1492,7 @@ impl Node {
         if enabled.is_empty() {
             return self
                 .publish_to_with_class(
-                    workspace,
-                    revision,
-                    topic,
-                    endpoints,
-                    recipients,
-                    delivery,
-                    payload,
+                    workspace, revision, topic, endpoints, recipients, delivery, payload,
                 )
                 .await;
         }
@@ -1718,7 +1709,6 @@ impl Node {
         self.connections.close().await;
         self.listener.abort();
         let _ = (&mut self.listener).await;
-
     }
 }
 

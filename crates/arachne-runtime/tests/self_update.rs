@@ -17,7 +17,10 @@ fn info(handle: i64) -> Value {
 }
 
 fn address(info: &Value) -> String {
-    info["bound_address"].as_str().unwrap().replace("0.0.0.0:", "127.0.0.1:")
+    info["bound_address"]
+        .as_str()
+        .unwrap()
+        .replace("0.0.0.0:", "127.0.0.1:")
 }
 
 #[test]
@@ -27,11 +30,23 @@ fn a_new_member_saves_its_self_update_before_administrator_adoption() {
     let admin = create(Some(&[121; 32])).unwrap();
     let mut member = create(Some(&[122; 32])).unwrap();
     attach_storage(admin, StorageConfig::sqlite(directory.path(), [121; 32])).unwrap();
-    attach_storage(member, StorageConfig::sqlite(member_directory.path(), [122; 32])).unwrap();
-    call(admin, json!({"op":"create_workspace","display_name":"Admin"}));
-    let staged = call(admin, json!({"op":"stage_invitation","personal":false,"expires_at":0}));
-    let invite = call(admin, json!({"op":"adopt_admission","candidate":staged["candidate"]}))
-        ["issued_invitation"]
+    attach_storage(
+        member,
+        StorageConfig::sqlite(member_directory.path(), [122; 32]),
+    )
+    .unwrap();
+    call(
+        admin,
+        json!({"op":"create_workspace","display_name":"Admin"}),
+    );
+    let staged = call(
+        admin,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    );
+    let invite = call(
+        admin,
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+    )["issued_invitation"]
         .clone();
     let (admin_info, member_info) = (info(admin), info(member));
     let pending = call(
@@ -40,10 +55,16 @@ fn a_new_member_saves_its_self_update_before_administrator_adoption() {
             "checkpoint":invite["checkpoint"],"peers":[admin_info["endpoint_key"]]}),
     );
     let workspace = pending["workspace"].clone();
-    call(member, json!({"op":"add_address_hint","peer":admin_info["endpoint_key"],
-        "address":address(&admin_info)}));
-    call(admin, json!({"op":"add_address_hint","peer":member_info["endpoint_key"],
-        "address":address(&member_info)}));
+    call(
+        member,
+        json!({"op":"add_address_hint","peer":admin_info["endpoint_key"],
+        "address":address(&admin_info)}),
+    );
+    call(
+        admin,
+        json!({"op":"add_address_hint","peer":member_info["endpoint_key"],
+        "address":address(&member_info)}),
+    );
 
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut joined = false;
@@ -75,19 +96,38 @@ fn a_new_member_saves_its_self_update_before_administrator_adoption() {
 
     close(member).unwrap();
     member = create(Some(&[122; 32])).unwrap();
-    attach_storage(member, StorageConfig::sqlite(member_directory.path(), [122; 32])).unwrap();
-    let restored = call(member, json!({"op":"restore_workspace","workspace":workspace}));
+    attach_storage(
+        member,
+        StorageConfig::sqlite(member_directory.path(), [122; 32]),
+    )
+    .unwrap();
+    let restored = call(
+        member,
+        json!({"op":"restore_workspace","workspace":workspace}),
+    );
     assert_eq!(restored["epoch"], updated["epoch"]);
     let member_info = info(member);
-    call(member, json!({"op":"add_address_hint","peer":admin_info["endpoint_key"],
-        "address":address(&admin_info)}));
-    call(admin, json!({"op":"add_address_hint","peer":member_info["endpoint_key"],
-        "address":address(&member_info)}));
-    call(member, json!({"op":"poll_workspace_presence","announce":true}));
+    call(
+        member,
+        json!({"op":"add_address_hint","peer":admin_info["endpoint_key"],
+        "address":address(&admin_info)}),
+    );
+    call(
+        admin,
+        json!({"op":"add_address_hint","peer":member_info["endpoint_key"],
+        "address":address(&member_info)}),
+    );
+    call(
+        member,
+        json!({"op":"poll_workspace_presence","announce":true}),
+    );
     while call(admin, json!({"op":"member_roster"}))["epoch"] != updated["epoch"] {
         call(admin, json!({"op":"drive_workspace"}));
         call(member, json!({"op":"drive_workspace"}));
-        assert!(Instant::now() < deadline, "administrator did not recover the saved update");
+        assert!(
+            Instant::now() < deadline,
+            "administrator did not recover the saved update"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     let admin_roster = call(admin, json!({"op":"member_roster"}));
@@ -97,7 +137,13 @@ fn a_new_member_saves_its_self_update_before_administrator_adoption() {
     // objects have not passed.
     for _ in 0..20 {
         let step = call(member, json!({"op":"drive_workspace"}));
-        assert!(!step["state"].as_str().unwrap_or("").starts_with("self_update"), "{step}");
+        assert!(
+            !step["state"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("self_update"),
+            "{step}"
+        );
         call(admin, json!({"op":"drive_workspace"}));
     }
     close(admin).unwrap();

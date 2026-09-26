@@ -180,7 +180,10 @@ pub(crate) fn workspaces(session: &mut Session) -> Result<NearbyWorkspaces, ApiE
 }
 
 /// Advertise (or withdraw) one workspace invitation to nearby devices.
-pub(crate) fn advertise(session: &mut Session, args: AdvertiseArgs) -> Result<NearbyState, ApiError> {
+pub(crate) fn advertise(
+    session: &mut Session,
+    args: AdvertiseArgs,
+) -> Result<NearbyState, ApiError> {
     let AdvertiseArgs {
         mode,
         invitation,
@@ -244,7 +247,10 @@ pub(crate) fn advertise(session: &mut Session, args: AdvertiseArgs) -> Result<Ne
 }
 
 /// The name this device answers to nearby identity asks.
-pub(crate) fn set_identity(session: &mut Session, args: IdentityArgs) -> Result<NearbyState, ApiError> {
+pub(crate) fn set_identity(
+    session: &mut Session,
+    args: IdentityArgs,
+) -> Result<NearbyState, ApiError> {
     arachne_security::validate_workspace_name(&args.name)
         .map_err(security(ErrorCode::InvalidInput))?;
     session.nearby.identity = Some(args.name.trim().to_owned());
@@ -272,7 +278,9 @@ pub(crate) fn send_invitation(
         .block_on(session.node.request_control(args.peer, &packet))
         .map_err(errors::node)?;
     if reply != [1] {
-        return Err(ApiError::not_authorized("nearby device rejected invitation"));
+        return Err(ApiError::not_authorized(
+            "nearby device rejected invitation",
+        ));
     }
     Ok(InvitationSent {
         state: "nearby_invitation_sent",

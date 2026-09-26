@@ -28,10 +28,7 @@ pub(crate) struct SelfUpdatePolicy {
 
 impl SelfUpdatePolicy {
     pub(crate) fn new(now: Instant) -> Self {
-        Self {
-            last: now,
-            sent: 0,
-        }
+        Self { last: now, sent: 0 }
     }
 
     /// Count objects this member sent.
@@ -80,5 +77,4 @@ mod tests {
         assert!(!policy.due(later + SELF_UPDATE_INTERVAL - Duration::from_secs(1), false));
         assert!(policy.due(later + SELF_UPDATE_INTERVAL, false));
     }
-
 }

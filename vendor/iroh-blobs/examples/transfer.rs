@@ -16,8 +16,13 @@ async fn main() -> anyhow::Result<()> {
     let blobs = BlobsProtocol::new(&store, None);
 
     // Grab all passed in arguments, the first one is the binary itself, so we skip it.
-    let args: Vec<String> = std::env::args_os().skip(1)
-        .map(|argument| argument.into_string().map_err(|_| anyhow::anyhow!("Arguments must be UTF-8")))
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|argument| {
+            argument
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("Arguments must be UTF-8"))
+        })
         .collect::<anyhow::Result<_>>()?;
     // Convert to &str, so we can pattern-match easily:
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();

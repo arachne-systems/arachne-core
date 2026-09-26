@@ -84,11 +84,10 @@ pub(crate) fn poll_protected(session: &mut Session) -> Result<Option<StagedObjec
         .map_err(security(ErrorCode::Internal))?;
     let publisher = session.delivery.publisher.clone();
     // Object delivery is the only receive path.
-    let inbox = session
-        .delivery
-        .inbox
-        .clone()
-        .unwrap_or_else(|| arachne_delivery::inbox::ObjectInbox::new(owner.id(), owner.epoch()));
+    let inbox =
+        session.delivery.inbox.clone().unwrap_or_else(|| {
+            arachne_delivery::inbox::ObjectInbox::new(owner.id(), owner.epoch())
+        });
     if message.workspace != owner.id() {
         return Err(ApiError::not_authorized("wrong workspace"));
     }
@@ -147,7 +146,9 @@ pub(crate) fn poll_protected(session: &mut Session) -> Result<Option<StagedObjec
     };
     let publisher = match publisher {
         Some(publisher) => publisher,
-        None => arachne_delivery::PublisherLog::new(owner).map_err(delivery(ErrorCode::Internal))?,
+        None => {
+            arachne_delivery::PublisherLog::new(owner).map_err(delivery(ErrorCode::Internal))?
+        }
     };
     stage_object(
         session,
@@ -206,7 +207,10 @@ pub(crate) fn poll_pending(
 }
 
 /// Stage the application's durable acceptance of a pending object.
-pub(crate) fn acknowledge(session: &mut Session, args: ResolveArgs) -> Result<StagedObject, ApiError> {
+pub(crate) fn acknowledge(
+    session: &mut Session,
+    args: ResolveArgs,
+) -> Result<StagedObject, ApiError> {
     resolve(session, args, false)
 }
 
@@ -216,7 +220,11 @@ pub(crate) fn reject(session: &mut Session, args: ResolveArgs) -> Result<StagedO
     resolve(session, args, true)
 }
 
-fn resolve(session: &mut Session, args: ResolveArgs, rejected: bool) -> Result<StagedObject, ApiError> {
+fn resolve(
+    session: &mut Session,
+    args: ResolveArgs,
+    rejected: bool,
+) -> Result<StagedObject, ApiError> {
     let owner = session
         .workspace
         .as_ref()
@@ -285,16 +293,16 @@ mod tests {
         let admin_key = arachne_security::EndpointKey::generate().unwrap();
         let mut admin = Workspace::create(&admin_key, "Publisher").unwrap();
         let secret = iroh::SecretKey::from_bytes(&root);
-        let (registered, invitation, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+        let (registered, invitation, checkpoint) =
+            admin.prepare_invitation(0, false, false).unwrap();
         admin = registered.workspace;
-        let join =
-            PendingJoin::from_invitation(
-                &invitation,
-                &checkpoint,
-                &arachne_node::IrohEndpointSigner(&secret),
-                "Reader",
-            )
-            .unwrap();
+        let join = PendingJoin::from_invitation(
+            &invitation,
+            &checkpoint,
+            &arachne_node::IrohEndpointSigner(&secret),
+            "Reader",
+        )
+        .unwrap();
         let prepared = admin
             .prepare_admission(endpoint, join.admission_request().unwrap())
             .unwrap();
@@ -334,9 +342,9 @@ mod tests {
             };
             inbox = *next;
         }
-        let publisher =
-            PublisherLog::new(&reader).unwrap();
-        crate::persistence::seed_workspace(&provider, &reader, Some(&publisher), Some(&inbox)).unwrap();
+        let publisher = PublisherLog::new(&reader).unwrap();
+        crate::persistence::seed_workspace(&provider, &reader, Some(&publisher), Some(&inbox))
+            .unwrap();
         call(json!({"op":"restore_workspace","workspace":reader.id()})).unwrap();
         let pending = call(json!({"op":"poll_pending_object"})).unwrap();
         assert_eq!(pending["id"], json!(vec![2; 16]));

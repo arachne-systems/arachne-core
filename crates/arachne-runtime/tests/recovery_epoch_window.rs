@@ -100,7 +100,10 @@ fn recovery_reaches_an_earlier_epoch_in_the_receive_window() {
     let invite = issue_invitation(author);
     add(author, reader, &invite, "Reader");
     for handle in [author, reader] {
-        call(handle, json!({"op":"install_workspace_policy","revision":3}));
+        call(
+            handle,
+            json!({"op":"install_workspace_policy","revision":3}),
+        );
     }
     // The reader is not subscribed: this object is missed live at epoch 2.
     let staged = call(
@@ -128,7 +131,10 @@ fn recovery_reaches_an_earlier_epoch_in_the_receive_window() {
     );
     assert_eq!(adopted["epoch"], 3);
     for handle in [author, reader] {
-        call(handle, json!({"op":"install_workspace_policy","revision":4}));
+        call(
+            handle,
+            json!({"op":"install_workspace_policy","revision":4}),
+        );
     }
     connect(reader, author);
     let member = created["member"]["id"].clone();

@@ -76,15 +76,34 @@ fn probe(session: &Session) -> Probe {
             || crate::membership::fork::has_republication_work(session)
             || crate::membership::fork::has_retry_work(session)
             || session.membership.fork.has_result()
-            || session.membership.update.as_ref().is_some_and(|job| job.task.is_finished())
-            || session.membership.offer.as_ref().is_some_and(|job| job.task.is_finished())
-            || session.membership.range_pull.as_ref().is_some_and(|job| job.task.is_finished())
-            || session.membership.profile_pull.as_ref().is_some_and(|job| job.task.is_finished()),
+            || session
+                .membership
+                .update
+                .as_ref()
+                .is_some_and(|job| job.task.is_finished())
+            || session
+                .membership
+                .offer
+                .as_ref()
+                .is_some_and(|job| job.task.is_finished())
+            || session
+                .membership
+                .range_pull
+                .as_ref()
+                .is_some_and(|job| job.task.is_finished())
+            || session
+                .membership
+                .profile_pull
+                .as_ref()
+                .is_some_and(|job| job.task.is_finished()),
         deliveries: !session.receiver.is_empty(),
         workspace: session.workspace.is_some(),
         recovery: recovery.ready_range.is_some()
             || recovery.ready_direct_range.is_some()
-            || recovery.range.as_ref().is_some_and(|job| job.task.is_finished())
+            || recovery
+                .range
+                .as_ref()
+                .is_some_and(|job| job.task.is_finished())
             || recovery
                 .direct_range
                 .as_ref()
@@ -139,7 +158,11 @@ fn classify(probe: Probe, reported: &mut Reported) -> Option<Event> {
         (Kind::Membership, probe.membership, Event::MembershipChanged),
         (Kind::Deliveries, probe.deliveries, delivery_event(&probe)),
         (Kind::Recovery, probe.recovery, Event::RecoveryReady),
-        (Kind::CurrentView, probe.current_view, Event::CurrentViewReady),
+        (
+            Kind::CurrentView,
+            probe.current_view,
+            Event::CurrentViewReady,
+        ),
         (Kind::Interest, probe.interest, Event::InterestChanged),
         (Kind::Presence, probe.presence, Event::Presence),
     ];
@@ -179,8 +202,7 @@ pub(crate) fn next(handle: i64, timeout: Option<Duration>) -> Result<Option<Even
         if event.is_some() {
             return Ok(event);
         }
-        let remaining =
-            deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        let remaining = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
         if remaining == Some(Duration::ZERO) {
             return Ok(None);
         }
@@ -207,34 +229,105 @@ mod tests {
     #[test]
     fn each_queue_and_job_has_its_event() {
         let cases = [
-            (Probe { controls: true, ..Probe::default() }, Event::Control),
-            (Probe { admissions: true, ..Probe::default() }, Event::Control),
-            (Probe { membership: true, ..Probe::default() }, Event::MembershipChanged),
-            (Probe { deliveries: true, ..Probe::default() }, Event::PublicationReceived),
             (
-                Probe { deliveries: true, workspace: true, ..Probe::default() },
+                Probe {
+                    controls: true,
+                    ..Probe::default()
+                },
+                Event::Control,
+            ),
+            (
+                Probe {
+                    admissions: true,
+                    ..Probe::default()
+                },
+                Event::Control,
+            ),
+            (
+                Probe {
+                    membership: true,
+                    ..Probe::default()
+                },
+                Event::MembershipChanged,
+            ),
+            (
+                Probe {
+                    deliveries: true,
+                    ..Probe::default()
+                },
+                Event::PublicationReceived,
+            ),
+            (
+                Probe {
+                    deliveries: true,
+                    workspace: true,
+                    ..Probe::default()
+                },
                 Event::ProtectedReceived,
             ),
-            (Probe { recovery: true, ..Probe::default() }, Event::RecoveryReady),
-            (Probe { current_view: true, ..Probe::default() }, Event::CurrentViewReady),
-            (Probe { interest: true, ..Probe::default() }, Event::InterestChanged),
-            (Probe { presence: true, ..Probe::default() }, Event::Presence),
+            (
+                Probe {
+                    recovery: true,
+                    ..Probe::default()
+                },
+                Event::RecoveryReady,
+            ),
+            (
+                Probe {
+                    current_view: true,
+                    ..Probe::default()
+                },
+                Event::CurrentViewReady,
+            ),
+            (
+                Probe {
+                    interest: true,
+                    ..Probe::default()
+                },
+                Event::InterestChanged,
+            ),
+            (
+                Probe {
+                    presence: true,
+                    ..Probe::default()
+                },
+                Event::Presence,
+            ),
         ];
         for (probe, event) in cases {
             assert_eq!(one(probe), Some(event.clone()), "{probe:?}");
         }
         assert_eq!(one(Probe::default()), None);
-        assert_eq!(one(Probe { in_flight: true, ..Probe::default() }), None);
+        assert_eq!(
+            one(Probe {
+                in_flight: true,
+                ..Probe::default()
+            }),
+            None
+        );
     }
 
     #[test]
     fn queues_repeat_until_drained_and_jobs_report_once() {
         let mut reported = Reported::default();
-        let queue = Probe { deliveries: true, ..Probe::default() };
-        assert_eq!(classify(queue, &mut reported), Some(Event::PublicationReceived));
-        assert_eq!(classify(queue, &mut reported), Some(Event::PublicationReceived));
+        let queue = Probe {
+            deliveries: true,
+            ..Probe::default()
+        };
+        assert_eq!(
+            classify(queue, &mut reported),
+            Some(Event::PublicationReceived)
+        );
+        assert_eq!(
+            classify(queue, &mut reported),
+            Some(Event::PublicationReceived)
+        );
 
-        let both = Probe { recovery: true, presence: true, ..Probe::default() };
+        let both = Probe {
+            recovery: true,
+            presence: true,
+            ..Probe::default()
+        };
         assert_eq!(classify(both, &mut reported), Some(Event::RecoveryReady));
         assert_eq!(classify(both, &mut reported), Some(Event::Presence));
         assert_eq!(classify(both, &mut reported), None);
@@ -247,20 +340,37 @@ mod tests {
     fn a_blocked_queue_reports_once_until_an_op_runs() {
         let mut reported = Reported::default();
         // A pending candidate: control and deliveries may not drain.
-        let blocked = Probe { busy: true, controls: true, deliveries: true, ..Probe::default() };
+        let blocked = Probe {
+            busy: true,
+            controls: true,
+            deliveries: true,
+            ..Probe::default()
+        };
         assert_eq!(classify(blocked, &mut reported), Some(Event::Control));
-        assert_eq!(classify(blocked, &mut reported), Some(Event::PublicationReceived));
+        assert_eq!(
+            classify(blocked, &mut reported),
+            Some(Event::PublicationReceived)
+        );
         assert_eq!(classify(blocked, &mut reported), None);
         reported.rearm_queues();
         assert_eq!(classify(blocked, &mut reported), Some(Event::Control));
         // Queued admissions the runtime holds report once, even when not busy.
         let mut reported = Reported::default();
-        let held = Probe { admissions: true, ..Probe::default() };
+        let held = Probe {
+            admissions: true,
+            ..Probe::default()
+        };
         assert_eq!(classify(held, &mut reported), Some(Event::Control));
         assert_eq!(classify(held, &mut reported), None);
         // Membership gossip reports once.
-        let gossip = Probe { membership: true, ..Probe::default() };
-        assert_eq!(classify(gossip, &mut reported), Some(Event::MembershipChanged));
+        let gossip = Probe {
+            membership: true,
+            ..Probe::default()
+        };
+        assert_eq!(
+            classify(gossip, &mut reported),
+            Some(Event::MembershipChanged)
+        );
         assert_eq!(classify(gossip, &mut reported), None);
     }
 

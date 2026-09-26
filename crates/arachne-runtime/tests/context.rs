@@ -73,10 +73,9 @@ fn a_host_runtime_handle_must_be_multi_thread() {
         .enable_all()
         .build()
         .unwrap();
-    let refused = Context::new(
-        ContextConfig::default()
-            .with_runtime(arachne_runtime::RuntimeConfig::Handle(host.handle().clone())),
-    )
+    let refused = Context::new(ContextConfig::default().with_runtime(
+        arachne_runtime::RuntimeConfig::Handle(host.handle().clone()),
+    ))
     .expect_err("a current-thread runtime cannot drive blocking calls");
     assert_eq!(refused.code(), ErrorCode::InvalidInput);
 
@@ -85,10 +84,9 @@ fn a_host_runtime_handle_must_be_multi_thread() {
         .enable_all()
         .build()
         .unwrap();
-    let context = Context::new(
-        ContextConfig::default()
-            .with_runtime(arachne_runtime::RuntimeConfig::Handle(host.handle().clone())),
-    )
+    let context = Context::new(ContextConfig::default().with_runtime(
+        arachne_runtime::RuntimeConfig::Handle(host.handle().clone()),
+    ))
     .unwrap();
     let client = context.open(config()).unwrap();
     client.endpoint().unwrap();

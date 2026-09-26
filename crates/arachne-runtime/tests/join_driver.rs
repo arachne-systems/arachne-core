@@ -19,8 +19,17 @@ fn bytes(value: &Value) -> Vec<u8> {
 }
 
 fn issue(h: i64) -> Value {
-    let staged = call(h, json!({"op":"stage_invitation","personal":false,"expires_at":0})).unwrap();
-    call(h, json!({"op":"adopt_admission","candidate":staged["candidate"]})).unwrap()["issued_invitation"].clone()
+    let staged = call(
+        h,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    )
+    .unwrap();
+    call(
+        h,
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+    )
+    .unwrap()["issued_invitation"]
+        .clone()
 }
 
 struct Owner {
@@ -94,7 +103,10 @@ fn async_driver_persists_selected_peer_and_exact_pending_request() {
     let first = call(joiner, json!({"op":"drive_join"})).unwrap();
     assert_eq!(first["state"], "admission_pending");
     assert_eq!(first["peer"], json!(owner_peer));
-    assert!(started.elapsed().as_millis() < 500, "driver still blocks on the dial");
+    assert!(
+        started.elapsed().as_millis() < 500,
+        "driver still blocks on the dial"
+    );
 
     close(joiner).unwrap();
     let restored_handle = common::stored(&[232; 32], &provider);
@@ -139,7 +151,11 @@ fn compact_pending_invitation_restores_in_rust_and_joins_without_host_hydration(
     close(joiner).unwrap();
 
     let resumed = common::stored(&[234; 32], &provider);
-    let restored = call(resumed, json!({"op":"restore_workspace","workspace":workspace})).unwrap();
+    let restored = call(
+        resumed,
+        json!({"op":"restore_workspace","workspace":workspace}),
+    )
+    .unwrap();
     assert_eq!(restored["state"], "pending");
     assert_eq!(restored["activity"]["state"], "joining");
     assert!(restored.get("invitation").is_none());

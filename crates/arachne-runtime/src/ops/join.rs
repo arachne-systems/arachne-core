@@ -11,14 +11,16 @@ use serde_json::{Value, json};
 use crate::errors::{self, security};
 use crate::membership::JoinStep;
 use crate::ops::admission::{
-    admission_history_page_packet, resolve_admission_reply, admission_offer_candidate, admission_request_packet, live,
-    live_mut, parse_admission_offer,
+    admission_history_page_packet, admission_offer_candidate, admission_request_packet, live,
+    live_mut, parse_admission_offer, resolve_admission_reply,
 };
 use crate::ops::candidate::{self, AdoptArgs, MemberView};
 use crate::ops::{self, Op};
 use crate::session::{activity_view, seal_state, transition_activity};
 use crate::workspace_activity::ActivityView;
-use crate::{Session, StagedWorkspace, WorkspacePhase, WorkspaceTransition, admission_state, persistence};
+use crate::{
+    Session, StagedWorkspace, WorkspacePhase, WorkspaceTransition, admission_state, persistence,
+};
 
 /// `DFIC\x02 | u32 offset | checkpoint request proof`; answered by one
 /// `DFCP\x01` checkpoint page (B3a).
@@ -69,7 +71,9 @@ impl JoinLifecycle {
                 .selected
                 .is_some_and(|peer| !self.peers.contains(&peer))
         {
-            return Err(ApiError::storage_corrupt("invalid persisted join lifecycle"));
+            return Err(ApiError::storage_corrupt(
+                "invalid persisted join lifecycle",
+            ));
         }
         Ok(())
     }
@@ -190,9 +194,14 @@ pub(crate) struct StagedJoin {
 // Ops
 // ---------------------------------------------------------------------------
 
-pub(crate) fn begin(session: &mut Session, args: BeginJoinArgs) -> Result<PendingJoinInfo, ApiError> {
+pub(crate) fn begin(
+    session: &mut Session,
+    args: BeginJoinArgs,
+) -> Result<PendingJoinInfo, ApiError> {
     if session.workspace.is_some() || session.join.pending.is_some() {
-        return Err(ApiError::wrong_state("session already owns workspace state"));
+        return Err(ApiError::wrong_state(
+            "session already owns workspace state",
+        ));
     }
     let invitation = arachne_security::Invitation::from_bytes(&args.invitation)
         .map_err(security(ErrorCode::InvitationInvalid))?;
@@ -318,7 +327,8 @@ pub(crate) fn request_admission(
     args: RequestAdmissionArgs,
 ) -> Result<Value, ApiError> {
     let peer = args.peer;
-    let from_peer = |detail: &str| ApiError::transport_failed(Some(EndpointId::from_bytes(peer)), detail);
+    let from_peer =
+        |detail: &str| ApiError::transport_failed(Some(EndpointId::from_bytes(peer)), detail);
     let too_much = |detail: &str| ApiError::limit_reached("admission history", 0, detail);
     let pending = session
         .join
@@ -349,8 +359,13 @@ pub(crate) fn request_admission(
     // responder stayed inside the control-reply bound while rolling a long
     // history over many pages.
     let mut page_bytes = vec![reply.len()];
-    let (mut reply, first_bytes) = session.runtime.block_on(resolve_admission_reply(
-        session.node.control_client(), peer, &reply))
+    let (mut reply, first_bytes) = session
+        .runtime
+        .block_on(resolve_admission_reply(
+            session.node.control_client(),
+            peer,
+            &reply,
+        ))
         .map_err(|_| from_peer("invalid admission reply"))?;
     if reply
         .get("history_complete")
@@ -384,8 +399,13 @@ pub(crate) fn request_admission(
                 .block_on(session.node.request_control(peer, &page))
                 .map_err(errors::node)?;
             page_bytes.push(page.len());
-            let (page, expanded_bytes) = session.runtime.block_on(resolve_admission_reply(
-                session.node.control_client(), peer, &page))
+            let (page, expanded_bytes) = session
+                .runtime
+                .block_on(resolve_admission_reply(
+                    session.node.control_client(),
+                    peer,
+                    &page,
+                ))
                 .map_err(|_| from_peer("invalid admission history page"))?;
             total_bytes = total_bytes.saturating_add(expanded_bytes);
             if total_bytes > arachne_security::MAX_JOIN_HISTORY_BYTES {
@@ -411,7 +431,10 @@ pub(crate) fn request_admission(
             // A page carries steps, except the final page that carries only
             // the Welcome.
             let complete = page["history_complete"].as_bool() == Some(true);
-            if (page_commits.is_empty() && !complete) || next < offset || (next == offset && !complete) {
+            if (page_commits.is_empty() && !complete)
+                || next < offset
+                || (next == offset && !complete)
+            {
                 return Err(from_peer("admission history page made no progress"));
             }
             if commits.len() + page_commits.len() > arachne_security::MAX_JOIN_HISTORY_STEPS {
@@ -454,10 +477,11 @@ fn roll_over(reply: &mut Value) -> Vec<Value> {
     let total = commits.len();
     let chunk = arachne_security::HISTORY_CHUNK_STEPS;
     let mut split = if total > chunk {
-        total - match total % chunk {
-            0 => chunk,
-            remainder => remainder,
-        }
+        total
+            - match total % chunk {
+                0 => chunk,
+                remainder => remainder,
+            }
     } else {
         0
     };
@@ -484,7 +508,11 @@ fn commit_pending_join(session: &mut Session) -> Result<(), ApiError> {
 }
 
 /// Stage the join through its own op's guards, as a drive op's inner step.
-fn nested_stage(session: &mut Session, commits: Vec<JoinStep>, welcome: Vec<u8>) -> Result<StagedJoin, ApiError> {
+fn nested_stage(
+    session: &mut Session,
+    commits: Vec<JoinStep>,
+    welcome: Vec<u8>,
+) -> Result<StagedJoin, ApiError> {
     let session = live_mut(session)?;
     ops::nested(session, Op::StageJoin, |session| {
         stage(session, StageJoinArgs { commits, welcome })
@@ -607,9 +635,9 @@ pub(crate) fn drive(session: &mut Session) -> Result<Value, ApiError> {
                         peers.push(*peer);
                     }
                 }
-                let selected = *peers
-                    .first()
-                    .ok_or_else(|| ApiError::peer_unreachable(None, "no reachable workspace member"))?;
+                let selected = *peers.first().ok_or_else(|| {
+                    ApiError::peer_unreachable(None, "no reachable workspace member")
+                })?;
                 let invitation = session
                     .join
                     .pending
@@ -716,7 +744,12 @@ pub(crate) fn drive(session: &mut Session) -> Result<Value, ApiError> {
         let joined = {
             let session = live_mut(session)?;
             ops::nested(session, Op::AdoptJoin, |session| {
-                candidate::adopt_join(session, AdoptArgs { candidate: snapshot })
+                candidate::adopt_join(
+                    session,
+                    AdoptArgs {
+                        candidate: snapshot,
+                    },
+                )
             })?
         };
         let mut joined = serde_json::to_value(joined).map_err(errors::encode)?;
@@ -910,7 +943,9 @@ pub(crate) fn invitation_checkpoint_page(
     let body = request
         .strip_prefix(INVITATION_CHECKPOINT_REQUEST)
         .filter(|body| body.len() > 4)
-        .ok_or_else(|| ApiError::invalid_input("request", "invalid invitation checkpoint request"))?;
+        .ok_or_else(|| {
+            ApiError::invalid_input("request", "invalid invitation checkpoint request")
+        })?;
     let offset = u32::from_be_bytes(body[..4].try_into().unwrap()) as usize;
     let checkpoint = workspace
         .checkpoint_for_invitation(requester, responder, &body[4..])
@@ -929,7 +964,11 @@ pub(crate) fn invitation_checkpoint_page(
             .map_err(|_| too_large())?
             .to_be_bytes(),
     );
-    page.extend(u32::try_from(offset).map_err(|_| too_large())?.to_be_bytes());
+    page.extend(
+        u32::try_from(offset)
+            .map_err(|_| too_large())?
+            .to_be_bytes(),
+    );
     page.extend(&checkpoint[offset..end]);
     Ok(page)
 }
@@ -975,7 +1014,8 @@ async fn request_join_exchange(
         Err(error) => return join_attempt_error(error, true),
     };
     let mut page_bytes = vec![first.len()];
-    let (mut reply, first_bytes) = match resolve_admission_reply(client.clone(), peer, &first).await {
+    let (mut reply, first_bytes) = match resolve_admission_reply(client.clone(), peer, &first).await
+    {
         Ok(value) => value,
         Err(_) => return JoinAttemptOutcome::Failed("invalid admission reply".into()),
     };
@@ -1015,13 +1055,18 @@ async fn request_join_exchange(
                 Err(error) => return join_attempt_error(error, false),
             };
             page_bytes.push(page.len());
-            let (page, expanded_bytes) = match resolve_admission_reply(client.clone(), peer, &page).await {
-                Ok(value) => value,
-                Err(_) => return JoinAttemptOutcome::Failed("invalid admission history page".into()),
-            };
+            let (page, expanded_bytes) =
+                match resolve_admission_reply(client.clone(), peer, &page).await {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return JoinAttemptOutcome::Failed("invalid admission history page".into());
+                    }
+                };
             total_bytes = total_bytes.saturating_add(expanded_bytes);
             if total_bytes > arachne_security::MAX_JOIN_HISTORY_BYTES {
-                return JoinAttemptOutcome::Failed("admission history exceeds transport bounds".into());
+                return JoinAttemptOutcome::Failed(
+                    "admission history exceeds transport bounds".into(),
+                );
             }
             if page.get("history_page").and_then(Value::as_bool) != Some(true) {
                 return JoinAttemptOutcome::Failed(
@@ -1050,7 +1095,10 @@ async fn request_join_exchange(
             // A page carries steps, except the final page that carries only
             // the Welcome.
             let complete = page["history_complete"].as_bool() == Some(true);
-            if (page_commits.is_empty() && !complete) || next < offset || (next == offset && !complete) {
+            if (page_commits.is_empty() && !complete)
+                || next < offset
+                || (next == offset && !complete)
+            {
                 return JoinAttemptOutcome::Failed(
                     "admission history page made no progress".into(),
                 );
@@ -1113,12 +1161,19 @@ mod tests {
         assert!(parse_checkpoint_page(&page(total, total, 0)).is_err());
         let over = arachne_security::MAX_CHECKPOINT as u32 + 1;
         assert!(parse_checkpoint_page(&page(over, 0, CHECKPOINT_PAGE_BYTES)).is_err());
-        const { assert!(CHECKPOINT_PAGE_BYTES + 13 <= arachne_node::MAX_CONTROL_REPLY); }
+        const {
+            assert!(CHECKPOINT_PAGE_BYTES + 13 <= arachne_node::MAX_CONTROL_REPLY);
+        }
     }
 
     #[test]
     fn a_lifecycle_needs_one_to_three_distinct_peers() {
-        for peers in [vec![], vec![[1; 32]; 2], vec![[0; 32]], vec![[1; 32], [2; 32], [3; 32], [4; 32]]] {
+        for peers in [
+            vec![],
+            vec![[1; 32]; 2],
+            vec![[0; 32]],
+            vec![[1; 32], [2; 32], [3; 32], [4; 32]],
+        ] {
             let error = JoinLifecycle::new(peers).err().unwrap();
             assert_eq!(error.code(), ErrorCode::InvalidInput);
         }

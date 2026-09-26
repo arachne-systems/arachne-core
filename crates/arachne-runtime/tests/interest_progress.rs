@@ -503,7 +503,10 @@ fn offline_interest_does_not_block_live_receive() {
         match progress["state"].as_str() {
             Some("interest_pending") => {}
             Some("interest_observed") => assert!(
-                !progress["admission"]["failed"].as_array().unwrap().is_empty(),
+                !progress["admission"]["failed"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
                 "an offline announcement reported no failed peer: {progress}"
             ),
             other => panic!("unexpected interest progress {other:?}: {progress}"),

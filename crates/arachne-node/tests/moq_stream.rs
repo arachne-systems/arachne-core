@@ -118,7 +118,8 @@ async fn three_peers_deliver_a_critical_reply_after_a_stream_burst() {
             let mut replies = BTreeSet::new();
             while replies.len() != 2 {
                 if let Ok(message) = receiver.try_recv()
-                    && matches!(message.payload.as_slice(), [16] | [17]) {
+                    && matches!(message.payload.as_slice(), [16] | [17])
+                {
                     replies.insert(message.payload[0]);
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;

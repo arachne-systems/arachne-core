@@ -55,7 +55,11 @@ fn discard_and_drop_release_the_session() {
     drop(owner.stage_workspace_name("Dropped").unwrap());
     let last = owner.stage_workspace_name("Last").unwrap();
     assert_eq!(
-        owner.adopt_admission(&last).unwrap().workspace_name.as_deref(),
+        owner
+            .adopt_admission(&last)
+            .unwrap()
+            .workspace_name
+            .as_deref(),
         Some("Last")
     );
     owner.close().unwrap();
@@ -72,7 +76,12 @@ fn a_candidate_of_one_kind_never_adopts_as_another_over_json() {
     };
     let created = call(json!({"op":"create_workspace","display_name":"Owner"})).unwrap();
     let staged = call(json!({"op":"stage_workspace_name","workspace_name":"Named"})).unwrap();
-    for op in ["adopt_join", "adopt_publication", "adopt_reception", "adopt_recovery"] {
+    for op in [
+        "adopt_join",
+        "adopt_publication",
+        "adopt_reception",
+        "adopt_recovery",
+    ] {
         let error = call(json!({"op":op,"candidate":staged["candidate"]})).unwrap_err();
         assert!(error.contains("kind"), "{op}: {error}");
     }
@@ -89,8 +98,7 @@ fn a_candidate_of_one_kind_never_adopts_as_another_over_json() {
         false
     );
     assert_eq!(
-        call(json!({"op":"discard_candidate","candidate":staged["candidate"]})).unwrap()
-            ["discarded"],
+        call(json!({"op":"discard_candidate","candidate":staged["candidate"]})).unwrap()["discarded"],
         true
     );
     arachne_runtime::close(handle).unwrap();
@@ -100,7 +108,11 @@ fn a_candidate_of_one_kind_never_adopts_as_another_over_json() {
 fn a_join_candidate_never_adopts_as_an_admission() {
     use arachne_security::Workspace;
     let provider = MemoryProvider::default();
-    let admin = Workspace::create(&arachne_security::EndpointKey::generate().unwrap(), "Administrator").unwrap();
+    let admin = Workspace::create(
+        &arachne_security::EndpointKey::generate().unwrap(),
+        "Administrator",
+    )
+    .unwrap();
     let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
     let admin = registered.workspace;
     let handle = arachne_runtime::create(Some(&[65; 32])).unwrap();
@@ -110,8 +122,10 @@ fn a_join_candidate_never_adopts_as_an_admission() {
             .map_err(|error| error.to_string())
     };
     let bytes = |value: &Value| -> Vec<u8> { serde_json::from_value(value.clone()).unwrap() };
-    let pending = call(json!({"op":"begin_join","invitation":invite.export_secret_token().as_slice(),
-        "checkpoint":checkpoint,"display_name":"Joiner"}))
+    let pending = call(
+        json!({"op":"begin_join","invitation":invite.export_secret_token().as_slice(),
+        "checkpoint":checkpoint,"display_name":"Joiner"}),
+    )
     .unwrap();
     let endpoint = serde_json::from_value(pending["endpoint"].clone()).unwrap();
     let prepared = admin

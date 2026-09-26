@@ -11,14 +11,20 @@ fn node(secret: u8) -> i64 {
 }
 
 fn call(handle: i64, request: Value) -> Value {
-    serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap()).unwrap()).unwrap()
+    serde_json::from_slice(&execute(handle, &serde_json::to_vec(&request).unwrap()).unwrap())
+        .unwrap()
 }
 
 /// Install the policy revision for the accepted epoch, as the Android host
 /// does after every commit.
 fn install_current_policy(handle: i64) {
-    let epoch = call(handle, json!({"op":"member_roster"}))["epoch"].as_u64().unwrap();
-    call(handle, json!({"op":"install_workspace_policy","revision":epoch + 1}));
+    let epoch = call(handle, json!({"op":"member_roster"}))["epoch"]
+        .as_u64()
+        .unwrap();
+    call(
+        handle,
+        json!({"op":"install_workspace_policy","revision":epoch + 1}),
+    );
 }
 
 /// Register a reusable link. Registration is a commit, so the host then
@@ -38,8 +44,11 @@ fn issue_invitation(handle: i64) -> Value {
 
 fn hint(from: i64, to: i64) {
     let info: Value = serde_json::from_str(&describe(to).unwrap()).unwrap();
-    call(from, json!({"op":"add_address_hint","peer":info["endpoint_key"],
-        "address":info["bound_address"].as_str().unwrap().replace("0.0.0.0:","127.0.0.1:")}));
+    call(
+        from,
+        json!({"op":"add_address_hint","peer":info["endpoint_key"],
+        "address":info["bound_address"].as_str().unwrap().replace("0.0.0.0:","127.0.0.1:")}),
+    );
 }
 
 /// A member at epoch N must receive the owner's step to N+1 by gossip, with no
@@ -51,22 +60,45 @@ fn a_committed_step_reaches_a_member_by_gossip_across_the_epoch() {
     let admin = node(94);
     let member = node(95);
     let late = node(96);
-    call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));
+    call(
+        admin,
+        json!({"op":"create_workspace","display_name":"Coordinator"}),
+    );
     let invite = issue_invitation(admin);
-    let begin = |handle, name| call(handle, json!({"op":"begin_join","invitation":invite["invitation"],
-        "checkpoint":invite["checkpoint"],"display_name":name}));
+    let begin = |handle, name| {
+        call(
+            handle,
+            json!({"op":"begin_join","invitation":invite["invitation"],
+        "checkpoint":invite["checkpoint"],"display_name":name}),
+        )
+    };
     let admit = |joiner: &Value| {
-        let staged = call(admin, json!({"op":"stage_admission","authenticated_endpoint":joiner["endpoint"],
-            "request":joiner["admission_request"]}));
-        call(admin, json!({"op":"adopt_admission","candidate":staged["candidate"]}));
-        call(admin, json!({"op":"retained_admission","authenticated_endpoint":joiner["endpoint"],
-            "request":joiner["admission_request"]}))
+        let staged = call(
+            admin,
+            json!({"op":"stage_admission","authenticated_endpoint":joiner["endpoint"],
+            "request":joiner["admission_request"]}),
+        );
+        call(
+            admin,
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+        );
+        call(
+            admin,
+            json!({"op":"retained_admission","authenticated_endpoint":joiner["endpoint"],
+            "request":joiner["admission_request"]}),
+        )
     };
     let early = begin(member, "Member");
     let reply = admit(&early);
-    let staged = call(member, json!({"op":"stage_join","welcome":reply["welcome"],
-        "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}));
-    call(member, json!({"op":"adopt_join","candidate":staged["candidate"]}));
+    let staged = call(
+        member,
+        json!({"op":"stage_join","welcome":reply["welcome"],
+        "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}),
+    );
+    call(
+        member,
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
+    );
     hint(admin, member);
     hint(member, admin);
     for handle in [admin, member] {
@@ -84,7 +116,10 @@ fn a_committed_step_reaches_a_member_by_gossip_across_the_epoch() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut members = 2;
     while members < 4 {
-        assert!(Instant::now() < deadline, "the member reached {members} of 4 members by gossip");
+        assert!(
+            Instant::now() < deadline,
+            "the member reached {members} of 4 members by gossip"
+        );
         // The author serves the range pull when its host drains controls.
         call(admin, json!({"op":"poll_admission"}));
         let staged = call(member, json!({"op":"poll_admission"}));
@@ -93,8 +128,15 @@ fn a_committed_step_reaches_a_member_by_gossip_across_the_epoch() {
             continue;
         }
         assert_eq!(staged["gossip"], true, "{staged}");
-        let adopted = call(member, json!({"op":"adopt_admission","candidate":staged["candidate"]}));
-        assert_eq!(adopted["members"], members + 1, "steps applied out of order: {adopted}");
+        let adopted = call(
+            member,
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+        );
+        assert_eq!(
+            adopted["members"],
+            members + 1,
+            "steps applied out of order: {adopted}"
+        );
         members += 1;
     }
     let sent = call(admin, json!({"op":"workspace_metrics"}))["membership_gossip"].clone();
@@ -115,26 +157,52 @@ fn a_committed_step_reaches_a_member_by_gossip_across_the_epoch() {
 fn steps_keep_arriving_while_every_epoch_reinstalls_policy() {
     let admin = node(98);
     let member = node(99);
-    call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));
+    call(
+        admin,
+        json!({"op":"create_workspace","display_name":"Coordinator"}),
+    );
     // As the Android host does at creation: the admin's overlay starts with no
     // other member (tablet HEWN then skipped every broadcast: sent 0).
     call(admin, json!({"op":"install_workspace_policy","revision":1}));
     let invite = issue_invitation(admin);
-    let begin = |handle: i64, name: &str| call(handle, json!({"op":"begin_join","invitation":invite["invitation"],
-        "checkpoint":invite["checkpoint"],"display_name":name}));
+    let begin = |handle: i64, name: &str| {
+        call(
+            handle,
+            json!({"op":"begin_join","invitation":invite["invitation"],
+        "checkpoint":invite["checkpoint"],"display_name":name}),
+        )
+    };
     let admit = |joiner: &Value| {
-        let staged = call(admin, json!({"op":"stage_admission","authenticated_endpoint":joiner["endpoint"],
-            "request":joiner["admission_request"]}));
-        let adopted = call(admin, json!({"op":"adopt_admission","candidate":staged["candidate"]}));
+        let staged = call(
+            admin,
+            json!({"op":"stage_admission","authenticated_endpoint":joiner["endpoint"],
+            "request":joiner["admission_request"]}),
+        );
+        let adopted = call(
+            admin,
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+        );
         // As the Android host does after every commit.
-        call(admin, json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}));
-        call(admin, json!({"op":"retained_admission","authenticated_endpoint":joiner["endpoint"],
-            "request":joiner["admission_request"]}))
+        call(
+            admin,
+            json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}),
+        );
+        call(
+            admin,
+            json!({"op":"retained_admission","authenticated_endpoint":joiner["endpoint"],
+            "request":joiner["admission_request"]}),
+        )
     };
     let reply = admit(&begin(member, "Member"));
-    let staged = call(member, json!({"op":"stage_join","welcome":reply["welcome"],
-        "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}));
-    call(member, json!({"op":"adopt_join","candidate":staged["candidate"]}));
+    let staged = call(
+        member,
+        json!({"op":"stage_join","welcome":reply["welcome"],
+        "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}),
+    );
+    call(
+        member,
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
+    );
     // As on tablets: the member knows the admin's address, not the reverse.
     hint(member, admin);
     install_current_policy(member);
@@ -151,7 +219,10 @@ fn steps_keep_arriving_while_every_epoch_reinstalls_policy() {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut members = 2;
     while members < 7 {
-        assert!(Instant::now() < deadline, "the member reached {members} of 7 members by gossip");
+        assert!(
+            Instant::now() < deadline,
+            "the member reached {members} of 7 members by gossip"
+        );
         // The author serves the range pull when its host drains controls.
         call(admin, json!({"op":"poll_admission"}));
         let staged = call(member, json!({"op":"poll_admission"}));
@@ -159,13 +230,22 @@ fn steps_keep_arriving_while_every_epoch_reinstalls_policy() {
             std::thread::sleep(Duration::from_millis(10));
             continue;
         }
-        let adopted = call(member, json!({"op":"adopt_admission","candidate":staged["candidate"]}));
+        let adopted = call(
+            member,
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+        );
         members = adopted["members"].as_u64().unwrap();
         // As the Android host does after every epoch change.
-        call(member, json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}));
+        call(
+            member,
+            json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}),
+        );
     }
     let sent = call(admin, json!({"op":"workspace_metrics"}))["membership_gossip"].clone();
-    assert!(sent["sent"].as_u64().unwrap() >= 5, "the admin did not send its steps: {sent}");
+    assert!(
+        sent["sent"].as_u64().unwrap() >= 5,
+        "the admin did not send its steps: {sent}"
+    );
     for handle in [admin, member] {
         close(handle).unwrap();
     }
@@ -181,25 +261,49 @@ fn a_new_members_name_reaches_existing_members_by_gossip() {
     let admin = node(110);
     let member = node(111);
     let late = node(112);
-    call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));
+    call(
+        admin,
+        json!({"op":"create_workspace","display_name":"Coordinator"}),
+    );
     let invite = issue_invitation(admin);
     let join = |handle: i64, name: &str| {
         // One registered link: a later joiner replays every Add since its
         // checkpoint. A fresh link per join would add registration steps.
-        let pending = call(handle, json!({"op":"begin_join","invitation":invite["invitation"],
-            "checkpoint":invite["checkpoint"],"display_name":name}));
-        let staged = call(admin, json!({"op":"stage_admission","authenticated_endpoint":pending["endpoint"],
-            "request":pending["admission_request"]}));
-        let adopted = call(admin, json!({"op":"adopt_admission","candidate":staged["candidate"]}));
-        call(admin, json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}));
-        call(admin, json!({"op":"retained_admission","authenticated_endpoint":pending["endpoint"],
-            "request":pending["admission_request"]}))
+        let pending = call(
+            handle,
+            json!({"op":"begin_join","invitation":invite["invitation"],
+            "checkpoint":invite["checkpoint"],"display_name":name}),
+        );
+        let staged = call(
+            admin,
+            json!({"op":"stage_admission","authenticated_endpoint":pending["endpoint"],
+            "request":pending["admission_request"]}),
+        );
+        let adopted = call(
+            admin,
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+        );
+        call(
+            admin,
+            json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}),
+        );
+        call(
+            admin,
+            json!({"op":"retained_admission","authenticated_endpoint":pending["endpoint"],
+            "request":pending["admission_request"]}),
+        )
     };
     let first = join(member, "Member");
     let first_step = json!({"commit":first["commit"],"authorization":first["authorization"]});
-    let staged = call(member, json!({"op":"stage_join","welcome":first["welcome"],
-        "commits":[first_step.clone()]}));
-    call(member, json!({"op":"adopt_join","candidate":staged["candidate"]}));
+    let staged = call(
+        member,
+        json!({"op":"stage_join","welcome":first["welcome"],
+        "commits":[first_step.clone()]}),
+    );
+    call(
+        member,
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
+    );
     hint(admin, member);
     hint(member, admin);
     install_current_policy(member);
@@ -209,25 +313,46 @@ fn a_new_members_name_reaches_existing_members_by_gossip() {
     let reply = join(late, "Late member");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        assert!(Instant::now() < deadline, "the member did not take the step by gossip");
+        assert!(
+            Instant::now() < deadline,
+            "the member did not take the step by gossip"
+        );
         call(admin, json!({"op":"poll_admission"}));
         let staged = call(member, json!({"op":"poll_admission"}));
         if staged["state"] == "awaiting_save" {
-            let adopted = call(member, json!({"op":"adopt_admission","candidate":staged["candidate"]}));
-            call(member, json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}));
+            let adopted = call(
+                member,
+                json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+            );
+            call(
+                member,
+                json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}),
+            );
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     // The late member finishes joining and sends its name to the admin only.
-    let staged = call(late, json!({"op":"stage_join","welcome":reply["welcome"],
-        "commits":[first_step, {"commit":reply["commit"],"authorization":reply["authorization"]}]}));
-    call(late, json!({"op":"adopt_join","candidate":staged["candidate"]}));
+    let staged = call(
+        late,
+        json!({"op":"stage_join","welcome":reply["welcome"],
+        "commits":[first_step, {"commit":reply["commit"],"authorization":reply["authorization"]}]}),
+    );
+    call(
+        late,
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
+    );
     hint(late, admin);
-    call(late, json!({"op":"fetch_membership_update","peer":invite["peer"]}));
+    call(
+        late,
+        json!({"op":"fetch_membership_update","peer":invite["peer"]}),
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     while call(late, json!({"op":"poll_membership_update"})).is_null() {
-        assert!(Instant::now() < deadline, "the late member's query never completed");
+        assert!(
+            Instant::now() < deadline,
+            "the late member's query never completed"
+        );
         call(admin, json!({"op":"poll_admission"}));
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -240,10 +365,18 @@ fn a_new_members_name_reaches_existing_members_by_gossip() {
         call(admin, json!({"op":"poll_admission"}));
         call(member, json!({"op":"poll_admission"}));
         let roster = call(member, json!({"op":"member_roster"}));
-        if roster["members"].as_array().unwrap().iter().any(|m| m["display_name"] == "Late member") {
+        if roster["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["display_name"] == "Late member")
+        {
             break;
         }
-        assert!(Instant::now() < deadline, "the new member's name did not reach the existing member: {roster}");
+        assert!(
+            Instant::now() < deadline,
+            "the new member's name did not reach the existing member: {roster}"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     for handle in [admin, member, late] {
@@ -261,23 +394,49 @@ fn a_held_step_wakes_the_host_when_its_turn_comes() {
     let member = node(121);
     let late = node(122);
     let later = node(123);
-    call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));
+    call(
+        admin,
+        json!({"op":"create_workspace","display_name":"Coordinator"}),
+    );
     call(admin, json!({"op":"install_workspace_policy","revision":1}));
     let invite = issue_invitation(admin);
-    let begin = |handle: i64, name: &str| call(handle, json!({"op":"begin_join","invitation":invite["invitation"],
-        "checkpoint":invite["checkpoint"],"display_name":name}));
+    let begin = |handle: i64, name: &str| {
+        call(
+            handle,
+            json!({"op":"begin_join","invitation":invite["invitation"],
+        "checkpoint":invite["checkpoint"],"display_name":name}),
+        )
+    };
     let admit = |joiner: &Value| {
-        let staged = call(admin, json!({"op":"stage_admission","authenticated_endpoint":joiner["endpoint"],
-            "request":joiner["admission_request"]}));
-        let adopted = call(admin, json!({"op":"adopt_admission","candidate":staged["candidate"]}));
-        call(admin, json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}));
-        call(admin, json!({"op":"retained_admission","authenticated_endpoint":joiner["endpoint"],
-            "request":joiner["admission_request"]}))
+        let staged = call(
+            admin,
+            json!({"op":"stage_admission","authenticated_endpoint":joiner["endpoint"],
+            "request":joiner["admission_request"]}),
+        );
+        let adopted = call(
+            admin,
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+        );
+        call(
+            admin,
+            json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}),
+        );
+        call(
+            admin,
+            json!({"op":"retained_admission","authenticated_endpoint":joiner["endpoint"],
+            "request":joiner["admission_request"]}),
+        )
     };
     let reply = admit(&begin(member, "Member"));
-    let staged = call(member, json!({"op":"stage_join","welcome":reply["welcome"],
-        "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}));
-    call(member, json!({"op":"adopt_join","candidate":staged["candidate"]}));
+    let staged = call(
+        member,
+        json!({"op":"stage_join","welcome":reply["welcome"],
+        "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}),
+    );
+    call(
+        member,
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
+    );
     hint(member, admin);
     install_current_policy(member);
     std::thread::sleep(Duration::from_millis(1500));
@@ -289,27 +448,40 @@ fn a_held_step_wakes_the_host_when_its_turn_comes() {
     let (woke, wakes) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         while arachne_runtime::wait_for_work(member).unwrap_or(false) {
-            if woke.send(()).is_err() { break; }
+            if woke.send(()).is_err() {
+                break;
+            }
         }
     });
     // Take the first step; the second stays held.
     let staged = loop {
         call(admin, json!({"op":"poll_admission"}));
         let value = call(member, json!({"op":"poll_admission"}));
-        if value["state"] == "awaiting_save" { break value; }
+        if value["state"] == "awaiting_save" {
+            break value;
+        }
         std::thread::sleep(Duration::from_millis(10));
     };
     std::thread::sleep(Duration::from_millis(200));
     while wakes.try_recv().is_ok() {}
-    call(member, json!({"op":"adopt_admission","candidate":staged["candidate"]}));
+    call(
+        member,
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+    );
     // Nothing new arrives; only landing the epoch can wake the host now.
     let woken = wakes.recv_timeout(Duration::from_secs(1));
     let held = call(member, json!({"op":"poll_admission"}));
     for handle in [admin, member, late, later] {
         close(handle).unwrap();
     }
-    assert_eq!(held["state"], "awaiting_save", "the held step was not ready: {held}");
-    assert!(woken.is_ok(), "the held step became ready but the host was not woken");
+    assert_eq!(
+        held["state"], "awaiting_save",
+        "the held step was not ready: {held}"
+    );
+    assert!(
+        woken.is_ok(),
+        "the held step became ready but the host was not woken"
+    );
 }
 
 /// A member that missed several steps must catch up from the next head it
@@ -320,23 +492,49 @@ fn a_held_step_wakes_the_host_when_its_turn_comes() {
 fn a_member_that_missed_steps_catches_up_from_the_next_head() {
     let admin = node(130);
     let member = node(131);
-    call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));
+    call(
+        admin,
+        json!({"op":"create_workspace","display_name":"Coordinator"}),
+    );
     call(admin, json!({"op":"install_workspace_policy","revision":1}));
     let invite = issue_invitation(admin);
-    let begin = |handle: i64, name: &str| call(handle, json!({"op":"begin_join","invitation":invite["invitation"],
-        "checkpoint":invite["checkpoint"],"display_name":name}));
+    let begin = |handle: i64, name: &str| {
+        call(
+            handle,
+            json!({"op":"begin_join","invitation":invite["invitation"],
+        "checkpoint":invite["checkpoint"],"display_name":name}),
+        )
+    };
     let admit = |joiner: &Value| {
-        let staged = call(admin, json!({"op":"stage_admission","authenticated_endpoint":joiner["endpoint"],
-            "request":joiner["admission_request"]}));
-        let adopted = call(admin, json!({"op":"adopt_admission","candidate":staged["candidate"]}));
-        call(admin, json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}));
-        call(admin, json!({"op":"retained_admission","authenticated_endpoint":joiner["endpoint"],
-            "request":joiner["admission_request"]}))
+        let staged = call(
+            admin,
+            json!({"op":"stage_admission","authenticated_endpoint":joiner["endpoint"],
+            "request":joiner["admission_request"]}),
+        );
+        let adopted = call(
+            admin,
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+        );
+        call(
+            admin,
+            json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}),
+        );
+        call(
+            admin,
+            json!({"op":"retained_admission","authenticated_endpoint":joiner["endpoint"],
+            "request":joiner["admission_request"]}),
+        )
     };
     let reply = admit(&begin(member, "Member"));
-    let staged = call(member, json!({"op":"stage_join","welcome":reply["welcome"],
-        "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}));
-    let joined = call(member, json!({"op":"adopt_join","candidate":staged["candidate"]}));
+    let staged = call(
+        member,
+        json!({"op":"stage_join","welcome":reply["welcome"],
+        "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}),
+    );
+    let joined = call(
+        member,
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
+    );
     hint(member, admin);
     // Three commits while the member has no overlay: it misses all three.
     for index in 0..3u8 {
@@ -346,7 +544,10 @@ fn a_member_that_missed_steps_catches_up_from_the_next_head() {
     }
     // A send waits up to 2 s for a first neighbor; let those sends give up.
     std::thread::sleep(Duration::from_millis(2500));
-    call(member, json!({"op":"install_workspace_policy","revision":joined["epoch"].as_u64().unwrap() + 1}));
+    call(
+        member,
+        json!({"op":"install_workspace_policy","revision":joined["epoch"].as_u64().unwrap() + 1}),
+    );
     std::thread::sleep(Duration::from_millis(1500));
     // One more commit. Its announcement is the only thing the member hears.
     let last = node(135);
@@ -356,7 +557,10 @@ fn a_member_that_missed_steps_catches_up_from_the_next_head() {
     let started = Instant::now();
     let mut members = joined["members"].as_u64().unwrap();
     while members < 6 {
-        assert!(started.elapsed() < Duration::from_secs(5), "the member reached {members} of 6 members");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the member reached {members} of 6 members"
+        );
         // The author serves the range pull when its host drains controls.
         call(admin, json!({"op":"poll_admission"}));
         let staged = call(member, json!({"op":"poll_admission"}));
@@ -364,9 +568,15 @@ fn a_member_that_missed_steps_catches_up_from_the_next_head() {
             std::thread::sleep(Duration::from_millis(10));
             continue;
         }
-        let adopted = call(member, json!({"op":"adopt_admission","candidate":staged["candidate"]}));
+        let adopted = call(
+            member,
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+        );
         members = adopted["members"].as_u64().unwrap();
-        call(member, json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}));
+        call(
+            member,
+            json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}),
+        );
     }
     // One announcement and one exchange carried all four missing steps.
     let counts = call(member, json!({"op":"workspace_metrics"}))["membership_gossip"].clone();
@@ -376,7 +586,10 @@ fn a_member_that_missed_steps_catches_up_from_the_next_head() {
     // behind it can pull from it instead of the owner.
     let deadline = Instant::now() + Duration::from_secs(3);
     while call(member, json!({"op":"workspace_metrics"}))["membership_gossip"]["sent"] != 1 {
-        assert!(Instant::now() < deadline, "the member did not announce the head it reached");
+        assert!(
+            Instant::now() < deadline,
+            "the member did not announce the head it reached"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     for handle in [admin, member] {
@@ -391,21 +604,44 @@ fn a_member_that_missed_steps_catches_up_from_the_next_head() {
 fn presence_of_a_newer_epoch_starts_the_range_pull() {
     let admin = node(140);
     let member = node(141);
-    call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));
+    call(
+        admin,
+        json!({"op":"create_workspace","display_name":"Coordinator"}),
+    );
     let invite = issue_invitation(admin);
-    let begin = |handle: i64, name: &str| call(handle, json!({"op":"begin_join","invitation":invite["invitation"],
-        "checkpoint":invite["checkpoint"],"display_name":name}));
+    let begin = |handle: i64, name: &str| {
+        call(
+            handle,
+            json!({"op":"begin_join","invitation":invite["invitation"],
+        "checkpoint":invite["checkpoint"],"display_name":name}),
+        )
+    };
     let admit = |joiner: &Value| {
-        let staged = call(admin, json!({"op":"stage_admission","authenticated_endpoint":joiner["endpoint"],
-            "request":joiner["admission_request"]}));
-        call(admin, json!({"op":"adopt_admission","candidate":staged["candidate"]}));
-        call(admin, json!({"op":"retained_admission","authenticated_endpoint":joiner["endpoint"],
-            "request":joiner["admission_request"]}))
+        let staged = call(
+            admin,
+            json!({"op":"stage_admission","authenticated_endpoint":joiner["endpoint"],
+            "request":joiner["admission_request"]}),
+        );
+        call(
+            admin,
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+        );
+        call(
+            admin,
+            json!({"op":"retained_admission","authenticated_endpoint":joiner["endpoint"],
+            "request":joiner["admission_request"]}),
+        )
     };
     let reply = admit(&begin(member, "Member"));
-    let staged = call(member, json!({"op":"stage_join","welcome":reply["welcome"],
-        "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}));
-    let joined = call(member, json!({"op":"adopt_join","candidate":staged["candidate"]}));
+    let staged = call(
+        member,
+        json!({"op":"stage_join","welcome":reply["welcome"],
+        "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}),
+    );
+    let joined = call(
+        member,
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
+    );
     hint(member, admin);
     for index in 0..3u8 {
         let handle = node(142 + index);
@@ -416,19 +652,31 @@ fn presence_of_a_newer_epoch_starts_the_range_pull() {
     let started = Instant::now();
     let mut members = joined["members"].as_u64().unwrap();
     while members < 5 {
-        assert!(started.elapsed() < Duration::from_secs(5), "the member reached {members} of 5 members");
-        call(member, json!({"op":"poll_workspace_presence","announce":false}));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the member reached {members} of 5 members"
+        );
+        call(
+            member,
+            json!({"op":"poll_workspace_presence","announce":false}),
+        );
         call(admin, json!({"op":"poll_admission"}));
         let staged = call(member, json!({"op":"poll_admission"}));
         if staged["state"] != "awaiting_save" {
             std::thread::sleep(Duration::from_millis(10));
             continue;
         }
-        let adopted = call(member, json!({"op":"adopt_admission","candidate":staged["candidate"]}));
+        let adopted = call(
+            member,
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+        );
         members = adopted["members"].as_u64().unwrap();
     }
     let counts = call(member, json!({"op":"workspace_metrics"}))["membership_gossip"].clone();
-    assert_eq!(counts["received"], 0, "no gossip reached the member: {counts}");
+    assert_eq!(
+        counts["received"], 0,
+        "no gossip reached the member: {counts}"
+    );
     assert_eq!(counts["range_pulled"], 1, "{counts}");
     for handle in [admin, member] {
         close(handle).unwrap();
@@ -443,33 +691,61 @@ fn presence_of_a_newer_epoch_starts_the_range_pull() {
 fn a_peer_that_is_behind_is_reported_as_behind_not_as_a_conflict() {
     let admin = node(150);
     let member = node(151);
-    call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));
+    call(
+        admin,
+        json!({"op":"create_workspace","display_name":"Coordinator"}),
+    );
     let invite = issue_invitation(admin);
-    let begin = |handle: i64, name: &str| call(handle, json!({"op":"begin_join","invitation":invite["invitation"],
-        "checkpoint":invite["checkpoint"],"display_name":name}));
+    let begin = |handle: i64, name: &str| {
+        call(
+            handle,
+            json!({"op":"begin_join","invitation":invite["invitation"],
+        "checkpoint":invite["checkpoint"],"display_name":name}),
+        )
+    };
     let admit = |joiner: &Value| {
-        let staged = call(admin, json!({"op":"stage_admission","authenticated_endpoint":joiner["endpoint"],
-            "request":joiner["admission_request"]}));
-        call(admin, json!({"op":"adopt_admission","candidate":staged["candidate"]}));
-        call(admin, json!({"op":"retained_admission","authenticated_endpoint":joiner["endpoint"],
-            "request":joiner["admission_request"]}))
+        let staged = call(
+            admin,
+            json!({"op":"stage_admission","authenticated_endpoint":joiner["endpoint"],
+            "request":joiner["admission_request"]}),
+        );
+        call(
+            admin,
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+        );
+        call(
+            admin,
+            json!({"op":"retained_admission","authenticated_endpoint":joiner["endpoint"],
+            "request":joiner["admission_request"]}),
+        )
     };
     let reply = admit(&begin(member, "Member"));
-    let staged = call(member, json!({"op":"stage_join","welcome":reply["welcome"],
-        "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}));
-    call(member, json!({"op":"adopt_join","candidate":staged["candidate"]}));
+    let staged = call(
+        member,
+        json!({"op":"stage_join","welcome":reply["welcome"],
+        "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}),
+    );
+    call(
+        member,
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
+    );
     hint(admin, member);
     let later = node(152);
     admit(&begin(later, "Later"));
     close(later).unwrap();
 
     let peer: Value = serde_json::from_str(&describe(member).unwrap()).unwrap();
-    call(admin, json!({"op":"fetch_membership_update","peer":peer["endpoint_key"]}));
+    call(
+        admin,
+        json!({"op":"fetch_membership_update","peer":peer["endpoint_key"]}),
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     let result = loop {
         call(member, json!({"op":"poll_admission"}));
         let result = call(admin, json!({"op":"poll_membership_update"}));
-        if !result.is_null() { break result; }
+        if !result.is_null() {
+            break result;
+        }
         assert!(Instant::now() < deadline, "the query never completed");
         std::thread::sleep(Duration::from_millis(10));
     };
@@ -486,23 +762,49 @@ fn a_peer_that_is_behind_is_reported_as_behind_not_as_a_conflict() {
 fn a_range_pull_is_answered_while_the_owner_host_never_polls() {
     let admin = node(160);
     let member = node(161);
-    call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));
+    call(
+        admin,
+        json!({"op":"create_workspace","display_name":"Coordinator"}),
+    );
     call(admin, json!({"op":"install_workspace_policy","revision":1}));
     let invite = issue_invitation(admin);
-    let begin = |handle: i64, name: &str| call(handle, json!({"op":"begin_join","invitation":invite["invitation"],
-        "checkpoint":invite["checkpoint"],"display_name":name}));
+    let begin = |handle: i64, name: &str| {
+        call(
+            handle,
+            json!({"op":"begin_join","invitation":invite["invitation"],
+        "checkpoint":invite["checkpoint"],"display_name":name}),
+        )
+    };
     let admit = |joiner: &Value| {
-        let staged = call(admin, json!({"op":"stage_admission","authenticated_endpoint":joiner["endpoint"],
-            "request":joiner["admission_request"]}));
-        let adopted = call(admin, json!({"op":"adopt_admission","candidate":staged["candidate"]}));
-        call(admin, json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}));
-        call(admin, json!({"op":"retained_admission","authenticated_endpoint":joiner["endpoint"],
-            "request":joiner["admission_request"]}))
+        let staged = call(
+            admin,
+            json!({"op":"stage_admission","authenticated_endpoint":joiner["endpoint"],
+            "request":joiner["admission_request"]}),
+        );
+        let adopted = call(
+            admin,
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+        );
+        call(
+            admin,
+            json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}),
+        );
+        call(
+            admin,
+            json!({"op":"retained_admission","authenticated_endpoint":joiner["endpoint"],
+            "request":joiner["admission_request"]}),
+        )
     };
     let reply = admit(&begin(member, "Member"));
-    let staged = call(member, json!({"op":"stage_join","welcome":reply["welcome"],
-        "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}));
-    let joined = call(member, json!({"op":"adopt_join","candidate":staged["candidate"]}));
+    let staged = call(
+        member,
+        json!({"op":"stage_join","welcome":reply["welcome"],
+        "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}),
+    );
+    let joined = call(
+        member,
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
+    );
     hint(member, admin);
     // Three commits while the member has no overlay: it misses all three.
     for index in 0..3u8 {
@@ -512,7 +814,10 @@ fn a_range_pull_is_answered_while_the_owner_host_never_polls() {
     }
     // A send waits up to 2 s for a first neighbor; let those sends give up.
     std::thread::sleep(Duration::from_millis(2500));
-    call(member, json!({"op":"install_workspace_policy","revision":joined["epoch"].as_u64().unwrap() + 1}));
+    call(
+        member,
+        json!({"op":"install_workspace_policy","revision":joined["epoch"].as_u64().unwrap() + 1}),
+    );
     std::thread::sleep(Duration::from_millis(1500));
     // One more commit. Its announcement is the only thing the member hears.
     let last = node(165);
@@ -522,15 +827,24 @@ fn a_range_pull_is_answered_while_the_owner_host_never_polls() {
     let started = Instant::now();
     let mut members = joined["members"].as_u64().unwrap();
     while members < 6 {
-        assert!(started.elapsed() < Duration::from_secs(5), "the member reached {members} of 6 members");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the member reached {members} of 6 members"
+        );
         let staged = call(member, json!({"op":"poll_admission"}));
         if staged["state"] != "awaiting_save" {
             std::thread::sleep(Duration::from_millis(10));
             continue;
         }
-        let adopted = call(member, json!({"op":"adopt_admission","candidate":staged["candidate"]}));
+        let adopted = call(
+            member,
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+        );
         members = adopted["members"].as_u64().unwrap();
-        call(member, json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}));
+        call(
+            member,
+            json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}),
+        );
     }
     // One announcement and one exchange carried all four missing steps.
     let counts = call(member, json!({"op":"workspace_metrics"}))["membership_gossip"].clone();
@@ -547,27 +861,56 @@ fn a_range_pull_is_answered_while_the_owner_host_never_polls() {
 fn a_member_catches_up_after_a_large_admission_wave() {
     let admin = node(170);
     let member = node(171);
-    call(admin, json!({"op":"create_workspace","display_name":"Coordinator"}));
+    call(
+        admin,
+        json!({"op":"create_workspace","display_name":"Coordinator"}),
+    );
     // Every node is record-backed now (see `node`).
     call(admin, json!({"op":"install_workspace_policy","revision":1}));
     let invite = issue_invitation(admin);
-    let begin = |handle: i64, name: &str| call(handle, json!({"op":"begin_join","invitation":invite["invitation"],
-        "checkpoint":invite["checkpoint"],"display_name":name}));
+    let begin = |handle: i64, name: &str| {
+        call(
+            handle,
+            json!({"op":"begin_join","invitation":invite["invitation"],
+        "checkpoint":invite["checkpoint"],"display_name":name}),
+        )
+    };
     let admit = |joiner: &Value| {
-        let staged = call(admin, json!({"op":"stage_admission","authenticated_endpoint":joiner["endpoint"],
-            "request":joiner["admission_request"]}));
-        let adopted = call(admin, json!({"op":"adopt_admission","candidate":staged["candidate"]}));
-        call(admin, json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}));
-        call(admin, json!({"op":"retained_admission","authenticated_endpoint":joiner["endpoint"],
-            "request":joiner["admission_request"]}))
+        let staged = call(
+            admin,
+            json!({"op":"stage_admission","authenticated_endpoint":joiner["endpoint"],
+            "request":joiner["admission_request"]}),
+        );
+        let adopted = call(
+            admin,
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+        );
+        call(
+            admin,
+            json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}),
+        );
+        call(
+            admin,
+            json!({"op":"retained_admission","authenticated_endpoint":joiner["endpoint"],
+            "request":joiner["admission_request"]}),
+        )
     };
     let pending = begin(member, "Member");
     let reply = admit(&pending);
-    let staged = call(member, json!({"op":"stage_join","welcome":reply["welcome"],
-        "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}));
-    let joined = call(member, json!({"op":"adopt_join","candidate":staged["candidate"]}));
+    let staged = call(
+        member,
+        json!({"op":"stage_join","welcome":reply["welcome"],
+        "commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]}),
+    );
+    let joined = call(
+        member,
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
+    );
     hint(member, admin);
-    call(member, json!({"op":"install_workspace_policy","revision":joined["epoch"].as_u64().unwrap() + 1}));
+    call(
+        member,
+        json!({"op":"install_workspace_policy","revision":joined["epoch"].as_u64().unwrap() + 1}),
+    );
     std::thread::sleep(Duration::from_millis(1500));
 
     for index in 0..80u8 {
@@ -577,14 +920,20 @@ fn a_member_catches_up_after_a_large_admission_wave() {
     }
 
     let peer: Value = serde_json::from_str(&describe(admin).unwrap()).unwrap();
-    call(member, json!({"op":"fetch_membership_update","peer":peer["endpoint_key"]}));
+    call(
+        member,
+        json!({"op":"fetch_membership_update","peer":peer["endpoint_key"]}),
+    );
     let query_deadline = Instant::now() + Duration::from_secs(10);
     let query = loop {
         let query = call(member, json!({"op":"poll_membership_update"}));
         if !query.is_null() {
             break query;
         }
-        assert!(Instant::now() < query_deadline, "membership query did not complete");
+        assert!(
+            Instant::now() < query_deadline,
+            "membership query did not complete"
+        );
         std::thread::sleep(Duration::from_millis(10));
     };
     assert_eq!(query["state"], "membership_update_available");
@@ -592,20 +941,31 @@ fn a_member_catches_up_after_a_large_admission_wave() {
     let mut members = joined["members"].as_u64().unwrap();
     while members < 82 {
         let staged = call(member, json!({"op":"poll_admission"}));
-        assert!(Instant::now() < deadline,
+        assert!(
+            Instant::now() < deadline,
             "catch-up stopped at {members} members; last={staged}; metrics={}",
-            call(member, json!({"op":"workspace_metrics"})));
+            call(member, json!({"op":"workspace_metrics"}))
+        );
         if staged["state"] != "awaiting_save" {
             std::thread::sleep(Duration::from_millis(10));
             continue;
         }
-        let adopted = call(member, json!({"op":"adopt_admission","candidate":staged["candidate"]}));
+        let adopted = call(
+            member,
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+        );
         members = adopted["members"].as_u64().unwrap();
-        call(member, json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}));
+        call(
+            member,
+            json!({"op":"install_workspace_policy","revision":adopted["epoch"].as_u64().unwrap() + 1}),
+        );
     }
     assert_eq!(members, 82);
     let counts = call(member, json!({"op":"workspace_metrics"}))["membership_gossip"].clone();
-    assert_eq!(counts["rejected"], 0, "catch-up rejected a membership step: {counts}");
+    assert_eq!(
+        counts["rejected"], 0,
+        "catch-up rejected a membership step: {counts}"
+    );
     assert!(
         counts["range_pulled"].as_u64().unwrap() >= 3,
         "80 missed steps should require at least three range pages: {counts}"

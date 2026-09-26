@@ -6,7 +6,7 @@
 //! covered here.
 
 use arachne_runtime::{
-    Client, ClientConfig, ApiError, FreshnessAnchor, MemoryProvider, Network, StorageConfig,
+    ApiError, Client, ClientConfig, FreshnessAnchor, MemoryProvider, Network, StorageConfig,
 };
 use base64::Engine;
 

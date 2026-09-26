@@ -1,5 +1,5 @@
 use arachne_api::{
-    API_VERSION, ApiError, Capabilities, Limits, EndpointId, ErrorCode, Event, Feature, Network,
+    API_VERSION, ApiError, Capabilities, EndpointId, ErrorCode, Event, Feature, Limits, Network,
     PublicationId, TopicName, WorkspaceId,
 };
 use serde_json::json;
@@ -119,7 +119,10 @@ fn limits_round_trip_and_default_above_the_old_cap() {
 
 #[test]
 fn new_event_wire_names_are_stable() {
-    assert_eq!(serde_json::to_value(Event::Control).unwrap(), json!({"kind": "control"}));
+    assert_eq!(
+        serde_json::to_value(Event::Control).unwrap(),
+        json!({"kind": "control"})
+    );
     assert_eq!(
         serde_json::to_value(Event::PublicationReceived).unwrap(),
         json!({"kind": "publication_received"})
@@ -129,7 +132,13 @@ fn new_event_wire_names_are_stable() {
 #[test]
 fn power_profile_wire_names_are_stable() {
     use arachne_api::PowerProfile;
-    assert_eq!(serde_json::to_value(PowerProfile::Low).unwrap(), json!("low"));
-    assert_eq!(serde_json::to_value(PowerProfile::Normal).unwrap(), json!("normal"));
+    assert_eq!(
+        serde_json::to_value(PowerProfile::Low).unwrap(),
+        json!("low")
+    );
+    assert_eq!(
+        serde_json::to_value(PowerProfile::Normal).unwrap(),
+        json!("normal")
+    );
     assert_eq!(PowerProfile::default(), PowerProfile::Normal);
 }

@@ -56,7 +56,9 @@ impl Presence {
 
     /// A request ended and a presence round has its answer.
     pub(crate) fn has_result(&self) -> bool {
-        self.pending.iter().any(|request| request.task.is_finished())
+        self.pending
+            .iter()
+            .any(|request| request.task.is_finished())
     }
 
     pub(super) fn announce_next(&mut self) {
@@ -76,7 +78,11 @@ fn base_packet(
     bytes.extend(owner.id());
     bytes.extend(owner.epoch().to_be_bytes());
     bytes.extend(owner.epoch_fingerprint());
-    bytes.extend(owner.workspace_name_head().map_err(security(ErrorCode::Internal))?);
+    bytes.extend(
+        owner
+            .workspace_name_head()
+            .map_err(security(ErrorCode::Internal))?,
+    );
     Ok(bytes)
 }
 
@@ -96,7 +102,10 @@ pub fn harness_presence_packet(
 }
 
 fn packet(session: &mut Session, peer: [u8; 32], announce: bool) -> Result<Vec<u8>, ApiError> {
-    let owner = session.workspace.as_ref().ok_or_else(|| ApiError::wrong_state("no workspace"))?;
+    let owner = session
+        .workspace
+        .as_ref()
+        .ok_or_else(|| ApiError::wrong_state("no workspace"))?;
     let recipient = owner
         .member_id_for_endpoint(peer)
         .map_err(security(ErrorCode::NotMember))?;
@@ -148,7 +157,10 @@ fn packet(session: &mut Session, peer: [u8; 32], announce: bool) -> Result<Vec<u
 }
 
 fn observe(session: &mut Session, peer: [u8; 32], bytes: &[u8]) -> Result<bool, ApiError> {
-    let owner = session.workspace.as_ref().ok_or_else(|| ApiError::wrong_state("no workspace"))?;
+    let owner = session
+        .workspace
+        .as_ref()
+        .ok_or_else(|| ApiError::wrong_state("no workspace"))?;
     if bytes.len() < 127
         || !bytes.starts_with(PREFIX)
         || bytes[5] > 1
@@ -176,9 +188,7 @@ fn observe(session: &mut Session, peer: [u8; 32], bytes: &[u8]) -> Result<bool, 
                 .unwrap(),
         ) as usize;
         cursor = end;
-        let end = cursor
-            .checked_add(length)
-            .ok_or_else(invalid_presence)?;
+        let end = cursor.checked_add(length).ok_or_else(invalid_presence)?;
         heads.push(
             arachne_delivery::wire::DirectHead::from_wire(
                 bytes.get(cursor..end).ok_or_else(invalid_presence)?,
@@ -283,10 +293,15 @@ pub(super) fn fresh_for(age: Duration) -> Duration {
 /// observation directly to start reconciliation; the host's display refresh
 /// must not be the membership trigger.
 fn reconcile_seen(session: &mut Session) -> Result<Option<[u8; 32]>, ApiError> {
-    let owner = session.workspace.as_ref().ok_or_else(|| ApiError::wrong_state("no workspace"))?;
+    let owner = session
+        .workspace
+        .as_ref()
+        .ok_or_else(|| ApiError::wrong_state("no workspace"))?;
     let epoch = owner.epoch();
     let fingerprint = owner.epoch_fingerprint();
-    let name_head = owner.workspace_name_head().map_err(security(ErrorCode::Internal))?;
+    let name_head = owner
+        .workspace_name_head()
+        .map_err(security(ErrorCode::Internal))?;
     let now = Instant::now();
     let ahead: Vec<(u64, [u8; 32])> = session
         .presence
@@ -320,7 +335,10 @@ fn reconcile_seen(session: &mut Session) -> Result<Option<[u8; 32]>, ApiError> {
 }
 
 pub(super) fn poll(session: &mut Session, announce: bool) -> Result<PresenceReply, ApiError> {
-    let owner = session.workspace.as_ref().ok_or_else(|| ApiError::wrong_state("no workspace"))?;
+    let owner = session
+        .workspace
+        .as_ref()
+        .ok_or_else(|| ApiError::wrong_state("no workspace"))?;
     let epoch = owner.epoch();
     let peers: BTreeSet<_> = owner
         .member_endpoints()

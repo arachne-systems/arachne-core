@@ -1,6 +1,6 @@
 //! Immediate local interests and bounded, serialized remote announcements.
-use crate::*;
 use crate::ops::policy::InterestQueued;
+use crate::*;
 use arachne_api::ApiError;
 use std::time::Instant;
 
@@ -42,7 +42,9 @@ pub(super) struct Updates {
 impl Updates {
     /// An announcement ended and `poll` has its result.
     pub fn has_result(&self) -> bool {
-        self.pending.as_ref().is_some_and(|job| job.task.is_finished())
+        self.pending
+            .as_ref()
+            .is_some_and(|job| job.task.is_finished())
     }
 
     /// Work waits for `poll` to start it: a queued change, a repair after a

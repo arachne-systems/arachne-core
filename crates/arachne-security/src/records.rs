@@ -81,9 +81,21 @@ impl Workspace {
     }
 
     fn export_record_set(&self, retained: bool) -> Result<SecurityRecords, &'static str> {
-        let admissions = if retained { self.admissions.as_slice() } else { &[] };
-        let history = if retained { self.join_history.as_ref() } else { None };
-        let checkpoints = if retained { self.invitation_checkpoints.as_slice() } else { &[] };
+        let admissions = if retained {
+            self.admissions.as_slice()
+        } else {
+            &[]
+        };
+        let history = if retained {
+            self.join_history.as_ref()
+        } else {
+            None
+        };
+        let checkpoints = if retained {
+            self.invitation_checkpoints.as_slice()
+        } else {
+            &[]
+        };
         let mut records = SecurityRecords::new();
         let provider = self
             .provider
@@ -158,10 +170,7 @@ impl Workspace {
         if version != VERSION && version.starts_with(b"DFWR") {
             return Err(super::step::FORMAT_NOT_SUPPORTED);
         }
-        if version != VERSION
-            || take(&mut meta, 32)? != id
-            || take(&mut meta, 32)? != endpoint
-        {
+        if version != VERSION || take(&mut meta, 32)? != id || take(&mut meta, 32)? != endpoint {
             return Err("security record scope mismatch");
         }
         let epoch = u64::from_be_bytes(take(&mut meta, 8)?.try_into().unwrap());
