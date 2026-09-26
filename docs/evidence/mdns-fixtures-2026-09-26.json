@@ -1,0 +1,17 @@
+[
+  {
+    "exit": 0,
+    "seconds": 16.268,
+    "log": "/tmp/core-mdns-isolation-green-1.log"
+  },
+  {
+    "exit": 0,
+    "seconds": 16.321,
+    "log": "/tmp/core-mdns-isolation-green-2.log"
+  },
+  {
+    "exit": 0,
+    "seconds": 16.278,
+    "log": "/tmp/core-mdns-isolation-green-3.log"
+  }
+]

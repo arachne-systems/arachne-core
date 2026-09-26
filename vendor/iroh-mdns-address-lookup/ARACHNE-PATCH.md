@@ -16,6 +16,11 @@ Crates.io archive SHA-256:
 - `src/lib.rs`: replace `entry.or_insert(peer_info)` with
   `entry.insert_entry(peer_info)`. The actor already detects changed peer
   information. It must replace the occupied cache entry, too.
+- `src/lib.rs` test fixtures use fresh random peer identities. The upstream
+  fixtures all used seed zero, so parallel Cargo tests confused another
+  test's advertisement with their own peer. A shared test mutex enforces the
+  upstream isolation rule under Cargo as well as nextest. Concurrent binds
+  otherwise lose discovery messages. Test assertions stay unchanged.
 - `Cargo.toml`: rename the package to `arachne-iroh-mdns-address-lookup` and
   set version `0.5.0-arachne.1`. The Rust import name stays unchanged.
 - `README.md`: add the fork notice. Add this patch record.
