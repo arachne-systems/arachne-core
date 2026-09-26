@@ -10,15 +10,16 @@
 //!
 //! This is a pure data structure. Snapshots are opaque sealed bytes made by
 //! the caller. It does not open them, verify steps, or talk to peers.
-use super::{ForkKey, MAX_SEALED_BUNDLE};
+use super::ForkKey;
 use std::collections::VecDeque;
 
 /// Epochs a node can go back. A fork deeper than this makes the node orphaned.
 pub const ROLLBACK_EPOCHS: u64 = 64;
 /// Upper bound for all retained snapshot bytes together.
 pub const MAX_ROLLBACK_BYTES: usize = 16 * 1024 * 1024;
-/// Upper bound for one sealed snapshot: a sealed workspace bundle.
-pub const MAX_BRANCH_SNAPSHOT: usize = MAX_SEALED_BUNDLE;
+/// One snapshot may use the full rollback budget. Native storage splits
+/// large values into bounded records. Large rosters retain fewer epochs.
+pub const MAX_BRANCH_SNAPSHOT: usize = MAX_ROLLBACK_BYTES;
 
 const MAGIC: &[u8; 4] = b"DFBR";
 const VERSION: u8 = 1;
@@ -255,9 +256,10 @@ impl BranchState {
         bytes
     }
 
-    /// The record split for a store with a per-record bound (1 MiB): a small
-    /// header (`DFBM`) and one record per snapshot. One snapshot is at most
-    /// `MAX_BRANCH_SNAPSHOT`, so each part fits one record.
+    /// A small header (`DFBM`) and one logical record per snapshot.
+    /// One snapshot is at most
+    /// `MAX_BRANCH_SNAPSHOT`. The encrypted store may split a logical
+    /// snapshot into several physical records in one transaction.
     pub fn meta_record(&self) -> Vec<u8> {
         let mut bytes = META_MAGIC.to_vec();
         bytes.extend(self.first_unsettled.to_be_bytes());
@@ -287,10 +289,7 @@ impl BranchState {
         }
         let header = take(&mut rest, 8 + 1 + 2)?;
         let count = u16::from_be_bytes(header[9..11].try_into().unwrap()) as usize;
-        if count > ROLLBACK_EPOCHS as usize
-            || rest.len() != count * 8
-            || snapshots.len() != count
-        {
+        if count > ROLLBACK_EPOCHS as usize || rest.len() != count * 8 || snapshots.len() != count {
             return Err("branch snapshots do not match the branch record");
         }
         let mut bytes = MAGIC.to_vec();
@@ -465,7 +464,7 @@ mod tests {
 
     #[test]
     fn byte_bound_evicts_oldest_first_and_settles_them() {
-        let size = MAX_BRANCH_SNAPSHOT;
+        let size = 1024 * 1024;
         let fits = MAX_ROLLBACK_BYTES / size;
         assert!(
             fits < ROLLBACK_EPOCHS as usize,
@@ -483,6 +482,20 @@ mod tests {
         assert_eq!(state.first_unsettled(), epochs[0]);
         assert_eq!(state.retained_bytes(), fits * size);
         assert_eq!(state.snapshot(29).unwrap()[0], 29 | 1);
+    }
+
+    #[test]
+    fn multi_megabyte_snapshots_keep_a_short_byte_limited_window() {
+        // The 2,049-member provider is about 3.1 MiB. Use a 4 MiB
+        // fixture to include record metadata and assert the total budget.
+        let size = 4 * 1024 * 1024;
+        let mut state = BranchState::new(0);
+        for epoch in 0..8 {
+            state.retain(epoch, vec![1; size]).unwrap();
+            assert!(state.retained_bytes() <= MAX_ROLLBACK_BYTES);
+        }
+        assert_eq!(state.retained_epochs(), vec![4, 5, 6, 7]);
+        assert_eq!(state.first_unsettled(), 4);
     }
 
     #[test]
@@ -634,7 +647,12 @@ mod tests {
         let mut gapped = BranchState::new(3);
         gapped.retain(3, sealed(3, 7)).unwrap();
         gapped.retain(9, sealed(9, 300)).unwrap();
-        for state in [BranchState::new(5), filled(0..=70), gapped.clone(), filled(1..=3).orphaned()] {
+        for state in [
+            BranchState::new(5),
+            filled(0..=70),
+            gapped.clone(),
+            filled(1..=3).orphaned(),
+        ] {
             let meta = state.meta_record();
             assert!(meta.len() <= 5 + 11 + 64 * 8);
             let parts: Vec<_> = state.snapshots().map(|(e, s)| (e, s.to_vec())).collect();
