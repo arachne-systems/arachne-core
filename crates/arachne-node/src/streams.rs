@@ -9,7 +9,7 @@ use std::{
 };
 
 use arachne_routing::RoutingTable;
-use futures_util::{StreamExt, stream::FuturesUnordered};
+use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use iroh::{EndpointAddr, PublicKey, endpoint::Connection};
 use iroh_moq::{Moq, MoqSession};
 use moq_net::{Timestamp, broadcast, group, track};
@@ -320,6 +320,8 @@ impl Streams {
                 Ok(()) if used_moq => {
                     report.queued = true;
                     self.0.counters.packets_sent.fetch_add(1, Ordering::Relaxed);
+                    let publisher_hop = routes.get(&peer).map(|route| route.moq.origin().hop().id());
+                    tracing::info!(target: "data_fabric_transport", peer = %hex(&peer), workspace = %hex(&frame.workspace), revision = frame.revision, sequence, ?publisher_hop, route = "moq", "PTT_MOQ_PACKET_ENQUEUED");
                 }
                 Ok(()) => report.admitted.push(peer),
                 Err(error) => report.failed.push((peer, error)),
@@ -498,6 +500,7 @@ async fn run_peer(
             session.close(moq_net::Error::Cancel);
             continue;
         }
+        tracing::info!(target: "data_fabric_transport", peer = %hex(&peer), connection = session.conn().stable_id(), dialed = session.dialed(), version = ?session.session().version(), route = "moq", "PTT_MOQ_SESSION_SELECTED");
         let receive = async {
             announce_interest(&connections, &routing, local, peer, scope, &topic).await?;
             receive_session(
@@ -515,6 +518,7 @@ async fn run_peer(
                 next = incoming.next() => match next {
                     Some(next) if next.conn().stable_id() == session.conn().stable_id() => continue,
                     Some(next) => {
+                        tracing::info!(target: "data_fabric_transport", peer = %hex(&peer), previous_connection = session.conn().stable_id(), selected_connection = next.conn().stable_id(), dialed = next.dialed(), route = "moq", "PTT_MOQ_SESSION_REPLACED");
                         selected = Some(next);
                         break;
                     }
@@ -522,7 +526,7 @@ async fn run_peer(
                 },
                 result = &mut receive => {
                     if let Err(error) = result {
-                        tracing::info!(target: "data_fabric_transport", peer = %session.remote_id(), route = "moq", ?error, "PTT_MOQ_SESSION_CLOSED");
+                        tracing::info!(target: "data_fabric_transport", peer = %hex(&peer), connection = session.conn().stable_id(), route = "moq", ?error, "PTT_MOQ_SESSION_CLOSED");
                     }
                     session.close(moq_net::Error::Cancel);
                     break;
@@ -589,6 +593,16 @@ async fn receive_session(
         .await
         .map_err(|_| Error::Timeout("subscribe MoQ broadcast"))?
         .map_err(transport)?;
+    // Observe only an already available announcement. Diagnostics must not
+    // add a wait or change which transport the receive loop selects. The first
+    // hop names this publisher incarnation; a missing/zero hop is unknown.
+    let publisher_hop = session
+        .announced()
+        .routed(path.as_str())
+        .now_or_never()
+        .flatten()
+        .and_then(|route| route.hops.iter().next().map(|hop| hop.id()))
+        .filter(|hop| *hop != 0);
     let track = broadcast.track(topic.as_str()).map_err(transport)?;
     // Lite05 encodes start 0 as omitted, which starts at the latest group even
     // with max_age set. Protected sequences start at 1: request that floor and
@@ -606,7 +620,7 @@ async fn receive_session(
         counters.sessions_active.fetch_add(1, Ordering::Relaxed);
     }
     let _active = ActiveSession(counters.upgrade());
-    tracing::info!(target: "data_fabric_transport", peer = %session.remote_id(), workspace = %hex(&scope.workspace), revision = scope.revision, topic = topic.as_str(), route = "moq", "PTT_MOQ_SESSION_ESTABLISHED");
+    tracing::info!(target: "data_fabric_transport", peer = %hex(&peer), connection = session.conn().stable_id(), ?publisher_hop, workspace = %hex(&scope.workspace), revision = scope.revision, topic = topic.as_str(), route = "moq", "PTT_MOQ_SESSION_ESTABLISHED");
     let closed = session.closed();
     tokio::pin!(closed);
     let mut pending = FuturesUnordered::new();
@@ -650,7 +664,7 @@ async fn receive_session(
         if let Some(counters) = counters.upgrade() {
             counters.packets_received.fetch_add(1, Ordering::Relaxed);
         }
-        tracing::info!(target: "data_fabric_transport", peer = %session.remote_id(), sequence, route = "moq", "PTT_MOQ_PACKET_RECEIVED");
+        tracing::info!(target: "data_fabric_transport", peer = %hex(&peer), connection = session.conn().stable_id(), ?publisher_hop, sequence, route = "moq", "PTT_MOQ_PACKET_RECEIVED");
     }
 }
 
