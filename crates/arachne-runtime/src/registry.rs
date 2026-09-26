@@ -520,7 +520,10 @@ mod tests {
                 },
             )
         });
-        assert_eq!(foreground.unwrap_err().code(), ErrorCode::DeadlineExceeded);
+        assert_eq!(
+            foreground.unwrap_err().code(),
+            arachne_api::ErrorCode::DeadlineExceeded
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
         let (mut background, held) = background.unwrap();
         let early = runtime.block_on(async {
