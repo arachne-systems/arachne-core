@@ -20,8 +20,8 @@ use tokio::{
 };
 
 use super::{
-    DeliveryClass, DeliveryQueue, Error, PeerId, Result, RoutingTable, Topic, WorkspaceId, apply,
-    wire,
+    DeliveryClass, DeliveryQueue, Error, PeerId, Result, RoutingTable, Topic, WorkspaceId,
+    apply_gossip, wire,
 };
 
 /// One gossip protocol name for every workspace: the ALPN is visible in the
@@ -397,7 +397,7 @@ impl Overlay {
                             delivery: envelope.delivery,
                             operation: super::Operation::Publish(envelope.payload),
                         };
-                        if let Err(error) = apply(
+                        if let Err(error) = apply_gossip(
                             &routing,
                             &events,
                             local,

@@ -263,6 +263,8 @@ struct DeliveryState {
     critical: VecDeque<Message>,
     current: BTreeMap<CurrentKey, Message>,
     bulk: VecDeque<Message>,
+    // ponytail: one bounded window; durable replay needs persisted history and an application receipt protocol.
+    deferred: VecDeque<Message>,
     critical_run: u8,
     bulk_turn: bool,
 }
@@ -276,42 +278,100 @@ struct DeliveryQueue {
 }
 
 impl DeliveryQueue {
-    fn push(&self, message: Message) -> Result<()> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(Error::Backpressure);
-        }
-        let mut state = self.state.lock().unwrap();
+    fn current_key(message: &Message, replacement_key: [u8; 32]) -> CurrentKey {
+        (
+            message.workspace,
+            message.revision,
+            message.topic.as_str().into(),
+            message.sender,
+            replacement_key,
+            message.recipients.clone(),
+        )
+    }
+
+    fn push_inner(state: &mut DeliveryState, message: Message) -> std::result::Result<(), Message> {
         match message.delivery {
             DeliveryClass::Critical if state.critical.len() < CRITICAL_QUEUE => {
                 state.critical.push_back(message)
             }
             DeliveryClass::Current { replacement_key } => {
-                let key = (
-                    message.workspace,
-                    message.revision,
-                    message.topic.as_str().into(),
-                    message.sender,
-                    replacement_key,
-                    message.recipients.clone(),
-                );
+                let key = Self::current_key(&message, replacement_key);
                 if state.current.len() == CURRENT_QUEUE && !state.current.contains_key(&key) {
-                    return Err(Error::Backpressure);
+                    return Err(message);
                 }
                 state.current.insert(key, message);
             }
             DeliveryClass::Bulk if state.bulk.len() < BULK_QUEUE => state.bulk.push_back(message),
-            _ => return Err(Error::Backpressure),
+            _ => return Err(message),
         }
-        drop(state);
+        Ok(())
+    }
+
+    fn defer_replayable(
+        state: &mut DeliveryState,
+        message: Message,
+    ) -> std::result::Result<(), Message> {
+        if let DeliveryClass::Current { replacement_key } = message.delivery {
+            let key = Self::current_key(&message, replacement_key);
+            if let Some(deferred) = state.deferred.iter_mut().find(|candidate| {
+                let DeliveryClass::Current { replacement_key } = candidate.delivery else {
+                    return false;
+                };
+                Self::current_key(candidate, replacement_key) == key
+            }) {
+                *deferred = message;
+                return Ok(());
+            }
+        }
+        if state.deferred.len() >= CRITICAL_QUEUE {
+            return Err(message);
+        }
+        state.deferred.push_back(message);
+        Ok(())
+    }
+
+    fn notify(&self) {
         self.changed.notify_one();
         if let Some(work) = &self.work {
             work.notify_one();
         }
+    }
+
+    fn push(&self, message: Message) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::Backpressure);
+        }
+        let mut state = self.state.lock().unwrap();
+        Self::push_inner(&mut state, message).map_err(|_| Error::Backpressure)?;
+        drop(state);
+        self.notify();
+        Ok(())
+    }
+
+    fn push_replayable(&self, message: Message) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::Backpressure);
+        }
+        let mut state = self.state.lock().unwrap();
+        if let Err(message) = Self::push_inner(&mut state, message) {
+            Self::defer_replayable(&mut state, message).map_err(|_| Error::Backpressure)?;
+        }
+        drop(state);
+        self.notify();
         Ok(())
     }
 
     fn pop(&self) -> Option<Message> {
         let mut state = self.state.lock().unwrap();
+        let mut remaining = state.deferred.len();
+        while remaining > 0 {
+            let message = state.deferred.pop_front()?;
+            match Self::push_inner(&mut state, message) {
+                Ok(()) => {}
+                Err(message) => state.deferred.push_back(message),
+            }
+            remaining -= 1;
+        }
         if state.critical_run < 8
             && let Some(message) = state.critical.pop_front()
         {
@@ -352,7 +412,10 @@ impl MessageReceiver {
     /// Snapshot of all delivery classes, without consuming the next message.
     pub fn is_empty(&self) -> bool {
         let state = self.queue.state.lock().unwrap();
-        state.critical.is_empty() && state.current.is_empty() && state.bulk.is_empty()
+        state.critical.is_empty()
+            && state.current.is_empty()
+            && state.bulk.is_empty()
+            && state.deferred.is_empty()
     }
 
     pub fn try_recv(&mut self) -> std::result::Result<Message, mpsc::error::TryRecvError> {
@@ -458,7 +521,8 @@ impl Node {
     pub fn transport_metrics(&self) -> TransportMetrics {
         let mut metrics = self.connections.metrics();
         let queue = self.events.state.lock().unwrap();
-        metrics.receive_queue = queue.critical.len() + queue.current.len() + queue.bulk.len();
+        metrics.receive_queue =
+            queue.critical.len() + queue.current.len() + queue.bulk.len() + queue.deferred.len();
         metrics
     }
 
@@ -1855,6 +1919,29 @@ async fn apply(
     received_from: PeerId,
     frame: Frame,
 ) -> Result<()> {
+    apply_inner(routing, events, local, sender, received_from, frame, false).await
+}
+
+pub(crate) async fn apply_gossip(
+    routing: &Mutex<RoutingTable>,
+    events: &DeliveryQueue,
+    local: PeerId,
+    sender: PeerId,
+    received_from: PeerId,
+    frame: Frame,
+) -> Result<()> {
+    apply_inner(routing, events, local, sender, received_from, frame, true).await
+}
+
+async fn apply_inner(
+    routing: &Mutex<RoutingTable>,
+    events: &DeliveryQueue,
+    local: PeerId,
+    sender: PeerId,
+    received_from: PeerId,
+    frame: Frame,
+    replayable: bool,
+) -> Result<()> {
     let topic = Topic::new(frame.topic)?;
     let delivery = frame.delivery;
     let mut routing = routing.lock().await;
@@ -1873,7 +1960,7 @@ async fn apply(
             if !recipients.contains(&local) {
                 return Err(Error::Rejected);
             }
-            events.push(Message {
+            let message = Message {
                 workspace: frame.workspace,
                 revision: frame.revision,
                 sender,
@@ -1882,7 +1969,12 @@ async fn apply(
                 payload,
                 recipients: Vec::new(),
                 delivery,
-            })?;
+            };
+            if replayable {
+                events.push_replayable(message)?;
+            } else {
+                events.push(message)?;
+            }
         }
         Operation::DirectPublish {
             payload,
@@ -1905,7 +1997,7 @@ async fn apply(
             if recipient_endpoints != [local] {
                 return Err(Error::Rejected);
             }
-            events.push(Message {
+            let message = Message {
                 workspace: frame.workspace,
                 revision: frame.revision,
                 sender,
@@ -1914,7 +2006,12 @@ async fn apply(
                 payload,
                 recipients,
                 delivery,
-            })?;
+            };
+            if replayable {
+                events.push_replayable(message)?;
+            } else {
+                events.push(message)?;
+            }
         }
     }
     Ok(())
@@ -2072,4 +2169,72 @@ fn tor_close_drain_is_not_the_tor_operation_deadline() {
     assert_eq!(tor.operation, Duration::from_secs(300));
     assert_eq!(tor.close_drain, CLOSE_DRAIN);
     assert_ne!(tor.close_drain, tor.operation);
+}
+
+#[test]
+fn replayable_current_delivery_survives_full_queue() {
+    let queue = DeliveryQueue::default();
+    let topic = Topic::new("atak/pli").unwrap();
+    for key in 0..CURRENT_QUEUE as u8 {
+        queue
+            .push(Message {
+                workspace: [1; 32],
+                revision: 1,
+                sender: [2; 32],
+                received_from: [2; 32],
+                topic: topic.clone(),
+                payload: vec![key],
+                recipients: Vec::new(),
+                delivery: DeliveryClass::Current {
+                    replacement_key: [key; 32],
+                },
+            })
+            .unwrap();
+    }
+    let target = Message {
+        workspace: [1; 32],
+        revision: 1,
+        sender: [3; 32],
+        received_from: [3; 32],
+        topic,
+        payload: vec![255],
+        recipients: Vec::new(),
+        delivery: DeliveryClass::Current {
+            replacement_key: [255; 32],
+        },
+    };
+    queue.push_replayable(target.clone()).unwrap();
+    assert!((0..=CURRENT_QUEUE).any(|_| queue.pop().as_ref() == Some(&target)));
+}
+
+#[test]
+fn replayable_bulk_delivery_survives_full_queue() {
+    let queue = DeliveryQueue::default();
+    let topic = Topic::new("chat/messages").unwrap();
+    for sequence in 0..BULK_QUEUE as u8 {
+        queue
+            .push(Message {
+                workspace: [1; 32],
+                revision: 1,
+                sender: [2; 32],
+                received_from: [2; 32],
+                topic: topic.clone(),
+                payload: vec![sequence],
+                recipients: Vec::new(),
+                delivery: DeliveryClass::Bulk,
+            })
+            .unwrap();
+    }
+    let target = Message {
+        workspace: [1; 32],
+        revision: 1,
+        sender: [3; 32],
+        received_from: [3; 32],
+        topic,
+        payload: vec![255],
+        recipients: Vec::new(),
+        delivery: DeliveryClass::Bulk,
+    };
+    queue.push_replayable(target.clone()).unwrap();
+    assert!((0..=BULK_QUEUE).any(|_| queue.pop().as_ref() == Some(&target)));
 }
