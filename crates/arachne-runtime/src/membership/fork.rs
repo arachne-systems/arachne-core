@@ -5,6 +5,7 @@ use arachne_security::{
     BranchDecision, BranchState, MembershipAuthorization, OrderStep, PreparedManagementUpdate,
     SecurityRecords, Workspace,
 };
+use std::collections::BTreeMap;
 use zeroize::Zeroizing;
 
 pub(crate) const PREFIX: &[u8] = b"runtime/branch/";
@@ -20,10 +21,33 @@ struct BranchCandidate {
     orders: Vec<OrderStep>,
 }
 
+#[derive(Clone)]
+struct EpochView {
+    fingerprint: [u8; 32],
+    members: Vec<[u8; 32]>,
+}
+
+impl EpochView {
+    fn of(owner: &Workspace) -> Result<Self, ApiError> {
+        Ok(Self {
+            fingerprint: owner.epoch_fingerprint(),
+            members: owner
+                .member_roster()
+                .map_err(security(ErrorCode::StorageCorrupt))?
+                .iter()
+                .map(|member| member.id)
+                .collect(),
+        })
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct ForkState {
     pub(crate) retained: Option<BranchState>,
     carried: Vec<OrderStep>,
+    observed: BTreeMap<[u8; 32], (u64, [u8; 32])>,
+    views: BTreeMap<u64, EpochView>,
+    settlement_pending: bool,
     candidate: Option<BranchCandidate>,
     query: Option<PendingControl<wire::BranchQuery>>,
     pull: Option<PendingControl<wire::RangeQuery>>,
@@ -31,9 +55,11 @@ pub(crate) struct ForkState {
 
 impl ForkState {
     pub(crate) fn has_result(&self) -> bool {
-        self.query
-            .as_ref()
-            .is_some_and(|job| job.task.is_finished())
+        self.settlement_pending
+            || self
+                .query
+                .as_ref()
+                .is_some_and(|job| job.task.is_finished())
             || self.pull.as_ref().is_some_and(|job| job.task.is_finished())
     }
     pub(crate) fn is_running(&self) -> bool {
@@ -113,6 +139,21 @@ pub(crate) fn adopt_candidate(session: &mut Session, token: &[u8]) -> Result<(),
     }
     session.membership.fork.retained = Some(candidate.branch);
     session.membership.fork.carried = candidate.orders;
+    let fork = &mut session.membership.fork;
+    fork.views.retain(|epoch, _| {
+        fork.retained
+            .as_ref()
+            .is_some_and(|branch| branch.snapshot(*epoch).is_some())
+    });
+    if let Some(staged) = &session.transition.staged {
+        let roster = staged
+            .workspace
+            .member_roster()
+            .map_err(security(ErrorCode::StorageCorrupt))?;
+        fork.observed
+            .retain(|member, _| roster.iter().any(|row| row.id == *member));
+    }
+    fork.settlement_pending = true;
     Ok(())
 }
 
@@ -212,6 +253,7 @@ pub(crate) fn restore(session: &mut Session, records: &SecurityRecords) -> Resul
         BranchState::from_parts(meta, &snapshots).map_err(security(ErrorCode::StorageCorrupt))?;
     session.membership.fork.retained = Some(branch);
     session.membership.fork.carried = orders;
+    session.membership.fork.settlement_pending = true;
     Ok(())
 }
 
@@ -260,6 +302,92 @@ pub(crate) fn has_carried_work(session: &Session) -> bool {
             .iter()
             .any(|order| !(order.order.kind.removes() && order.order.target == id))
     })
+}
+
+/// The caller has verified the member's signed head or authenticated its
+/// control reply. A report is counted only after its fingerprint matches
+/// locally accepted state at the same epoch.
+pub(crate) fn observe(session: &mut Session, member: [u8; 32], epoch: u64, fingerprint: [u8; 32]) {
+    let fork = &mut session.membership.fork;
+    if fork.observed.get(&member) != Some(&(epoch, fingerprint)) {
+        fork.observed.insert(member, (epoch, fingerprint));
+        fork.settlement_pending = true;
+    }
+}
+
+pub(crate) fn stage_settlement(session: &mut Session) -> Result<Option<Value>, ApiError> {
+    if !session.membership.fork.settlement_pending
+        || session.transition.staged.is_some()
+        || session.transition.removal.is_some()
+    {
+        return Ok(None);
+    }
+    session.membership.fork.settlement_pending = false;
+    let Some(owner) = &session.workspace else {
+        return Ok(None);
+    };
+    let Some(mut branch) = session.membership.fork.retained.clone() else {
+        return Ok(None);
+    };
+    if branch.is_orphaned() {
+        return Ok(None);
+    }
+    let key = session
+        .storage_key
+        .as_ref()
+        .ok_or_else(errors::no_root_key)?;
+    let current = EpochView::of(owner)?;
+    let own = owner.member().ok_or_else(errors::no_workspace)?.id();
+    let views = &mut session.membership.fork.views;
+    let mut at = |epoch: u64| -> Result<Option<EpochView>, ApiError> {
+        if epoch == owner.epoch() {
+            return Ok(Some(current.clone()));
+        }
+        if let Some(view) = views.get(&epoch) {
+            return Ok(Some(view.clone()));
+        }
+        let Some(snapshot) = branch.snapshot(epoch) else {
+            return Ok(None);
+        };
+        let snapshot =
+            Workspace::restore_branch_snapshot(key, owner.endpoint(), owner.id(), snapshot)
+                .map_err(security(ErrorCode::StorageCorrupt))?;
+        if snapshot.epoch() != epoch {
+            return Err(ApiError::storage_corrupt(
+                "branch snapshot has the wrong epoch",
+            ));
+        }
+        let view = EpochView::of(&snapshot)?;
+        views.insert(epoch, view.clone());
+        Ok(Some(view))
+    };
+    let mut reports = vec![(own, owner.epoch())];
+    for (member, (epoch, fingerprint)) in &session.membership.fork.observed {
+        if let Some(view) = at(*epoch)?
+            && view.fingerprint == *fingerprint
+            && view.members.contains(member)
+        {
+            reports.push((*member, *epoch));
+        }
+    }
+    let mut rosters = Vec::new();
+    for epoch in branch.retained_epochs() {
+        if let Some(view) = at(epoch)? {
+            rosters.push((epoch, view.members))
+        }
+    }
+    let before = branch.first_unsettled();
+    for (epoch, members) in rosters {
+        branch.settle_reported(epoch, &members, &reports);
+    }
+    if branch.first_unsettled() == before {
+        return Ok(None);
+    }
+    let orders = session.membership.fork.carried.clone();
+    let mut value = stage_orders(session, orders, "branch_settlement_staged")?;
+    value["first_unsettled"] = json!(branch.first_unsettled());
+    session.membership.fork.candidate.as_mut().unwrap().branch = branch;
+    Ok(Some(value))
 }
 
 /// Compare one conflicting step at its parent epoch. The remote class is

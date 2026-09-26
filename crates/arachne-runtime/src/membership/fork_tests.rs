@@ -411,3 +411,111 @@ fn a_winner_carries_a_verified_losing_remove_without_switching() {
     fork::require_send(&session).unwrap();
     assert_eq!(owner(&session).member_count(), 3);
 }
+
+#[test]
+fn settlement_needs_every_prior_member_on_the_same_next_chain() {
+    let (admin, mut members, _) = admit_members(7, "Observer", 1);
+    let observer = members.remove(0);
+    let observer_id = observer.member().unwrap().id();
+    let epoch = admin.epoch();
+    let mut session = bare_test_session(admin);
+    session.storage_key = Some(StorageKey::derive(&[87; 32]).unwrap());
+    stage_management(
+        &mut session,
+        ManagementAction::CreateInvitation([88; 32], 0, false),
+    )
+    .unwrap();
+    adopt_staged(&mut session);
+    assert!(
+        session
+            .membership
+            .fork
+            .retained
+            .as_ref()
+            .unwrap()
+            .snapshot(epoch)
+            .is_some()
+    );
+    fork::observe(
+        &mut session,
+        observer_id,
+        epoch,
+        observer.epoch_fingerprint(),
+    );
+    assert!(
+        fork::stage_settlement(&mut session).unwrap().is_none(),
+        "a report at E does not settle E"
+    );
+    fork::observe(&mut session, observer_id, epoch + 1, [0; 32]);
+    assert!(
+        fork::stage_settlement(&mut session).unwrap().is_none(),
+        "another branch cannot settle this one"
+    );
+    let fingerprint = owner(&session).epoch_fingerprint();
+    fork::observe(&mut session, observer_id, epoch + 1, fingerprint);
+    assert!(
+        fork::stage_settlement(&mut session).unwrap().is_some(),
+        "every old member reached E+1: stage deletion"
+    );
+    assert!(
+        session
+            .membership
+            .fork
+            .retained
+            .as_ref()
+            .unwrap()
+            .snapshot(epoch)
+            .is_some(),
+        "deletion waits for durable adoption"
+    );
+    adopt_staged(&mut session);
+    assert!(
+        session
+            .membership
+            .fork
+            .retained
+            .as_ref()
+            .unwrap()
+            .snapshot(epoch)
+            .is_none()
+    );
+    let records = fork::records(&session, false).unwrap();
+    let mut restored = bare_test_session(owner(&session).provisional_copy().unwrap());
+    restored.storage_key = Some(StorageKey::derive(&[87; 32]).unwrap());
+    fork::restore(&mut restored, &records).unwrap();
+    assert!(
+        restored
+            .membership
+            .fork
+            .retained
+            .as_ref()
+            .unwrap()
+            .snapshot(epoch)
+            .is_none()
+    );
+}
+
+#[test]
+fn removal_epoch_waits_for_the_window_when_the_removed_member_cannot_report() {
+    let (admin, members, _) = admit_members(8, "Member", 2);
+    let removed = members[0].member().unwrap().id();
+    let survivor = members[1].member().unwrap().id();
+    let epoch = admin.epoch();
+    let mut session = bare_test_session(admin);
+    session.storage_key = Some(StorageKey::derive(&[88; 32]).unwrap());
+    stage_management(&mut session, ManagementAction::Remove(removed)).unwrap();
+    adopt_staged(&mut session);
+    let fingerprint = owner(&session).epoch_fingerprint();
+    fork::observe(&mut session, survivor, epoch + 1, fingerprint);
+    assert!(fork::stage_settlement(&mut session).unwrap().is_none());
+    assert!(
+        session
+            .membership
+            .fork
+            .retained
+            .as_ref()
+            .unwrap()
+            .snapshot(epoch)
+            .is_some()
+    );
+}

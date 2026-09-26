@@ -1288,6 +1288,10 @@ fn poll_with_budget(
                     if state == "membership_branch_mismatch" { fork::start(session, pending.peer); }
                     return Ok(result);
                 }
+                let member = owner.member_id_for_endpoint(pending.peer).map_err(security(ErrorCode::NotMember))?;
+                let epoch = owner.epoch();
+                let fingerprint = owner.epoch_fingerprint();
+                fork::observe(session, member, epoch, fingerprint);
             }
             if let Some(profiles) = value.get("profiles") {
                 let profiles: Vec<Vec<u8>> = serde_json::from_value(profiles.clone())
@@ -2421,17 +2425,19 @@ pub(super) fn stage_gossiped_step(session: &mut Session) -> Result<Option<Value>
             let signed = payload.len() - 64;
             let signature = payload[signed..].try_into().unwrap();
             let owner = session.workspace.as_ref().unwrap();
-            if owner.verify_announcement(author, &payload[..signed], &signature).is_err() { continue }
-            let fingerprint = &payload[at + 40..at + 72];
+            let Ok(member) = owner.verify_announcement(author, &payload[..signed], &signature) else { continue };
+            let fingerprint: [u8; 32] = payload[at + 40..at + 72].try_into().unwrap();
             if head == owner.epoch() && fingerprint != owner.epoch_fingerprint() {
                 fork::start(session, author);
             }
+            fork::observe(session, member, head, fingerprint);
             note_head(session, head, author);
             continue;
         }
     }
     if let Some(staged) = fork::poll(session)? { return Ok(Some(staged)) }
     if let Some(staged) = fork::stage_carried(session)? { return Ok(Some(staged)) }
+    if let Some(staged) = fork::stage_settlement(session)? { return Ok(Some(staged)) }
     finish_range_pull(session);
     finish_profile_pull(session);
     session
