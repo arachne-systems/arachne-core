@@ -5,9 +5,10 @@
 ## BLUF
 
 H1, H2, H3, H4 and H6 are merged locally on `integrate/wave1`. H7 source
-`0d37ba9` passes 724 tests, zero failed and 22 ignored across 120 executables.
-All strict gates pass. H5 host SDK `2183cb3` uses the same Core source; Android
-artifacts keep their earlier qualified pin. H8 and consumer upgrade gates need
+`6c70a6d` passes 726 tests, zero failed and 22 ignored across 120 executables.
+All strict gates pass. H5 SDK `7057bd6` passes fresh Rust and Python checks on
+this Core source; other language and Android proofs keep their earlier pins.
+Both completed H7 targets were cleaned. H8 and consumer upgrade gates need
 owner decisions.
 The [work tracker](../2026-09-24-work-tracker.md) separates implementation
 evidence from these open gates.
@@ -35,9 +36,9 @@ Nothing is pushed. All branches are local.
 | [H2](H2-a5-storage.md) | Native storage, opaque candidates, physical parts, branch records | `codex/night-h2-storage` | `840c25a` merged as `0d5e071`; old-data upgrade is a release gate | — |
 | [H3](H3-test-speed.md) | Optimize dependencies in test builds | `a6619db` | merged as `688946b`; same-source before/after measurements are in `docs/development.md` | — |
 | [H4](H4-core-ffi-api.md) | Core-owned typed API and UniFFI metadata | `codex/night-h2-storage` | `91ce5b1` merged as `e420a52`; dispatcher caller migration remains open | H2 |
-| [H5](H5-sdk-completion.md) | Generated bindings and Android packaging | SDK `codex/night-h5-refresh` | Host `2183cb3` on Core `0d37ba9`: 15 files match fresh generation and four languages pass. Preserved Android `853bacd` / Core `05434f86` was not rebuilt. MoQ is opt-in; default AAR excludes it. SDK-line/ATAK decisions open | H1, H2, H4 |
+| [H5](H5-sdk-completion.md) | Generated bindings and Android packaging | SDK `codex/night-h5-refresh` | Final `7057bd6` / Core `6c70a6d`: fresh Rust, examples and Python pass; 15 generated hashes unchanged. Four-language proof stays `2183cb3` / Core `0d37ba9`. Android `853bacd` / Core `05434f86` was not rebuilt. MoQ is opt-in; default AAR excludes it. SDK-line/ATAK decisions open | H1, H2, H4 |
 | [H6](H6-crypto-dependency-bumps.md) | SHA-2 0.11, HKDF/HMAC 0.13 and SFrame check | `codex/night-h6-crypto` | `fc06673` merged as `ad31b97`; MSRV, deny and corrected full suite green | H1, H2 |
-| [H7](H7-final-integration.md) | Integrated qualification, cleanup and merge summary | `codex/night-h7-integration` | final `0d37ba9`: 724/0/22 and all strict gates green; prior REDs and 706/0/21, 710/0/21 remain separate. First target cleaned; current 7.8 GiB target held until the lead's 08:30 decision | all |
+| [H7](H7-final-integration.md) | Integrated qualification, cleanup and merge summary | `codex/night-h7-integration` | final `6c70a6d`: 726/0/22 and all strict gates green; prior REDs and 706/0/21, 710/0/21, 724/0/22 remain separate. First 12.0 GiB and final 7.9 GiB targets cleaned; current target absent | all |
 | [H8](H8-owner-decisions.md) | Owner decisions and outward actions | — | open | — |
 
 ## Rules every agent must follow

@@ -2,13 +2,14 @@
 
 ## BLUF
 
-Core H1, H2, H3, H4 and H6 are merged locally. Final H7 source `0d37ba9`
-passes 724 tests, with zero failures and 22 ignored across 120 executables.
+Core H1, H2, H3, H4 and H6 are merged locally. Final H7 source `6c70a6d`
+passes 726 tests, with zero failures and 22 ignored across 120 executables.
 Strict Clippy, Rust 1.91 workspace/default-feature compilation, dependency
-policy and formatting also pass. H5 host checks use the same Core source.
-The first 12.0 GiB cache was removed; the current 7.8 GiB target stays warm
-until the lead's 08:30 CDT decision. No branch has been pushed or published.
-Existing tablet data is not yet qualified for the new storage format.
+policy and formatting also pass. H5 SDK `7057bd6` passes fresh Rust and Python
+checks on the same Core source. Other consumer proofs keep their prior pins.
+The first 12.0 GiB and final 7.9 GiB caches were removed. This lane's target
+is absent. No branch has been pushed or published. Existing tablet data is
+not yet qualified for the new storage format.
 
 ## What changed
 
@@ -46,21 +47,28 @@ Existing tablet data is not yet qualified for the new storage format.
 The [H7 report](../evidence/h7-night-2026-09-26.md) keeps the initial integrated
 RED, unchanged repetitions, fixes, final checks and their source revisions.
 The [tracker](2026-09-24-work-tracker.md) links each earlier package's proof.
-H5's SDK checkpoint `2183cb3` passes four host language flows on Core `0d37ba9`.
-All 15 generated files match fresh generation. Rust examples, default tests and
-three opt-in MoQ metrics tests also pass. Its `moq` feature forwards to Core.
-The preserved AAR, R8 and test APK use SDK `853bacd` / Core `05434f86`; this
-refresh did not rebuild them. The default AAR excludes streaming support.
-The selected mobile package still needs matching bindings, native code and
-existing-data upgrade checks.
+H5's final SDK checkpoint `7057bd6` passes fresh default Rust tests (4),
+opt-in metrics tests (3), four examples, Python smoke (12), flow (35) and
+storage/management on Core `6c70a6d`. All 15 generated hashes are unchanged.
+The MoQ metrics tests do not exchange a stream. SDK `2183cb3` / Core `0d37ba9`
+retains the prior four-language proof; Kotlin, Swift and Go were not rerun at
+the final pin. The AAR, R8 and test APK remain SDK `853bacd` / Core `05434f86`
+and were not rebuilt. MoQ is opt-in; the default AAR excludes it. The selected
+mobile package still needs matching bindings, native code and existing-data
+upgrade checks.
 
-The final qualified implementation is `0d37ba9d73385278aa7baf34a3d831d991a0686e`.
-Its uninterrupted full run has 724 passed, zero failed and 22 ignored across
+The final qualified implementation is `6c70a6d465ee0e8746ee407600c845ad3aa08893`.
+Its uninterrupted full run has 726 passed, zero failed and 22 ignored across
 120 executables. Strict Clippy, Rust 1.91 workspace/default-feature compilation,
-dependency policy, format and 63 local documentation links pass. The group-read
-fix has separate RED evidence and 40 unchanged focused repeat passes.
+dependency policy, format and local documentation links pass. The group-read
+fix keeps its separate RED evidence and 40 focused repeat passes. The admitted
+MoQ peer now clears its own stale reachability delay after authorization; its
+positive RED/GREEN and rejected-peer control also pass in the full suite.
+The [Android UDP comparison](2026-09-26-android-gso-diagnostic.md) is separate
+device evidence. Host tests do not execute the Android-only setting.
 
 The report keeps the earlier 687/2/21 and 701/1/21 failed runs, first qualified
-706/0/21 on `05434f86`, and deadline follow-up 710/0/21 on `2b568922` separate.
-The new ignored case is a subprocess helper. A host proof does not close the
-current tablet stall, selected mobile package, old-data upgrade or ATAK gates.
+706/0/21 on `05434f86`, deadline follow-up 710/0/21 on `2b568922`, and stream
+follow-up 724/0/22 on `0d37ba9` separate. The additional ignored stream case
+is a subprocess helper. A host proof does not close the device, selected
+mobile package, old-data upgrade or ATAK gates.

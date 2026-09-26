@@ -7,10 +7,11 @@ test is red → green and the crate tests pass.
 
 H1, H2, H3, H4 and H6 are merged locally on `integrate/wave1`. Core has API
 version 6, native storage, opaque candidates, generated binding metadata and
-bounded fork recovery. H7 source `0d37ba9` passes 724 tests, zero failed and
-22 ignored across 120 executables. All strict gates pass. H5 host SDK `2183cb3`
-uses the same Core source. The preserved Android artifacts use an older pin.
-Owner decisions and unproved consumer upgrades stay open.
+bounded fork recovery. H7 source `6c70a6d` passes 726 tests, zero failed and
+22 ignored across 120 executables. All strict gates pass. H5 SDK `7057bd6`
+passes fresh Rust and Python checks on the same Core source. Other language
+and Android proofs retain their prior pins. Both completed H7 targets were
+cleaned. Owner decisions and unproved consumer upgrades stay open.
 
 ## Integration evidence (2026-09-26)
 
@@ -20,14 +21,15 @@ Owner decisions and unproved consumer upgrades stay open.
 | H2 | `840c25a`; merge `0d5e071` | [Native storage report](../evidence/h2-night-2026-09-26.md) |
 | H3 | `a6619db`; merge `688946b` | [Measured test profile](handoff/H3-test-speed.md) |
 | H4 | `91ce5b1`; merge `e420a52` | [Core binding report](../evidence/h4-night-2026-09-26.md) |
-| H5 (SDK) | Host SDK `2183cb3`, Core `0d37ba9`; preserved Android SDK `853bacd`, Core `05434f86` | Fifteen generated files match fresh generation; four host language flows, Rust and opt-in metrics tests passed. Android artifacts were not rebuilt. MoQ is opt-in; the default AAR excludes it. Device/ATAK gates remain |
+| H5 (SDK) | Final SDK `7057bd6`, Core `6c70a6d`; prior four-language SDK `2183cb3`, Core `0d37ba9`; Android SDK `853bacd`, Core `05434f86` | Fresh Rust, examples, Python and opt-in metrics checks pass at the final pin; all 15 generated hashes are unchanged. Kotlin/Swift/Go and Android were not rebuilt at this pin. MoQ is opt-in; the default AAR excludes it. Device/ATAK gates remain |
 | H6 | `fc06673`; merge `ad31b97` | [Crypto report](../evidence/h6-night-2026-09-26.md): 681 passed, 0 failed, 20 ignored; MSRV and deny green |
 | Typed publication options | `db57185`; merge `05434f8` | [Audience, Bulk and Current proof](2026-09-26-typed-publication-options.md); included in H7 |
-| H7 | Final `0d37ba9`; earlier `05434f86` and `2b568922` | [Report](../evidence/h7-night-2026-09-26.md): final uninterrupted 724/0/22 across 120 executables; strict Clippy, Rust 1.91/default features, deny, format and 63 local links pass. Earlier 706/0/21 and 710/0/21 stay separate. First 12.0 GiB target cleaned; current 7.8 GiB target held until the lead's 08:30 decision |
+| H7 | Final `6c70a6d`; prior `0d37ba9`, `05434f86` and `2b568922` | [Report](../evidence/h7-night-2026-09-26.md): final uninterrupted 726/0/22 across 120 executables; strict Clippy, Rust 1.91/default features, deny, format and local links pass. Earlier 724/0/22, 706/0/21 and 710/0/21 stay separate. First 12.0 GiB and final 7.9 GiB targets cleaned; current target absent |
 
 The H6 total includes 18 tests in 20 example harnesses. It is a corrected
 aggregate with the original failures and reruns retained in its receipts.
-The latest SDK report is `docs/reviews/2026-09-26-h5-deadline-refresh.md` in the SDK repo.
+The latest SDK report is `docs/reviews/2026-09-26-h5-final-transport-refresh.md` in the SDK repo.
+The prior four-language proof remains in `docs/reviews/2026-09-26-h5-deadline-refresh.md`.
 The first package report is `docs/reviews/2026-09-26-h5-sdk-completion.md`.
 
 Open gates: migrate remaining Core dispatcher callers; choose and reconcile the
@@ -62,6 +64,16 @@ and publication. The [H8 brief](handoff/H8-owner-decisions.md) owns outward acti
   payloads and missing EOF no longer block later complete groups. Eight bounded
   readers use the existing live window; close cancels them. Malformed, oversized
   and outsider checks pass. The actual tablet stall remains a separate issue.
+
+- [x] Admitted-peer reachability (`7c7c4cc`, tests/evidence `d85b134`): a fresh
+  authorized incoming MoQ session clears only that peer's stale dial delay.
+  The [RED/GREEN proof](../evidence/moq-authenticated-reachability-2026-09-26.md)
+  keeps rejected and unrelated peers' delays intact. Both regressions pass in
+  final source `6c70a6d`.
+- [x] Android individual UDP sends (`c2a5968`): the existing Android x86_64
+  no-GSO setting now applies to all Android targets. The separate
+  [device comparison](2026-09-26-android-gso-diagnostic.md) records its source
+  and limits. H7 host tests do not execute the Android-only setting.
 
 ## Fix-now bugs (core)
 

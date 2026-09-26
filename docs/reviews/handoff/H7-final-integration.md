@@ -4,12 +4,12 @@
 
 ## BLUF
 
-Final H7 source `0d37ba9` passes 724 tests, zero failed and 22 ignored across
+Final H7 source `6c70a6d` passes 726 tests, zero failed and 22 ignored across
 120 executables. Strict Clippy, Rust 1.91 workspace/default-feature compilation,
 dependency policy, format and local documentation links pass. Earlier REDs and
-qualified runs stay separate in the report. The first 12.0 GiB target was cleaned;
-the current 7.8 GiB target stays warm until the lead's 08:30 CDT decision.
-The owner decides any merge to `main` or outward action.
+qualified runs stay separate in the report. The first 12.0 GiB and final
+7.9 GiB targets were cleaned; this lane's current target is absent. The owner
+decides any merge to `main` or outward action.
 
 ## Initial integrated evidence
 
@@ -20,7 +20,8 @@ reruns passed; the first failures remain in the
 [H7 report](../../evidence/h7-night-2026-09-26.md). H1 fixed deterministic
 membership-driver starvation. A later 701/1/21 run found an admission fixture
 race, corrected in `911ecce`. Both failed runs remain separate from the final
-uninterrupted 706/0/21 run.
+uninterrupted 706/0/21 run. Later 710/0/21, 724/0/22 and final 726/0/22
+runs retain their own exact source revisions and receipts.
 
 ## Work
 
@@ -41,8 +42,11 @@ uninterrupted 706/0/21 run.
 
 - [x] Complete the later stream follow-ups and repeat full and strict qualification
   on frozen source `0d37ba9` (724/0/22).
-- [ ] Clean the new target after the lead ends the warm-cache hold and all owned
-  build/test processes have exited. The next decision is at 08:30 CDT.
+- [x] Complete the admitted-peer reachability and Android send-policy follow-up
+  qualification on frozen source `6c70a6d` (726/0/22); retain device evidence
+  separately from host tests.
+- [x] Clean the final target after the lead ended the hold and all owned
+  build/test processes exited: 14,786 files, 7.9 GiB; target absent.
 
 ## Done when
 
