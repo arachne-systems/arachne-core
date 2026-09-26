@@ -1,5 +1,11 @@
 > Written by Claude (AI).
 
+> Historical evidence. Commit `9c0fa81` already imported this report unchanged
+> from `85ae3e2`. H4 now supplies the production Core metadata; H5 generates
+> the SDK bindings. The throwaway crate and commands below remain in
+> `82060c4`, outside the current workspace. The maintained Go generator patch
+> is in the SDK. See [the migration guide](h4-core-sdk-migration.md).
+
 # Spike: UniFFI 0.31 bindings for the `arachne-api` contract (ADR A1/A4, step 7)
 
 Date: 2026-09-24. Branch: `spike/a1-uniffi`. Input: [ADR A1/A4](adr-a1-a4-sdk-contract.md),

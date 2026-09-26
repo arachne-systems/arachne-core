@@ -71,3 +71,12 @@ Use an `ours` ancestry merge for these two audited old histories. This records
 their lineage and keeps the newer integration tree. It does not publish or
 move main. A full integration suite is required after the remaining H packages
 merge; this content audit alone is not a runtime test result.
+
+## UniFFI prototype history
+
+`9c0fa81` already imported `docs/reviews/spike-a1-uniffi.md` unchanged from
+`85ae3e2`. H4 supplies the optional Core derives, typed client, ID lifting and
+Kotlin shutdown rename. H5 carries the Go discriminant generator correction
+and runs the four production language clients. An ancestry merge records
+`spike/a1-uniffi`; it does not restore the throwaway client crate. The report
+now identifies the old reproduction commands as historical evidence.
