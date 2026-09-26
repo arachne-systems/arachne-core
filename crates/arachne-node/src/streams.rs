@@ -23,13 +23,15 @@ use crate::{
 const SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Counters for the distinct MoQ data path. A queued packet is not a remote receipt.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct MoqMetrics {
     pub sessions_total: u64,
     pub sessions_active: usize,
     pub packets_sent: u64,
     pub packets_received: u64,
     pub rejected_sessions: u64,
+    pub interest_sync_pending: usize,
+    pub last_error: Option<String>,
 }
 
 #[derive(Default)]
@@ -39,6 +41,8 @@ struct Counters {
     packets_sent: AtomicU64,
     packets_received: AtomicU64,
     rejected_sessions: AtomicU64,
+    interest_sync_pending: AtomicUsize,
+    last_error: StdMutex<Option<String>>,
 }
 
 impl Counters {
@@ -49,6 +53,8 @@ impl Counters {
             packets_sent: self.packets_sent.load(Ordering::Relaxed),
             packets_received: self.packets_received.load(Ordering::Relaxed),
             rejected_sessions: self.rejected_sessions.load(Ordering::Relaxed),
+            interest_sync_pending: self.interest_sync_pending.load(Ordering::Relaxed),
+            last_error: self.last_error.lock().unwrap().clone(),
         }
     }
 }
@@ -500,9 +506,17 @@ async fn run_peer(
             session.close(moq_net::Error::Cancel);
             continue;
         }
-        if let Err(error) =
-            announce_interest(&connections, &routing, local, peer, scope, &topic).await
-        {
+        if let Some(counters) = counters.upgrade() {
+            counters.interest_sync_pending.fetch_add(1, Ordering::Relaxed);
+        }
+        let interest = announce_interest(&connections, &routing, local, peer, scope, &topic).await;
+        if let Some(counters) = counters.upgrade() {
+            counters.interest_sync_pending.fetch_sub(1, Ordering::Relaxed);
+        }
+        if let Err(error) = interest {
+            if let Some(counters) = counters.upgrade() {
+                *counters.last_error.lock().unwrap() = Some(format!("interest: {error}"));
+            }
             tracing::warn!(
                 target: "data_fabric_transport",
                 peer = %session.remote_id(),
@@ -524,6 +538,9 @@ async fn run_peer(
         )
         .await
         {
+            if let Some(counters) = counters.upgrade() {
+                *counters.last_error.lock().unwrap() = Some(format!("receive: {error}"));
+            }
             tracing::info!(target: "data_fabric_transport", peer = %session.remote_id(), route = "moq", ?error, "PTT_MOQ_SESSION_CLOSED");
             session.close(moq_net::Error::Cancel);
         }
