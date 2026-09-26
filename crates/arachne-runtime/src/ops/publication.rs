@@ -59,6 +59,7 @@ pub(crate) struct StagedObject {
 /// B5: a publication names the session workspace, checked before anything
 /// is staged so the session stays usable.
 pub(crate) fn check_workspace(session: &Session, workspace: Option<[u8; 32]>) -> Result<(), ApiError> {
+    crate::membership::fork::require_send(session)?;
     let owner = session
         .workspace
         .as_ref()

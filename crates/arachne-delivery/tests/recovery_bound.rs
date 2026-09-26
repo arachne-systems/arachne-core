@@ -225,14 +225,14 @@ fn full_size_history(head: u64) -> History {
             REVISION,
             BTreeMap::from([
                 (
-                    [1; 32],
+                    test_endpoint(1),
                     Permissions::Selected {
                         publish: topics.clone(),
                         subscribe: BTreeSet::new(),
                     },
                 ),
                 (
-                    [2; 32],
+                    test_endpoint(2),
                     Permissions::Selected {
                         publish: BTreeSet::new(),
                         subscribe: topics.clone(),

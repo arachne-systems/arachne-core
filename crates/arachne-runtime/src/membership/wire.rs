@@ -133,6 +133,52 @@ pub(super) fn decode_range_reply(bytes: &[u8]) -> Result<RangeReply<'_>, String>
     Ok(reply)
 }
 
+/// Bounded hints for finding the first distinct committed step. The receiver
+/// must fetch and verify a step before using its class for fork choice.
+pub(crate) const BRANCH_QUERY: &[u8] = b"DFBQ\x01";
+const BRANCH_REPLY: &[u8] = b"DFBP\x01";
+pub(crate) const MAX_BRANCH_ROWS: usize = 256;
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct BranchQuery {
+    pub workspace: [u8; 32],
+    pub from: u64,
+    pub until: u64,
+}
+#[derive(Serialize, Deserialize)]
+pub(crate) struct BranchRow {
+    pub epoch: u64,
+    pub class: u8,
+    pub digest: [u8; 32],
+}
+#[derive(Serialize, Deserialize)]
+pub(crate) struct BranchReply {
+    pub workspace: [u8; 32],
+    pub from: u64,
+    pub head: u64,
+    pub fingerprint: [u8; 32],
+    pub rows: Vec<BranchRow>,
+}
+pub(crate) fn encode_branch_query(query: &BranchQuery) -> Result<Vec<u8>, String> {
+    if query.from >= query.until { return Err("invalid branch range".into()) }
+    encode(BRANCH_QUERY, query, MAX_RANGE_QUERY)
+}
+pub(crate) fn decode_branch_query(bytes: &[u8]) -> Result<BranchQuery, String> {
+    let query: BranchQuery = decode(BRANCH_QUERY, bytes, MAX_RANGE_QUERY)?;
+    if query.from >= query.until { return Err("invalid branch range".into()) }
+    Ok(query)
+}
+pub(crate) fn encode_branch_reply(reply: &BranchReply) -> Result<Vec<u8>, String> {
+    if reply.rows.len() > MAX_BRANCH_ROWS { return Err("too many branch rows".into()) }
+    encode(BRANCH_REPLY, reply, arachne_node::MAX_CONTROL_REPLY)
+}
+pub(crate) fn decode_branch_reply(bytes: &[u8]) -> Result<BranchReply, String> {
+    let reply: BranchReply = decode(BRANCH_REPLY, bytes, arachne_node::MAX_CONTROL_REPLY)?;
+    if reply.rows.len() > MAX_BRANCH_ROWS || reply.rows.iter().enumerate().any(|(n, row)| {
+        reply.from.checked_add(n as u64) != Some(row.epoch) || row.epoch >= reply.head
+    }) { return Err("invalid branch rows".into()) }
+    Ok(reply)
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Query<'a> {
     pub workspace: [u8; 32],

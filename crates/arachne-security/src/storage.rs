@@ -183,7 +183,7 @@ impl StorageKey {
         self.protect_record(provider, magic, id, endpoint, plain)
     }
     // Callers enforce their record-family bounds before encrypting.
-    fn protect_record(
+    pub(super) fn protect_record(
         &self,
         provider: &OpenMlsRustCrypto,
         magic: &[u8; 5],
@@ -247,7 +247,7 @@ impl StorageKey {
     ) -> Result<Zeroizing<Vec<u8>>, &'static str> {
         self.unprotect_record(magic, id, endpoint, sealed, MAX_SEALED_WORKSPACE)
     }
-    fn unprotect_record(
+    pub(super) fn unprotect_record(
         &self,
         magic: &[u8; 5],
         id: [u8; 32],

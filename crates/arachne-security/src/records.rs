@@ -71,6 +71,19 @@ impl Workspace {
     /// the complete change set with associated delivery state before adoption.
     /// No transport, database or host-language representation is selected here.
     pub fn export_records(&self) -> Result<SecurityRecords, &'static str> {
+        self.export_record_set(true)
+    }
+
+    /// MLS state only. The accepted common history remains in the active
+    /// record store and is attached when a rollback snapshot is restored.
+    pub(super) fn export_branch_records(&self) -> Result<SecurityRecords, &'static str> {
+        self.export_record_set(false)
+    }
+
+    fn export_record_set(&self, retained: bool) -> Result<SecurityRecords, &'static str> {
+        let admissions = if retained { self.admissions.as_slice() } else { &[] };
+        let history = if retained { self.join_history.as_ref() } else { None };
+        let checkpoints = if retained { self.invitation_checkpoints.as_slice() } else { &[] };
         let mut records = SecurityRecords::new();
         let provider = self
             .provider
@@ -87,12 +100,12 @@ impl Workspace {
             storage::write_profile(&mut meta, member);
         }
         meta.extend((provider.len() as u64).to_be_bytes());
-        meta.extend((self.admissions.len() as u64).to_be_bytes());
-        meta.push(u8::from(self.join_history.is_some()));
+        meta.extend((admissions.len() as u64).to_be_bytes());
+        meta.push(u8::from(history.is_some()));
         for (key, value) in provider.iter() {
             records.insert(named(PROVIDER, key), Zeroizing::new(value.clone()));
         }
-        for entry in &self.admissions {
+        for entry in admissions {
             let mut bytes = Zeroizing::new(Vec::new());
             bytes.extend(entry.endpoint);
             bytes.extend(entry.issuer);
@@ -107,7 +120,7 @@ impl Workspace {
                 return Err("duplicate retained admission");
             }
         }
-        if let Some(history) = &self.join_history {
+        if let Some(history) = history {
             meta.extend((history.steps.len() as u64).to_be_bytes());
             records.insert(
                 CHECKPOINT.to_vec(),
@@ -120,8 +133,8 @@ impl Workspace {
                 );
             }
         }
-        meta.extend((self.invitation_checkpoints.len() as u64).to_be_bytes());
-        for saved in &self.invitation_checkpoints {
+        meta.extend((checkpoints.len() as u64).to_be_bytes());
+        for saved in checkpoints {
             let mut value = Zeroizing::new(saved.grant.to_vec());
             value.extend(&saved.checkpoint);
             records.insert(named(INVITATION_CHECKPOINT, &saved.grant[101..133]), value);

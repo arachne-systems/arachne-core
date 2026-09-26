@@ -137,6 +137,9 @@ impl CommittedView {
             );
             return Some(page.unwrap_or_else(|| UNAVAILABLE.to_vec()));
         }
+        if payload.starts_with(membership::wire::BRANCH_QUERY) {
+            return Some(membership::fork::reply(Some(&self.workspace), peer, payload));
+        }
         // A range pull reads committed steps only.
         if payload.starts_with(membership::wire::RANGE_QUERY) {
             return Some(membership::range_reply(

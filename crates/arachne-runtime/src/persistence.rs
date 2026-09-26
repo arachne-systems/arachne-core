@@ -562,7 +562,8 @@ pub(crate) fn commit_candidate(session: &mut Session, token: &[u8]) -> Result<()
     if store.is_committed(token) {
         return Ok(());
     }
-    let records = if let Some(staged) = &session.transition.staged {
+    membership::fork::prepare_candidate(session)?;
+    let mut records = if let Some(staged) = &session.transition.staged {
         if token != staged.snapshot {
             return Err(ApiError::candidate_stale("token does not match candidate"));
         }
@@ -591,6 +592,9 @@ pub(crate) fn commit_candidate(session: &mut Session, token: &[u8]) -> Result<()
     } else {
         return Err(ApiError::wrong_state("session has no candidate"));
     };
+    if session.transition.staged.is_some() {
+        records.extend(membership::fork::records(session, true)?);
+    }
     session
         .records
         .as_mut()
@@ -823,6 +827,7 @@ pub(crate) fn restore(
     }
     for name in &keys {
         if !name.starts_with(b"security/")
+            && !name.starts_with(membership::fork::PREFIX)
             && ![TOKEN, ENDPOINT, FORMAT, INBOX, ACTIVITY].contains(&name.as_slice())
         {
             return Err(corrupt("unknown native runtime record"));
@@ -861,6 +866,13 @@ pub(crate) fn restore(
     if !matches!(activity.phase, WorkspacePhase::Active | WorkspacePhase::Recovering) {
         return Err(corrupt("active store has invalid workspace activity"));
     }
+    let branch_records = keys.iter()
+        .filter(|name| name.starts_with(membership::fork::PREFIX))
+        .map(|name| {
+            Ok((name.clone(), get(name)?.ok_or_else(|| corrupt("missing branch record"))?))
+        })
+        .collect::<Result<SecurityRecords, ApiError>>()?;
+    membership::fork::restore(session, &branch_records)?;
     session.activity = activity;
     session.delivery.publisher = publisher;
     session.delivery.inbox = inbox;

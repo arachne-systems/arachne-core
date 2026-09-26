@@ -3,22 +3,22 @@
 //! copy of it is dropped: it is never delivered after newer objects.
 use arachne_delivery::inbox::{InboxStage, ObjectInbox};
 use arachne_routing::{PublicationContext, Topic};
-use arachne_security::{EndpointKey, EndpointSigner, PendingJoin, Workspace};
+use arachne_security::{PendingJoin, Workspace};
+mod common;
+use common::{test_endpoint, test_key};
 
 const REVISION: u64 = 1;
 /// One more than the per-scope record window (32).
 const LIVE_THROUGH: u64 = 34;
 
 fn author_and_reader() -> (Workspace, Workspace) {
-    let admin_key = EndpointKey::generate().unwrap();
-    let reader_key = EndpointKey::generate().unwrap();
-    let admin = Workspace::create(&admin_key, "Publisher").unwrap();
+    let admin = Workspace::create(test_key(1), "Publisher").unwrap();
     let (registered, invite, checkpoint) =
         admin.prepare_invitation(u64::MAX, false, false).unwrap();
     let admin = registered.workspace.provisional_copy().unwrap();
-    let join = PendingJoin::from_invitation(&invite, &checkpoint, &reader_key, "Reader").unwrap();
+    let join = PendingJoin::from_invitation(&invite, &checkpoint, test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission(reader_key.endpoint(), join.admission_request().unwrap())
+        .prepare_admission(test_endpoint(2), join.admission_request().unwrap())
         .unwrap();
     let mut proof = join.join_proof().unwrap();
     proof

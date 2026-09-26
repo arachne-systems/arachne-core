@@ -5,21 +5,21 @@
 use arachne_delivery::inbox::{AUTHOR_QUOTA_EXHAUSTED, InboxStage, ObjectInbox};
 use arachne_delivery::wire;
 use arachne_routing::{Permissions, PublicationContext, RoutingTable, Topic};
-use arachne_security::{EndpointKey, EndpointSigner, PendingJoin, Workspace};
+use arachne_security::{PendingJoin, Workspace};
 use std::collections::{BTreeMap, BTreeSet};
+mod common;
+use common::{test_endpoint, test_key};
 
 const REVISION: u64 = 1;
 
 fn author_and_reader() -> (Workspace, Workspace) {
-    let admin_key = EndpointKey::generate().unwrap();
-    let reader_key = EndpointKey::generate().unwrap();
-    let admin = Workspace::create(&admin_key, "Publisher").unwrap();
+    let admin = Workspace::create(test_key(1), "Publisher").unwrap();
     let (registered, invite, checkpoint) =
         admin.prepare_invitation(u64::MAX, false, false).unwrap();
     let admin = registered.workspace.provisional_copy().unwrap();
-    let join = PendingJoin::from_invitation(&invite, &checkpoint, &reader_key, "Reader").unwrap();
+    let join = PendingJoin::from_invitation(&invite, &checkpoint, test_key(2), "Reader").unwrap();
     let prepared = admin
-        .prepare_admission(reader_key.endpoint(), join.admission_request().unwrap())
+        .prepare_admission(test_endpoint(2), join.admission_request().unwrap())
         .unwrap();
     let mut proof = join.join_proof().unwrap();
     proof
@@ -31,22 +31,22 @@ fn author_and_reader() -> (Workspace, Workspace) {
     (author, reader)
 }
 
-fn policy(author: &Workspace, reader: &Workspace, topics: &BTreeSet<Topic>) -> RoutingTable {
+fn policy(workspace: [u8; 32], topics: &BTreeSet<Topic>) -> RoutingTable {
     let mut policy = RoutingTable::default();
     policy
         .install_verified_policy(
-            author.id(),
+            workspace,
             REVISION,
             BTreeMap::from([
                 (
-                    author.endpoint(),
+                    test_endpoint(1),
                     Permissions::Selected {
                         publish: topics.clone(),
                         subscribe: BTreeSet::new(),
                     },
                 ),
                 (
-                    reader.endpoint(),
+                    test_endpoint(2),
                     Permissions::Selected {
                         publish: BTreeSet::new(),
                         subscribe: topics.clone(),
@@ -72,7 +72,7 @@ fn setup(topics: &[&str]) -> Setup {
         .map(|topic| Topic::new(*topic).unwrap())
         .collect::<BTreeSet<_>>();
     Setup {
-        policy: policy(&author, &reader, &topics),
+        policy: policy(author.id(), &topics),
         recipients: vec![reader.member().unwrap().id()],
         author,
         reader,

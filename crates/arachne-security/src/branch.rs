@@ -22,6 +22,8 @@ pub const MAX_BRANCH_SNAPSHOT: usize = MAX_SEALED_BUNDLE;
 
 const MAGIC: &[u8; 4] = b"DFBR";
 const VERSION: u8 = 1;
+/// Header of the split record form (`meta_record`).
+const META_MAGIC: &[u8; 5] = b"DFBM\x01";
 // magic, version, first_unsettled, orphaned, count
 const HEADER: usize = 4 + 1 + 8 + 1 + 2;
 // epoch, length
@@ -251,6 +253,61 @@ impl BranchState {
             bytes.extend(sealed);
         }
         bytes
+    }
+
+    /// The record split for a store with a per-record bound (1 MiB): a small
+    /// header (`DFBM`) and one record per snapshot. One snapshot is at most
+    /// `MAX_BRANCH_SNAPSHOT`, so each part fits one record.
+    pub fn meta_record(&self) -> Vec<u8> {
+        let mut bytes = META_MAGIC.to_vec();
+        bytes.extend(self.first_unsettled.to_be_bytes());
+        bytes.push(u8::from(self.orphaned));
+        bytes.extend((self.snapshots.len() as u16).to_be_bytes());
+        for (epoch, _) in &self.snapshots {
+            bytes.extend(epoch.to_be_bytes());
+        }
+        bytes
+    }
+
+    /// The retained snapshots, lowest epoch first.
+    pub fn snapshots(&self) -> impl Iterator<Item = (u64, &[u8])> {
+        self.snapshots
+            .iter()
+            .map(|(epoch, sealed)| (*epoch, sealed.as_slice()))
+    }
+
+    /// Rebuild from `meta_record` and the snapshot records. The snapshot set
+    /// must be exactly the one the header names; every bound of `decode`
+    /// applies.
+    pub fn from_parts(meta: &[u8], snapshots: &[(u64, Vec<u8>)]) -> Result<Self, &'static str> {
+        use super::storage::take;
+        let mut rest = meta;
+        if take(&mut rest, META_MAGIC.len())? != META_MAGIC {
+            return Err("branch record format not supported");
+        }
+        let header = take(&mut rest, 8 + 1 + 2)?;
+        let count = u16::from_be_bytes(header[9..11].try_into().unwrap()) as usize;
+        if count > ROLLBACK_EPOCHS as usize
+            || rest.len() != count * 8
+            || snapshots.len() != count
+        {
+            return Err("branch snapshots do not match the branch record");
+        }
+        let mut bytes = MAGIC.to_vec();
+        bytes.push(VERSION);
+        bytes.extend(header);
+        for (index, (epoch, sealed)) in snapshots.iter().enumerate() {
+            if rest[index * 8..index * 8 + 8] != epoch.to_be_bytes() {
+                return Err("branch snapshots do not match the branch record");
+            }
+            if sealed.len() > MAX_BRANCH_SNAPSHOT {
+                return Err("invalid branch snapshot size");
+            }
+            bytes.extend(epoch.to_be_bytes());
+            bytes.extend((sealed.len() as u32).to_be_bytes());
+            bytes.extend(sealed);
+        }
+        Self::decode(&bytes)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, &'static str> {
@@ -570,6 +627,35 @@ mod tests {
             assert_eq!(decoded, state);
             assert_eq!(decoded.encode(), bytes);
         }
+    }
+
+    #[test]
+    fn split_records_round_trip_and_must_match_their_header() {
+        let mut gapped = BranchState::new(3);
+        gapped.retain(3, sealed(3, 7)).unwrap();
+        gapped.retain(9, sealed(9, 300)).unwrap();
+        for state in [BranchState::new(5), filled(0..=70), gapped.clone(), filled(1..=3).orphaned()] {
+            let meta = state.meta_record();
+            assert!(meta.len() <= 5 + 11 + 64 * 8);
+            let parts: Vec<_> = state.snapshots().map(|(e, s)| (e, s.to_vec())).collect();
+            assert!(parts.iter().all(|(_, s)| s.len() <= MAX_BRANCH_SNAPSHOT));
+            assert_eq!(BranchState::from_parts(&meta, &parts).unwrap(), state);
+        }
+        let meta = gapped.meta_record();
+        let parts: Vec<_> = gapped.snapshots().map(|(e, s)| (e, s.to_vec())).collect();
+        // A missing, an extra and a renamed snapshot are rejected.
+        assert!(BranchState::from_parts(&meta, &parts[..1]).is_err());
+        let mut extra = parts.clone();
+        extra.push((10, vec![1]));
+        assert!(BranchState::from_parts(&meta, &extra).is_err());
+        let mut renamed = parts.clone();
+        renamed[1].0 = 8;
+        assert!(BranchState::from_parts(&meta, &renamed).is_err());
+        // The bounds of the whole record still apply (settled epoch).
+        let mut bad = meta.clone();
+        bad[5..13].copy_from_slice(&4u64.to_be_bytes());
+        assert!(BranchState::from_parts(&bad, &parts).is_err());
+        assert!(BranchState::from_parts(b"DFBR\x01", &[]).is_err());
     }
 
     fn record(first_unsettled: u64, orphaned: u8, entries: &[(u64, Vec<u8>)]) -> Vec<u8> {

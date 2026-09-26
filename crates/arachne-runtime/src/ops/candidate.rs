@@ -378,6 +378,7 @@ pub(crate) fn adopt(
             .transition(WorkspacePhase::Synchronizing, None)?;
     }
     persistence::commit_candidate(session, &snapshot)?;
+    membership::fork::adopt_candidate(session, &snapshot)?;
     let staged = session.transition.staged.take().unwrap();
     let mut value = Adopted {
         workspace: staged.workspace.id(),
@@ -417,6 +418,7 @@ pub(crate) fn adopt(
     let committed_here = matches!(
         staged.transition,
         WorkspaceTransition::Admission | WorkspaceTransition::SelfUpdate(_)
+            | WorkspaceTransition::Management(..) | WorkspaceTransition::Invitation(..)
     ) && !received;
     match staged.transition {
         WorkspaceTransition::Inbox => value.state = Some("inbox_adopted"),
