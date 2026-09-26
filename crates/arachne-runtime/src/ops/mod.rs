@@ -9,8 +9,8 @@
 
 use arachne_api::ApiError;
 
-use crate::errors;
 use crate::Session;
+use crate::errors;
 
 pub(crate) mod admission;
 pub(crate) mod candidate;
@@ -31,7 +31,9 @@ pub(crate) mod workspace;
 pub(crate) enum Op {
     Resource,
     WorkspaceMetrics,
+    #[cfg(feature = "moq")]
     MoqMetrics,
+    #[cfg(feature = "moq")]
     EnableMoqDelivery,
     WorkspaceState,
     ResetWorkspace,
@@ -76,6 +78,7 @@ pub(crate) enum Op {
     StageObjectRejection,
     PollProtected,
     EndpointInfo,
+    #[cfg(feature = "debug-rig")]
     ControlExchange,
     AdoptPublication,
     AdoptReception,
@@ -110,18 +113,25 @@ pub(crate) enum Op {
     AddAddressHint,
     InstallWorkspacePolicy,
     InstallMemberPolicy,
+    #[cfg(feature = "test-fixtures")]
     InstallVerifiedPolicy,
     SetInterest,
     PollInterest,
     Subscribe,
     Unsubscribe,
+    #[cfg(feature = "test-fixtures")]
     Publish,
+    #[cfg(feature = "test-fixtures")]
     Poll,
 }
 
 impl Op {
     /// Ops that run whatever candidate or exchange is pending.
     fn always_allowed(self) -> bool {
+        #[cfg(feature = "moq")]
+        if self == Op::MoqMetrics {
+            return true;
+        }
         matches!(
             self,
             Op::ResetWorkspace
@@ -131,7 +141,6 @@ impl Op {
                 | Op::DriveJoin
                 | Op::WorkspaceState
                 | Op::WorkspaceMetrics
-                | Op::MoqMetrics
                 | Op::NetworkChange
                 | Op::NearbyEndpoints
                 | Op::NearbyWorkspaces
@@ -170,7 +179,10 @@ impl Op {
 /// The guards that hold before an op runs, in their fixed order.
 pub(crate) fn admit(session: &Session, op: Op) -> Result<(), ApiError> {
     // A save with an unknown outcome: live state must not move on.
-    if session.records.as_ref().is_some_and(|store| store.uncertain)
+    if session
+        .records
+        .as_ref()
+        .is_some_and(|store| store.uncertain)
         && !matches!(
             op,
             Op::ResetWorkspace | Op::WorkspaceState | Op::WorkspaceMetrics | Op::EndpointInfo
@@ -203,16 +215,19 @@ pub(crate) fn admit(session: &Session, op: Op) -> Result<(), ApiError> {
     }
     if session.workspace.is_some() {
         match op {
+            #[cfg(feature = "test-fixtures")]
             Op::Publish => {
                 return Err(ApiError::wrong_state(
                     "unprotected publication is disabled for an admitted workspace",
                 ));
             }
+            #[cfg(feature = "test-fixtures")]
             Op::InstallVerifiedPolicy => {
                 return Err(ApiError::wrong_state(
                     "admitted workspace routing must derive from verified membership",
                 ));
             }
+            #[cfg(feature = "test-fixtures")]
             Op::Poll => {
                 return Err(ApiError::wrong_state(
                     "use poll_protected for an admitted workspace",
@@ -315,12 +330,10 @@ fn run_locked<T>(
     // A gossiped step held for a later epoch spent its arrival signal. Once
     // the epoch before it lands, wake the host to stage it.
     if !admission_busy(session)
-        && session.workspace.as_ref().is_some_and(|owner| {
-            session
-                .membership
-                .steps_ahead
-                .contains_key(&owner.epoch())
-        })
+        && session
+            .workspace
+            .as_ref()
+            .is_some_and(|owner| session.membership.steps_ahead.contains_key(&owner.epoch()))
     {
         session.node.rearm_control_signal();
     }

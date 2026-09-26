@@ -5,8 +5,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arachne_runtime::{
-    Client, ClientConfig, Context, ContextConfig, ErrorCode, Event, MemoryProvider, Network, PeerPolicy,
-    PowerProfile, StorageConfig, TransportOptions, TransportTimeouts,
+    Client, ClientConfig, Context, ContextConfig, ErrorCode, Event, MemoryProvider, Network,
+    PeerPolicy, PowerProfile, StorageConfig, TransportOptions, TransportTimeouts,
 };
 
 fn context() -> Arc<Context> {
@@ -16,9 +16,9 @@ fn context() -> Arc<Context> {
 fn direct(secret: Option<[u8; 32]>) -> ClientConfig {
     ClientConfig {
         network: Network::Direct,
-        secret,
+        secret: secret.map(Into::into),
         transport: Default::default(),
-        storage: Some(StorageConfig::memory(&MemoryProvider::default())),
+        storage: Some((StorageConfig::memory(&MemoryProvider::default())).into()),
     }
 }
 
@@ -55,7 +55,11 @@ fn wake_releases_a_waiter_and_a_timeout_returns() {
     let context = context();
     let client = Arc::new(context.open(direct(None)).unwrap());
     let started = Instant::now();
-    assert!(!client.wait_for_work(Some(Duration::from_millis(100))).unwrap());
+    assert!(
+        !client
+            .wait_for_work(Some(Duration::from_millis(100)))
+            .unwrap()
+    );
     assert!(started.elapsed() >= Duration::from_millis(100));
     let parked = Arc::clone(&client);
     let waiter = thread::spawn(move || parked.wait_for_work(Some(Duration::from_secs(30))));
@@ -80,7 +84,7 @@ fn a_per_op_deadline_fails_the_op_and_keeps_the_session() {
     let client = context
         .open(ClientConfig {
             network: Network::Direct,
-            secret: Some([61; 32]),
+            secret: Some(([61; 32]).into()),
             transport: TransportOptions {
                 timeouts: Some(TransportTimeouts {
                     operation: Duration::from_secs(30),
@@ -90,7 +94,7 @@ fn a_per_op_deadline_fails_the_op_and_keeps_the_session() {
                 }),
                 ..Default::default()
             },
-            storage: Some(StorageConfig::memory(&MemoryProvider::default())),
+            storage: Some((StorageConfig::memory(&MemoryProvider::default())).into()),
         })
         .unwrap()
         .with_deadline(Duration::from_millis(300));
@@ -101,8 +105,14 @@ fn a_per_op_deadline_fails_the_op_and_keeps_the_session() {
         let error = client.send_nearby_invitation(peer, &[7; 16]).unwrap_err();
         let elapsed = started.elapsed();
         assert_eq!(error.code(), ErrorCode::DeadlineExceeded, "{error}");
-        assert!(elapsed >= Duration::from_millis(250), "failed at once: {elapsed:?}");
-        assert!(elapsed < Duration::from_secs(5), "deadline ignored: {elapsed:?}");
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "failed at once: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "deadline ignored: {elapsed:?}"
+        );
     }
     // An explicit cancel is not sticky either.
     client.cancel().unwrap();
@@ -136,7 +146,10 @@ fn next_event_times_out_and_wakes_with_none() {
     let context = context();
     let client = Arc::new(context.open(direct(None)).unwrap());
     let started = Instant::now();
-    assert_eq!(client.next_event(Some(Duration::from_millis(100))).unwrap(), None);
+    assert_eq!(
+        client.next_event(Some(Duration::from_millis(100))).unwrap(),
+        None
+    );
     assert!(started.elapsed() >= Duration::from_millis(100));
     let parked = Arc::clone(&client);
     let waiter = thread::spawn(move || parked.next_event(Some(Duration::from_secs(30))));
@@ -149,7 +162,9 @@ fn next_event_times_out_and_wakes_with_none() {
 fn next_event_reports_a_control_request() {
     let context = context();
     let owner = context.open(direct(Some([81; 32]))).unwrap();
-    owner.create_workspace("Event owner", Some("Events")).unwrap();
+    owner
+        .create_workspace("Event owner", Some("Events".into()))
+        .unwrap();
     let peer = owner.endpoint().unwrap().endpoint_key;
     let address: std::net::SocketAddr = local(&owner).parse().unwrap();
     let sender = thread::spawn(move || {
@@ -161,8 +176,12 @@ fn next_event_reports_a_control_request() {
             let (node, _) = arachne_node::Node::bind("127.0.0.1:0".parse().unwrap())
                 .await
                 .unwrap();
-            node.add_address_hint(peer, address).await.unwrap();
-            node.request_control(peer, b"DFND\x01").await.unwrap()
+            node.add_address_hint((peer).to_bytes(), address)
+                .await
+                .unwrap();
+            node.request_control((peer).to_bytes(), b"DFND\x01")
+                .await
+                .unwrap()
         })
     });
     assert_eq!(
@@ -171,17 +190,29 @@ fn next_event_reports_a_control_request() {
     );
     assert!(owner.poll_control().unwrap());
     sender.join().unwrap();
-    assert_eq!(owner.next_event(Some(Duration::from_millis(100))).unwrap(), None);
+    assert_eq!(
+        owner.next_event(Some(Duration::from_millis(100))).unwrap(),
+        None
+    );
 }
 
 /// A fixture publisher and subscriber with routes both ways and the
 /// subscriber's interest announced (not yet observed).
-fn pubsub(context: &Arc<Context>, seed: u8) -> (Client, Client, [u8; 32], &'static str) {
+#[cfg(feature = "test-fixtures")]
+fn pubsub(
+    context: &Arc<Context>,
+    seed: u8,
+) -> (
+    Arc<Client>,
+    Arc<Client>,
+    arachne_runtime::WorkspaceId,
+    &'static str,
+) {
     let publisher = context.open(direct(Some([seed; 32]))).unwrap();
     let subscriber = context.open(direct(Some([seed + 1; 32]))).unwrap();
     let publisher_key = publisher.endpoint().unwrap().endpoint_key;
     let subscriber_key = subscriber.endpoint().unwrap().endpoint_key;
-    let workspace = [seed + 2; 32];
+    let workspace = arachne_runtime::WorkspaceId::from_bytes([seed + 2; 32]);
     let topic = "streams/events";
     let policy = [
         PeerPolicy {
@@ -208,6 +239,7 @@ fn pubsub(context: &Arc<Context>, seed: u8) -> (Client, Client, [u8; 32], &'stat
 }
 
 #[test]
+#[cfg(feature = "test-fixtures")]
 fn next_event_reports_interest_and_publication() {
     let context = context();
     let (publisher, subscriber, workspace, topic) = pubsub(&context, 71);
@@ -215,17 +247,31 @@ fn next_event_reports_interest_and_publication() {
     // `set_interest` starts the announcement in the background; its end is
     // an event, and `poll_interest` reads its result.
     assert_eq!(
-        subscriber.next_event(Some(Duration::from_secs(10))).unwrap(),
+        subscriber
+            .next_event(Some(Duration::from_secs(10)))
+            .unwrap(),
         Some(Event::InterestChanged)
     );
-    let observation = subscriber.poll_interest().unwrap().expect("interest result");
+    let observation = subscriber
+        .poll_interest()
+        .unwrap()
+        .expect("interest result");
     assert!(observation.admission.failed.is_empty());
     // A ready job reports once.
-    assert_eq!(subscriber.next_event(Some(Duration::from_millis(200))).unwrap(), None);
-
-    publisher.publish(workspace, 1, topic, vec![1, 2, 3]).unwrap();
     assert_eq!(
-        subscriber.next_event(Some(Duration::from_secs(10))).unwrap(),
+        subscriber
+            .next_event(Some(Duration::from_millis(200)))
+            .unwrap(),
+        None
+    );
+
+    publisher
+        .publish(workspace, 1, topic, vec![1, 2, 3])
+        .unwrap();
+    assert_eq!(
+        subscriber
+            .next_event(Some(Duration::from_secs(10)))
+            .unwrap(),
         Some(Event::PublicationReceived)
     );
     // A queue reports until it is drained.
@@ -234,7 +280,12 @@ fn next_event_reports_interest_and_publication() {
         Some(Event::PublicationReceived)
     );
     assert_eq!(subscriber.poll().unwrap().unwrap().payload, vec![1, 2, 3]);
-    assert_eq!(subscriber.next_event(Some(Duration::from_millis(100))).unwrap(), None);
+    assert_eq!(
+        subscriber
+            .next_event(Some(Duration::from_millis(100)))
+            .unwrap(),
+        None
+    );
 
     // A network change queues an interest repair. A host that only waits on
     // next_event must hear of it, so the repair starts at its poll.
@@ -246,7 +297,9 @@ fn next_event_reports_interest_and_publication() {
     // The poll starts the repair; its end is the next event.
     let _ = subscriber.poll_interest().unwrap();
     assert_eq!(
-        subscriber.next_event(Some(Duration::from_secs(10))).unwrap(),
+        subscriber
+            .next_event(Some(Duration::from_secs(10)))
+            .unwrap(),
         Some(Event::InterestChanged)
     );
     assert!(subscriber.poll_interest().unwrap().is_some());
@@ -256,7 +309,9 @@ fn next_event_reports_interest_and_publication() {
 fn suspend_stops_background_timers_and_resume_restores_them() {
     let context = context();
     let owner = context.open(direct(Some([91; 32]))).unwrap();
-    let info = owner.create_workspace("Suspend owner", Some("Suspend")).unwrap();
+    let info = owner
+        .create_workspace("Suspend owner", Some("Suspend".into()))
+        .unwrap();
     owner.install_workspace_policy(info.epoch + 1).unwrap();
     assert_eq!(context.background_timers(), 1, "one gossip overlay");
 
@@ -317,8 +372,14 @@ fn low_power_slows_every_background_timer() {
     assert_eq!((normal_timers.len(), low_timers.len()), (1, 1));
     let (normal_shuffle, normal_retry) = normal_timers[0];
     let (low_shuffle, low_retry) = low_timers[0];
-    assert!(low_shuffle > normal_shuffle, "{low_shuffle:?} <= {normal_shuffle:?}");
-    assert!(low_retry > normal_retry, "{low_retry:?} <= {normal_retry:?}");
+    assert!(
+        low_shuffle > normal_shuffle,
+        "{low_shuffle:?} <= {normal_shuffle:?}"
+    );
+    assert!(
+        low_retry > normal_retry,
+        "{low_retry:?} <= {normal_retry:?}"
+    );
     assert!(low.interest_retry() > normal.interest_retry());
 }
 
@@ -333,7 +394,7 @@ fn close_while_another_thread_is_inside_an_op_is_bounded() {
         context
             .open(ClientConfig {
                 network: Network::Direct,
-                secret: Some([62; 32]),
+                secret: Some(([62; 32]).into()),
                 transport: TransportOptions {
                     timeouts: Some(TransportTimeouts {
                         operation: Duration::from_secs(30),
@@ -343,7 +404,7 @@ fn close_while_another_thread_is_inside_an_op_is_bounded() {
                     }),
                     ..Default::default()
                 },
-                storage: Some(StorageConfig::memory(&MemoryProvider::default())),
+                storage: Some((StorageConfig::memory(&MemoryProvider::default())).into()),
             })
             .unwrap(),
     );
@@ -362,21 +423,38 @@ fn close_while_another_thread_is_inside_an_op_is_bounded() {
     let (result, op_time) = op.join().unwrap();
     assert!(result.is_err());
     // Close drain (1 s) plus the local teardown (2 s) bound it.
-    assert!(closed_in < Duration::from_millis(3500), "close took {closed_in:?}");
+    assert!(
+        closed_in < Duration::from_millis(3500),
+        "close took {closed_in:?}"
+    );
     assert!(op_time < Duration::from_secs(4), "op ran {op_time:?}");
 }
 
 #[test]
+#[cfg(feature = "test-fixtures")]
 fn suspend_closes_idle_connections_and_resume_reconnects() {
     let context = context();
     let (publisher, subscriber, workspace, topic) = pubsub(&context, 101);
     assert_eq!(
-        subscriber.next_event(Some(Duration::from_secs(10))).unwrap(),
+        subscriber
+            .next_event(Some(Duration::from_secs(10)))
+            .unwrap(),
         Some(Event::InterestChanged)
     );
-    assert!(subscriber.poll_interest().unwrap().unwrap().admission.failed.is_empty());
+    assert!(
+        subscriber
+            .poll_interest()
+            .unwrap()
+            .unwrap()
+            .admission
+            .failed
+            .is_empty()
+    );
     publisher.publish(workspace, 1, topic, vec![1]).unwrap();
-    assert!(context.open_connections() > 0, "the publication opened a link");
+    assert!(
+        context.open_connections() > 0,
+        "the publication opened a link"
+    );
     let address = publisher.endpoint().unwrap().bound_address;
 
     context.suspend().unwrap();
@@ -384,7 +462,11 @@ fn suspend_closes_idle_connections_and_resume_reconnects() {
     while context.open_connections() > 0 && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(context.open_connections(), 0, "idle links stay open while suspended");
+    assert_eq!(
+        context.open_connections(),
+        0,
+        "idle links stay open while suspended"
+    );
     // The endpoint stays bound.
     assert_eq!(publisher.endpoint().unwrap().bound_address, address);
     // Queued data stays too.
@@ -394,7 +476,9 @@ fn suspend_closes_idle_connections_and_resume_reconnects() {
     let report = publisher.publish(workspace, 1, topic, vec![2]).unwrap();
     assert!(report.failed.is_empty(), "{report:?}");
     assert_eq!(
-        subscriber.next_event(Some(Duration::from_secs(10))).unwrap(),
+        subscriber
+            .next_event(Some(Duration::from_secs(10)))
+            .unwrap(),
         Some(Event::PublicationReceived)
     );
     assert_eq!(subscriber.poll().unwrap().unwrap().payload, vec![2]);
@@ -407,9 +491,9 @@ fn suspend_stops_mdns_announcements_and_resume_restarts_them() {
     let client = context
         .open(ClientConfig {
             network: Network::Lan,
-            secret: Some([111; 32]),
+            secret: Some(([111; 32]).into()),
             transport: Default::default(),
-            storage: Some(StorageConfig::memory(&MemoryProvider::default())),
+            storage: Some((StorageConfig::memory(&MemoryProvider::default())).into()),
         })
         .unwrap();
     // The mDNS service runs and has the endpoint's addresses to announce.
@@ -419,7 +503,10 @@ fn suspend_stops_mdns_announcements_and_resume_restarts_them() {
     }
     let (running, announced) = context.mdns();
     assert_eq!(running, 1);
-    assert!(announced > 0, "the endpoint published its addresses to mDNS");
+    assert!(
+        announced > 0,
+        "the endpoint published its addresses to mDNS"
+    );
 
     context.suspend().unwrap();
     assert_eq!(context.mdns(), (0, announced), "the mDNS service stopped");
@@ -442,7 +529,7 @@ fn a_deadline_bounds_the_endpoint_bind() {
     let error = context
         .open(ClientConfig {
             network: Network::RelayOnly,
-            secret: Some([131; 32]),
+            secret: Some(([131; 32]).into()),
             transport: TransportOptions {
                 relay: Some(arachne_runtime::OperatorRelay {
                     urls: vec!["https://relay.example.invalid".into()],
@@ -452,7 +539,7 @@ fn a_deadline_bounds_the_endpoint_bind() {
                 deadline: Some(Duration::from_millis(300)),
                 ..Default::default()
             },
-            storage: Some(StorageConfig::memory(&MemoryProvider::default())),
+            storage: Some((StorageConfig::memory(&MemoryProvider::default())).into()),
         })
         .err()
         .expect("the relay never comes online");
@@ -480,8 +567,9 @@ fn the_handle_api_takes_a_per_session_deadline() {
     let call = |request: serde_json::Value| {
         execute_with_code(handle, &serde_json::to_vec(&request).unwrap())
     };
-    call(serde_json::json!({"op":"add_address_hint","peer":peer,"address":address})).unwrap();
-    let invite = serde_json::json!({"op":"send_nearby_invitation","peer":peer,"invitation":vec![7u8; 16]});
+    call(serde_json::json!({"op":"add_address_hint","peer":peer.to_bytes(),"address":address}))
+        .unwrap();
+    let invite = serde_json::json!({"op":"send_nearby_invitation","peer":peer.to_bytes(),"invitation":vec![7u8; 16]});
     for _ in 0..2 {
         let started = Instant::now();
         let error = call(invite.clone()).unwrap_err();

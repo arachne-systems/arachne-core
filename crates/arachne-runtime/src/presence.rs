@@ -84,6 +84,7 @@ fn base_packet(
 /// A joiner with no publications legitimately advertises no heads; receivers
 /// treat a zero head count as an ordinary presence refresh. Grants no authority.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn harness_presence_packet(
     owner: &arachne_security::Workspace,
     instance: [u8; 16],

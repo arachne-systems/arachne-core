@@ -197,8 +197,8 @@ pub(crate) fn poll_pending(
         from_losing_branch: pending.from_losing_branch,
         recipients: pending.recipients,
         current: pending.current.map(|current| PublicationCurrent {
-            selector: current.selector,
-            replacement_key: current.replacement_key,
+            selector: current.selector.into(),
+            replacement_key: current.replacement_key.into(),
             expires_at: current.expires_at,
             tombstone: current.tombstone,
         }),
@@ -336,7 +336,7 @@ mod tests {
         }
         let publisher =
             PublisherLog::new(&reader).unwrap();
-        harness::seed_workspace(&provider, &reader, Some(&publisher), Some(&inbox)).unwrap();
+        crate::persistence::seed_workspace(&provider, &reader, Some(&publisher), Some(&inbox)).unwrap();
         call(json!({"op":"restore_workspace","workspace":reader.id()})).unwrap();
         let pending = call(json!({"op":"poll_pending_object"})).unwrap();
         assert_eq!(pending["id"], json!(vec![2; 16]));

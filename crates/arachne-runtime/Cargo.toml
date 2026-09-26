@@ -15,10 +15,14 @@ publish = ["crates-io"]
 
 [features]
 default = []
+uniffi = ["dep:uniffi", "arachne-api/uniffi"]
+test-fixtures = []
+debug-rig = []
 moq = ["arachne-node/moq"]
 tor = ["arachne-node/tor"]
 
 [dependencies]
+uniffi = { version = "=0.31.2", optional = true }
 arachne-api = { path = "../arachne-api", version = "0.1.0" }
 arachne-delivery = { path = "../arachne-delivery", version = "0.1.0" }
 arachne-routing = { path = "../arachne-routing", version = "0.1.0" }
@@ -42,3 +46,59 @@ iroh = { version = "=1.2.0", default-features = false, features = ["tls-ring", "
 # Test only: edits a store file header as a later build would.
 rusqlite = "0.40.2"
 tempfile = "3.27.0"
+
+[[test]]
+name = "admission_capacity"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "admission_event_driven"
+required-features = ["test-fixtures", "debug-rig"]
+
+[[test]]
+name = "admission_staging"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "committed_view"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "gossip_key"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "interest_progress"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "invitation_link_capacity"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "native_persistence"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "record_bounds"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "removed_membership"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "returning_member"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "workspace_name"
+required-features = ["test-fixtures"]
+
+[[example]]
+name = "typed_pubsub"
+required-features = ["test-fixtures"]
+
+[[example]]
+name = "real-iroh-qualification"
+required-features = ["test-fixtures"]

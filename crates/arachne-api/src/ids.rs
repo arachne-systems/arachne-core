@@ -122,6 +122,12 @@ macro_rules! byte_id {
             }
         }
 
+        #[cfg(feature = "uniffi")]
+        uniffi::custom_type!($name, String, {
+            lower: |id| id.to_string(),
+            try_lift: |text| Ok($name::from_hex(&text)?),
+        });
+
         impl<'de> Deserialize<'de> for $name {
             fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
                 let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
@@ -154,6 +160,11 @@ byte_id!(
 byte_id!(
     /// A publication ID (16 bytes).
     PublicationId, "publication", 16
+);
+
+byte_id!(
+    /// A protocol key or digest that is not an endpoint, member or workspace identity.
+    Key32, "key", 32
 );
 
 /// Maximum topic length in bytes.
@@ -216,3 +227,9 @@ impl From<TopicName> for String {
         value.0
     }
 }
+
+#[cfg(feature = "uniffi")]
+uniffi::custom_type!(TopicName, String, {
+    lower: |topic| topic.to_string(),
+    try_lift: |text| Ok(TopicName::new(text)?),
+});

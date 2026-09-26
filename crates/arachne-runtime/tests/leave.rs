@@ -78,7 +78,10 @@ fn wait_for_offer(owner: i64) -> Value {
         if !value.is_null() {
             return value;
         }
-        assert!(Instant::now() < until, "membership handoff acknowledgement timed out");
+        assert!(
+            Instant::now() < until,
+            "membership handoff acknowledgement timed out"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -88,7 +91,10 @@ fn wait_for_offer_result(owner: i64) -> Result<Value, String> {
     loop {
         match call(owner, json!({"op":"poll_membership_offer"})) {
             Ok(value) if value.is_null() => {
-                assert!(Instant::now() < until, "membership offer response timed out");
+                assert!(
+                    Instant::now() < until,
+                    "membership offer response timed out"
+                );
                 std::thread::sleep(Duration::from_millis(10));
             }
             result => return result,
@@ -104,7 +110,10 @@ fn drive_until_work(handle: i64) -> Value {
         if value.get("state").is_some() && value["state"] != "presence_replied" {
             return value;
         }
-        assert!(Instant::now() < until, "workspace driver did not observe work");
+        assert!(
+            Instant::now() < until,
+            "workspace driver did not observe work"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -118,7 +127,11 @@ fn settle_self_update(member: i64, admin: i64) {
         let value = call(member, json!({"op":"drive_workspace"})).unwrap();
         if value["state"] == "self_update_committed" {
             committed = true;
-            call(member, json!({"op":"poll_workspace_presence","announce":true})).unwrap();
+            call(
+                member,
+                json!({"op":"poll_workspace_presence","announce":true}),
+            )
+            .unwrap();
         }
         call(admin, json!({"op":"drive_workspace"})).unwrap();
         if committed
@@ -130,6 +143,25 @@ fn settle_self_update(member: i64, admin: i64) {
         assert!(Instant::now() < until, "no self-update: {value}");
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// Complete a self-update through an explicit authenticated offer while the
+/// fixture has suspended automatic gossip and presence.
+fn settle_self_update_by_offer(member: i64, admin: i64) {
+    let before = call(member, json!({"op":"member_roster"})).unwrap()["epoch"]
+        .as_u64()
+        .unwrap();
+    let updated = drive_until_work(member);
+    assert_eq!(updated["state"], "self_update_committed");
+    assert_eq!(
+        call(member, json!({"op":"member_roster"})).unwrap()["epoch"],
+        before + 1
+    );
+    offer_and_drive(member, admin, before);
+    assert_eq!(
+        call(admin, json!({"op":"member_roster"})).unwrap()["epoch"],
+        before + 1
+    );
 }
 
 fn self_member_id(handle: i64) -> [u8; 32] {
@@ -156,7 +188,10 @@ fn offer_and_drive(owner: i64, peer: i64, after: u64) {
         json!({"op":"offer_membership_update","peer":peer_info["endpoint_key"],"after":after}),
     )
     .unwrap();
-    assert_eq!(pending["state"], "membership_offer_pending", "offer owner={owner} peer={peer} after={after}: {pending}; owner_roster={owner_roster}; peer_info={peer_info}");
+    assert_eq!(
+        pending["state"], "membership_offer_pending",
+        "offer owner={owner} peer={peer} after={after}: {pending}; owner_roster={owner_roster}; peer_info={peer_info}"
+    );
     assert_eq!(drive_until_work(peer)["state"], "workspace_committed");
     assert_eq!(wait_for_offer(owner)["state"], "membership_offer_finished");
 }
@@ -176,7 +211,11 @@ fn issue_invitation(handle: i64) -> Value {
 }
 
 fn adopt_candidate(handle: i64, staged: &Value) -> Value {
-    call(handle, json!({"op":"adopt_admission","candidate":staged["candidate"]})).unwrap()
+    call(
+        handle,
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -218,7 +257,10 @@ fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave()
         call(admin, json!({"op":"discard_workspace_candidate"})).unwrap()["discarded"],
         true
     );
-    assert_eq!(call(admin, json!({"op":"member_roster"})).unwrap()["epoch"], old_epoch);
+    assert_eq!(
+        call(admin, json!({"op":"member_roster"})).unwrap()["epoch"],
+        old_epoch
+    );
     assert_eq!(abandoned["state"], "awaiting_save");
 
     let promotion = call(
@@ -235,18 +277,17 @@ fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave()
     assert_eq!(pending["state"], "membership_offer_pending");
     // The acknowledgement is deliberately not available until the successor
     // has received, saved, and adopted the promoted membership.
-    assert!(call(admin, json!({"op":"poll_membership_offer"}))
-        .unwrap()
-        .is_null());
+    assert!(
+        call(admin, json!({"op":"poll_membership_offer"}))
+            .unwrap()
+            .is_null()
+    );
 
     let offered = drive_until_work(successor);
     assert_eq!(offered["state"], "workspace_committed");
     assert_eq!(offered["epoch"], old_epoch + 1);
     assert_eq!(offered["reply_queued"], true);
-    assert_eq!(
-        wait_for_offer(admin)["state"],
-        "membership_offer_finished"
-    );
+    assert_eq!(wait_for_offer(admin)["state"], "membership_offer_finished");
     let promoted = call(
         admin,
         json!({"op":"adopt_admission","candidate":promotion["candidate"]}),
@@ -262,7 +303,10 @@ fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave()
     });
     let staged = incoming(successor);
     assert_eq!(staged["state"], "awaiting_save");
-    assert!(!leaving.is_finished(), "departure completed before the peer adopted it");
+    assert!(
+        !leaving.is_finished(),
+        "departure completed before the peer adopted it"
+    );
     call(
         successor,
         json!({"op":"adopt_admission","candidate":staged["candidate"]}),
@@ -295,9 +339,24 @@ fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave()
 
 #[test]
 fn three_member_leave_converges_through_successive_administrator_handoffs() {
-    let admin = node(101);
-    let successor = node(102);
-    let third = node(103);
+    // This scenario controls each membership exchange. Suspend background
+    // gossip and presence so they cannot repair the deliberately stale member
+    // before the negative handoff check. Authenticated control still works.
+    let context = arachne_runtime::Context::new(Default::default()).unwrap();
+    context.suspend().unwrap();
+    let make_node = |secret: u8| {
+        let handle = context
+            .create_with_options(
+                Some(&[secret; 32]),
+                arachne_node::NodeOptions::new(arachne_node::NetworkProfile::Direct),
+            )
+            .unwrap();
+        common::attach(handle, &MemoryProvider::default());
+        handle
+    };
+    let admin = make_node(101);
+    let successor = make_node(102);
+    let third = make_node(103);
     call(
         admin,
         json!({"op":"create_workspace","display_name":"Alpha"}),
@@ -307,7 +366,7 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
     join(admin, successor, &invite, "Bravo");
     route(admin, successor);
     route(successor, admin);
-    settle_self_update(successor, admin);
+    settle_self_update_by_offer(successor, admin);
     // Registering the second invitation costs admin an epoch that successor
     // (already a member) does not automatically have. Apply that management
     // step to successor directly so it doesn't fork before the third join.
@@ -332,6 +391,10 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
         json!({"op":"adopt_admission","candidate":synced["candidate"]}),
     )
     .unwrap();
+    assert_eq!(
+        call(successor, json!({"op":"member_roster"})).unwrap()["epoch"],
+        4
+    );
     join(admin, third, &invite, "Charlie");
 
     route(admin, successor);
@@ -340,10 +403,9 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
     route(third, admin);
     route(successor, third);
     route(third, successor);
-    // The current third member self-updates through the admin (epoch 5 -> 6).
-    // Keep the successor stale until the handoff offer below. Newer head
-    // announcements defer its self-update; no refusal handshake is required.
-    settle_self_update(third, admin);
+    // The third member saves and offers its self-update (epoch 5 -> 6).
+    // The successor stays at epoch 4 until the explicit handoff below.
+    settle_self_update_by_offer(third, admin);
 
     let successor_id = self_member_id(successor);
     let third_id = self_member_id(third);
@@ -361,7 +423,10 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
     let poll = std::thread::spawn(move || wait_for_offer_result(admin));
     assert_eq!(drive_until_work(successor)["state"], "membership_replied");
     let rejected = poll.join().unwrap();
-    assert!(rejected.is_err(), "stale peer unexpectedly accepted handoff: {rejected:?}");
+    assert!(
+        rejected.is_err(),
+        "stale peer unexpectedly accepted handoff: {rejected:?}"
+    );
     assert_eq!(
         call(admin, json!({"op":"discard_workspace_candidate"})).unwrap()["discarded"],
         true
@@ -408,11 +473,13 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
     let after_admin_leave = call(successor, json!({"op":"member_roster"})).unwrap();
     assert_eq!(after_admin_leave["epoch"], before_promotion_epoch + 2);
     assert_eq!(after_admin_leave["members"].as_array().unwrap().len(), 2);
-    assert!(after_admin_leave["members"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|member| member["self"] == true && member["administrator"] == true));
+    assert!(
+        after_admin_leave["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|member| member["self"] == true && member["administrator"] == true)
+    );
 
     let promotion = call(
         successor,

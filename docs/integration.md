@@ -3,14 +3,16 @@
 This repository is a pre-release Rust workspace, not a stable SDK. All eight
 crates have an initial release on crates.io. APIs, wire formats, and saved
 state can change.
-The current typed entry point is `arachne_runtime::Client`. It is synchronous
-and owns a Tokio runtime internally, so call it from a blocking worker rather
-than from inside an application's async executor or UI thread.
+The typed entry point is `arachne_runtime::Client`. It is synchronous and belongs to a
+`Context`, which owns or borrows its Tokio runtime. Call it from a blocking worker.
+`Client::open` returns an `Arc<Client>` in the default shared context. Foreign bindings
+use the same Core types through the optional `uniffi` feature; see the
+[Core binding contract](reviews/h4-core-sdk-migration.md).
 
 For a small runnable example, see
 [`typed_pubsub.rs`](../crates/arachne-runtime/examples/typed_pubsub.rs). It
-demonstrates two local clients, explicit routing policy, topic interest, and
-opaque byte publication. It does **not** create an MLS workspace or demonstrate
+requires the `test-fixtures` feature and demonstrates two local clients, explicit
+routing policy, topic interest, and opaque byte publication. It does **not** create an MLS workspace or demonstrate
 protected group messaging.
 
 ## Client startup and identity
@@ -28,12 +30,13 @@ other typed profiles require one.
 | `Lan` | LAN discovery and direct paths. | Does not imply internet-wide lookup. |
 | `Nearby` | Nearby/local discovery behavior. | Deployment and platform discovery conditions apply. |
 | `Wan` | Public lookup and relay-assisted connectivity. | Does not guarantee a usable route. |
-| `RelayOnly` | Prefer relay-only transport behavior. | A custom operator relay is not configurable through `ClientConfig` today. |
+| `RelayOnly` | Prefer relay-only transport behavior. | Set operator relays through `ClientConfig.transport.relay` when needed. |
 | `WanOnly` | WAN lookup without LAN discovery or saved address hints. | Intended for diagnostics; direct paths remain enabled. |
 | `Tor` | Tor hidden-service transport only. | Requires the `tor` feature, a stable endpoint secret, and a local Tor daemon; IP and Iroh relay transports are disabled. |
 
-The lower-level node/runtime surface has additional relay configuration. The
-typed `ClientConfig` does not currently expose it as an adopter-ready option.
+The typed `TransportOptions` record exposes operator relays, public lookup, transport
+timeouts and an operation deadline. `Tor` stays in the enum when its feature is off;
+selecting it then returns `Unsupported` (103).
 
 `Tor` is experimental because it uses Iroh's unstable custom-transport API.
 The Tor transport creates an ephemeral onion service from the endpoint identity,
@@ -126,8 +129,8 @@ Otherwise the host keeps the anchor:
 
 ## Routing and permissions
 
-`install_policy` installs explicit endpoint/topic permissions associated with a
-workspace and caller-supplied policy revision. `install_workspace_policy`
+`install_policy` is a development fixture behind `test-fixtures`. It installs explicit
+endpoint/topic permissions for a caller-supplied workspace and revision. `install_workspace_policy`
 derives an all-current-members, all-topics policy from the current MLS roster;
 it is a convenience policy, not a least-privilege policy. An adapter should
 only install policy derived from accepted, current workspace state.
@@ -144,10 +147,11 @@ There are two paths that must not be conflated:
 
 | Path | API | Security meaning |
 | --- | --- | --- |
-| Basic transport/pub-sub example | `publish` and `poll` | Uses installed routing policy and Iroh transport. It does not encrypt the payload as an MLS group message. The example has no admitted workspace. |
+| Development fixture (`test-fixtures`) | `publish` and `poll` | Uses installed routing policy and Iroh transport. It does not encrypt the payload as an MLS group message. The example has no admitted workspace. |
 | Protected workspace publication | `stage_protected_publication`, then `adopt_protected_publication` | Stages an MLS-protected publication and delays network effects until adoption. Adoption saves the candidate first. |
 
-`publish` is rejected for a workspace after admission; the runtime directs the
+Production builds omit `install_policy`, `publish`, `poll` and the public harness.
+With `test-fixtures` enabled, `publish` is rejected for a workspace after admission; the runtime directs the
 caller to the protected path. Do not use the basic example as a secure group
 messaging recipe. The typed facade receives with `poll_protected` and
 `adopt_protected_reception`, then reads the inbox with `poll_pending_object`

@@ -1,7 +1,7 @@
 //! Typed transport options: an operator relay, no n0 lookup, and deadlines
 //! reach the bound endpoint through `ClientConfig`.
 use arachne_runtime::{
-    Client, ClientConfig, ErrorKind, Network, OperatorRelay, RelayTrust, TransportOptions,
+    Client, ClientConfig, ErrorCode, Network, OperatorRelay, RelayTrust, TransportOptions,
     TransportTimeouts,
 };
 use std::time::Duration;
@@ -10,10 +10,10 @@ fn open(
     network: Network,
     secret: u8,
     transport: TransportOptions,
-) -> arachne_runtime::ClientResult<Client> {
+) -> arachne_runtime::ClientResult<std::sync::Arc<Client>> {
     Client::open(ClientConfig {
         network,
-        secret: Some([secret; 32]),
+        secret: Some(([secret; 32]).into()),
         transport,
         storage: None,
     })
@@ -99,7 +99,7 @@ fn invalid_relay_settings_are_invalid_input() {
         )
         .err()
         .expect("invalid relay settings must not bind");
-        assert_eq!(error.kind(), ErrorKind::InvalidInput, "{error}");
+        assert_eq!(error.code(), ErrorCode::InvalidInput, "{error}");
     }
     let valid = TransportTimeouts {
         operation: Duration::from_secs(1),
@@ -127,6 +127,6 @@ fn invalid_relay_settings_are_invalid_input() {
         )
         .err()
         .expect("zero deadlines must not bind");
-        assert_eq!(error.kind(), ErrorKind::InvalidInput, "{error}");
+        assert_eq!(error.code(), ErrorCode::InvalidInput, "{error}");
     }
 }

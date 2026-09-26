@@ -290,7 +290,7 @@ mod tests {
     /// the source instead.
     #[test]
     fn internal_fallbacks_only_go_down() {
-        const CEILING: usize = 89;
+        const CEILING: usize = 88;
         fn count(dir: &std::path::Path) -> usize {
             let mut total = 0;
             for entry in std::fs::read_dir(dir).unwrap() {

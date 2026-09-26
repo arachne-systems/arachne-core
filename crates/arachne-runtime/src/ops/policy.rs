@@ -15,13 +15,12 @@ use tokio::sync::mpsc;
 
 use crate::client::DeliveryReport;
 use crate::errors::{self, security};
-use crate::{
-    MAX_WORKSPACE_OVERLAY_PATHS, Session, interest, report,
-};
+use crate::{MAX_WORKSPACE_OVERLAY_PATHS, Session, interest, report};
 
 /// A peer's topic permissions in a fixture policy.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(feature = "test-fixtures")]
 pub(crate) struct EndpointPolicy {
     pub(crate) peer: [u8; 32],
     pub(crate) publish: Vec<String>,
@@ -52,6 +51,7 @@ pub(crate) struct MemberPolicyArgs {
 /// Development fixture only; rejected when the session owns a workspace.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(feature = "test-fixtures")]
 pub(crate) struct VerifiedPolicyArgs {
     pub workspace: [u8; 32],
     pub revision: u64,
@@ -77,6 +77,7 @@ pub(crate) struct TopicArgs {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(feature = "test-fixtures")]
 pub(crate) struct PublishArgs {
     pub workspace: [u8; 32],
     pub revision: u64,
@@ -99,6 +100,7 @@ pub(crate) struct InterestQueued {
 
 /// An unprotected fixture message.
 #[derive(Clone, Debug, Serialize)]
+#[cfg(feature = "test-fixtures")]
 pub(crate) struct FixtureMessage {
     pub workspace: [u8; 32],
     pub revision: u64,
@@ -116,9 +118,12 @@ fn with_deadline<T>(
     work: impl Future<Output = Result<T, ApiError>>,
 ) -> Result<T, ApiError> {
     runtime.block_on(async {
-        tokio::time::timeout(crate::deadline::cap(op_deadline, Duration::from_secs(10)), work)
-            .await
-            .map_err(|_| ApiError::DeadlineExceeded)?
+        tokio::time::timeout(
+            crate::deadline::cap(op_deadline, Duration::from_secs(10)),
+            work,
+        )
+        .await
+        .map_err(|_| ApiError::DeadlineExceeded)?
     })
 }
 
@@ -130,7 +135,10 @@ fn topics(names: Vec<String>) -> Result<BTreeSet<Topic>, ApiError> {
         .map_err(errors::routing)
 }
 
-pub(crate) fn add_address_hint(session: &mut Session, args: AddressHintArgs) -> Result<(), ApiError> {
+pub(crate) fn add_address_hint(
+    session: &mut Session,
+    args: AddressHintArgs,
+) -> Result<(), ApiError> {
     with_deadline(session.op_deadline, &session.runtime, async {
         session
             .node
@@ -175,7 +183,9 @@ pub(crate) fn install_workspace_policy(
             owner.id(),
             revision,
             policy,
-            owner.gossip_tag_key().map_err(security(ErrorCode::Internal))?,
+            owner
+                .gossip_tag_key()
+                .map_err(security(ErrorCode::Internal))?,
         )
         .await?;
         session.interests.replace_revision(owner.id(), revision);
@@ -192,7 +202,10 @@ pub(crate) fn install_member_policy(
     session: &mut Session,
     args: MemberPolicyArgs,
 ) -> Result<PolicyInstalled, ApiError> {
-    let MemberPolicyArgs { revision, topics: names } = args;
+    let MemberPolicyArgs {
+        revision,
+        topics: names,
+    } = args;
     with_deadline(session.op_deadline, &session.runtime, async {
         let workspace = session
             .workspace
@@ -245,6 +258,7 @@ pub(crate) fn install_member_policy(
 
 /// Fixture: install a caller-made policy. The guards reject it once the
 /// session owns a workspace.
+#[cfg(feature = "test-fixtures")]
 pub(crate) fn install_verified_policy(
     session: &mut Session,
     args: VerifiedPolicyArgs,
@@ -272,7 +286,10 @@ pub(crate) fn install_verified_policy(
     })
 }
 
-pub(crate) fn set_interest(session: &mut Session, args: InterestArgs) -> Result<InterestQueued, ApiError> {
+pub(crate) fn set_interest(
+    session: &mut Session,
+    args: InterestArgs,
+) -> Result<InterestQueued, ApiError> {
     session.interests.set(
         &session.node,
         &session.runtime,
@@ -300,7 +317,10 @@ fn interest_idle(session: &Session) -> Result<(), ApiError> {
     Ok(())
 }
 
-pub(crate) fn subscribe(session: &mut Session, args: TopicArgs) -> Result<DeliveryReport, ApiError> {
+pub(crate) fn subscribe(
+    session: &mut Session,
+    args: TopicArgs,
+) -> Result<DeliveryReport, ApiError> {
     interest_idle(session)?;
     with_deadline(session.op_deadline, &session.runtime, async {
         let topic = Topic::new(args.topic).map_err(errors::routing)?;
@@ -314,7 +334,10 @@ pub(crate) fn subscribe(session: &mut Session, args: TopicArgs) -> Result<Delive
     })
 }
 
-pub(crate) fn unsubscribe(session: &mut Session, args: TopicArgs) -> Result<DeliveryReport, ApiError> {
+pub(crate) fn unsubscribe(
+    session: &mut Session,
+    args: TopicArgs,
+) -> Result<DeliveryReport, ApiError> {
     interest_idle(session)?;
     with_deadline(session.op_deadline, &session.runtime, async {
         let topic = Topic::new(args.topic).map_err(errors::routing)?;
@@ -330,7 +353,11 @@ pub(crate) fn unsubscribe(session: &mut Session, args: TopicArgs) -> Result<Deli
 
 /// Fixture: an unprotected publication, rejected once the session owns a
 /// workspace.
-pub(crate) fn publish(session: &mut Session, args: PublishArgs) -> Result<DeliveryReport, ApiError> {
+#[cfg(feature = "test-fixtures")]
+pub(crate) fn publish(
+    session: &mut Session,
+    args: PublishArgs,
+) -> Result<DeliveryReport, ApiError> {
     with_deadline(session.op_deadline, &session.runtime, async {
         let topic = Topic::new(args.topic).map_err(errors::routing)?;
         Ok(report(
@@ -344,6 +371,7 @@ pub(crate) fn publish(session: &mut Session, args: PublishArgs) -> Result<Delive
 }
 
 /// Fixture: the next unprotected message.
+#[cfg(feature = "test-fixtures")]
 pub(crate) fn poll(session: &mut Session) -> Result<Option<FixtureMessage>, ApiError> {
     match session.receiver.try_recv() {
         Ok(message) => Ok(Some(FixtureMessage {

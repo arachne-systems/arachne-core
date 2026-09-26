@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 /// lower values, for example `Limits::default().with_max_sessions(8)`.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Limits {
     /// Live sessions (endpoints). Sessions that are still binding count too.
     pub max_sessions: u32,
@@ -45,6 +46,7 @@ impl Default for Limits {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum PowerProfile {
     #[default]
     Normal,

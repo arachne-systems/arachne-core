@@ -769,7 +769,7 @@ mod tests {
             panic!("object was not staged")
         };
         let publisher = PublisherLog::new(&admin).unwrap();
-        harness::seed_workspace(&provider, &admin, Some(&publisher), Some(&inbox)).unwrap();
+        crate::persistence::seed_workspace(&provider, &admin, Some(&publisher), Some(&inbox)).unwrap();
         call(json!({"op":"restore_workspace","workspace":admin.id()})).unwrap();
         let pending = call(json!({"op":"poll_pending_object"})).unwrap();
         assert_eq!(pending["payload"], json!(b"still pending"));

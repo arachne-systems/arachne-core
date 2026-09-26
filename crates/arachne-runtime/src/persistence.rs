@@ -139,6 +139,7 @@ impl Logical<'_> {
 /// rolled-back database is refused. Without it the anchor is optional: the
 /// host may save `record_freshness` itself and pass it to restore.
 #[derive(Clone)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct StorageConfig {
     provider: Arc<dyn StorageProvider>,
     root: Arc<Zeroizing<[u8; 32]>>,
@@ -887,6 +888,7 @@ pub(crate) fn restore(
 /// to build state outside the runtime and then restore it. Not an import
 /// path: nothing on a session accepts state bytes.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn seed_workspace(
     provider: &dyn StorageProvider,
     owner: &Workspace,
@@ -1006,3 +1008,26 @@ mod tests {
         assert_eq!(stored_format(Some(&1u32.to_be_bytes())).unwrap(), 1);
     }
 }
+
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+impl StorageConfig {
+    /// Open native SQLite storage from a host-private directory and a separate
+    /// 32-byte storage root. The root is validated before a provider is made.
+    #[cfg_attr(feature = "uniffi", uniffi::constructor)]
+    pub fn open_sqlite(directory: String, root: Vec<u8>) -> Result<Arc<Self>, ApiError> {
+        let root: [u8; 32] = root.try_into()
+            .map_err(|_| ApiError::invalid_input("storage_root", "must contain 32 bytes"))?;
+        if directory.is_empty() {
+            return Err(ApiError::invalid_input("directory", "must not be empty"));
+        }
+        Ok(Arc::new(Self::sqlite(Path::new(&directory), root)))
+    }
+}
+
+#[cfg(feature = "uniffi")]
+uniffi::custom_type!(FreshnessAnchor, Vec<u8>, {
+    remote,
+    lower: |anchor| anchor.to_bytes().to_vec(),
+    try_lift: |bytes| Ok(FreshnessAnchor::from_bytes(&bytes)
+        .map_err(|_| ApiError::invalid_input("anchor", "must contain 40 bytes"))?),
+});

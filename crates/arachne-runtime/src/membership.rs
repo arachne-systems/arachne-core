@@ -103,7 +103,7 @@ impl WireManagement {
 /// carry its own admission in the redemption form (`commit` and
 /// `authorization`, as the admission reply names them). `kind` is
 /// informational only; the binary step is what is verified.
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct JoinStep {
     #[serde(default)]
@@ -119,13 +119,13 @@ pub(super) struct JoinStep {
     invitation_checkpoint: Option<InvitationCheckpoint>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct InvitationCheckpoint {
     pub(super) grant: Vec<u8>,
     pub(super) checkpoint: Vec<u8>,
 }
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JoinAuthorization {
     invitation_key: [u8; 32],

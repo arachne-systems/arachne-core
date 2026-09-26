@@ -98,10 +98,11 @@ fn event_round_trips() {
 
 #[test]
 fn capabilities_carry_the_api_version() {
-    assert_eq!(API_VERSION, 5, "bump deliberately with the change log");
+    assert_eq!(API_VERSION, 6, "bump deliberately with the change log");
     let caps = Capabilities::new(
         vec![Network::Direct, Network::Lan],
         vec![Feature::ResourceTransfer],
+        Limits::default(),
     );
     assert_eq!(caps.api_version, API_VERSION);
     assert_eq!(round_trip(&caps), caps);

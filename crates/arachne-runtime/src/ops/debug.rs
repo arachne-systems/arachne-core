@@ -4,7 +4,6 @@
 
 use arachne_api::ApiError;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::errors;
 use crate::{Session, resources};
@@ -14,6 +13,7 @@ use crate::{Session, resources};
 /// Used by the debug rig link to dial its controller.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(feature = "debug-rig")]
 pub(crate) struct ControlExchangeArgs {
     pub peer: [u8; 32],
     pub address: Option<String>,
@@ -33,6 +33,7 @@ pub(crate) struct EndpointBinding {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[cfg(feature = "debug-rig")]
 pub(crate) struct ControlReply {
     pub reply: Vec<u8>,
 }
@@ -49,6 +50,7 @@ pub(crate) fn endpoint_info(session: &mut Session) -> Result<EndpointBinding, Ap
     })
 }
 
+#[cfg(feature = "debug-rig")]
 pub(crate) fn control_exchange(
     session: &mut Session,
     args: ControlExchangeArgs,
@@ -76,8 +78,10 @@ pub(crate) fn network_change(session: &mut Session) -> Result<Notified, ApiError
     Ok(Notified { notified: true })
 }
 
-/// One resource transfer step. The reply is the job's state (an open
-/// event, typed in ADR step 4).
-pub(crate) fn resource(session: &mut Session, args: ResourceArgs) -> Result<Value, ApiError> {
+/// One resource transfer step, shared by the typed client and JSON adapter.
+pub(crate) fn resource(
+    session: &mut Session,
+    args: ResourceArgs,
+) -> Result<crate::client::ResourceStatus, ApiError> {
     resources::execute(session, args.request)
 }

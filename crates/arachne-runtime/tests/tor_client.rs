@@ -19,14 +19,14 @@ fn typed_client_opens_tor_only_endpoint_with_the_supplied_identity() {
     let secret = [81; 32];
     let mut client = Client::open(ClientConfig {
         network: Network::Tor,
-        secret: Some(secret),
+        secret: Some((secret).into()),
         transport: Default::default(),
         storage: None,
     })
     .unwrap();
     assert_eq!(
         client.endpoint().unwrap().endpoint_key,
-        *iroh::SecretKey::from_bytes(&secret).public().as_bytes()
+        (*iroh::SecretKey::from_bytes(&secret).public().as_bytes()).into()
     );
     client.close().unwrap();
 }

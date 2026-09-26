@@ -167,7 +167,7 @@ reason; review them when you change dependencies.
 For the simple transport example:
 
 ```sh
-cargo +1.98.0 run --locked -p arachne-runtime --example typed_pubsub
+cargo +1.98.0 run --locked -p arachne-runtime --features test-fixtures --example typed_pubsub
 ```
 
 That example exercises basic routing and transport only; it is not a secure MLS

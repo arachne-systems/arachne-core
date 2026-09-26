@@ -1,13 +1,15 @@
 //! H1/H2: branch state is saved with its workspace and restored before the
 //! next candidate. A restart must not silently discard the rollback window.
-use arachne_runtime::{Client, ClientConfig, MemoryProvider, Network, RestoredWorkspace, StorageConfig};
+use arachne_runtime::{
+    Client, ClientConfig, MemoryProvider, Network, RestoredWorkspace, StorageConfig,
+};
 
-fn open(provider: &MemoryProvider) -> Client {
+fn open(provider: &MemoryProvider) -> std::sync::Arc<Client> {
     Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([171; 32]),
+        secret: Some(([171; 32]).into()),
         transport: Default::default(),
-        storage: Some(StorageConfig::memory(provider)),
+        storage: Some((StorageConfig::memory(provider)).into()),
     })
     .unwrap()
 }
@@ -27,10 +29,10 @@ fn branch_records_survive_restore_and_the_next_candidate() {
     let invitation = client.stage_invitation(0).unwrap();
     client.adopt_invitation(&invitation).unwrap();
     let meta = provider
-        .value(workspace, b"runtime/branch/meta")
+        .value((workspace).to_bytes(), b"runtime/branch/meta")
         .expect("the candidate must save branch metadata");
     let prior = provider
-        .value(workspace, &snapshot_name(created.epoch))
+        .value((workspace).to_bytes(), &snapshot_name(created.epoch))
         .expect("the candidate must save its pre-commit snapshot");
     client.close().unwrap();
 
@@ -42,13 +44,26 @@ fn branch_records_survive_restore_and_the_next_candidate() {
     assert_eq!(restored.epoch, created.epoch + 1);
     let name = client.stage_workspace_name("Restored").unwrap();
     client.adopt_admission(&name).unwrap();
-    assert_eq!(provider.value(workspace, b"runtime/branch/meta"), Some(meta));
-    assert_eq!(provider.value(workspace, &snapshot_name(created.epoch)), Some(prior.clone()));
+    assert_eq!(
+        provider.value((workspace).to_bytes(), b"runtime/branch/meta"),
+        Some(meta)
+    );
+    assert_eq!(
+        provider.value((workspace).to_bytes(), &snapshot_name(created.epoch)),
+        Some(prior.clone())
+    );
 
     let invitation = client.stage_invitation(0).unwrap();
     client.adopt_invitation(&invitation).unwrap();
-    assert_eq!(provider.value(workspace, &snapshot_name(created.epoch)), Some(prior));
-    assert!(provider.value(workspace, &snapshot_name(restored.epoch)).is_some());
+    assert_eq!(
+        provider.value((workspace).to_bytes(), &snapshot_name(created.epoch)),
+        Some(prior)
+    );
+    assert!(
+        provider
+            .value((workspace).to_bytes(), &snapshot_name(restored.epoch))
+            .is_some()
+    );
     client.close().unwrap();
 
     let client = open(&provider);

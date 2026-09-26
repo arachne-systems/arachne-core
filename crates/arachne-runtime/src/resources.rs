@@ -3,7 +3,7 @@
 use arachne_node::resources::ResourceTicket;
 use serde::Deserialize;
 use arachne_api::{ApiError, ErrorCode};
-use serde_json::{Value, json};
+use crate::client::ResourceStatus;
 
 use crate::errors::{self, security};
 use std::{collections::BTreeMap, path::PathBuf};
@@ -38,7 +38,7 @@ pub(super) enum Request {
 }
 
 struct Job {
-    task: JoinHandle<Result<Value, String>>,
+    task: JoinHandle<Result<ResourceStatus, String>>,
     progress: watch::Receiver<u64>,
 }
 impl Drop for Job {
@@ -53,7 +53,7 @@ pub(super) struct Jobs {
     jobs: BTreeMap<u64, Job>,
 }
 
-pub(super) fn execute(session: &mut super::Session, request: Request) -> Result<Value, ApiError> {
+pub(super) fn execute(session: &mut super::Session, request: Request) -> Result<ResourceStatus, ApiError> {
     let resources = session.node.resources();
     match request {
         Request::Poll { id } => {
@@ -63,7 +63,7 @@ pub(super) fn execute(session: &mut super::Session, request: Request) -> Result<
                 .get(&id)
                 .ok_or_else(|| ApiError::invalid_input("id", "unknown resource operation"))?;
             if !job.task.is_finished() {
-                return Ok(json!({"state":"running", "bytes":*job.progress.borrow()}));
+                return Ok(ResourceStatus::Running { bytes: *job.progress.borrow() });
             }
             let mut job = session.resources.jobs.remove(&id).unwrap();
             return session
@@ -74,11 +74,11 @@ pub(super) fn execute(session: &mut super::Session, request: Request) -> Result<
         }
         Request::Cancel { id } => {
             session.resources.jobs.remove(&id);
-            return Ok(json!({"state":"cancelled"}));
+            return Ok(ResourceStatus::Cancelled);
         }
         Request::Revoke { path } => {
             resources.revoke(path.as_deref());
-            return Ok(json!({"state":"revoked"}));
+            return Ok(ResourceStatus::Revoked);
         }
         _ => (),
     }
@@ -112,7 +112,7 @@ pub(super) fn execute(session: &mut super::Session, request: Request) -> Result<
                     .prepare(&root, &path, workspace, revision, peer)
                     .await
                     .map_err(|error| error.to_string())?;
-                Ok(json!({"state":"prepared", "ticket":ticket}))
+                Ok(ResourceStatus::Prepared { ticket: ticket.into() })
             })
         }
         Request::Fetch {
@@ -130,7 +130,7 @@ pub(super) fn execute(session: &mut super::Session, request: Request) -> Result<
                     .fetch(&root, &path, workspace, revision, peer, ticket, progress)
                     .await
                     .map_err(|error| error.to_string())?;
-                Ok(json!({"state":"complete", "bytes":size}))
+                Ok(ResourceStatus::Complete { bytes: size })
             })
         }
         Request::Clear { root } => session.runtime.spawn(async move {
@@ -138,7 +138,7 @@ pub(super) fn execute(session: &mut super::Session, request: Request) -> Result<
                 .clear_partial(&root)
                 .await
                 .map_err(|error| error.to_string())?;
-            Ok(json!({"state":"cleared"}))
+            Ok(ResourceStatus::Cleared)
         }),
         _ => unreachable!(),
     };
@@ -155,5 +155,5 @@ pub(super) fn execute(session: &mut super::Session, request: Request) -> Result<
             progress: receiver,
         },
     );
-    Ok(json!({"state":"started", "id":id}))
+    Ok(ResourceStatus::Started { id })
 }
