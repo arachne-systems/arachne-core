@@ -29,6 +29,12 @@ pub struct MoqMetrics {
     pub sessions_active: usize,
     pub packets_sent: u64,
     pub packets_received: u64,
+    /// Groups yielded by a receive subscription, before its first frame is read.
+    pub groups_received: u64,
+    /// First frames read from received groups, before envelope validation.
+    pub frames_received: u64,
+    /// Received groups whose second frame read confirmed a clean end.
+    pub groups_completed: u64,
     pub rejected_sessions: u64,
 }
 
@@ -38,6 +44,9 @@ struct Counters {
     sessions_active: AtomicUsize,
     packets_sent: AtomicU64,
     packets_received: AtomicU64,
+    groups_received: AtomicU64,
+    frames_received: AtomicU64,
+    groups_completed: AtomicU64,
     rejected_sessions: AtomicU64,
 }
 
@@ -48,6 +57,9 @@ impl Counters {
             sessions_active: self.sessions_active.load(Ordering::Relaxed),
             packets_sent: self.packets_sent.load(Ordering::Relaxed),
             packets_received: self.packets_received.load(Ordering::Relaxed),
+            groups_received: self.groups_received.load(Ordering::Relaxed),
+            frames_received: self.frames_received.load(Ordering::Relaxed),
+            groups_completed: self.groups_completed.load(Ordering::Relaxed),
             rejected_sessions: self.rejected_sessions.load(Ordering::Relaxed),
         }
     }
@@ -601,14 +613,23 @@ async fn receive_session(
         let Some(mut group) = next_group else {
             return Ok(());
         };
+        if let Some(counters) = counters.upgrade() {
+            counters.groups_received.fetch_add(1, Ordering::Relaxed);
+        }
         let sequence = group.sequence;
         let Some(frame) = group.read_frame().await.map_err(transport)? else {
             return Err(Error::InvalidFrame);
         };
+        if let Some(counters) = counters.upgrade() {
+            counters.frames_received.fetch_add(1, Ordering::Relaxed);
+        }
         if frame.payload.len() > super::MAX_FRAME
             || group.read_frame().await.map_err(transport)?.is_some()
         {
             return Err(Error::TooLarge);
+        }
+        if let Some(counters) = counters.upgrade() {
+            counters.groups_completed.fetch_add(1, Ordering::Relaxed);
         }
         let envelope = wire::decode::<Envelope>(&frame.payload)?;
         if envelope.sequence != sequence {

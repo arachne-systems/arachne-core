@@ -1754,6 +1754,9 @@ impl Client {
                     sessions_active: raw.sessions_active as u64,
                     packets_sent: raw.packets_sent,
                     packets_received: raw.packets_received,
+                    groups_received: raw.groups_received,
+                    frames_received: raw.frames_received,
+                    groups_completed: raw.groups_completed,
                     rejected_sessions: raw.rejected_sessions,
                 })
             })
@@ -2576,6 +2579,12 @@ pub struct StreamMetrics {
     pub sessions_active: u64,
     pub packets_sent: u64,
     pub packets_received: u64,
+    /// Groups returned by the subscriber, across all peers.
+    pub groups_received: u64,
+    /// First frames returned by their group readers.
+    pub frames_received: u64,
+    /// Groups whose second read confirmed the expected clean end.
+    pub groups_completed: u64,
     pub rejected_sessions: u64,
 }
 
