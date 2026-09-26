@@ -1083,6 +1083,111 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(feature = "moq")]
+    #[tokio::test]
+    async fn authenticated_incoming_moq_ends_only_its_peers_backoff() {
+        use crate::{Node, Permissions, Topic};
+        use iroh_moq::{Moq, MoqSession};
+        use std::time::Duration;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (receiver, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let (sender, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let workspace = [56; 32];
+            let topic = Topic::new("shared/stream").unwrap();
+            let policy = BTreeMap::from([
+                (receiver.id(), Permissions::AllTopics),
+                (sender.id(), Permissions::AllTopics),
+            ]);
+            for node in [&receiver, &sender] {
+                node.install_verified_policy(workspace, 1, policy.clone())
+                    .await
+                    .unwrap();
+            }
+            receiver
+                .subscribe(workspace, 1, topic.clone())
+                .await
+                .unwrap();
+            receiver
+                .add_address_hint(sender.id(), sender.address())
+                .await
+                .unwrap();
+            receiver
+                .enable_moq_delivery(workspace, 1, sender.id(), topic)
+                .await
+                .unwrap();
+            let unrelated = *iroh::SecretKey::generate().public().as_bytes();
+            let until = Instant::now() + Duration::from_secs(120);
+            receiver
+                .connections
+                .unreachable
+                .lock()
+                .await
+                .extend([(sender.id(), (until, 6)), (unrelated, (until, 6))]);
+            let error = receiver
+                .connections
+                .connect(sender.id(), super::super::ALPN)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("recently unreachable"));
+
+            // A fresh incoming QUIC/MoQ handshake is authenticated by Iroh and
+            // admitted by the receiver's existing route/topic policy. It does
+            // not send a direct-frame message that could clear the backoff.
+            let moq = Moq::new(sender.connections.endpoint());
+            let (session, driver) = MoqSession::connect(
+                &sender.connections.endpoint(),
+                EndpointAddr::new(PublicKey::from_bytes(&receiver.id()).unwrap())
+                    .with_ip_addr(receiver.address()),
+                moq.origin(),
+            )
+            .await
+            .unwrap();
+            let driver = tokio::spawn(driver.run());
+            let observed = tokio::time::timeout(Duration::from_secs(1), async {
+                while receiver
+                    .connections
+                    .unreachable
+                    .lock()
+                    .await
+                    .contains_key(&sender.id())
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            let data = receiver
+                .connections
+                .connect(sender.id(), super::super::ALPN)
+                .await;
+            let unrelated_kept = receiver
+                .connections
+                .unreachable
+                .lock()
+                .await
+                .contains_key(&unrelated);
+            session.close(moq_net::Error::Cancel);
+            driver.abort();
+            let _ = driver.await;
+            sender.close().await;
+            receiver.close().await;
+            assert!(
+                observed.is_ok(),
+                "authenticated incoming MoQ left stale backoff: {data:?}"
+            );
+            assert!(
+                data.is_ok(),
+                "fresh reachable peer could not use the data ALPN: {data:?}"
+            );
+            assert!(
+                unrelated_kept,
+                "one peer cleared another peer's failure state"
+            );
+        })
+        .await
+        .expect("authenticated reachability fixture timed out");
+    }
+
     #[test]
     fn unreachable_backoff_doubles_from_five_seconds_to_a_two_minute_cap() {
         let seconds = |failures| unreachable_backoff(failures).as_secs();
