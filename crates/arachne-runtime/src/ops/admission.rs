@@ -259,7 +259,16 @@ pub(crate) fn poll(session: &mut Session, args: PollAdmissionArgs) -> Result<Val
     let Some(incoming) = incoming else {
         // Membership queries the committed view answered: tell the host
         // once, when it has nothing else to do.
-        return Ok(membership::take_answered(session).unwrap_or(Value::Null));
+        if let Some(answered) = membership::take_answered(session) {
+            return Ok(answered);
+        }
+        if !admission_busy && membership::fork::stage_settlement(session)?.is_some() {
+            // Private snapshot deletion follows foreground work. Save and
+            // adopt here; it is never an admission candidate for the host.
+            let token = session.transition.staged.as_ref().unwrap().snapshot.clone();
+            ops::candidate::adopt(session, ops::candidate::AdoptKind::Admission, token)?;
+        }
+        return Ok(Value::Null);
     };
     if incoming.payload() == NEARBY_IDENTITY {
         incoming
@@ -663,8 +672,31 @@ fn drive_workspace_step(session: &mut Session) -> Result<Value, ApiError> {
         committed["reply_queued"] = json!(reply.queued);
     }
     committed["state"] = json!("workspace_committed");
+    copy_branch_outcome(&staged, &mut committed);
     committed["activity"] = activity_value(live(session)?);
     Ok(committed)
+}
+
+fn copy_branch_outcome(staged: &Value, committed: &mut Value) {
+    for name in ["branch_state", "fork_epoch", "first_unsettled", "action_id", "reason",
+        "carried_revocation", "republication", "republication_lost", "publication_id"] {
+        if let Some(value) = staged.get(name) {
+            committed[name] = value.clone();
+        }
+    }
+}
+
+#[test]
+fn a_saved_branch_outcome_reaches_the_host() {
+    let staged = json!({"state":"awaiting_save", "candidate":[1,2],
+        "branch_state":"action_lost", "action_id":[3], "reason":"retry_already_used"});
+    let mut committed = json!({"state":"workspace_committed", "durable":true});
+    copy_branch_outcome(&staged, &mut committed);
+    assert_eq!(committed["branch_state"], "action_lost");
+    assert_eq!(committed["action_id"], json!([3]));
+    assert_eq!(committed["reason"], "retry_already_used");
+    assert_eq!(committed["state"], "workspace_committed");
+    assert!(committed.get("candidate").is_none());
 }
 
 /// Save and adopt this member's staged self-update, then announce the head.
@@ -1570,12 +1602,14 @@ fn queue_admission(
 /// Whether this poll should stage before it reads another admission packet.
 /// The normal trigger is elsewhere: PollAdmission stages when no admission
 /// packet is waiting. This is the forced-progress trigger for a busy inbox: a
-/// full batch, or a full batch's worth of reads since the last attempt. Both
-/// are counts. Nothing on this path waits for time to pass.
+/// full batch, or 16 reads since the last attempt. The read limit stays
+/// independent of batch capacity so duplicate traffic cannot delay a small
+/// batch. Nothing on this path waits for time to pass.
 fn should_stage_queued_admission(session: &Session) -> bool {
+    const MAX_READS_BEFORE_STAGE: usize = 16;
     !session.admission.queue.is_empty()
         && (session.admission.queue.len() >= MAX_RUNTIME_ADMISSION_BATCH
-            || session.admission.reads_since_stage >= MAX_RUNTIME_ADMISSION_BATCH)
+            || session.admission.reads_since_stage >= MAX_READS_BEFORE_STAGE)
 }
 
 fn stage_queued_admission(session: &mut Session) -> Result<Option<Value>, ApiError> {
@@ -1943,7 +1977,7 @@ mod tests {
             AdmissionAssessment, MembershipAuthorization, PendingJoin, Workspace,
         };
 
-        for count in [8, MAX_RUNTIME_ADMISSION_BATCH] {
+        for count in [8, 16, 32, 64, 128] {
             let endpoint = |index: usize| crate::test_endpoint(index as u64);
             let key = |index: usize| crate::test_key(index as u64);
             let mut owner = Workspace::create(key(10_000), "Wire-size owner").unwrap();
@@ -1991,10 +2025,8 @@ mod tests {
                     .collect(),
             );
             let step = membership::encode_step(&authorization, &prepared.commit).unwrap();
-            let mut offer = b"DFMO\x02".to_vec();
-            offer.extend(prepared.workspace.id());
-            offer.extend(0_u64.to_be_bytes());
-            offer.extend(membership::wire_step(&step, None, usize::MAX).unwrap());
+            let offer = membership::offer_packet(&prepared.workspace, owner.epoch(), &authorization, &prepared.commit, false).unwrap();
+            let step_size = step.len();
             let reply = admission_history_page(
                 &retained_reply(&prepared.workspace, endpoint(20_000), &requests[0]).unwrap(),
                 &[step],
@@ -2003,7 +2035,7 @@ mod tests {
             )
             .unwrap();
             println!(
-                "admission_wire_size count={count} offer_bytes={} reply_bytes={}",
+                "admission_wire_size count={count} step_bytes={step_size} offer_bytes={} reply_bytes={}",
                 offer.len(),
                 reply.len()
             );
@@ -2019,6 +2051,7 @@ mod tests {
             assert_eq!(owner.member_count(), count + 1);
             assert_eq!(joins.len(), count);
         }
+        assert_eq!(MAX_RUNTIME_ADMISSION_BATCH, 128, "binary transport can admit a full supported batch");
     }
 
     #[test]

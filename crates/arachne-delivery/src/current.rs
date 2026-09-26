@@ -300,6 +300,16 @@ impl CurrentViewIndex {
             .sum()
     }
 
+    pub(crate) fn publications(&self) -> Result<Vec<(PublicationContext, CurrentMetadata, Vec<u8>)>, &'static str> {
+        self.values.iter().map(|((revision, topic, selector, replacement_key), entry)| {
+            let (context, ciphertext) = PublicationContext::unpack(self.workspace, *revision,
+                topic.clone(), &entry.value.packet)?;
+            let metadata = CurrentMetadata { selector: *selector, replacement_key: *replacement_key,
+                expires_at: entry.value.expires_at, tombstone: entry.value.tombstone };
+            Ok((context, metadata, ciphertext.to_vec()))
+        }).collect()
+    }
+
     /// Caller stores these bytes inside the authenticated workspace record.
     pub fn snapshot(&self) -> Result<Vec<u8>, &'static str> {
         self.validate()?;

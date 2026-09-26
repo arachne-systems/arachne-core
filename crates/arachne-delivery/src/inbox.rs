@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8] = b"DFOI\x02";
 /// Binary inbox state (A6f). Earlier versions are rejected.
-const CACHE_MAGIC: &[u8] = b"DFIC\x05";
+const CACHE_MAGIC: &[u8] = b"DFIC\x06";
 /// Replay windows: one per (author, epoch) that sent to this member.
 const MAX_REPLAY_WINDOWS: usize = 4096;
 /// Accepted counters tracked above one replay floor. An author's counter is
@@ -131,13 +131,14 @@ struct Pending {
     sequence: u64,
     recipients: Vec<[u8; 32]>,
     current: Option<CurrentReceipt>,
+    from_losing_branch: bool,
     payload: Vec<u8>,
 }
 
 impl Pending {
     /// Encoded size in the inbox snapshot (see `Snapshot::encode`).
     fn weight(topic: usize, recipients: usize, current: bool, payload: usize) -> usize {
-        32 + 32 + 8 * 3 + 1 + topic + 16 + 8 + 1 + 32 * recipients + 1
+        32 + 32 + 8 * 3 + 1 + topic + 16 + 8 + 1 + 32 * recipients + 2
             + if current { 72 } else { 0 }
             + 4
             + payload
@@ -485,6 +486,7 @@ impl Snapshot {
                     codec::u64(bytes, current.expires_at);
                 }
             }
+            bytes.push(u8::from(pending.from_losing_branch));
             codec::blob(bytes, &pending.payload);
         }
         codec::count(bytes, inbox.recent.len());
@@ -570,6 +572,11 @@ impl Snapshot {
                 }),
                 _ => return Err("invalid pending current marker"),
             };
+            let from_losing_branch = match take(input, 1)?[0] {
+                0 => false,
+                1 => true,
+                _ => return Err("invalid pending branch marker"),
+            };
             let payload = codec::read_blob(input, arachne_security::MAX_APPLICATION_PAYLOAD)?;
             pending.push(Pending {
                 author,
@@ -582,6 +589,7 @@ impl Snapshot {
                 sequence,
                 recipients,
                 current,
+                from_losing_branch,
                 payload,
             });
         }
@@ -649,6 +657,33 @@ pub struct PendingObject {
     pub counter: u64,
     pub recipients: Vec<[u8; 32]>,
     pub current: Option<current::CurrentMetadata>,
+    /// The plaintext was accepted on a branch that this node later left.
+    pub from_losing_branch: bool,
+}
+
+/// This node's authenticated plaintext recovered from its retained losing
+/// branch publications. The runtime can protect it again with the same id.
+pub struct OwnPublication {
+    pub context: PublicationContext,
+    pub payload: Vec<u8>,
+    pub recipients: Vec<[u8; 32]>,
+    pub current: Option<current::CurrentMetadata>,
+}
+
+impl OwnPublication {
+    fn open(owner: &arachne_security::Workspace, context: PublicationContext, ciphertext: &[u8],
+        recipients: Vec<[u8; 32]>, current: Option<current::CurrentMetadata>) -> Result<Self, &'static str> {
+        let aad = match current {
+            Some(metadata) => metadata.authenticated_context(&context),
+            None if recipients.is_empty() => context.authenticated_bytes(),
+            None => context.direct_authenticated_bytes(&recipients)?,
+        };
+        let object = owner.unprotect_object(context.topic.namespace().as_bytes(), &aad, ciphertext)?;
+        if owner.member().map(|member| member.id()) != Some(object.message.member) {
+            return Err("only an object's author can re-publish it");
+        }
+        Ok(Self { context, payload: object.message.payload, recipients, current })
+    }
 }
 
 /// A caller-local scheduling hint, never an acknowledgement or rejection.
@@ -827,6 +862,9 @@ impl ObjectInbox {
         let member = |id: &[u8; 32]| next.endpoints_for_members(&[*id]).is_ok();
         let mut moved = self.clone();
         moved.epoch = next.epoch();
+        for pending in &mut moved.pending {
+            pending.from_losing_branch |= pending.epoch > fork_epoch;
+        }
         moved.replay.retain(|replay| kept(replay.epoch));
         moved.progress.retain(|progress| kept(progress.epoch));
         moved.retained_ranges.retain(|range| {
@@ -837,6 +875,17 @@ impl ObjectInbox {
         moved.retained_current_views.clear();
         moved.current_progress.clear();
         for stream in &mut moved.direct {
+            // Direct scopes span epochs. Rewind their sequence frontier with
+            // the discarded suffix, or re-publication starts behind a hole
+            // that only existed on the losing branch.
+            if let Some(first_lost) = stream.records.iter().filter(|record| {
+                arachne_security::object_epoch(&record.object).is_some_and(|epoch| epoch > fork_epoch)
+            }).map(|record| record.sequence).min() {
+                let through = first_lost.saturating_sub(1);
+                stream.known_head = stream.known_head.min(through);
+                stream.floor = stream.floor.min(through);
+                stream.recovery_floor = stream.recovery_floor.min(through);
+            }
             stream.records.retain(|record| {
                 arachne_security::object_epoch(&record.object).is_some_and(kept)
             });
@@ -848,6 +897,49 @@ impl ObjectInbox {
         });
         moved.snapshot()?;
         Ok(moved)
+    }
+
+    /// Recover only this author's retained objects above the fork epoch.
+    /// Foreign pending plaintext is never a source for re-publication.
+    pub fn own_losing_publications(&self, owner: &arachne_security::Workspace,
+        publisher: &PublisherLog, fork_epoch: u64) -> Result<Vec<OwnPublication>, &'static str> {
+        self.validate_owner(owner)?;
+        publisher.validate_owner(owner)?;
+        let mut own = Vec::new();
+        for epoch in publisher.epochs().into_iter().filter(|epoch| *epoch > fork_epoch) {
+            for record in publisher.epoch_log(epoch).ok_or("missing publisher epoch")?.publications() {
+                let publication = if let Ok(live) = current::LiveCurrentPacket::from_wire(&record.ciphertext) {
+                    let (context, ciphertext) = PublicationContext::unpack(record.context.workspace,
+                        record.context.revision, record.context.topic.clone(), &live.packet)?;
+                    if context != record.context { return Err("retained current context mismatch") }
+                    OwnPublication::open(owner, context, ciphertext, Vec::new(), Some(live.metadata))?
+                } else {
+                    OwnPublication::open(owner, record.context.clone(), &record.ciphertext, Vec::new(), None)?
+                };
+                own.push(publication);
+            }
+        }
+        let author = owner.member().ok_or("publisher requires member identity")?.id();
+        for stream in self.direct.iter().filter(|stream| stream.author == author) {
+            for record in &stream.records {
+                if arachne_security::object_epoch(&record.object).is_none_or(|epoch| epoch <= fork_epoch) { continue }
+                let context = PublicationContext { workspace: self.workspace, revision: record.revision,
+                    topic: Topic::new(&stream.topic).map_err(|_| "invalid direct topic")?, id: record.id,
+                    sequence: std::num::NonZeroU64::new(record.sequence) };
+                own.push(OwnPublication::open(owner, context, &record.object, stream.recipients.clone(), None)?);
+            }
+        }
+        // A current index can outlive the publisher log's byte budget.
+        if let Some(current) = &self.current {
+            for (context, metadata, ciphertext) in current.publications()? {
+                if !own.iter().any(|publication| publication.context.id == context.id)
+                    && arachne_security::object_epoch(&ciphertext).is_some_and(|epoch| epoch > fork_epoch)
+                {
+                    own.push(OwnPublication::open(owner, context, &ciphertext, Vec::new(), Some(metadata))?);
+                }
+            }
+        }
+        Ok(own)
     }
 
     /// Direct sequences given up as missed since this inbox was created or
@@ -1212,7 +1304,21 @@ impl ObjectInbox {
         }
         let identity = publication_identity(author, context.id);
         if self.recent.contains(&identity) {
-            return Ok(InboxStage::Duplicate);
+            if recipients.is_empty() || sequence == 0 || self.direct.iter().any(|stream| {
+                stream.author == author && stream.revision == context.revision
+                    && stream.topic == context.topic.as_str() && stream.recipients == recipients
+                    && (stream.closed(sequence) || stream.records.iter().any(|record| record.id == context.id))
+            }) {
+                return Ok(InboxStage::Duplicate);
+            }
+            // The app already accepted this id on another branch or scope.
+            // Keep its newly authenticated sequence proof without delivering
+            // the plaintext twice. Otherwise the next direct object waits
+            // behind a gap that duplicate suppression can never fill.
+            let mut next = self.clone();
+            next.retain_direct(author, context, recipients, object)?;
+            next.snapshot()?;
+            return Ok(InboxStage::Prepared(Box::new(next)));
         }
         // B7e: a direct sequence at or below its scope floor was accepted or
         // given up as missed. A late copy is dropped, never delivered after
@@ -1283,6 +1389,7 @@ impl ObjectInbox {
             sequence,
             recipients: recipients.to_vec(),
             current,
+            from_losing_branch: false,
             payload: authenticated.message.payload,
         });
         if !recipients.is_empty() && context.sequence.is_some() {
@@ -1726,6 +1833,9 @@ impl ObjectInbox {
 
     /// A direct object waits while an earlier sequence of its scope is missing.
     fn behind_direct_gap(&self, pending: &Pending) -> bool {
+        // Already authenticated losing plaintext remains deliverable even
+        // though its ciphertext sequence has left the accepted branch.
+        if pending.from_losing_branch { return false; }
         if pending.recipients.is_empty() || pending.sequence == 0 {
             return false;
         }
@@ -1900,6 +2010,7 @@ impl ObjectInbox {
             counter: pending.counter,
             recipients: pending.recipients.clone(),
             current: pending.current.as_ref().map(Into::into),
+            from_losing_branch: pending.from_losing_branch,
         })
     }
 

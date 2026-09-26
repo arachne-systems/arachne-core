@@ -47,6 +47,7 @@ impl AdoptKind {
                     | WorkspaceTransition::WorkspaceName
                     | WorkspaceTransition::SelfUpdate(_)
                     | WorkspaceTransition::Invitation(..)
+                    | WorkspaceTransition::Republication(..)
             ) | (AdoptKind::Join, WorkspaceTransition::Join)
                 | (
                     AdoptKind::Recovery,
@@ -82,6 +83,7 @@ pub(crate) enum CandidateKind {
     Removal,
     Join,
     Publication,
+    Republication,
     Reception,
     Recovery,
     CurrentView,
@@ -97,6 +99,7 @@ impl CandidateKind {
             WorkspaceTransition::SelfUpdate(_) => CandidateKind::SelfUpdate,
             WorkspaceTransition::Join => CandidateKind::Join,
             WorkspaceTransition::RoutedPublication(..) => CandidateKind::Publication,
+            WorkspaceTransition::Republication(..) => CandidateKind::Republication,
             WorkspaceTransition::Inbox | WorkspaceTransition::InboxRejected => {
                 CandidateKind::Reception
             }
@@ -115,7 +118,8 @@ impl CandidateKind {
             | CandidateKind::WorkspaceName
             | CandidateKind::Invitation
             | CandidateKind::SelfUpdate
-            | CandidateKind::Removal => AdoptKind::Admission,
+            | CandidateKind::Removal
+            | CandidateKind::Republication => AdoptKind::Admission,
             CandidateKind::Join => AdoptKind::Join,
             CandidateKind::Publication => AdoptKind::Publication,
             CandidateKind::Reception => AdoptKind::Reception,
@@ -390,8 +394,11 @@ pub(crate) fn adopt(
             .clone()
             .transition(WorkspacePhase::Synchronizing, None)?;
     }
+    let membership_changed = session.workspace.as_ref().is_none_or(|previous| {
+        previous.epoch_fingerprint() != staged.workspace.epoch_fingerprint()
+    });
     persistence::commit_candidate(session, &snapshot)?;
-    membership::fork::adopt_candidate(session, &snapshot)?;
+    let orders_changed = membership::fork::adopt_candidate(session, &snapshot)?;
     let staged = session.transition.staged.take().unwrap();
     let mut value = Adopted {
         workspace: staged.workspace.id(),
@@ -457,13 +464,8 @@ pub(crate) fn adopt(
                 stale,
             });
         }
-        WorkspaceTransition::RoutedPublication(
-            context,
-            delivery,
-            packet,
-            endpoints,
-            recipients,
-        ) => {
+        WorkspaceTransition::RoutedPublication(context, delivery, packet, endpoints, recipients)
+        | WorkspaceTransition::Republication(context, delivery, packet, endpoints, recipients) => {
             // Adoption is final even if network admission fails or times out.
             // The send (and its gossip join) also ends at the op deadline.
             let send_limit = crate::deadline::cap(session.op_deadline, Duration::from_secs(10));
@@ -631,8 +633,12 @@ pub(crate) fn adopt(
                     .as_ref()
                     .is_none_or(|(head, _)| *head <= owner.epoch())
         });
-    if committed_here || reached_head {
+    if membership_changed && (committed_here || reached_head) {
         membership::announce_head(session);
+    } else if orders_changed {
+        // A received carried order is durable even when membership did not
+        // move. Relay it without advertising a new membership head.
+        membership::fork::announce_orders(session);
     }
     if value.missing_count.is_none() {
         value.missing_count = missed;

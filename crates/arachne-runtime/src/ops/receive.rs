@@ -42,6 +42,8 @@ pub(crate) struct PendingObject {
     pub endpoint: [u8; 32],
     pub payload: Vec<u8>,
     pub counter: u64,
+    pub epoch: u64,
+    pub from_losing_branch: bool,
     pub recipients: Vec<[u8; 32]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current: Option<PublicationCurrent>,
@@ -191,6 +193,8 @@ pub(crate) fn poll_pending(
         endpoint: pending.message.endpoint,
         payload: pending.message.payload,
         counter: pending.counter,
+        epoch: pending.epoch,
+        from_losing_branch: pending.from_losing_branch,
         recipients: pending.recipients,
         current: pending.current.map(|current| PublicationCurrent {
             selector: current.selector,

@@ -778,6 +778,10 @@ pub struct ReceivedProtectedPublication {
     pub sequence: Option<u64>,
     pub payload: Vec<u8>,
     pub recipients: Vec<[u8; 32]>,
+    /// The author epoch in which this object was authenticated.
+    pub epoch: u64,
+    /// True after this node leaves the branch on which it accepted the object.
+    pub from_losing_branch: bool,
     /// Author sender counter; identifies the object for acknowledgement.
     pub counter: u64,
     /// Present for a latest-value (current) publication.
@@ -1994,6 +1998,8 @@ impl Client {
             payload: pending.payload,
             recipients: pending.recipients,
             counter: pending.counter,
+            epoch: pending.epoch,
+            from_losing_branch: pending.from_losing_branch,
             current: pending.current,
         }))
     }

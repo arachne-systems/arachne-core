@@ -12,6 +12,7 @@
 //! the caller. It does not open them, verify steps, or talk to peers.
 use super::ForkKey;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 /// Epochs a node can go back. A fork deeper than this makes the node orphaned.
 pub const ROLLBACK_EPOCHS: u64 = 64;
@@ -36,7 +37,9 @@ pub const MAX_BRANCH_RECORD: usize = HEADER + ROLLBACK_EPOCHS as usize * ENTRY +
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BranchState {
     first_unsettled: u64,
-    snapshots: VecDeque<(u64, Vec<u8>)>,
+    // Candidates share immutable sealed bytes. Staging one publication
+    // must not copy the whole rollback budget before any record is saved.
+    snapshots: VecDeque<(u64, Arc<Vec<u8>>)>,
     bytes: usize,
     orphaned: bool,
 }
@@ -137,7 +140,7 @@ impl BranchState {
             return Err("branch snapshot epoch must follow the retained epochs");
         }
         self.bytes += sealed.len();
-        self.snapshots.push_back((epoch, sealed));
+        self.snapshots.push_back((epoch, Arc::new(sealed)));
         if let Some(settled) = epoch.checked_sub(ROLLBACK_EPOCHS) {
             self.settle_through(settled);
         }
@@ -251,7 +254,7 @@ impl BranchState {
         for (epoch, sealed) in &self.snapshots {
             bytes.extend(epoch.to_be_bytes());
             bytes.extend((sealed.len() as u32).to_be_bytes());
-            bytes.extend(sealed);
+            bytes.extend(sealed.as_slice());
         }
         bytes
     }
@@ -351,7 +354,7 @@ impl BranchState {
             }
             state
                 .snapshots
-                .push_back((epoch, take(&mut rest, length)?.to_vec()));
+                .push_back((epoch, Arc::new(take(&mut rest, length)?.to_vec())));
         }
         if !rest.is_empty() {
             return Err("trailing bytes after branch record");

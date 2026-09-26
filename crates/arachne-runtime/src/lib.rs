@@ -122,10 +122,10 @@ pub use json::{
 
 
 const MAX_WORKSPACE_OVERLAY_PATHS: usize = 5;
-// JSON commit/authorization arrays must fit both the 32 KiB membership offer
-// request and the 128 KiB admission reply. The lower MLS seam supports 128;
-// this transport adapter deliberately uses the smaller safe batch.
-const MAX_RUNTIME_ADMISSION_BATCH: usize = 16;
+// Binary steps use the 128 KiB reply path. Large committed offers carry a
+// digest in the 32 KiB request and the receiver pulls the exact step. At
+// 128 Adds the measured step is 76,394 bytes and the reply is 92,108 bytes.
+const MAX_RUNTIME_ADMISSION_BATCH: usize = arachne_security::MAX_ADMISSION_BATCH;
 // Half of the 512 control-exchange reserve (arachne-node budget.rs). Presence,
 // profile and recovery exchanges always keep the other half.
 pub(crate) const MAX_ADMISSION_WAITERS: usize = 256;
