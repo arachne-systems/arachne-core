@@ -320,7 +320,8 @@ impl Streams {
                 Ok(()) if used_moq => {
                     report.queued = true;
                     self.0.counters.packets_sent.fetch_add(1, Ordering::Relaxed);
-                    let publisher_hop = routes.get(&peer).map(|route| route.moq.origin().hop().id());
+                    let publisher_hop =
+                        routes.get(&peer).map(|route| route.moq.origin().hop().id());
                     tracing::info!(target: "data_fabric_transport", peer = %hex(&peer), workspace = %hex(&frame.workspace), revision = frame.revision, sequence, ?publisher_hop, route = "moq", "PTT_MOQ_PACKET_ENQUEUED");
                 }
                 Ok(()) => report.admitted.push(peer),
