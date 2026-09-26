@@ -610,5 +610,5 @@ fn a_step_at_the_verifier_bound_is_accepted_and_served_in_one_reply() {
     })
     .unwrap();
     assert!(reply.len() <= arachne_node::MAX_CONTROL_REPLY, "{}", reply.len());
-    assert!(arachne_security::MAX_MEMBERSHIP_COMMIT > 64 * 1024);
+    const { assert!(arachne_security::MAX_MEMBERSHIP_COMMIT > 64 * 1024); }
 }

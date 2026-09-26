@@ -1113,7 +1113,7 @@ mod tests {
         assert!(parse_checkpoint_page(&page(total, total, 0)).is_err());
         let over = arachne_security::MAX_CHECKPOINT as u32 + 1;
         assert!(parse_checkpoint_page(&page(over, 0, CHECKPOINT_PAGE_BYTES)).is_err());
-        assert!(CHECKPOINT_PAGE_BYTES + 13 <= arachne_node::MAX_CONTROL_REPLY);
+        const { assert!(CHECKPOINT_PAGE_BYTES + 13 <= arachne_node::MAX_CONTROL_REPLY); }
     }
 
     #[test]

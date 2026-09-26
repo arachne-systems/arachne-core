@@ -1110,8 +1110,8 @@ impl Client {
                     checkpoint: checkpoint.to_vec(),
                     display_name: display_name.to_owned(),
                     peers: peers
-                        .to_vec()
-                        .into_iter()
+                        .iter()
+                        .copied()
                         .map(EndpointId::to_bytes)
                         .collect(),
                 },
@@ -1133,8 +1133,8 @@ impl Client {
                 join::FetchCheckpointArgs {
                     peer: None,
                     peers: peers
-                        .to_vec()
-                        .into_iter()
+                        .iter()
+                        .copied()
                         .map(EndpointId::to_bytes)
                         .collect(),
                     invitation: invitation.to_vec(),
@@ -2157,7 +2157,7 @@ impl Client {
         if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return Ok(());
         }
-        Ok(crate::registry::close_session(self.handle)?)
+        crate::registry::close_session(self.handle)
     }
 }
 

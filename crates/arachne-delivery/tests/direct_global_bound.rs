@@ -51,7 +51,7 @@ fn three_authors_and_reader() -> (Vec<Workspace>, Workspace) {
             .map(|member| {
                 active(
                     member
-                        .prepare_management_update(registered.action.clone(), &registered.commit)
+                        .prepare_management_update(registered.action, &registered.commit)
                         .unwrap(),
                 )
                 .prepare_admission_update(&admission.authorization, &admission.commit)

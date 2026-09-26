@@ -200,9 +200,11 @@ fn fixed_bound_records_fit_one_store_record() {
     // The delivery attachment and a pending join (with its B3a checkpoint)
     // are each one record; an invitation checkpoint record holds a grant and
     // one checkpoint.
-    assert!(MAX_WORKSPACE_ATTACHMENT <= MAX_RECORD_BYTES);
-    assert!(MAX_SEALED_PENDING_JOIN <= MAX_RECORD_BYTES);
-    assert!(1024 + MAX_CHECKPOINT <= MAX_RECORD_BYTES);
+    const {
+        assert!(MAX_WORKSPACE_ATTACHMENT <= MAX_RECORD_BYTES);
+        assert!(MAX_SEALED_PENDING_JOIN <= MAX_RECORD_BYTES);
+        assert!(1024 + MAX_CHECKPOINT <= MAX_RECORD_BYTES);
+    }
 }
 
 #[test]

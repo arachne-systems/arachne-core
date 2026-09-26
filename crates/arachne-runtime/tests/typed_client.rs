@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn typed_client_reports_endpoint_and_workspace_state_then_closes() {
-    let mut client = Client::open(ClientConfig {
+    let client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some(([7; 32]).into()),
         transport: Default::default(),
@@ -38,7 +38,7 @@ fn typed_client_reports_endpoint_and_workspace_state_then_closes() {
 #[test]
 fn typed_client_creates_named_workspace_with_typed_state() {
     let provider = MemoryProvider::default();
-    let mut client = Client::open(ClientConfig {
+    let client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some(([10; 32]).into()),
         transport: Default::default(),
@@ -64,7 +64,7 @@ fn typed_client_creates_named_workspace_with_typed_state() {
 #[test]
 fn typed_client_exposes_recovery_result_without_vendor_types() {
     let provider = MemoryProvider::default();
-    let mut client = Client::open(ClientConfig {
+    let client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some(([11; 32]).into()),
         transport: Default::default(),
@@ -81,7 +81,7 @@ fn typed_client_exposes_recovery_result_without_vendor_types() {
 #[test]
 fn typed_client_exposes_recovery_request_lifecycle() {
     let provider = MemoryProvider::default();
-    let mut client = Client::open(ClientConfig {
+    let client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some(([15; 32]).into()),
         transport: Default::default(),
@@ -115,14 +115,14 @@ fn typed_client_exposes_recovery_request_lifecycle() {
 fn typed_clients_recover_an_opaque_publication() {
     let owner_provider = MemoryProvider::default();
     let reader_provider = MemoryProvider::default();
-    let mut owner = Client::open(ClientConfig {
+    let owner = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some(([16; 32]).into()),
         transport: Default::default(),
         storage: Some((StorageConfig::memory(&owner_provider)).into()),
     })
     .unwrap();
-    let mut reader = Client::open(ClientConfig {
+    let reader = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some(([17; 32]).into()),
         transport: Default::default(),
@@ -242,7 +242,7 @@ fn typed_clients_recover_an_opaque_publication() {
 #[test]
 fn typed_client_rejects_wrong_publication_workspace_before_staging() {
     let provider = MemoryProvider::default();
-    let mut client = Client::open(ClientConfig {
+    let client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some(([18; 32]).into()),
         transport: Default::default(),
@@ -286,7 +286,7 @@ fn typed_client_rejects_wrong_publication_workspace_before_staging() {
 fn typed_client_restores_only_with_matching_freshness_anchor() {
     let directory = tempfile::tempdir().unwrap();
     let root = [19; 32];
-    let mut client = Client::open(ClientConfig {
+    let client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some((root).into()),
         transport: Default::default(),
@@ -299,7 +299,7 @@ fn typed_client_restores_only_with_matching_freshness_anchor() {
 
     let mut stale = anchor;
     stale.revision += 1;
-    let mut client = Client::open(ClientConfig {
+    let client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some((root).into()),
         transport: Default::default(),
@@ -320,7 +320,7 @@ fn typed_client_restores_only_with_matching_freshness_anchor() {
 #[test]
 fn typed_client_exposes_workspace_roster_and_profile_projection() {
     let provider = MemoryProvider::default();
-    let mut client = Client::open(ClientConfig {
+    let client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some(([12; 32]).into()),
         transport: Default::default(),
@@ -343,7 +343,7 @@ fn typed_client_exposes_workspace_roster_and_profile_projection() {
 #[test]
 fn typed_client_issues_an_invitation_with_bounded_route_hints() {
     let provider = MemoryProvider::default();
-    let mut client = Client::open(ClientConfig {
+    let client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some(([13; 32]).into()),
         transport: Default::default(),
@@ -375,7 +375,7 @@ fn typed_client_issues_an_invitation_with_bounded_route_hints() {
 #[test]
 fn typed_client_reports_connectivity_without_exposing_transport_types() {
     let provider = MemoryProvider::default();
-    let mut client = Client::open(ClientConfig {
+    let client = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some(([14; 32]).into()),
         transport: Default::default(),
@@ -404,14 +404,14 @@ fn typed_client_reports_connectivity_without_exposing_transport_types() {
 #[test]
 #[cfg(feature = "test-fixtures")]
 fn typed_client_routes_opaque_publication_and_reports_interest() {
-    let mut publisher = Client::open(ClientConfig {
+    let publisher = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some(([8; 32]).into()),
         transport: Default::default(),
         storage: None,
     })
     .unwrap();
-    let mut subscriber = Client::open(ClientConfig {
+    let subscriber = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some(([9; 32]).into()),
         transport: Default::default(),
@@ -497,7 +497,7 @@ fn typed_client_routes_opaque_publication_and_reports_interest() {
 fn typed_admission_ops_report_codes_and_pages() {
     use arachne_runtime::ErrorCode;
     let provider = MemoryProvider::default();
-    let mut owner = Client::open(ClientConfig {
+    let owner = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some(([21; 32]).into()),
         transport: Default::default(),
@@ -539,7 +539,7 @@ fn typed_admission_ops_report_codes_and_pages() {
 fn typed_management_invitation_and_name_ops() {
     use arachne_runtime::{ErrorCode, InvitationKind, MemberAction};
     let provider = MemoryProvider::default();
-    let mut owner = Client::open(ClientConfig {
+    let owner = Client::open(ClientConfig {
         network: Network::Direct,
         secret: Some(([22; 32]).into()),
         transport: Default::default(),

@@ -28,6 +28,8 @@ pub struct CurrentMetadata {
     pub tombstone: bool,
 }
 
+type CurrentPublication = (PublicationContext, CurrentMetadata, Vec<u8>);
+
 impl CurrentMetadata {
     pub fn authenticated_context(&self, context: &PublicationContext) -> Vec<u8> {
         let mut bytes = if self.tombstone {
@@ -300,7 +302,7 @@ impl CurrentViewIndex {
             .sum()
     }
 
-    pub(crate) fn publications(&self) -> Result<Vec<(PublicationContext, CurrentMetadata, Vec<u8>)>, &'static str> {
+    pub(crate) fn publications(&self) -> Result<Vec<CurrentPublication>, &'static str> {
         self.values.iter().map(|((revision, topic, selector, replacement_key), entry)| {
             let (context, ciphertext) = PublicationContext::unpack(self.workspace, *revision,
                 topic.clone(), &entry.value.packet)?;

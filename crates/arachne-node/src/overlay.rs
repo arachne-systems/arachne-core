@@ -271,6 +271,8 @@ impl Overlay {
         }
     }
 
+    // Construction binds the authenticated scope to the existing shared owners.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn prepare(
         connections: &super::Connections,
         workspace: WorkspaceId,

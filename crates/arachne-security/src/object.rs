@@ -458,7 +458,9 @@ fn parse_window(bytes: Option<&Vec<u8>>) -> Result<Vec<(u64, [u8; 32])>, &'stati
         return Err("invalid object receive window");
     }
     let window: Vec<(u64, [u8; 32])> = bytes
-        .chunks_exact(40)
+        .as_chunks::<40>()
+        .0
+        .iter()
         .map(|entry| {
             (
                 u64::from_be_bytes(entry[..8].try_into().unwrap()),

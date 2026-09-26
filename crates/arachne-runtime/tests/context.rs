@@ -24,7 +24,7 @@ fn context(max_sessions: u32) -> std::sync::Arc<Context> {
 fn two_contexts_in_one_process_are_independent() {
     let first = context(1);
     let second = context(1);
-    let mut a = first.open(config()).unwrap();
+    let a = first.open(config()).unwrap();
     // The cap of one context does not count the other context's sessions.
     let b = second.open(config()).unwrap();
     let refused = first.open(config()).err().expect("first context is full");
@@ -56,7 +56,7 @@ fn clients_share_one_runtime_and_close_leaves_no_tasks() {
     let baseline = context.alive_tasks();
     let clients: Vec<_> = (0..3).map(|_| context.open(config()).unwrap()).collect();
     assert!(context.alive_tasks() > baseline);
-    for mut client in clients {
+    for client in clients {
         client.close().unwrap();
     }
     // Tasks end when their session closes, not when a runtime shuts down.
@@ -77,8 +77,7 @@ fn a_host_runtime_handle_must_be_multi_thread() {
         ContextConfig::default()
             .with_runtime(arachne_runtime::RuntimeConfig::Handle(host.handle().clone())),
     )
-    .err()
-    .expect("a current-thread runtime cannot drive blocking calls");
+    .expect_err("a current-thread runtime cannot drive blocking calls");
     assert_eq!(refused.code(), ErrorCode::InvalidInput);
 
     let host = tokio::runtime::Builder::new_multi_thread()
@@ -91,7 +90,7 @@ fn a_host_runtime_handle_must_be_multi_thread() {
             .with_runtime(arachne_runtime::RuntimeConfig::Handle(host.handle().clone())),
     )
     .unwrap();
-    let mut client = context.open(config()).unwrap();
+    let client = context.open(config()).unwrap();
     client.endpoint().unwrap();
     client.close().unwrap();
 }

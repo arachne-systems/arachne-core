@@ -17,6 +17,8 @@ Small host-integration changes, with no Bao, wire, hashing or crypto changes:
 - Export the existing `gc_run_once` function. Arachne serializes calls so changing
   the single resumable partial reclaims obsolete bytes before another download.
 - Bound the file-store runtime to two workers per workspace instead of one per CPU.
+- Use fixed-size slice chunks in `HashSeq::iter` for Rust 1.98 Clippy. The
+  iterator returns the same hashes and retains the existing length checks.
 - Declare the Tokio runtime features the file-store crate uses, rather than
   relying on feature unification from Arachne's host workspace.
 - The copied CLI example rejects non-UTF-8 arguments explicitly, rather than
@@ -36,7 +38,7 @@ added to `authors`, new `description`, an `arachne` keyword, and new
 `Cargo.toml.orig` is the unchanged upstream original. Source changes are in
 `src/lib.rs` (`ticket` module behind the `tickets` feature), `src/store/fs.rs`
 (`worker_threads(2)`), `src/store/mod.rs` (export `gc_run_once`) and
-`examples/transfer.rs`. The other differences are whitespace normalization in
+`src/hashseq.rs` (fixed-size hash iteration) and `examples/transfer.rs`. The other differences are whitespace normalization in
 `CHANGELOG.md`, `DESIGN.md`, `.config/nextest.toml` and `.github/workflows/`.
 
 The earlier `arachne-iroh-blobs` 0.103.0 release reused the upstream number.

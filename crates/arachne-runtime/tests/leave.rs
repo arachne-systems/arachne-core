@@ -4,11 +4,6 @@ use std::time::{Duration, Instant};
 
 mod common;
 
-/// A node with its own in-memory record storage.
-fn node(secret: u8) -> i64 {
-    common::stored(&[secret; 32], &MemoryProvider::default())
-}
-
 fn call(h: i64, request: Value) -> Result<Value, String> {
     serde_json::from_slice(&execute(h, &serde_json::to_vec(&request).unwrap())?)
         .map_err(|e| e.to_string())

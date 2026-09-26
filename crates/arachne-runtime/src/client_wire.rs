@@ -45,12 +45,4 @@ pub(crate) mod many {
             .collect::<Vec<_>>()
             .serialize(serializer)
     }
-    pub fn deserialize<'de, T: WireId, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Vec<T>, D::Error> {
-        Vec::<Vec<u8>>::deserialize(deserializer)?
-            .into_iter()
-            .map(|bytes| T::from_wire(&bytes).map_err(serde::de::Error::custom))
-            .collect()
-    }
 }

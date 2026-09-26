@@ -906,6 +906,8 @@ fn reply_too_large(detail: &str) -> ApiError {
 /// admission commit travels once, as the last step.
 const ADMISSION_REPLY: &[u8; 5] = b"DFAY\x02";
 
+type AdmissionWelcomeWire<'a> = (&'a [u8], [u8; 32], &'a [u8], &'a [u8]);
+
 #[derive(Serialize, Deserialize)]
 struct AdmissionReplyWire<'a> {
     workspace: [u8; 32],
@@ -915,7 +917,7 @@ struct AdmissionReplyWire<'a> {
     /// Final page only: the Welcome and the admission's authorization
     /// (invitation key, grant and redemption signatures).
     #[serde(borrow)]
-    welcome: Option<(&'a [u8], [u8; 32], &'a [u8], &'a [u8])>,
+    welcome: Option<AdmissionWelcomeWire<'a>>,
     /// `(offset, next, complete)` when the history spans more than one page.
     page: Option<(u32, u32, bool)>,
 }

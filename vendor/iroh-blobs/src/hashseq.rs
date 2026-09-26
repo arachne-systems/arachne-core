@@ -1,3 +1,4 @@
+// Modified by Arachne Systems from iroh-blobs 0.103.0; see ARACHNE-PATCH.md.
 //! Helpers for blobs that contain a sequence of hashes.
 use std::fmt::Debug;
 
@@ -63,10 +64,7 @@ impl HashSeq {
 
     /// Iterate over the hashes in this sequence.
     pub fn iter(&self) -> impl Iterator<Item = Hash> + '_ {
-        self.0.chunks_exact(32).map(|chunk| {
-            let hash: [u8; 32] = chunk.try_into().unwrap();
-            hash.into()
-        })
+        self.0.as_chunks::<32>().0.iter().copied().map(Hash::from)
     }
 
     /// Get the number of hashes in this sequence.

@@ -51,7 +51,7 @@ const PARTS: u8 = 1;
 /// Parts of `name` are stored at `name`, this marker, and a u32 index.
 /// Record names never contain a NUL byte.
 const PART_MARKER: &[u8] = b"\x00part/";
-const _: () = assert!(PART_BYTES + 1 <= arachne_store::MAX_RECORD_BYTES);
+const _: () = assert!(PART_BYTES < arachne_store::MAX_RECORD_BYTES);
 
 fn is_part(name: &[u8]) -> bool {
     name.windows(PART_MARKER.len()).any(|window| window == PART_MARKER)
@@ -662,7 +662,7 @@ pub(super) fn reset_records(
 /// Commits also happen inside ops, so read this after every call and
 /// persist it outside the database before releasing that call's result.
 pub fn record_freshness(handle: i64) -> Result<FreshnessAnchor, String> {
-    with_session(handle, |session| freshness(session)).map_err(errors::text)
+    with_session(handle, freshness).map_err(errors::text)
 }
 
 pub(crate) fn freshness(session: &mut Session) -> Result<FreshnessAnchor, ApiError> {

@@ -654,6 +654,8 @@ async fn request_until_welcome(
     }
 }
 
+// The qualification fixture keeps its transport, authority and timing inputs explicit.
+#[allow(clippy::too_many_arguments)]
 async fn full_join(
     node: Arc<Node>,
     owner: &OwnerData,
@@ -1120,6 +1122,8 @@ async fn bind_node(
     }
 }
 
+// The qualification fixture keeps its transport, authority and timing inputs explicit.
+#[allow(clippy::too_many_arguments)]
 async fn run_nodes(
     options: Options,
     owner: OwnerData,

@@ -14,7 +14,7 @@ it sorts above `0.101.0-arachne.1`, so dependents must pin the fork with `=`.
 Found with `diff -ru` against the crates.io archive
 (`~/.cargo/registry/src/*/iroh-gossip-0.101.0`).
 
-### `src/net.rs` (the only source change)
+### `src/net.rs`
 
 1. **Shared dial capacity.** `Builder::dial_capacity(Arc<Semaphore>)` stores a
    host-owned `tokio::sync::Semaphore` (new `Builder.dial_capacity` field,
@@ -65,6 +65,9 @@ The actor still owns its peer-deduplicated queue, retries, routing and gossip
 state machine.
 
 ### Other files
+
+- `src/bin/sim.rs`: remove a redundant borrow in a formatting argument for
+  Rust 1.98 Clippy. This diagnostic binary keeps the same behavior.
 
 - `Cargo.toml` (normalized manifest): `name = "arachne-iroh-gossip"`, version
   `0.101.0-arachne.1`, "Arachne Systems" added to `authors`, new

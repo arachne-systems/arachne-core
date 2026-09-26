@@ -216,7 +216,7 @@ pub(super) fn grow(nodes: &[Session], size: usize) -> Vec<Workspace> {
             .map(|other| apply(other, &disabled.authorization, &disabled.commit))
             .collect();
         owner = disabled.workspace;
-        if owner.member_count() >= size || next % 512 == 0 {
+        if owner.member_count() >= size || next.is_multiple_of(512) {
             eprintln!("proof_capacity growing members={}", owner.member_count());
         }
     }

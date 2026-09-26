@@ -167,6 +167,8 @@ pub(crate) struct CutoffArgs {
 /// Where a recovery range stands.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
+// The variant names preserve the existing serialized dispatcher states.
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum RangeStatus {
     RecoverySourceWaiting {
         accepted_progress: bool,
@@ -224,6 +226,8 @@ pub(crate) struct DirectGap {
 /// Where a direct recovery stands.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
+// The variant names preserve the existing serialized dispatcher states.
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum DirectStatus {
     DirectRecoverySourceWaiting {
         accepted_progress: bool,
@@ -259,6 +263,8 @@ pub(crate) enum DirectStatus {
 /// Where a current-view fetch stands.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
+// The variant names preserve the existing serialized dispatcher states.
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum CurrentViewStatus {
     CurrentViewSourceWaiting {
         accepted_progress: bool,
@@ -290,6 +296,8 @@ pub(crate) enum CurrentViewStatus {
 /// Where a recovery cutoff discovery stands.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
+// The variant names preserve the existing serialized dispatcher states.
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum CutoffStatus {
     RecoveryCutoffPending {
         accepted_progress: bool,

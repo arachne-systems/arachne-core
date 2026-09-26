@@ -3460,7 +3460,9 @@ fn the_history_byte_budget_holds_one_full_chunk_of_inline_steps() {
 
 #[test]
 fn a_membership_step_can_carry_the_supported_anchor_proof() {
+    const {
     assert!(MAX_WIRE_STEP >= arachne_security::MAX_MEMBERSHIP_COMMIT
         + arachne_security::MAX_ANCHOR_PROOF,
         "fragment transfer must carry a valid anchor proof without raising control packet limits");
+    }
 }

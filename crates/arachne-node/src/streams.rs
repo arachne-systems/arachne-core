@@ -157,11 +157,11 @@ impl Streams {
         });
         let inserted = {
             let mut routes = self.0.routes.lock().await;
-            if routes.contains_key(&peer) {
-                false
-            } else {
-                routes.insert(peer, route.clone());
+            if let std::collections::btree_map::Entry::Vacant(entry) = routes.entry(peer) {
+                entry.insert(route.clone());
                 true
+            } else {
+                false
             }
         };
         if !inserted {
@@ -424,6 +424,8 @@ async fn authorize(
     Ok(())
 }
 
+// One peer task borrows the existing transport, routing and delivery owners.
+#[allow(clippy::too_many_arguments)]
 async fn run_peer(
     mut incoming: iroh_moq::IncomingSessionStream,
     moq: Moq,
@@ -553,6 +555,8 @@ impl Drop for ActiveSession {
     }
 }
 
+// Keep the authenticated stream scope explicit at the receive boundary.
+#[allow(clippy::too_many_arguments)]
 async fn receive_session(
     session: &MoqSession,
     local: PeerId,
