@@ -69,7 +69,7 @@ fn expand(records: &SecurityRecords) -> Result<SecurityRecords, ApiError> {
     let mut stored = SecurityRecords::new();
     for (name, value) in records {
         if is_part(name) {
-            return Err(ApiError::internal("record name holds the part marker"));
+            return Err(ApiError::storage_failed("record name holds the part marker"));
         }
         if value.len() <= PART_BYTES {
             let mut tagged = Zeroizing::new(Vec::with_capacity(value.len() + 1));
@@ -80,7 +80,7 @@ fn expand(records: &SecurityRecords) -> Result<SecurityRecords, ApiError> {
         }
         let parts = value.chunks(PART_BYTES);
         let count = u32::try_from(parts.len())
-            .map_err(|_| ApiError::internal("record has too many parts"))?;
+            .map_err(|_| ApiError::storage_failed("record has too many parts"))?;
         let mut index = Zeroizing::new(vec![PARTS]);
         index.extend(count.to_be_bytes());
         stored.insert(name.clone(), index);
@@ -421,7 +421,7 @@ fn active_records(
     Ok(records)
 }
 
-fn record_key(session: &Session) -> Result<arachne_security::StorageKey, ApiError> {
+pub(crate) fn record_key(session: &Session) -> Result<arachne_security::StorageKey, ApiError> {
     session
         .storage
         .as_ref()

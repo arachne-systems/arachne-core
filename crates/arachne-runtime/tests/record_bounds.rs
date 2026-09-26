@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 mod common;
 
 /// `owner` grown to `size` or more members, admitted in batches.
-fn grown(owner: Workspace, size: usize) -> Workspace {
+fn grown(owner: Workspace, size: usize) -> (Workspace, arachne_security::Invitation, Vec<u8>) {
     let (registration, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
     let mut owner = registration.workspace;
     while owner.member_count() < size {
@@ -31,7 +31,7 @@ fn grown(owner: Workspace, size: usize) -> Workspace {
             .unwrap()
             .workspace;
     }
-    owner
+    (owner, invitation, checkpoint)
 }
 
 /// Admission entries for `keys` (owned requests and validations leak into
@@ -64,11 +64,17 @@ fn batch<'a>(
 /// Members, the largest record (name, bytes) and the checkpoint tree bytes.
 fn measure(owner: &Workspace) -> (usize, String, usize, usize) {
     let records = owner.export_records().unwrap();
+    println!(
+        "A3g: {} members: {} security records, {} total value bytes",
+        owner.member_count(),
+        records.len(),
+        records.values().map(|value| value.len()).sum::<usize>(),
+    );
     let (name, value) = records
         .iter()
         .max_by_key(|(_, value)| value.len())
         .unwrap();
-    let (_, _, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+    let checkpoint = owner.public_checkpoint().unwrap();
     let pin = u32::from_be_bytes(checkpoint[5..9].try_into().unwrap()) as usize;
     let tree = checkpoint.len() - 13 - pin;
     (
@@ -87,15 +93,16 @@ fn call(handle: i64, request: Value) -> Value {
 }
 
 /// A runtime session whose endpoint owns the workspace, the workspace grown
-/// to `size`, seeded into SQLite storage, restored, then one name change
-/// staged and adopted at that size. Returns the member count.
+/// to `size`, seeded into SQLite storage, restored, then a name change and
+/// an admission staged and adopted at that size. Returns the member count.
 fn saves_stages_and_restores_at(size: usize) -> usize {
     let directory = common::directory();
     let root = [8; 32];
     let secret = [7; 32];
     let signer_key = iroh::SecretKey::from_bytes(&secret);
     let signer = arachne_node::IrohEndpointSigner(&signer_key);
-    let owner = grown(Workspace::create(&signer, "Record bound owner").unwrap(), size);
+    let (owner, invitation, checkpoint) =
+        grown(Workspace::create(&signer, "Record bound owner").unwrap(), size);
     let (members, name, largest, tree) = measure(&owner);
     println!("A3g: {members} members: largest value {name} {largest} B, checkpoint tree {tree} B");
     let provider = arachne_runtime::SqliteProvider::new(directory.path(), root);
@@ -138,6 +145,15 @@ fn saves_stages_and_restores_at(size: usize) -> usize {
     let staged = call(handle, json!({"op":"stage_workspace_name","workspace_name":"Large"}));
     let adopted = call(handle, json!({"op":"adopt_admission","candidate":staged["candidate"]}));
     assert_eq!(adopted["workspace_name"], "Large");
+    // An epoch transition also saves. Optional fork retention must not
+    // reintroduce the old sealed-snapshot ceiling on a large workspace.
+    let joining_key = EndpointKey::generate().unwrap();
+    let joining = PendingJoin::from_invitation(&invitation, &checkpoint, &joining_key, "Next").unwrap();
+    let staged = call(handle, json!({"op":"stage_admission",
+        "authenticated_endpoint":joining_key.endpoint(),
+        "request":joining.admission_request().unwrap()}));
+    let adopted = call(handle, json!({"op":"adopt_admission","candidate":staged["candidate"]}));
+    assert_eq!(adopted["members"], members + 1);
     arachne_runtime::close(handle).unwrap();
     let handle = arachne_runtime::create(Some(&secret)).unwrap();
     arachne_runtime::attach_storage(
@@ -147,10 +163,10 @@ fn saves_stages_and_restores_at(size: usize) -> usize {
     .unwrap();
     let restored = call(handle, json!({"op":"restore_workspace","workspace":workspace}));
     assert_eq!(restored["workspace_name"], "Large");
-    assert_eq!(restored["members"], members);
+    assert_eq!(restored["members"], members + 1);
     arachne_runtime::close(handle).unwrap();
     directory.close().unwrap();
-    members
+    members + 1
 }
 
 #[test]
@@ -169,9 +185,9 @@ fn the_largest_value_grows_past_one_record_and_is_saved_in_parts() {
     // Growth per member of the largest value, projected to the roster where
     // the checkpoint tree reaches its bound.
     let signer = EndpointKey::generate().unwrap();
-    let small = grown(Workspace::create(&signer, "Measure").unwrap(), MAX_ADMISSION_BATCH + 1);
+    let (small, _, _) = grown(Workspace::create(&signer, "Measure").unwrap(), MAX_ADMISSION_BATCH + 1);
     let (members_a, _, largest_a, tree_a) = measure(&small);
-    let large = grown(small, 2 * MAX_ADMISSION_BATCH + 1);
+    let (large, _, _) = grown(small, 2 * MAX_ADMISSION_BATCH + 1);
     let (members_b, _, largest_b, tree_b) = measure(&large);
     let added = members_b - members_a;
     let record_per_member = (largest_b - largest_a).div_ceil(added);
@@ -197,27 +213,40 @@ fn two_thousand_members_save_stage_and_restore() {
     // The joiner replays history steps under MAX_JOIN_HISTORY_BYTES. Measure
     // one single Add and one full batch Add at this roster.
     let signer = EndpointKey::generate().unwrap();
-    let owner = grown(Workspace::create(&signer, "History").unwrap(), size);
-    let (registration, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
-    let owner = registration.workspace;
+    let (owner, invitation, checkpoint) =
+        grown(Workspace::create(&signer, "History").unwrap(), size);
     let one = [EndpointKey::generate().unwrap()];
+    let records = owner.export_records().unwrap();
+    // DFJH header, its checkpoint, and full encoded steps (including
+    // authorizations). Raw commit lengths alone undercount this budget.
+    let history_bytes = 5 + 32 + 4
+        + records[b"security/history/checkpoint".as_slice()].len()
+        + records.iter()
+            .filter(|(name, _)| name.starts_with(b"security/history/step/"))
+            .map(|(_, value)| value.len())
+            .sum::<usize>();
+    assert!(history_bytes <= MAX_JOIN_HISTORY_BYTES);
     let single = owner
         .prepare_validated_admission_batch(&batch(&owner, &invitation, &checkpoint, &one))
-        .unwrap()
-        .commit
-        .len();
+        .unwrap();
+    let single = arachne_security::encode_membership_step(
+        &arachne_security::MembershipAuthorization::Admission(single.replies[0].authorization.clone()),
+        &single.commit,
+    ).unwrap().len() - 5; // The standalone DFMS header is not part of DFJH.
     let keys: Vec<_> = (0..MAX_ADMISSION_BATCH)
         .map(|_| EndpointKey::generate().unwrap())
         .collect();
     let full = owner
         .prepare_validated_admission_batch(&batch(&owner, &invitation, &checkpoint, &keys))
-        .unwrap()
-        .commit
-        .len();
+        .unwrap();
+    let full = arachne_security::encode_membership_step(
+        &arachne_security::MembershipAuthorization::AdmissionBatch(
+            full.replies.iter().map(|reply| reply.authorization.clone()).collect(),
+        ),
+        &full.commit,
+    ).unwrap().len() - 5;
     println!(
-        "A3g history at {} members: one Add {single} B ({} fit {MAX_JOIN_HISTORY_BYTES} B); a batch of {MAX_ADMISSION_BATCH} Adds {full} B ({} fit)",
+        "A3g history at {} members: complete binary history {history_bytes}/{MAX_JOIN_HISTORY_BYTES} B; one Add step {single} B; a batch of {MAX_ADMISSION_BATCH} Adds {full} B",
         owner.member_count(),
-        MAX_JOIN_HISTORY_BYTES / single,
-        MAX_JOIN_HISTORY_BYTES / full,
     );
 }

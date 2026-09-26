@@ -3498,8 +3498,9 @@ fn a_self_update_waits_while_every_administrator_is_unreachable() {
     // Deferred, not retried at once.
     session.membership.peer_failures.clear();
     assert!(start_self_update(&mut session, now).unwrap().is_none());
-    // Due again after the wait: it goes on to stage (this bare session has
-    // no storage key, so staging reports that).
+    // Due again after the wait: the stored session stages and offers it.
     let later = now + self_update::SELF_UPDATE_RETRY;
-    assert!(start_self_update(&mut session, later).is_err());
+    let started = start_self_update(&mut session, later).unwrap().unwrap();
+    assert_eq!(started["state"], "self_update_offered");
+    assert!(session.transition.staged.is_some());
 }
