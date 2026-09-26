@@ -3,11 +3,44 @@
 Source: [architecture review](2026-09-24-architecture-review.md). Tick each box only after its
 test is red → green and the crate tests pass.
 
-## PAUSED 2026-09-24 — see the handoff package
+## BLUF
 
-All open work is described in [`handoff/README.md`](handoff/README.md) (briefs H1–H8).
-In-flight work is committed as WIP: `feat/a2-forks` `df5dcec`, `feat/a5-storage` `0119662`
-(merge, not built), `feat/a4-context` `f84acfe`. Integration head: `integrate/wave1` `bc2a2d1`.
+H1, H2, H3, H4 and H6 are merged locally on `integrate/wave1`. Core has API
+version 6, native storage, opaque candidates, generated binding metadata and
+bounded fork recovery. H5 proves the generated SDK on Core `e420a52`. H7 now
+checks the combined Core branch. Owner decisions and unproved consumer upgrades
+stay open below.
+
+## Integration evidence (2026-09-26)
+
+| Package | Implementation and merge | Evidence |
+| --- | --- | --- |
+| H1 | `3379267`, `5a80e43`; merges `3ab4486`, `0808c38` | [Fork and proof-transfer report](../evidence/h1-night-2026-09-26.md) |
+| H2 | `840c25a`; merge `0d5e071` | [Native storage report](../evidence/h2-night-2026-09-26.md) |
+| H3 | `a6619db`; merge `688946b` | [Measured test profile](handoff/H3-test-speed.md) |
+| H4 | `91ce5b1`; merge `e420a52` | [Core binding report](../evidence/h4-night-2026-09-26.md) |
+| H5 (SDK) | SDK `3c750fb`, Core `e420a52` | Four language flows, Rust, AAR, R8 and Android test APK passed; device/ATAK gates remain |
+| H6 | `fc06673`; merge `ad31b97` | [Crypto report](../evidence/h6-night-2026-09-26.md): 681 passed, 0 failed, 20 ignored; MSRV and deny green |
+| H7 | `codex/night-h7-integration`, base `ad31b97` | Baseline build green; unchanged convergence test and admission timing check are RED; diagnosis and final checks in progress |
+
+The H6 total includes 18 tests in 20 example harnesses. It is a corrected
+aggregate with the original failures and reruns retained in its receipts.
+The SDK report is `docs/reviews/2026-09-26-h5-sdk-completion.md` in the SDK repo.
+
+Open gates: migrate remaining Core dispatcher callers; choose and reconcile the
+SDK line; prove the existing-data upgrade; qualify the ATAK host; approve pushes
+and publication. The [H8 brief](handoff/H8-owner-decisions.md) owns outward actions.
+
+## H7 integration defects
+
+- [ ] Same-epoch convergence: baseline `ad31b97` kept one of three members on a
+  different authenticated branch for the full 20-second deadline. The unchanged
+  test then passed three focused runs and three complete-binary runs. H1 owns
+  the driver scheduling investigation. The first RED stays in the H7 evidence.
+- Admission timing: the first post-restore intake measured 1.909802 ms against
+  an early median of 0.93733 ms (2.038 times). Three unchanged runs passed the
+  existing two-times bound. The fixture is unchanged from H6; its correctness,
+  negative authorization and performance assertions remain intact.
 
 ## Fix-now bugs (core)
 
@@ -17,7 +50,7 @@ In-flight work is committed as WIP: `feat/a2-forks` `df5dcec`, `feat/a5-storage`
 - [x] **B3** (`fix/sec-mgmt-bound` d226107) Receivers reject management commits above ~250 members (64 KiB inline bound).
 - [x] **B3a** (`82f35c5`, `778dc1c`; checkpoint = tree-less pin + tree bound by tree hash, paged fetch; runtime join at 641 members over real Iroh passes; joiner limit now set by B3c) Joiners cannot receive an invitation above 241 members (64 KiB wire checkpoint carries the full ratchet tree). Needs a smaller joiner checkpoint (wire change).
 - [x] **B3b** (`85ba181`; own history rebuilt under the local 8 MiB bound) A member restored with `join_history == None` still uses the inline bound and can reject a valid management commit above ~250 members.
-- [~] **B3c** Commit size fixed (self-update: 12 KB at 900 members; 96 KiB bound; binary paged transport). **Remaining:** OpenMLS tree record 1.37 MB at 900 members > 1 MiB store record limit → assigned to A5. (Was: in `feat/a2-security-wiring` analysis; runtime side also: binary history steps instead of JSON number arrays (~3.6 chars/byte); page the no-pinned-checkpoint admission reply path) Management commits (link registration, Remove, Promote) are capped at 64 KiB (`bootstrap` `MAX_BYTES`). At ~82 B/member (the update path encrypts to every unmerged batch-added leaf), registration fails above ~785 members (769 = 64,006 B; 897 fails). Raising the cap alone fails: commits also travel as JSON history steps in one 128 KiB control reply, and DFMO offers are 32 KiB. Options: page history steps as binary; merge unmerged leaves (member SelfUpdate, A2 step 5) so the update path shrinks.
+- [x] **B3c** (`840c25a`, `5a80e43`; merges `0d5e071`, `0808c38`). Binary membership pages and physical record parts remove the old inline and 1 MiB logical-value failures. H2 saved 2,049 members, then restored a name change and member 2,050. H1 bounds large proof transfer over the existing Iroh control connection. The current count/byte limits remain explicit in the [security guide](../security.md#membership-proof-transfer-and-bounds).
 - [x] **B4** (`b192cef`; disabled rows pruned; 221 *active* links remains the cap, with a clear error) Invitation controls fill at 221 rows and are never pruned.
 - [x] **B5** (`7dc9201`, workspace tests 387 pass / 0 fail) `stage_protected_publication` does not send `workspace`; a mismatch leaves the session stuck.
 - [x] **B6** (`3236e4f`, workspace tests 387 pass / 0 fail) `create_endpoint` holds the global `REGISTRY` lock during bind (up to 10 s).
@@ -54,18 +87,19 @@ and a different Core pin. Core work that each plan step depends on:
 
 - [x] SDK B10/B11 (`fix/b10-b11-locks-pin`).
 - [x] UniFFI pipeline (`feat/uniffi-sdk`, 9 commits): generated Kotlin/Swift/Python/Go, committed `generated/` + drift check in CI, patched Go generator, smoke tests pass in all four; Rust examples/tests ported to new core; hand-binding CI steps disabled (to be deleted).
-- [ ] Extend generated surface to stable Client groups (in progress); storage/candidates after A5; management/revocation after A2.
-- [ ] Core step 6 blockers from the SDK: `#[non_exhaustive]` blocks remote derives (add `uniffi` derives behind a feature in arachne-api); `Event` needs `ALL`; `[u8;32]` IDs, `usize`, `serde_json::Value` returns (`drive_join`, `request_admission`, `drive_workspace`, `poll_membership_update`), `&[&str]`, `&Path`; `with_deadline(self)`; two `Network` enums (Tor feature-gated); plain struct error; `open_in(&Arc<Context>)`; close-race code 101 vs `Closed`.
-- [ ] Delete `ffi.rs` + hand bindings; reconcile Kotlin PR #1 (other agent's) with generated Kotlin.
+- [x] Extend generated Client groups (Core `91ce5b1`, SDK `3c750fb`): 95 Client methods plus Context, storage, candidates, admission, management, current/direct/range recovery and resources.
+- [x] Core step 6 binding blockers (Core `91ce5b1`): Core-owned UniFFI derives, stable IDs/errors/network enum, `Event::ALL`, fixed-width counts, typed driver results and opaque received proofs. Four generated language flows pass in H5.
+- [x] Delete SDK `ffi.rs`, C header and hand bindings (SDK `3c750fb`). The SDK no longer copies Core domain or persistence logic.
+- [ ] Reconcile the live Kotlin branch and select the SDK line. The owner decides. H5's default SDK build still needs the PTT line's `moq` feature forwarding before streaming calls are available.
 
 ## SDK-facing notes from core changes
 
 - B3a: a host that passes the checkpoint inline in `begin_join` JSON hits the 128 KiB request cap near 120 members. SDK must use the compact path (invitation link + peers).
 - B3a: only the issuer, or a member whose join history starts at that checkpoint, can answer a join (narrower failover).
 - A3: ops removed `stage_publication`, `stage_reception`, `enable_object_delivery`, `poll_recovered_publication`; added `poll_pending_object`, `stage_object_acknowledgement`, `stage_object_rejection`.
-- A2 runtime: host step JSON is `{step: <binary>, kind, invitation_checkpoint?}`; network admission reply has no top-level `commit`; new reason `administrator_required`; states `self_update_offered|pending|committed|refused`, `membership_offer_pull`; `Client::members_without_self_update()`; self-update only runs in native `drive_workspace`.
+- A2/H2 runtime: self-update stages, saves and adopts locally before it announces committed history. `drive_workspace` reports `self_update_committed` and typed branch outcomes. Recovery activity can report `branch_orphaned` or `branch_send_quarantined`; a current roster alone is not send readiness. Membership proofs can use bounded Iroh fragments (H1).
 - A4b: C-ABI `set_deadline(handle, ms)`, `create_with_deadline(secret, options, ms)`; `TransportOptions::deadline`.
-- A4: `Context`, `ContextConfig`, `Limits`, `PowerProfile`, `Client::open_in`, `wait_for_work(Option<Duration>)`, `wake`, `next_event`, `set_deadline`/`with_deadline`, `suspend`/`resume`; C-ABI handle fns `wait_for_work_timeout`, `wake`, `next_event`; `close` idempotent; `API_VERSION` 5.
+- A4: `Context`, `ContextConfig`, `Limits`, `PowerProfile`, `Client::open_in`, `wait_for_work(Option<Duration>)`, `wake`, `next_event`, `set_deadline`/`with_deadline`, `suspend`/`resume`; C-ABI handle fns `wait_for_work_timeout`, `wake`, `next_event`; `close` idempotent; `API_VERSION` 6 (H4).
 - T1: `TransportTimeouts` gains `close_drain` (breaking for struct literals).
 - B7c: new state `direct_recovery_awaiting_application`.
 - B7b: new recovery state `recovery_awaiting_application`, field `accepted_through`; `RecoveryStage::AwaitingApplication`.
@@ -73,31 +107,26 @@ and a different Core pin. Core work that each plan step depends on:
 - A7r: `ClientConfig` gains relay, public lookup and timeouts.
 - A5/H2: storage is supplied before create/join; adoption owns commit and read-back;
   candidate objects replace snapshot tokens in the typed API. See
-  [SDK migration](h2-storage-sdk-migration.md). H4 must increment `API_VERSION`.
+  [SDK migration](h2-storage-sdk-migration.md). H4 sets `API_VERSION` to 6.
 
 ## Architecture work (needs design first)
 
-- [ ] **A1** — steps 1–2 done (`71cc9db`, `feat/a1-typed-ops` → `bfd10cc`); UniFFI spike done. Next: A4 (steps 3–4), A5 (step 5) in progress; then steps 6–9.
+- [~] **A1** — Core and SDK steps 1–8 are implemented (`91ce5b1`; SDK `3c750fb`). One Core-owned typed contract, native errors, feature gates and generated metadata are proved through four language flows. Step 9 remains: migrate the existing Core dispatcher/qualification callers and complete the ATAK single-library host path before deleting that dispatcher. See [binding and upgrade gates](h4-core-sdk-migration.md#fixtures-and-json-removal).
   Original: One typed, versioned contract; stable error codes; `#[non_exhaustive]`; consider UniFFI.
-- [ ] **A2** — steps 1–7 done and runtime integrated (`feat/a2-security-wiring`, `feat/a2-runtime` merged at `60e14c9`: binary paged steps, digest offers, 96 KiB commit bound, self-update policy, admin-only admission). Steps 8–13 (fork detection/switch, order carry-forward, re-publish, settlement, convergence tests, docs) in progress on `feat/a2-forks`.
-  Original: Commit-ordering authority. **Decision open:** sequencer admin vs deterministic tie-break (recommended).
+- [x] **A2** — steps 1–13 implemented (`3379267`, `5a80e43`; merges `3ab4486`, `0808c38`). Deterministic commit classes/hash order, endpoint-signed credentials, admin-only admission, durable self-update, branch switch, revocation carry, local re-publication and bounded settlement are wired. The H1 report records RED/GREEN and convergence proofs. Public-anchor follow-up is tracked separately by H1.
+  Original: Commit-ordering authority. Decision made: deterministic tie-break; removal and leave have highest priority.
 - [x] **A3** (`fix/a3-delivery-epochs`, merging)
   - [x] A3f (`8078d8e`): runtime recovery ops (`fetch_recovery_range`, `discover_recovery_cutoff`) still ask for the current epoch only; wire the 4-epoch window.
   - [x] A3g (H2): 2,049 members save as parts, then a name change and one admission
     restore with 2,050 members. Fixed attachment bounds fit. A 3,208,876-byte H1
     snapshot restores from seven parts. See [evidence](../evidence/h2-night-2026-09-26.md).
-  - [ ] A3h: drop unused `serde_json` in `arachne-delivery`; run `cargo fmt` workspace-wide once branches settle.
+  - [ ] A3h: unused `serde_json` edge removed in H7 (static RED/GREEN). Workspace formatting and final crate checks are pending the last branch merges.
   Original: Decouple delivery and routing from the exact epoch and policy revision.
 - [x] **A4** (`feat/a4-context` merged at `2205887`; full suite before merge 526 pass / 0 fail; ADR steps 3–4; default limits 64 sessions / 320 overlay paths accepted)
   - [x] A4c (`6b98b22`, `5db52d3`): 8 leftover test locks removed; `cargo test -p arachne-runtime` runs with default threads (39 binaries pass).
   - [x] A4b (`f0eb382`..`b419723`; suspend closes idle links + stops mDNS via wrapper; Low ×4 all timers; deadlines on bind/policy/send + C-ABI `set_deadline`; 5 event e2e tests). Was: mDNS has no pause API (iroh-mdns-address-lookup 0.5); suspend does not close idle connections; Low profile only slows presence; deadlines only on typed Client and only for outbound control exchanges; end-to-end event tests for MembershipChanged, ProtectedReceived, RecoveryReady, CurrentViewReady, Presence.
   Original: Owned `Context`, event stream, `wait_for_work(timeout)`, `close(&self)`, suspend/resume.
-- [ ] **A5** Code and local proof complete on `codex/night-h2-storage`: native storage,
-  typed candidates, separate storage root, versions, anchors, and large-value parts.
-  H1 branch records share the atomic commit. Store/runtime suite: 243 pass, 0 fail;
-  workspace all-target/all-feature release check passes. The lead's final merge with
-  current `integrate/wave1` remains the completion gate.
-  See [evidence](../evidence/h2-night-2026-09-26.md) and [SDK migration](h2-storage-sdk-migration.md).
+- [x] **A5** (`840c25a`; merged `0d5e071`): native storage, typed candidates, separate storage root, format versions, anchors and large-value parts. H1 branch records share the atomic commit. The package store/runtime suite had 243 passed and zero failed; integrated focused checks and the H6 full suite passed. See [evidence](../evidence/h2-night-2026-09-26.md) and [SDK migration](h2-storage-sdk-migration.md). Deployment to older app data still needs the authenticated upgrade proof.
 - [x] **A6** (`fix/a3-delivery-epochs`; `docs/delivery.md`)
   Original: Delivery spec; per-author quotas; bitmap dedup; remove the legacy receive stack.
 - [x] **A7** (`fix/a7-network`, merged)
@@ -107,7 +136,7 @@ and a different Core pin. Core work that each plan step depends on:
 - [x] **A9** Version ranges; renamed forks with own versions; SPDX license field. (`fix/a9-supply-chain`, merged into `integrate/wave1`)
   - [x] A9a (`fd189aa`; 40 comments rewritten, `docs/architecture.md` gossip section): ~40 `.rs` comments cite ADR 0008/0009/0010 that live only in `arachne-development`. Replace with inline rationale.
   - [x] A9b (`fix/a9b-tor`; torut replaced, deny clean): `tor` feature pulls `torut` → `ed25519-dalek 1.0.1` / `curve25519-dalek 3.2.0` (RUSTSEC-2022-0093, RUSTSEC-2024-0344).
-  - [~] A9c: rusqlite 0.40.2 (SQLite 3.53.2) and getrandom 0.4 done (`a227d9a`). **Next** (after A3/B3a merge): our crates to sha2 0.11 + hkdf/hmac 0.13 (same as iroh 1.2 and openmls_rust_crypto 0.6; sha2 0.10 stays only via ed25519-dalek 2 / p256 / p384). **Keep** aes-gcm 0.10 (openmls_rust_crypto uses 0.10). Check sframe 2.0 separately.
+  - [x] A9c (`fc06673`; merged `ad31b97`): all nine owned old-generation edges now use SHA-2 0.11 and HKDF/HMAC 0.13. SFrame 2.0 uses ring; AES-GCM stays 0.10. MSRV 1.91 and cargo-deny pass. Upstream elliptic-curve/dalek still require three duplicate names; the lead accepted that explicit scope limit. No dependency or duplicate version was added. See [H6 evidence](../evidence/h6-night-2026-09-26.md).
   - [x] A9d (`334ab7f`): in-file change notices in fork sources; stale `release = false` in `release-plz.toml`.
   - [x] A9f (`8fcf5f8`, live Tor SAFECOOKIE passed): Tor control client uses plain COOKIE auth; add SAFECOOKIE. Full `tor_transport` node test not run (no Tor network reach here).
   - [ ] A9e (owner approval): publish `arachne-bao-tree`, then blobs, gossip, node, runtime; decide on yanking old fork versions.

@@ -275,7 +275,17 @@ reach an offline peer.
 
 Native record storage is the only persistence mode. Core saves each staged
 candidate, reads it back, and only then adopts it; the host never handles
-state bytes. `arachne-store` encrypts values with AES-256-GCM using a derived
+state bytes. Configure storage on `ClientConfig` before creation, join or
+restore. Candidate objects are bound to their client, operation kind and
+staged token. Successful adoption consumes them; a wrong client or repeated
+adoption fails. Dropping an uncommitted candidate discards it. A stored
+candidate cannot be discarded after an uncertain save.
+
+A `Context` owns runtime resources and limits for its clients. Suspend keeps
+workspace state and queued content; it does not remove membership or erase
+keys. A host that stops using a client closes it and protects its stored state.
+
+`arachne-store` encrypts values with AES-256-GCM using a derived
 key based on a storage root key supplied by the host and the workspace scope.
 The storage root is not derived from the endpoint secret; rotating the
 endpoint identity does not change the storage key. It authenticates the
@@ -292,10 +302,16 @@ Stored data is versioned. A store file carries its format (format 1) in the
 SQLite header and in the authenticated head, and the runtime records carry
 their own format record (format 1). There are no legacy readers: an unknown,
 older-than-first or newer format fails with `FormatNotSupported` (code 303)
-before any state is used. A later format change adds a migration step that
-runs on restore and saves the upgraded records in one commit. A new store is
-built in a temporary file and linked into place only when complete, so a crash
-during creation never leaves an empty file that cannot open.
+before any state is used. A later format upgrade must authenticate the old
+state and commit the converted records atomically. The deployed older native
+format needs that upgrade before an app adopts this Core line; changing a
+file path does not upgrade it. The
+[upgrade gate](reviews/h4-core-sdk-migration.md#device-upgrade-gate) requires
+identity, counters, authority, retained data and crash recovery to be preserved.
+
+A new store is built in a temporary file and linked into place only when
+complete, so a crash during creation never leaves an empty file that cannot
+open.
 
 The store's `FreshnessAnchor` detects rollback only when the host saves the
 anchor somewhere independent of the database and verifies it during restore.
@@ -307,7 +323,9 @@ Where the platform supplies monotonic storage (a hardware-backed keystore,
 a counter, or storage an attacker who replaces the database files cannot roll
 back), the host passes it as an `AnchorStore` with
 `StorageConfig::with_anchors`. Core then keeps the anchor itself and restore
-requires it (B9):
+requires it (B9). `AnchorStore` is a native Rust integration hook; the generated
+storage constructor does not supply a platform monotonic store. Foreign hosts
+need that platform integration to get the atomic anchor behavior below:
 
 - Before each commit, core saves two slots: `current` (the last confirmed
   anchor) and `next` (the anchor the commit will produce). After the commit
