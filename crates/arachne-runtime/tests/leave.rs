@@ -100,7 +100,8 @@ fn drive_until_work(handle: i64) -> Value {
     let until = Instant::now() + Duration::from_secs(10);
     loop {
         let value = call(handle, json!({"op":"drive_workspace"})).unwrap();
-        if value.get("state").is_some() {
+        // Presence replies can precede the membership exchange under test.
+        if value.get("state").is_some() && value["state"] != "presence_replied" {
             return value;
         }
         assert!(Instant::now() < until, "workspace driver did not observe work");
@@ -117,6 +118,7 @@ fn settle_self_update(member: i64, admin: i64) {
         let value = call(member, json!({"op":"drive_workspace"})).unwrap();
         if value["state"] == "self_update_committed" {
             committed = true;
+            call(member, json!({"op":"poll_workspace_presence","announce":true})).unwrap();
         }
         call(admin, json!({"op":"drive_workspace"})).unwrap();
         if committed

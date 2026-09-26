@@ -387,6 +387,14 @@ fn simultaneous_presence_and_self_updates_converge_and_survive_restart() {
         assert!(Instant::now() < deadline, "three-member sync stalled: rosters={rosters:?}; events={events:?}");
         std::thread::sleep(Duration::from_millis(5));
     };
+    // Equal epoch numbers alone do not prove equal membership authority.
+    // A current reply verifies the peer's epoch fingerprint against ours.
+    let admin_info: Value = serde_json::from_str(&describe(admin).unwrap()).unwrap();
+    for peer in [existing, newer] {
+        call(peer, json!({"op":"fetch_membership_update","peer":admin_info["endpoint_key"],"replace_pending":true}));
+        let agreed = poll(peer, "poll_membership_update");
+        assert_eq!(agreed["state"], "membership_current", "{agreed}");
+    }
     for node in nodes { close(node).unwrap(); }
     for (index, store) in stores.iter().enumerate() {
         let node = common::stored(&[151 + index as u8; 32], store);

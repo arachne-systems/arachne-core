@@ -105,6 +105,16 @@ fn saves_stages_and_restores_at(size: usize) -> usize {
         grown(Workspace::create(&signer, "Record bound owner").unwrap(), size);
     let (members, name, largest, tree) = measure(&owner);
     println!("A3g: {members} members: largest value {name} {largest} B, checkpoint tree {tree} B");
+    let record_key = arachne_security::StorageKey::derive(&root).unwrap();
+    let snapshot = owner.seal_branch_snapshot(&record_key).unwrap();
+    println!("H1/H2: {members} members: rollback snapshot {} B; byte budget {} B",
+        snapshot.len(), arachne_security::MAX_ROLLBACK_BYTES);
+    assert!(snapshot.len() <= arachne_security::MAX_BRANCH_SNAPSHOT);
+    if members >= 2000 {
+        assert!(snapshot.len() > MAX_RECORD_BYTES);
+    }
+    let snapshot_epoch = owner.epoch();
+    drop(snapshot);
     let provider = arachne_runtime::SqliteProvider::new(directory.path(), root);
     arachne_runtime::harness::seed_workspace(&provider, &owner, None, None).unwrap();
     let workspace = owner.id();
@@ -165,6 +175,22 @@ fn saves_stages_and_restores_at(size: usize) -> usize {
     assert_eq!(restored["workspace_name"], "Large");
     assert_eq!(restored["members"], members + 1);
     arachne_runtime::close(handle).unwrap();
+    // Native storage has one retained pre-admission epoch. Its encrypted
+    // snapshot is physically split, and the restore above read those parts.
+    let store = arachne_store::Store::open_existing(&provider.path(workspace), &root, workspace).unwrap();
+    let prefix = b"runtime/branch/snapshot/";
+    let names: Vec<Vec<u8>> = store.keys(prefix).map(<[u8]>::to_vec).collect();
+    let epochs: Vec<u64> = names.iter()
+        .filter_map(|name| name.strip_prefix(prefix.as_slice()))
+        .filter(|tail| tail.len() == 8)
+        .map(|tail| u64::from_be_bytes(tail.try_into().unwrap()))
+        .collect();
+    let parts = names.iter().filter(|name| name.windows(6).any(|w| w == b"\x00part/")).count();
+    println!("H1/H2: native rollback epochs {epochs:?}, {parts} physical snapshot parts");
+    assert_eq!(epochs, vec![snapshot_epoch]);
+    assert!(names.iter().all(|name| store.get(name).unwrap().unwrap().len() <= MAX_RECORD_BYTES));
+    if members >= 2000 { assert!(parts > 1); }
+    drop(store);
     directory.close().unwrap();
     members + 1
 }

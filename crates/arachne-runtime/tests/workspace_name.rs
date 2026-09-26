@@ -366,16 +366,24 @@ fn rust_workspace_driver_converges_same_epoch_name_from_presence() {
         json!({"op":"add_address_hint","peer":admin_info["endpoint_key"],"address":loopback(&admin_info)}),
     )
     .unwrap();
-    // The new member's Rust driver self-updates through the administrator
-    // first (B3c policy); the rename below then lands at the same epoch.
+    // The member saves its own update, then the administrator catches up.
+    // The rename below must start with both members at the same epoch.
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut self_updated = false;
     loop {
         call(admin, json!({"op":"drive_workspace"})).unwrap();
         let value = call(member, json!({"op":"drive_workspace"})).unwrap();
         if value["state"] == "self_update_committed" {
+            self_updated = true;
+            call(member, json!({"op":"poll_workspace_presence","announce":true})).unwrap();
+        }
+        if self_updated
+            && call(admin, json!({"op":"member_roster"})).unwrap()["epoch"]
+                == call(member, json!({"op":"member_roster"})).unwrap()["epoch"]
+        {
             break;
         }
-        assert!(Instant::now() < deadline, "no self-update: {value}");
+        assert!(Instant::now() < deadline, "self-update did not converge: {value}");
         std::thread::sleep(Duration::from_millis(5));
     }
     // Consume the initial announcement so the rename below must trigger its

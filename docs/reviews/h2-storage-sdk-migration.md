@@ -73,11 +73,22 @@ H4/H5 must remove this surface after its consumers use the typed API.
 The store limits each physical record to 1 MiB. The runtime splits logical
 values over 512 KiB into parts in the same authenticated commit. Restore joins
 the parts before it decodes a security record. This also applies to branch
-records when H1 is integrated.
+records, including H1 rollback snapshots and carried revocation orders.
 
 Store format 1 and runtime record format 1 are explicit. There is no reader
 for a store that predates these versions. The migration hook accepts only
 declared format upgrades; it is not a legacy import path.
+
+## Workspace driver
+
+`drive_workspace` saves and adopts its own self-update in one call. It then
+announces the committed history. It no longer returns `self_update_offered`,
+`self_update_pending`, or `self_update_refused`. It returns
+`self_update_committed` after the local save succeeds. Other members catch up
+through the membership protocol. H1 fork choice resolves concurrent updates.
+
+The candidate guard still blocks unrelated operations while a host has an
+explicit staged candidate. A failed save still requires close and restore.
 
 ## H4/H5 follow-up
 
