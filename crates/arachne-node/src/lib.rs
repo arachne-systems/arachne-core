@@ -1416,20 +1416,28 @@ impl Node {
         delivery: DeliveryClass,
         payload: Vec<u8>,
     ) -> Result<AdmissionReport> {
-        let peers = self
+        if payload.len() > MAX_PAYLOAD {
+            return Err(Error::TooLarge);
+        }
+        let mut peers = self
             .routing
             .lock()
             .await
             .recipients(workspace, revision, self.id(), &topic)?;
-        if !self
+        let enabled = self
             .streams
-            .any_enabled(workspace, revision, &topic, &peers)
-            .await
-        {
+            .enabled_peers(workspace, revision, &topic)
+            .await;
+        if enabled.is_empty() {
             return self
                 .publish_with_class(workspace, revision, topic, delivery, payload)
                 .await;
         }
+        // An explicitly enabled stream keeps its bounded recent window while
+        // a returning peer's interest announcement is still in flight.
+        peers.extend(enabled);
+        peers.sort_unstable();
+        peers.dedup();
         self.streams
             .publish_selected(
                 sequence,
@@ -1459,18 +1467,28 @@ impl Node {
         delivery: DeliveryClass,
         payload: Vec<u8>,
     ) -> Result<AdmissionReport> {
-        let peers = self.routing.lock().await.direct_recipients(
+        if payload.len() > MAX_PAYLOAD
+            || recipients.is_empty()
+            || recipients.len() > MAX_RECIPIENTS
+            || recipients.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(Error::Rejected);
+        }
+        let mut peers = self.routing.lock().await.direct_recipients(
             workspace,
             revision,
             self.id(),
             &topic,
             &endpoints,
         )?;
-        if !self
+        let enabled: Vec<_> = self
             .streams
-            .any_enabled(workspace, revision, &topic, &peers)
+            .enabled_peers(workspace, revision, &topic)
             .await
-        {
+            .into_iter()
+            .filter(|peer| endpoints.binary_search(peer).is_ok())
+            .collect();
+        if enabled.is_empty() {
             return self
                 .publish_to_with_class(
                     workspace,
@@ -1483,6 +1501,9 @@ impl Node {
                 )
                 .await;
         }
+        peers.extend(enabled);
+        peers.sort_unstable();
+        peers.dedup();
         let skipped: Vec<_> = endpoints
             .into_iter()
             .filter(|peer| peers.binary_search(peer).is_err())
