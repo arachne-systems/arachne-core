@@ -24,7 +24,7 @@ membership-driver starvation fix. Do not treat retries as the final green run.
 - [x] Confirm H1, H2, H3, H4 and H6 integration ancestry; H5 has its own SDK proof.
 - [ ] Import and qualify the final H1 and general retained-tail follow-ups.
 - [ ] Finish A3h dependency removal and workspace qualification.
-- [ ] Run `cargo fmt --all` as its own commit after the code follow-ups merge.
+- [x] Run `cargo fmt --all` as its own commit after the code follow-ups merge (`70b8c75`).
 - [ ] Pass `cargo clippy --workspace --all-targets --all-features -- -D warnings`;
   document each narrow lint exception.
 - [ ] Pass the final full suite and dependency policy check.

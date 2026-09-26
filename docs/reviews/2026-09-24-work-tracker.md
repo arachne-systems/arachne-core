@@ -21,7 +21,7 @@ stay open below.
 | H4 | `91ce5b1`; merge `e420a52` | [Core binding report](../evidence/h4-night-2026-09-26.md) |
 | H5 (SDK) | SDK `3c750fb`, Core `e420a52` | Four language flows, Rust, AAR, R8 and Android test APK passed; device/ATAK gates remain |
 | H6 | `fc06673`; merge `ad31b97` | [Crypto report](../evidence/h6-night-2026-09-26.md): 681 passed, 0 failed, 20 ignored; MSRV and deny green |
-| H7 | `codex/night-h7-integration`, base `ad31b97` | Baseline build green; unchanged convergence test and admission timing check are RED; diagnosis and final checks in progress |
+| H7 | `codex/night-h7-integration`, base `ad31b97` | Initial RED retained; H1 driver fix imported; strict Clippy, deny and MSRV green; format `70b8c75`; final suite pending |
 
 The H6 total includes 18 tests in 20 example harnesses. It is a corrected
 aggregate with the original failures and reruns retained in its receipts.
@@ -33,14 +33,23 @@ and publication. The [H8 brief](handoff/H8-owner-decisions.md) owns outward acti
 
 ## H7 integration defects
 
-- [ ] Same-epoch convergence: baseline `ad31b97` kept one of three members on a
+- [x] Same-epoch convergence (`21054c4`, integration `94e30da`): baseline `ad31b97` kept one of three members on a
   different authenticated branch for the full 20-second deadline. The unchanged
-  test then passed three focused runs and three complete-binary runs. H1 owns
-  the driver scheduling investigation. The first RED stays in the H7 evidence.
+  test then passed three focused runs and three complete-binary runs. H1
+  reproduced native driver starvation, fixed it, and passed deterministic
+  checks plus 50 unchanged convergence runs. The first RED stays in the H7
+  evidence. The combined run on `70b8c75` passed the returning-member binary.
 - Admission timing: the first post-restore intake measured 1.909802 ms against
   an early median of 0.93733 ms (2.038 times). Three unchanged runs passed the
   existing two-times bound. The fixture is unchanged from H6; its correctness,
-  negative authorization and performance assertions remain intact.
+  negative authorization and performance assertions remain intact. It also
+  passed in the combined run on `70b8c75`.
+- [x] Admission push fixture (`911ecce`): local task cancellation did not prove
+  remote exchange expiry. The test now waits for the owner's observed expiry
+  within the same deadline and requires zero old-exchange replies and one
+  push. Fifty corrected exact repeats and all 13 admission tests passed.
+  The original combined run remains 701 passed, one failed and 21 ignored;
+  the corrected full run is reported separately in the H7 evidence.
 
 ## Fix-now bugs (core)
 
@@ -120,7 +129,7 @@ and a different Core pin. Core work that each plan step depends on:
   - [x] A3g (H2): 2,049 members save as parts, then a name change and one admission
     restore with 2,050 members. Fixed attachment bounds fit. A 3,208,876-byte H1
     snapshot restores from seven parts. See [evidence](../evidence/h2-night-2026-09-26.md).
-  - [ ] A3h: unused `serde_json` edge removed in H7 (static RED/GREEN). Workspace formatting and final crate checks are pending the last branch merges.
+  - [x] A3h (`381f451`, `70b8c75`): unused `serde_json` edge removed with static RED/GREEN. Strict all-feature Clippy and the separate workspace formatting check pass. Final integrated execution is recorded in the H7 row.
   Original: Decouple delivery and routing from the exact epoch and policy revision.
 - [x] **A4** (`feat/a4-context` merged at `2205887`; full suite before merge 526 pass / 0 fail; ADR steps 3–4; default limits 64 sessions / 320 overlay paths accepted)
   - [x] A4c (`6b98b22`, `5db52d3`): 8 leftover test locks removed; `cargo test -p arachne-runtime` runs with default threads (39 binaries pass).
@@ -140,5 +149,5 @@ and a different Core pin. Core work that each plan step depends on:
   - [x] A9d (`334ab7f`): in-file change notices in fork sources; stale `release = false` in `release-plz.toml`.
   - [x] A9f (`8fcf5f8`, live Tor SAFECOOKIE passed): Tor control client uses plain COOKIE auth; add SAFECOOKIE. Full `tor_transport` node test not run (no Tor network reach here).
   - [ ] A9e (owner approval): publish `arachne-bao-tree`, then blobs, gossip, node, runtime; decide on yanking old fork versions.
-- [x] **A10** (`feat/a1-typed-ops` merged; lib.rs 8k → 163 lines, 14 ops modules) Split `arachne-runtime/src/lib.rs` by subsystem; test through the typed Client.
+- [x] **A10** (`feat/a1-typed-ops` merged; lib.rs 8k → 163 lines, 14 ops modules) Split `arachne-runtime/src/lib.rs` by subsystem. Typed Client tests are present; migration of the remaining dispatcher callers is the open A1 step 9 gate.
 - [x] Fix stale docs (A9 `bbb5488`, A9a `fd189aa`) (`docs/integration.md` gaps list, missing ADR 0008/0009).

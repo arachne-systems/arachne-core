@@ -29,13 +29,13 @@ Nothing is pushed. All branches are local.
 
 | ID | Package | Branch (worktree) | State | Depends on |
 | --- | --- | --- | --- | --- |
-| [H1](H1-a2-fork-healing.md) | A2 fork healing, revocation carry, re-publication and settlement | `codex/night-h1-forks` and follow-ups | `3379267` and fragment checkpoint `5a80e43` merged; public-anchor follow-up and H7 convergence RED under review | — |
+| [H1](H1-a2-fork-healing.md) | A2 fork healing, revocation carry, re-publication and settlement | `codex/night-h1-forks` and follow-ups | `3379267` and fragment checkpoint `5a80e43` merged; public anchors `08d021a` and scheduler `21054c4` merged; final H7 qualification pending | — |
 | [H2](H2-a5-storage.md) | Native storage, opaque candidates, physical parts, branch records | `codex/night-h2-storage` | `840c25a` merged as `0d5e071`; old-data upgrade is a release gate | — |
 | [H3](H3-test-speed.md) | Optimize dependencies in test builds | `a6619db` | merged as `688946b`; same-source before/after measurements are in `docs/development.md` | — |
 | [H4](H4-core-ffi-api.md) | Core-owned typed API and UniFFI metadata | `codex/night-h2-storage` | `91ce5b1` merged as `e420a52`; dispatcher caller migration remains open | H2 |
 | [H5](H5-sdk-completion.md) | Generated bindings and Android packaging | SDK `codex/night-h5-bindings` | `3c750fb` on Core `e420a52`; four languages and AAR builds green, SDK-line/ATAK decisions open | H1, H2, H4 |
 | [H6](H6-crypto-dependency-bumps.md) | SHA-2 0.11, HKDF/HMAC 0.13 and SFrame check | `codex/night-h6-crypto` | `fc06673` merged as `ad31b97`; MSRV, deny and corrected full suite green | H1, H2 |
-| [H7](H7-final-integration.md) | Integrated qualification, cleanup and merge summary | `codex/night-h7-integration` | in progress; preserve the first integrated RED receipts | all |
+| [H7](H7-final-integration.md) | Integrated qualification, cleanup and merge summary | `codex/night-h7-integration` | format `70b8c75` and strict Clippy green; complete combined suite running | all |
 | [H8](H8-owner-decisions.md) | Owner decisions and outward actions | — | open | — |
 
 ## Rules every agent must follow
