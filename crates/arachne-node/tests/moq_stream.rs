@@ -334,11 +334,20 @@ async fn opted_in_peers_exchange_packets_over_moq_and_reject_an_outsider() {
             serde_json::to_string(&receive_metrics).unwrap(),
         );
 
+        // A new revision with unchanged members must replace the old MoQ scope.
+        let next_policy = BTreeMap::from([
+            (sender.id(), access(&topic)), (receiver.id(), access(&topic)),
+        ]);
+        receiver.install_verified_policy(workspace, 2, next_policy.clone()).await.unwrap();
+        sender.install_verified_policy(workspace, 2, next_policy).await.unwrap();
+        receiver.enable_moq_delivery(workspace, 2, sender.id(), topic.clone()).await.unwrap();
+        sender.enable_moq_delivery(workspace, 2, receiver.id(), topic.clone()).await.unwrap();
+
         // A policy revision and peer removal close both ends of the old session.
         receiver
             .install_verified_policy(
                 workspace,
-                2,
+                3,
                 BTreeMap::from([(receiver.id(), Permissions::AllTopics)]),
             )
             .await
@@ -346,7 +355,7 @@ async fn opted_in_peers_exchange_packets_over_moq_and_reject_an_outsider() {
         sender
             .install_verified_policy(
                 workspace,
-                2,
+                3,
                 BTreeMap::from([(sender.id(), Permissions::AllTopics)]),
             )
             .await
