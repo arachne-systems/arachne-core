@@ -8,7 +8,7 @@ use std::fmt;
 
 use data_encoding::{BASE32_NOPAD, BASE64};
 use sha2::{Digest as _, Sha512};
-use sha3::{Digest as _, Sha3_256};
+use sha3::Sha3_256;
 
 /// Onion address version byte for v3 onion services.
 const ONION_V3_VERSION: u8 = 0x03;

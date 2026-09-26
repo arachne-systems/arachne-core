@@ -10,7 +10,7 @@
 use std::{fmt, io, net::SocketAddr, path::PathBuf};
 
 use data_encoding::HEXUPPER;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 

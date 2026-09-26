@@ -40,6 +40,20 @@ impl StorageKey {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn storage_key_derivation_keeps_its_bytes_across_crypto_upgrades() {
+    // Independently calculated with Python hashlib/hmac and RFC 5869.
+    let root = std::array::from_fn(|i| i as u8);
+    let expected = [
+        0x7a, 0x81, 0xed, 0x72, 0xce, 0x9a, 0x3a, 0xf2,
+        0x18, 0x5d, 0xd0, 0x5b, 0x23, 0x53, 0x7b, 0xaf,
+        0x11, 0x4a, 0x26, 0xb5, 0x0d, 0xff, 0xac, 0xfb,
+        0xe5, 0x5b, 0xff, 0xbe, 0xe6, 0x73, 0xcf, 0x62,
+    ];
+    assert_eq!(*StorageKey::derive(&root).unwrap().0, expected);
+}
+
 pub(super) fn take<'a>(bytes: &mut &'a [u8], count: usize) -> Result<&'a [u8], &'static str> {
     let (head, tail) = bytes
         .split_at_checked(count)

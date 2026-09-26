@@ -118,33 +118,6 @@ fn drive_until_work(handle: i64) -> Value {
     }
 }
 
-/// Let the member save its first self-update, then let the administrator
-/// catch up, so each handoff scenario starts with the same accepted epoch.
-fn settle_self_update(member: i64, admin: i64) {
-    let until = Instant::now() + Duration::from_secs(10);
-    let mut committed = false;
-    loop {
-        let value = call(member, json!({"op":"drive_workspace"})).unwrap();
-        if value["state"] == "self_update_committed" {
-            committed = true;
-            call(
-                member,
-                json!({"op":"poll_workspace_presence","announce":true}),
-            )
-            .unwrap();
-        }
-        call(admin, json!({"op":"drive_workspace"})).unwrap();
-        if committed
-            && call(member, json!({"op":"member_roster"})).unwrap()["epoch"]
-                == call(admin, json!({"op":"member_roster"})).unwrap()["epoch"]
-        {
-            return;
-        }
-        assert!(Instant::now() < until, "no self-update: {value}");
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
 /// Complete a self-update through an explicit authenticated offer while the
 /// fixture has suspended automatic gossip and presence.
 fn settle_self_update_by_offer(member: i64, admin: i64) {
@@ -220,8 +193,22 @@ fn adopt_candidate(handle: i64, staged: &Value) -> Value {
 
 #[test]
 fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave() {
-    let admin = node(73);
-    let successor = node(74);
+    // This fixture checks one staged offer and its save/adopt acknowledgement.
+    // Keep automatic presence requests out of that controlled exchange.
+    let context = arachne_runtime::Context::new(Default::default()).unwrap();
+    context.suspend().unwrap();
+    let make_node = |secret: u8| {
+        let handle = context
+            .create_with_options(
+                Some(&[secret; 32]),
+                arachne_node::NodeOptions::new(arachne_node::NetworkProfile::Direct),
+            )
+            .unwrap();
+        common::attach(handle, &MemoryProvider::default());
+        handle
+    };
+    let admin = make_node(73);
+    let successor = make_node(74);
     call(
         admin,
         json!({"op":"create_workspace","display_name":"Original admin"}),
@@ -231,7 +218,7 @@ fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave()
     join(admin, successor, &invite, "Successor");
     route(admin, successor);
     route(successor, admin);
-    settle_self_update(successor, admin);
+    settle_self_update_by_offer(successor, admin);
 
     let before_promotion = call(admin, json!({"op":"member_roster"})).unwrap();
     let successor_id = before_promotion["members"]

@@ -167,7 +167,7 @@ dependencies = [
  "arachne-security",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -293,14 +293,14 @@ dependencies = [
  "clap",
  "data-encoding",
  "getrandom 0.4.3",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "iroh",
  "iroh-base",
  "n0-error",
  "n0-future",
  "n0-watcher",
  "noq-udp",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sha3 0.11.0",
  "tokio",
  "tokio-socks",
@@ -328,7 +328,7 @@ dependencies = [
  "postcard",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -357,7 +357,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
  "tracing",
@@ -370,13 +370,13 @@ name = "arachne-security"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
- "hkdf 0.12.4",
+ "hkdf 0.13.0",
  "openmls",
  "openmls_basic_credential",
  "openmls_rust_crypto",
  "openmls_traits",
  "sframe",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "zeroize",
 ]
 
@@ -387,9 +387,9 @@ dependencies = [
  "aes-gcm",
  "arachne-security",
  "getrandom 0.4.3",
- "hkdf 0.12.4",
+ "hkdf 0.13.0",
  "rusqlite",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "zeroize",
 ]
@@ -5608,9 +5608,9 @@ dependencies = [
 
 [[package]]
 name = "sframe"
-version = "1.4.3"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f2fd5ba69d8d8944c678ebc1ba9c8def537adffaacd13ecb28d1426d5516e5e"
+checksum = "6432d6a7e4401be913326b22110134b5c86a4de2f0c6a72839fc63fb8559e28f"
 dependencies = [
  "bitfield",
  "cfg-if",
