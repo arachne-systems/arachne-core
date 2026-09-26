@@ -37,3 +37,7 @@ netlink-packet-core = { path = "vendor/netlink-packet-core" }
 hax-lib-macros = { path = "vendor/hax-lib-macros" }
 moq-net = { git = "https://github.com/moq-dev/moq", rev = "6ab7d1a223e1949a5c2e10b68e29db2e8ab9bdd1" }
 moq-tokio = { git = "https://github.com/moq-dev/moq", rev = "6ab7d1a223e1949a5c2e10b68e29db2e8ab9bdd1" }
+
+# Optimize dependencies for crypto-heavy tests; workspace crates stay unoptimized.
+[profile.dev.package."*"]
+opt-level = 2

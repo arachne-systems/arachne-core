@@ -59,14 +59,15 @@ Install Rust 1.98.0, then run from the repository root:
 
 ```sh
 cargo +1.98.0 check --locked --workspace
-cargo +1.98.0 test --locked --workspace --exclude arachne-runtime -- --test-threads=1
-cargo +1.98.0 test --locked -p arachne-runtime
+cargo +1.98.0 test --locked --workspace
 ```
 
-The lower crates run their tests serially. Runtime tests own their sessions
-through a `Context`, so they run with the default thread count. These
-commands build the portable Rust workspace; they do not require Android, ATAK,
-or a device.
+Use the default test thread count. Runtime tests own their sessions through
+a `Context`; LAN discovery tests protect their shared fixture locally.
+Dependencies use optimization level 2 in development and test builds. Workspace
+crates stay unoptimized. See the [development guide](docs/development.md) for
+measurements and settings that keep build caches small. These commands build
+the portable Rust workspace; they do not require Android, ATAK, or a device.
 
 ## Documentation
 
