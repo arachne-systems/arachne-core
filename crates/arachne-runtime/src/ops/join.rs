@@ -343,12 +343,10 @@ pub(crate) fn request_admission(
         .map_err(security(ErrorCode::WrongState))?;
     let name = pending.member().display_name().as_bytes();
     let packet = admission_request_packet(request, name)?;
-    let outcome = session
-        .runtime
-        .block_on(crate::deadline::wait(
-            session.op_deadline,
-            session.node.request_control(peer, &packet),
-        ))?;
+    let outcome = session.runtime.block_on(crate::deadline::wait(
+        session.op_deadline,
+        session.node.request_control(peer, &packet),
+    ))?;
     let reply = match outcome {
         Ok(reply) => reply,
         Err(arachne_node::Error::ControlNotSent(_) | arachne_node::Error::MissingPeer) => {

@@ -443,7 +443,13 @@ mod tests {
     #[test]
     fn an_expired_operation_does_not_enter_its_body() {
         let context = Context::new(Default::default()).unwrap();
-        let handle = open(&context, None, NodeOptions::new(NetworkProfile::Direct), None).unwrap();
+        let handle = open(
+            &context,
+            None,
+            NodeOptions::new(NetworkProfile::Direct),
+            None,
+        )
+        .unwrap();
         entry(handle).unwrap().set_deadline(Some(Duration::ZERO));
         let outcome: Result<(), ApiError> =
             crate::ops::run(handle, crate::ops::Op::ControlExchange, |_| {
@@ -455,7 +461,13 @@ mod tests {
 
     fn deadline_preserves_background_control(start_during_op: bool) {
         let context = Context::new(Default::default()).unwrap();
-        let handle = open(&context, None, NodeOptions::new(NetworkProfile::Direct), None).unwrap();
+        let handle = open(
+            &context,
+            None,
+            NodeOptions::new(NetworkProfile::Direct),
+            None,
+        )
+        .unwrap();
         let entry = entry(handle).unwrap();
         let runtime = context.handle();
         let (mut peer, _) = runtime
@@ -470,7 +482,8 @@ mod tests {
             session.node.control_client()
         };
         let start_background = |peer: &mut Node| {
-            let background = runtime.spawn(control.clone().request_control(peer.id(), b"background"));
+            let background =
+                runtime.spawn(control.clone().request_control(peer.id(), b"background"));
             let held = runtime.block_on(async {
                 tokio::time::timeout(Duration::from_secs(2), async {
                     loop {
@@ -513,7 +526,10 @@ mod tests {
         let early = runtime.block_on(async {
             tokio::time::timeout(Duration::from_millis(100), &mut background).await
         });
-        assert!(early.is_err(), "unrelated background exchange ended: {early:?}");
+        assert!(
+            early.is_err(),
+            "unrelated background exchange ended: {early:?}"
+        );
         held.respond(b"background survived".to_vec()).unwrap();
         let reply = runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(2), background)
