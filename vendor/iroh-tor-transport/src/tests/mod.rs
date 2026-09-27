@@ -20,7 +20,7 @@ use tokio::{
 };
 
 use crate::{
-    MAX_PACKET_SIZE, TorPacket, TorPacketSender, TorPacketService, TorStreamIo,
+    MAX_PACKET_SIZE, TorPacket, TorPacketSender, TorPacketService, TorStreamIo, accept_streams,
     iroh_to_tor_secret_key, read_tor_packet, write_tor_packet,
 };
 
@@ -91,6 +91,59 @@ async fn packet_length_is_bounded_before_body_allocation() -> Result<()> {
         Some(packet)
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn idle_inbound_streams_are_bounded_and_release_capacity() -> Result<()> {
+    let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await?);
+    let addr = listener.local_addr()?;
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let io = Arc::new(TorStreamIo::new(
+        {
+            let listener = listener.clone();
+            let accepted = accepted.clone();
+            move || {
+                let listener = listener.clone();
+                let accepted = accepted.clone();
+                async move {
+                    let stream = listener.accept().await?.0;
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    Ok(stream)
+                }
+            }
+        },
+        |_| async { Err(std::io::Error::other("connect not used in this test")) },
+    ));
+    let (tx, _rx) = mpsc::channel(1);
+    let service = TorPacketService::with_read_timeout(tx, Duration::from_millis(250));
+    let accept_loop = tokio::spawn(accept_streams(
+        io,
+        service,
+        Arc::new(tokio::sync::Semaphore::new(2)),
+    ));
+
+    let _clients = [
+        TcpStream::connect(addr).await?,
+        TcpStream::connect(addr).await?,
+        TcpStream::connect(addr).await?,
+    ];
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while accepted.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while accepted.load(Ordering::SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    accept_loop.abort();
     Ok(())
 }
 

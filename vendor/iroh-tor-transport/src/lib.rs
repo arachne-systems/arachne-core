@@ -7,7 +7,7 @@
 mod control;
 mod onion;
 
-use std::{collections::HashMap, future::Future, io, num::NonZeroUsize, sync::Arc};
+use std::{collections::HashMap, future::Future, io, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use iroh::{
@@ -228,20 +228,68 @@ pub(crate) async fn write_tor_packet<W: AsyncWrite + Unpin>(
 #[derive(Clone)]
 pub(crate) struct TorPacketService {
     sender: tokio::sync::mpsc::Sender<TorPacket>,
+    read_timeout: Duration,
 }
 
 impl TorPacketService {
     /// Create a new service with the given handler.
     pub(crate) fn new(sender: tokio::sync::mpsc::Sender<TorPacket>) -> Self {
-        Self { sender }
+        Self {
+            sender,
+            read_timeout: INBOUND_READ_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_read_timeout(
+        sender: tokio::sync::mpsc::Sender<TorPacket>,
+        read_timeout: Duration,
+    ) -> Self {
+        Self {
+            sender,
+            read_timeout,
+        }
     }
 
     /// Handle packets on a single stream until EOF.
     pub(crate) async fn handle_stream(&self, mut stream: TcpStream) -> io::Result<()> {
-        while let Some(packet) = read_tor_packet(&mut stream).await? {
-            let _ = self.sender.send(packet).await;
+        loop {
+            let packet = tokio::time::timeout(self.read_timeout, read_tor_packet(&mut stream))
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "Tor packet read timed out")
+                })??;
+            let Some(packet) = packet else {
+                return Ok(());
+            };
+            let _ = self.sender.try_send(packet);
         }
-        Ok(())
+    }
+}
+
+async fn accept_streams(
+    io: Arc<TorStreamIo>,
+    service: TorPacketService,
+    permits: Arc<tokio::sync::Semaphore>,
+) {
+    loop {
+        let permit = match permits.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
+        match io.accept().await {
+            Ok(stream) => {
+                let service = service.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let _ = service.handle_stream(stream).await;
+                });
+            }
+            Err(err) => {
+                tracing::warn!("Tor accept loop stopped: {err:#}");
+                return;
+            }
+        }
     }
 }
 
@@ -367,6 +415,8 @@ impl TorPacketSender {
 }
 
 const DEFAULT_RECV_CAPACITY: usize = 64 * 1024;
+const MAX_INBOUND_STREAMS: usize = 64;
+const INBOUND_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_SOCKS_PORT: u16 = 9050;
 const DEFAULT_CONTROL_PORT: u16 = 9051;
 const DEFAULT_ONION_PORT: u16 = 9999;
@@ -610,23 +660,11 @@ impl CustomTransport for TorCustomTransport {
         let sender = Arc::new(TorPacketSender::new(self.io.clone()));
         let watchable = Watchable::new(vec![tor_user_addr(self.local_id)]);
 
-        let io = self.io.clone();
-        tokio::spawn(async move {
-            loop {
-                match io.accept().await {
-                    Ok(stream) => {
-                        let service = service.clone();
-                        tokio::spawn(async move {
-                            let _ = service.handle_stream(stream).await;
-                        });
-                    }
-                    Err(err) => {
-                        tracing::warn!("Tor accept loop stopped: {err:#}");
-                        break;
-                    }
-                }
-            }
-        });
+        tokio::spawn(accept_streams(
+            self.io.clone(),
+            service,
+            Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_STREAMS)),
+        ));
 
         Ok(Box::new(TorCustomEndpoint {
             local_id: self.local_id,
