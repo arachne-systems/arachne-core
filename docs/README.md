@@ -16,6 +16,8 @@ the pre-release crates in an application.
   epoch behavior.
 - [Security](security.md) — security properties, trust boundaries, host duties,
   and known limitations.
+- [Security release gates](security-release-gates.md) — disclosure, evidence,
+  signing, fuzzing, dependency, and incident-response checks for a release.
 - [Development](development.md) — repository layout, Rust commands, test
   coverage map, and vendored dependency maintenance.
 
