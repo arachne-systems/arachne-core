@@ -4,8 +4,9 @@ use super::*;
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8] = b"DFOI\x02";
-/// Binary inbox state (A6f). Earlier versions are rejected.
+/// Current binary inbox state (A6f).
 const CACHE_MAGIC: &[u8] = b"DFIC\x06";
+const LEGACY_CACHE_MAGIC: &[u8] = b"DFIC\x05";
 /// Replay windows: one per (author, epoch) that sent to this member.
 const MAX_REPLAY_WINDOWS: usize = 4096;
 /// Accepted counters tracked above one replay floor. An author's counter is
@@ -538,7 +539,7 @@ impl Snapshot {
         }
     }
 
-    fn decode(input: &mut &[u8]) -> Result<Self, &'static str> {
+    fn decode(input: &mut &[u8], legacy: bool) -> Result<Self, &'static str> {
         let workspace = codec::read_array(input)?;
         let epoch = codec::read_u64(input)?;
         let count = codec::read_count(input, MAX_REPLAY_WINDOWS)?;
@@ -589,10 +590,14 @@ impl Snapshot {
                 }),
                 _ => return Err("invalid pending current marker"),
             };
-            let from_losing_branch = match take(input, 1)?[0] {
-                0 => false,
-                1 => true,
-                _ => return Err("invalid pending branch marker"),
+            let from_losing_branch = if legacy {
+                false
+            } else {
+                match take(input, 1)?[0] {
+                    0 => false,
+                    1 => true,
+                    _ => return Err("invalid pending branch marker"),
+                }
             };
             let payload = codec::read_blob(input, arachne_security::MAX_APPLICATION_PAYLOAD)?;
             pending.push(Pending {
@@ -2521,11 +2526,14 @@ impl ObjectInbox {
         }
         let length = u32::from_be_bytes(take(&mut bytes, 4)?.try_into().unwrap()) as usize;
         let publisher = PublisherLog::restore(owner, take(&mut bytes, length)?)?;
-        let (parsed, ranges, retained_current_views, current) = if bytes.starts_with(CACHE_MAGIC) {
+        let legacy = bytes.starts_with(LEGACY_CACHE_MAGIC);
+        let (parsed, ranges, retained_current_views, current) = if bytes.starts_with(CACHE_MAGIC)
+            || legacy
+        {
             let has_current = true;
             let has_retained_current = true;
             let mut input = &bytes[5..];
-            let parsed = Snapshot::decode(&mut input)?;
+            let parsed = Snapshot::decode(&mut input, legacy)?;
             let count = take(&mut input, 1)?[0] as usize;
             if count > MAX_RETAINED_RANGES {
                 return Err("retained range capacity exceeded");
@@ -3613,6 +3621,104 @@ fn durable_pending_objects_and_bounded_topic_replay() {
         "OBJECT_INBOX skipped=10000 subsequent=1024 pending_survives_save_restore=true duplicate_and_expired_replay_rejected=true receipt_window=32 pending_eviction=backpressure adapter_exactly_once=not_proven"
     );
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn previous_inbox_snapshot_format_restores_and_rewrites_current_format() {
+    use arachne_security::{PendingJoin, Workspace};
+
+    let admin = Workspace::create(crate::test_key(81), "Publisher").unwrap();
+    let (admin, invitation, checkpoint) = issue_registered_invitation(admin);
+    let join =
+        PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(82), "Reader")
+            .unwrap();
+    let prepared = admin
+        .prepare_admission(crate::test_endpoint(82), join.admission_request().unwrap())
+        .unwrap();
+    let mut proof = join.join_proof().unwrap();
+    proof
+        .apply_add(&prepared.authorization, &prepared.commit)
+        .unwrap();
+    let reader = join.prepare_workspace(&proof, &prepared.welcome).unwrap();
+    let mut sender = prepared.workspace;
+    let context = PublicationContext {
+        workspace: reader.id(),
+        revision: 7,
+        topic: Topic::new("chat/messages").unwrap(),
+        id: [1; 16],
+        sequence: std::num::NonZeroU64::new(1),
+    };
+    let object = sender
+        .protect_object(
+            context.topic.namespace().as_bytes(),
+            &context.authenticated_bytes(),
+            b"pending legacy payload",
+        )
+        .unwrap();
+    let InboxStage::Prepared(inbox) = ObjectInbox::new(reader.id(), reader.epoch())
+        .stage(&reader, &context, &object)
+        .unwrap()
+    else {
+        panic!("new object was not staged")
+    };
+    let publisher = PublisherLog::new(&reader).unwrap();
+    let mut legacy = inbox.snapshot_with_publisher(&reader, &publisher).unwrap();
+    let offset = legacy
+        .windows(CACHE_MAGIC.len())
+        .position(|window| window == CACHE_MAGIC)
+        .unwrap();
+    legacy[offset..offset + CACHE_MAGIC.len()].copy_from_slice(LEGACY_CACHE_MAGIC);
+    let mut input = &legacy[offset + CACHE_MAGIC.len()..];
+    codec::read_array::<32>(&mut input).unwrap();
+    codec::read_u64(&mut input).unwrap();
+    let replay_count = codec::read_count(&mut input, MAX_REPLAY_WINDOWS).unwrap();
+    for _ in 0..replay_count {
+        codec::read_array::<32>(&mut input).unwrap();
+        codec::read_u64(&mut input).unwrap();
+        codec::read_u64(&mut input).unwrap();
+        codec::read_u64(&mut input).unwrap();
+        let seen = codec::read_count(&mut input, REPLAY_ENTRIES).unwrap();
+        for _ in 0..seen {
+            codec::read_varint(&mut input).unwrap();
+        }
+    }
+    let pending_count = codec::read_count(&mut input, MAX_PENDING_OBJECTS).unwrap();
+    assert_eq!(pending_count, 1);
+    codec::read_array::<32>(&mut input).unwrap();
+    codec::read_array::<32>(&mut input).unwrap();
+    codec::read_u64(&mut input).unwrap();
+    codec::read_u64(&mut input).unwrap();
+    codec::read_u64(&mut input).unwrap();
+    codec::read_text(&mut input).unwrap();
+    codec::read_array::<16>(&mut input).unwrap();
+    codec::read_u64(&mut input).unwrap();
+    decode_recipients(&mut input).unwrap();
+    let current = take(&mut input, 1).unwrap()[0];
+    if current != 0 {
+        take(&mut input, 72).unwrap();
+    }
+    let branch_marker = legacy.len() - offset - CACHE_MAGIC.len() - input.len();
+    legacy.remove(offset + CACHE_MAGIC.len() + branch_marker);
+
+    let (publisher, inbox) = ObjectInbox::restore_snapshot(&reader, &legacy).unwrap();
+    assert_eq!(inbox.pending_count(), 1);
+    assert_eq!(
+        inbox.pending(&reader).unwrap().unwrap().message.payload,
+        b"pending legacy payload"
+    );
+    let current = inbox.snapshot_with_publisher(&reader, &publisher).unwrap();
+    assert!(
+        current
+            .windows(CACHE_MAGIC.len())
+            .any(|window| window == CACHE_MAGIC)
+    );
+    assert_eq!(
+        ObjectInbox::restore_snapshot(&reader, &current)
+            .unwrap()
+            .1
+            .pending_count(),
+        1
+    );
 }
 
 #[test]

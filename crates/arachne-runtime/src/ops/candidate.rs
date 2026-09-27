@@ -476,11 +476,38 @@ pub(crate) fn adopt(
             packet,
             endpoints,
             recipients,
+            mirror_floor_state,
         )
-        | WorkspaceTransition::Republication(context, delivery, packet, endpoints, recipients) => {
+        | WorkspaceTransition::Republication(
+            context,
+            delivery,
+            packet,
+            endpoints,
+            recipients,
+            mirror_floor_state,
+        ) => {
             // Adoption is final even if network admission fails or times out.
             // The send (and its gossip join) also ends at the op deadline.
             let send_limit = crate::deadline::cap(session.op_deadline, Duration::from_secs(10));
+            if mirror_floor_state {
+                let stored = session.runtime.block_on(async {
+                    tokio::time::timeout(
+                        send_limit,
+                        session.node.write_ptt_floor_document(
+                            context.workspace,
+                            context.revision,
+                            b"streams/ptt",
+                            &packet,
+                        ),
+                    )
+                    .await
+                });
+                match stored {
+                    Err(error) => tracing::debug!(%error, "PTT floor Docs write timed out"),
+                    Ok(Err(error)) => tracing::debug!(%error, "PTT floor Docs write failed"),
+                    Ok(Ok(())) => {}
+                }
+            }
             let sent = session.runtime.block_on(async {
                 tokio::time::timeout(send_limit, async {
                     if recipients.is_empty() {

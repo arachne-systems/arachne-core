@@ -1,6 +1,6 @@
 use arachne_runtime::{
     Client, ClientConfig, ErrorCode, JoinAdmissionStep, MemoryProvider, Network,
-    ReceivedProtectedPublication, StorageConfig,
+    ReceivedProtectedPublication, StorageConfig, TransportOptions,
 };
 use std::{
     fs,
@@ -8,6 +8,159 @@ use std::{
     time::{Duration, Instant},
 };
 mod common;
+
+#[test]
+fn ptt_floor_docs_mirror_only_authenticated_gossip_snapshots_from_each_member() {
+    let owner_store = common::directory();
+    let reader_store = common::directory();
+    let owner_root = [141; 32];
+    let reader_root = [142; 32];
+    let mut owner = Client::open(ClientConfig {
+        network: Network::Direct,
+        secret: Some([41; 32].into()),
+        transport: TransportOptions {
+            documents_path: Some(
+                owner_store
+                    .path()
+                    .join("docs")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ..Default::default()
+        },
+        storage: Some((StorageConfig::sqlite(owner_store.path(), owner_root)).into()),
+    })
+    .unwrap();
+    let mut reader = Client::open(ClientConfig {
+        network: Network::Direct,
+        secret: Some([42; 32].into()),
+        transport: TransportOptions {
+            documents_path: Some(
+                reader_store
+                    .path()
+                    .join("docs")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ..Default::default()
+        },
+        storage: Some((StorageConfig::sqlite(reader_store.path(), reader_root)).into()),
+    })
+    .unwrap();
+    let workspace = owner
+        .create_workspace("Owner", Some("PTT floor Docs".into()))
+        .unwrap();
+    let invitation = owner.stage_invitation(0).unwrap();
+    let owner_invitation = owner.adopt_invitation(&invitation).unwrap();
+    reader
+        .add_address_hint(
+            owner_invitation.peer,
+            &owner_invitation.address.replace("0.0.0.0:", "127.0.0.1:"),
+        )
+        .unwrap();
+    let join = reader
+        .begin_join(
+            &owner_invitation.invitation,
+            &owner_invitation.checkpoint,
+            "Reader",
+        )
+        .unwrap();
+    let admission = owner
+        .stage_admission(join.endpoint, &join.admission_request)
+        .unwrap();
+    let joined_owner = owner.adopt_admission(&admission).unwrap();
+    let reply = owner
+        .retained_admission(join.endpoint, &join.admission_request)
+        .unwrap();
+    let joined = reader
+        .stage_join(
+            &reply.welcome,
+            &[JoinAdmissionStep {
+                commit: reply.commit,
+                authorization: reply.authorization,
+            }],
+        )
+        .unwrap();
+    let joined_reader = reader.adopt_join(&joined).unwrap();
+    assert_eq!(joined_owner.epoch, joined_reader.epoch);
+
+    let owner_endpoint = owner.endpoint().unwrap().endpoint_key;
+    let reader_endpoint = reader.endpoint().unwrap().endpoint_key;
+    owner
+        .add_address_hint(
+            reader_endpoint,
+            &reader
+                .endpoint()
+                .unwrap()
+                .bound_address
+                .replace("0.0.0.0:", "127.0.0.1:"),
+        )
+        .unwrap();
+    reader
+        .add_address_hint(
+            owner_endpoint,
+            &owner_invitation.address.replace("0.0.0.0:", "127.0.0.1:"),
+        )
+        .unwrap();
+    let revision = joined_owner.epoch + 1;
+    owner.install_workspace_policy(revision).unwrap();
+    reader.install_workspace_policy(revision).unwrap();
+
+    for (client, id) in [(&mut owner, 51), (&mut reader, 52)] {
+        let mut payload = b"APTF\x01\x06".to_vec();
+        payload.extend([0; 16]);
+        payload.extend([id; 16]);
+        payload.extend([0; 2]);
+        let candidate = client
+            .stage_protected_publication(
+                workspace.workspace,
+                revision,
+                "streams/ptt",
+                [id; 16].into(),
+                payload,
+            )
+            .unwrap();
+        if let Err(error) = client.adopt_protected_publication(&candidate) {
+            assert_eq!(error.code(), ErrorCode::TransportFailed);
+        }
+        let endpoint = client.endpoint().unwrap().endpoint_key;
+        assert!(client.floor_state().unwrap().iter().any(|record| {
+            record.endpoint == endpoint && record.payload.starts_with(b"APTF\x01\x06")
+        }));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let records = loop {
+        owner.poll_control().unwrap();
+        reader.poll_control().unwrap();
+        let records = reader.floor_state().unwrap();
+        if records.len() == 2 {
+            break records;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "floor Docs did not converge: {records:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.endpoint.to_bytes())
+            .collect::<std::collections::BTreeSet<_>>(),
+        [owner_endpoint.to_bytes(), reader_endpoint.to_bytes()]
+            .into_iter()
+            .collect(),
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record.payload.starts_with(b"APTF\x01\x06"))
+    );
+    reader.close().unwrap();
+    owner.close().unwrap();
+}
+
 #[test]
 fn typed_clients_persist_authenticated_inbox_objects_before_acknowledging() {
     let owner_secret = [31; 32];

@@ -12,8 +12,8 @@
 [package]
 edition = "2021"
 rust-version = "1.91"
-name = "arachne-iroh-blobs"
-version = "0.103.0-arachne.1"
+name = "iroh-blobs"
+version = "0.103.0"
 authors = [
     "Arachne Systems",
     "dignifiedquire <me@dignifiedquire.com>",

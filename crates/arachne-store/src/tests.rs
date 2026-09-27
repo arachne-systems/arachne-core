@@ -255,6 +255,60 @@ fn external_freshness_anchor_rejects_a_valid_rolled_back_store() {
 }
 
 #[test]
+fn original_store_head_upgrades_without_rewriting_records() {
+    let directory = Directory::new();
+    let path = directory.0.path().join("workspace.db");
+    let root = [71; 32];
+    let scope = [72; 32];
+    let mut store = Store::create(&path, &root, scope).unwrap();
+    store
+        .commit(0, &[(b"workspace", Some(b"retained state"))])
+        .unwrap();
+    let expected = store.freshness();
+    let record_ciphertext: Vec<u8> = store
+        .connection
+        .query_row(
+            "SELECT sealed FROM records WHERE name=?1",
+            [b"workspace"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut old_head = store.revision.to_be_bytes().to_vec();
+    old_head.extend(index_digest(&store.index));
+    let old_head = store.seal(0, b"", &old_head).unwrap();
+    store
+        .connection
+        .execute("UPDATE head SET sealed=?1 WHERE id=0", [&old_head])
+        .unwrap();
+    store
+        .connection
+        .pragma_update(None, "user_version", 0)
+        .unwrap();
+    drop(store);
+
+    let store = Store::open_existing(&path, &root, scope).unwrap();
+    assert_eq!(store.freshness(), expected);
+    assert_eq!(
+        store.get(b"workspace").unwrap().unwrap().as_slice(),
+        b"retained state"
+    );
+    let migrated_ciphertext: Vec<u8> = store
+        .connection
+        .query_row(
+            "SELECT sealed FROM records WHERE name=?1",
+            [b"workspace"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(migrated_ciphertext, record_ciphertext);
+    let version: u32 = store
+        .connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, STORE_FORMAT);
+}
+
+#[test]
 fn freshness_anchor_has_a_fixed_byte_encoding() {
     let anchor = FreshnessAnchor {
         revision: 0x0102_0304_0506_0708,

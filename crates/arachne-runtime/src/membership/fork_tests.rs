@@ -647,7 +647,7 @@ fn check_own_republication(kind: u8) {
                 .prepare_step_update(&losing.authorization, &losing.commit)
                 .unwrap(),
         );
-        let WorkspaceTransition::RoutedPublication(context, _, packet, _, recipients) =
+        let WorkspaceTransition::RoutedPublication(context, _, packet, _, recipients, _) =
             &session.transition.staged.as_ref().unwrap().transition
         else {
             panic!("publication")
@@ -700,7 +700,7 @@ fn check_own_republication(kind: u8) {
         fork::stage_republication(&mut session).unwrap().is_some(),
         "own losing data must survive the switch for re-publication"
     );
-    let WorkspaceTransition::Republication(context, _, packet, _, recipients) =
+    let WorkspaceTransition::Republication(context, _, packet, _, recipients, _) =
         &session.transition.staged.as_ref().unwrap().transition
     else {
         panic!("expected recovery publication")
@@ -784,7 +784,7 @@ fn check_own_republication(kind: u8) {
             },
         )
         .unwrap();
-        let WorkspaceTransition::RoutedPublication(context, _, packet, _, recipients) =
+        let WorkspaceTransition::RoutedPublication(context, _, packet, _, recipients, _) =
             &session.transition.staged.as_ref().unwrap().transition
         else {
             panic!("publication")

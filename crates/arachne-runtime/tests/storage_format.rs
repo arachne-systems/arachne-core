@@ -1,9 +1,10 @@
-//! A5 item 5: stored formats are versioned. There are no legacy readers: an
-//! unknown or newer format fails with FormatNotSupported and a clear message.
+//! Stored formats are versioned: supported legacy formats migrate; unknown or
+//! newer formats fail with FormatNotSupported and a clear message.
 use arachne_runtime::{
     Client, ClientConfig, ErrorCode, MemoryProvider, Network, RestoredWorkspace, SqliteProvider,
     StorageConfig,
 };
+use arachne_store::StorageProvider;
 
 mod common;
 
@@ -33,7 +34,7 @@ fn runtime_records_carry_their_format_and_refuse_others() {
     for (format, what) in [
         (Some(vec![0, 0, 0, 0, 2]), "newer"),
         (None, "no runtime format"),
-        (Some(vec![0, 0, 1]), "invalid"),
+        (Some(vec![0, 0, 0, 1]), "invalid"),
     ] {
         let original = provider.value((workspace).to_bytes(), b"runtime/format");
         provider.tamper((workspace).to_bytes(), b"runtime/format", format.as_deref());
@@ -54,6 +55,57 @@ fn runtime_records_carry_their_format_and_refuse_others() {
         RestoredWorkspace::Active(_)
     ));
     client.close().unwrap();
+}
+
+#[test]
+fn original_runtime_records_restore_and_migrate_before_use() {
+    let provider = MemoryProvider::default();
+    let storage = StorageConfig::memory(&provider);
+    let client = open(storage.clone());
+    let created = client.create_workspace("Legacy owner", None).unwrap();
+    let workspace = created.workspace;
+    client.close().unwrap();
+
+    // Rebuild the original flat record layout: no runtime/format or endpoint
+    // record and no one-byte value tags.
+    let mut store = provider.open(workspace.to_bytes()).unwrap().unwrap();
+    let keys = store.keys(b"");
+    let values = keys
+        .into_iter()
+        .map(|name| {
+            let value = store.get(&name).unwrap().unwrap();
+            if name == b"runtime/format" || name == b"runtime/endpoint" {
+                (name, None)
+            } else {
+                assert_eq!(value.first(), Some(&0));
+                (name, Some(value[1..].to_vec()))
+            }
+        })
+        .collect::<Vec<_>>();
+    let changes = values
+        .iter()
+        .map(|(name, value)| (name.as_slice(), value.as_deref()))
+        .collect::<Vec<_>>();
+    let revision = store.revision();
+    store.commit(revision, &changes).unwrap();
+    let legacy_anchor = store.freshness();
+    drop(store);
+
+    let restored = open(storage);
+    assert!(matches!(
+        restored
+            .restore_workspace(workspace, Some(legacy_anchor))
+            .unwrap(),
+        RestoredWorkspace::Active(_)
+    ));
+    assert_ne!(restored.record_freshness().unwrap(), legacy_anchor);
+    let migrated = provider.open(workspace.to_bytes()).unwrap().unwrap();
+    assert_eq!(
+        migrated.get(b"runtime/format").unwrap().unwrap().as_slice(),
+        [0, 0, 0, 0, 1]
+    );
+    assert!(migrated.get(b"runtime/endpoint").unwrap().is_some());
+    restored.close().unwrap();
 }
 
 #[test]

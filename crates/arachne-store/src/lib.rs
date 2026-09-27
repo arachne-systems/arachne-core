@@ -196,14 +196,11 @@ impl Store {
         let found: u32 = store
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if found == 0 || found > STORE_FORMAT {
+        if found > STORE_FORMAT {
             return Err(Box::new(FormatNotSupported {
                 found,
                 supported: STORE_FORMAT,
             }));
-        }
-        for migration in &MIGRATIONS[found as usize - 1..] {
-            migration(&store.connection)?;
         }
         // An untrusted DB must not install triggers that silently alter commits.
         let schema: Vec<(String, String)> = store
@@ -221,6 +218,39 @@ impl Store {
         {
             return Err("unexpected record store schema".into());
         }
+        if found == 0 {
+            // Format 0 is the original store: the same authenticated record
+            // rows, with a 40-byte head and no SQLite user_version. Validate
+            // its complete index before atomically replacing only the head.
+            let sealed: Option<Vec<u8>> = store
+                .connection
+                .query_row("SELECT sealed FROM head WHERE id=0", [], |row| row.get(0))
+                .optional()?;
+            let sealed = sealed.ok_or("record head missing")?;
+            if sealed.len() != OVERHEAD + 40 {
+                return Err(Box::new(FormatNotSupported {
+                    found,
+                    supported: STORE_FORMAT,
+                }));
+            }
+            let old_head = store.unseal(0, b"", &sealed)?;
+            store.revision = u64::from_be_bytes(old_head[..8].try_into()?);
+            store.read_index()?;
+            if old_head[8..] != index_digest(&store.index) {
+                return Err("record set authentication failed".into());
+            }
+            let head = store.seal_head(store.revision, &store.index)?;
+            let tx = store
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute("UPDATE head SET sealed=?1 WHERE id=0", [&head])?;
+            tx.pragma_update(None, "user_version", STORE_FORMAT)?;
+            tx.commit()?;
+            return Ok(store);
+        }
+        for migration in &MIGRATIONS[found as usize - 1..] {
+            migration(&store.connection)?;
+        }
         let sealed: Option<Vec<u8>> = store
             .connection
             .query_row("SELECT sealed FROM head WHERE id=0", [], |row| row.get(0))
@@ -234,27 +264,30 @@ impl Store {
             return Err("record head format differs from the store header".into());
         }
         store.revision = u64::from_be_bytes(head[4..12].try_into()?);
-        {
-            let mut statement = store
-                .connection
-                .prepare("SELECT name,sealed FROM records ORDER BY name")?;
-            let mut rows = statement.query([])?;
-            while let Some(row) = rows.next()? {
-                let name = row.get_ref(0)?.as_blob()?;
-                let sealed = row.get_ref(1)?.as_blob()?;
-                Self::validate_key(name)?;
-                if !(OVERHEAD..=OVERHEAD + MAX_RECORD_BYTES).contains(&sealed.len()) {
-                    return Err("invalid encrypted record size".into());
-                }
-                store
-                    .index
-                    .insert(name.to_vec(), Sha256::digest(sealed).into());
-            }
-        }
+        store.read_index()?;
         if head[12..] != index_digest(&store.index) {
             return Err("record set authentication failed".into());
         }
         Ok(store)
+    }
+
+    fn read_index(&mut self) -> Result<()> {
+        self.index.clear();
+        let mut statement = self
+            .connection
+            .prepare("SELECT name,sealed FROM records ORDER BY name")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let name = row.get_ref(0)?.as_blob()?;
+            let sealed = row.get_ref(1)?.as_blob()?;
+            Self::validate_key(name)?;
+            if !(OVERHEAD..=OVERHEAD + MAX_RECORD_BYTES).contains(&sealed.len()) {
+                return Err("invalid encrypted record size".into());
+            }
+            self.index
+                .insert(name.to_vec(), Sha256::digest(sealed).into());
+        }
+        Ok(())
     }
 
     /// The existing store at `path`, or a new one when it is absent.

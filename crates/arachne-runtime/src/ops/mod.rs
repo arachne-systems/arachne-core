@@ -36,6 +36,7 @@ pub(crate) enum Op {
     #[cfg(feature = "moq")]
     EnableMoqDelivery,
     WorkspaceState,
+    FloorState,
     ResetWorkspace,
     DiscardWorkspaceCandidate,
     DiscardCandidate,
@@ -140,6 +141,7 @@ impl Op {
                 | Op::DriveWorkspace
                 | Op::DriveJoin
                 | Op::WorkspaceState
+                | Op::FloorState
                 | Op::WorkspaceMetrics
                 | Op::NetworkChange
                 | Op::NearbyEndpoints

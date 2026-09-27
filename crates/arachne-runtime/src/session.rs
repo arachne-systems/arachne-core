@@ -29,6 +29,7 @@ pub(crate) enum WorkspaceTransition {
         Vec<u8>,
         Vec<[u8; 32]>,
         Vec<[u8; 32]>,
+        bool,
     ),
     /// An automatic re-publication after fork recovery. The workspace
     /// driver saves it and adopts it through its own transition lifecycle.
@@ -38,6 +39,7 @@ pub(crate) enum WorkspaceTransition {
         Vec<u8>,
         Vec<[u8; 32]>,
         Vec<[u8; 32]>,
+        bool,
     ),
     Inbox,
     InboxRejected,
