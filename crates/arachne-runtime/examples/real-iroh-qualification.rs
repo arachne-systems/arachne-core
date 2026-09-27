@@ -17,8 +17,8 @@ use arachne_node::{
 };
 use arachne_runtime::harness::{self, Query, StateBasis};
 use arachne_runtime::{
-    StorageConfig, attach_storage, create, create_relay, create_relay_with_options, create_wan,
-    describe, execute, wait_for_work,
+    FreshnessAnchor, StorageConfig, attach_storage, create, create_relay,
+    create_relay_with_options, create_wan, describe, execute, record_freshness, wait_for_work,
 };
 use arachne_security::{Invitation, MembershipAuthorization, PendingJoin};
 use serde_json::{Value, json};
@@ -373,6 +373,7 @@ struct Owner {
     address: SocketAddr,
     invitation: Vec<u8>,
     checkpoint: Vec<u8>,
+    freshness: FreshnessAnchor,
     _records: TempDir,
 }
 
@@ -1032,6 +1033,7 @@ fn create_owner(
             json!({"op":"adopt_admission","candidate":staged["candidate"]}),
         )?["issued_invitation"]
             .clone();
+        let freshness = record_freshness(handle)?;
         let info: Value = serde_json::from_str(&describe(handle)?).map_err(|e| e.to_string())?;
         let peer = array32(&info["endpoint_key"])?;
         let port = info["bound_address"]
@@ -1049,6 +1051,7 @@ fn create_owner(
             address: ([127, 0, 0, 1], port).into(),
             invitation: bytes(&invitation["invitation"])?,
             checkpoint: bytes(&invitation["checkpoint"])?,
+            freshness,
             _records: records,
         })
     })();
@@ -1069,6 +1072,7 @@ fn restore_owner(
         workspace,
         invitation,
         checkpoint,
+        freshness,
         _records: records,
         ..
     } = owner;
@@ -1082,7 +1086,7 @@ fn restore_owner(
         attach_storage(handle, StorageConfig::sqlite(records.path(), secret))?;
         call(
             handle,
-            json!({"op":"restore_workspace","workspace":workspace}),
+            json!({"op":"restore_workspace","workspace":workspace,"freshness":freshness.to_bytes().to_vec()}),
         )?;
         let info: Value = serde_json::from_str(&describe(handle)?).map_err(|e| e.to_string())?;
         let peer = array32(&info["endpoint_key"])?;
@@ -1101,6 +1105,7 @@ fn restore_owner(
             address: ([127, 0, 0, 1], port).into(),
             invitation,
             checkpoint,
+            freshness,
             _records: records,
         })
     })();
