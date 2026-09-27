@@ -59,7 +59,8 @@ pub struct TransportOptions {
     /// Deadlines for a slow or constrained link.
     pub timeouts: Option<TransportTimeouts>,
     /// Persistent Iroh Docs and blob storage. `None` uses in-memory stores.
-    pub documents_path: Option<std::path::PathBuf>,
+    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
+    pub documents_path: Option<String>,
     /// Per-op deadline for this client's blocking ops, and for its bind.
     /// At the deadline an op fails with `DeadlineExceeded` and the session
     /// stays usable. `Client::set_deadline` changes it later.
@@ -139,7 +140,7 @@ impl TransportOptions {
     fn node_options(&self, network: Network) -> Result<arachne_node::NodeOptions> {
         let invalid = |message: &str| error(ErrorKind::InvalidInput, message);
         let mut options = arachne_node::NodeOptions::new(network_profile(network)?);
-        options.documents_path = self.documents_path.clone();
+        options.documents_path = self.documents_path.as_deref().map(std::path::PathBuf::from);
         if let Some(lookup) = self.public_lookup {
             options.public_lookup = lookup;
         }
@@ -676,8 +677,8 @@ pub struct WorkspaceMetrics {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FloorStateRecord {
-    pub member: [u8; 32],
-    pub endpoint: [u8; 32],
+    pub member: MemberId,
+    pub endpoint: EndpointId,
     pub payload: Vec<u8>,
 }
 

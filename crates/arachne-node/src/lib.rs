@@ -1171,6 +1171,10 @@ impl Node {
             .lock()
             .await
             .authorizes_endpoint(workspace, revision, self.id())?;
+        // Active SDK readers also drive bounded retries after a missed gossip bootstrap.
+        if let Err(error) = self.refresh_ptt_floor_document_peers().await {
+            tracing::debug!(%error, "floor Docs retry failed");
+        }
         self.documents.read(workspace, revision).await
     }
 

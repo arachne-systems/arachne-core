@@ -19,7 +19,13 @@ fn ptt_floor_docs_mirror_only_authenticated_gossip_snapshots_from_each_member() 
         network: Network::Direct,
         secret: Some([41; 32].into()),
         transport: TransportOptions {
-            documents_path: Some(owner_store.path().join("docs")),
+            documents_path: Some(
+                owner_store
+                    .path()
+                    .join("docs")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             ..Default::default()
         },
         storage: Some((StorageConfig::sqlite(owner_store.path(), owner_root)).into()),
@@ -29,7 +35,13 @@ fn ptt_floor_docs_mirror_only_authenticated_gossip_snapshots_from_each_member() 
         network: Network::Direct,
         secret: Some([42; 32].into()),
         transport: TransportOptions {
-            documents_path: Some(reader_store.path().join("docs")),
+            documents_path: Some(
+                reader_store
+                    .path()
+                    .join("docs")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             ..Default::default()
         },
         storage: Some((StorageConfig::sqlite(reader_store.path(), reader_root)).into()),
@@ -128,7 +140,7 @@ fn ptt_floor_docs_mirror_only_authenticated_gossip_snapshots_from_each_member() 
     assert_eq!(
         records
             .iter()
-            .map(|record| record.endpoint)
+            .map(|record| record.endpoint.to_bytes())
             .collect::<std::collections::BTreeSet<_>>(),
         [owner_endpoint.to_bytes(), reader_endpoint.to_bytes()]
             .into_iter()

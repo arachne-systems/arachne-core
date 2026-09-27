@@ -457,8 +457,8 @@ pub(crate) fn floor_state(
             continue;
         }
         records.push(crate::client::FloorStateRecord {
-            member: authenticated.message.member,
-            endpoint: authenticated.message.endpoint,
+            member: authenticated.message.member.into(),
+            endpoint: authenticated.message.endpoint.into(),
             payload: authenticated.message.payload,
         });
     }

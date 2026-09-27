@@ -1,5 +1,9 @@
 //! Iroh Docs handlers and the Core-only workspace floor snapshot seam.
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use futures_util::StreamExt;
 use iroh::{Endpoint, EndpointAddr, endpoint::Connection, protocol::ProtocolHandler};
@@ -18,6 +22,8 @@ const FLOOR_KEY_PREFIX: &[u8] = b"\0arachne/ptt-floor/v1\0";
 const MAX_FLOOR_KEY: usize = 128;
 const MAX_FLOOR_VALUE: usize = 8 * 1024;
 const MAX_FLOOR_RECORDS: u64 = 512;
+// ponytail: retry polled reads at 1 Hz; use sync-failure events if faster recovery is needed.
+const SYNC_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FloorDocumentEntry {
@@ -31,6 +37,8 @@ struct Scope {
     revision: u64,
     doc: Doc,
     members: Vec<PeerId>,
+    sync_peers: Vec<iroh::EndpointAddr>,
+    last_sync: Instant,
 }
 
 #[derive(Clone)]
@@ -90,7 +98,7 @@ impl Documents {
             && current.doc.id() == namespace
         {
             current.members = members;
-            current.doc.start_sync(peers).await.map_err(transport)?;
+            sync_scope(current, peers).await?;
             return Ok(());
         }
 
@@ -99,7 +107,7 @@ impl Documents {
             .import_namespace(Capability::Write(secret))
             .await
             .map_err(transport)?;
-        doc.start_sync(peers).await.map_err(transport)?;
+        doc.start_sync(peers.clone()).await.map_err(transport)?;
         if let Some(old) = scope.take() {
             let old_id = old.doc.id();
             let _ = old.doc.leave().await;
@@ -110,13 +118,15 @@ impl Documents {
             revision,
             doc,
             members,
+            sync_peers: peers,
+            last_sync: Instant::now(),
         });
         Ok(())
     }
 
     pub(super) async fn sync_peers(&self, peers: Vec<EndpointAddr>) -> Result<()> {
-        if let Some(scope) = self.scope.lock().await.as_ref() {
-            scope.doc.start_sync(peers).await.map_err(transport)?;
+        if let Some(scope) = self.scope.lock().await.as_mut() {
+            sync_scope(scope, peers).await?;
         }
         Ok(())
     }
@@ -259,6 +269,16 @@ fn current_scope<'a>(
     scope
         .filter(|scope| scope.workspace == workspace && scope.revision == revision)
         .ok_or(Error::Rejected)
+}
+
+async fn sync_scope(scope: &mut Scope, peers: Vec<EndpointAddr>) -> Result<()> {
+    if scope.sync_peers == peers && scope.last_sync.elapsed() < SYNC_RETRY_INTERVAL {
+        return Ok(());
+    }
+    scope.last_sync = Instant::now();
+    scope.sync_peers = peers.clone();
+    scope.doc.start_sync(peers).await.map_err(transport)?;
+    Ok(())
 }
 
 fn storage_key(author: &[u8; 32], key: &[u8]) -> Vec<u8> {
