@@ -327,6 +327,10 @@ pub struct ControlClient {
 }
 
 impl ControlClient {
+    pub async fn add_address_hint(&self, peer: PeerId, address: SocketAddr) -> Result<()> {
+        self.connections.add_address_hint(peer, address).await
+    }
+
     pub fn request_control(
         self,
         peer: PeerId,
