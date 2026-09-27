@@ -16,6 +16,8 @@ the pre-release crates in an application.
   epoch behavior.
 - [Security](security.md) — security properties, trust boundaries, host duties,
   and known limitations.
+- [Protocol integration security review](reviews/2026-09-27-protocol-integration-security-review.md)
+  — MLS, Iroh, gossip, and Tor composition assumptions, evidence, and open findings.
 - [Development](development.md) — repository layout, Rust commands, test
   coverage map, and vendored dependency maintenance.
 
