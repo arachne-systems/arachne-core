@@ -685,7 +685,11 @@ fn expired_admission_exchange_receives_a_pushed_result_without_retry() {
         assert!(Instant::now() < deadline, "admission was not staged");
         thread::sleep(Duration::from_millis(5));
     };
-    let committed = adopt(owner.handle, "adopt_admission", &staged);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let committed = runtime.block_on(async { adopt(owner.handle, "adopt_admission", &staged) });
     assert_eq!(committed["members"], 2);
     assert_eq!(committed["results_delivered"], 0);
     assert_eq!(committed["results_pushed"], 1);

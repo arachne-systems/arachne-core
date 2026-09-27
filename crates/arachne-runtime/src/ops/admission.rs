@@ -1378,11 +1378,6 @@ pub(crate) fn queue_admission_push(
         return false;
     };
     let peer = attempt.endpoint();
-    if let Some(route) = route {
-        let _ = session
-            .runtime
-            .block_on(session.node.add_address_hint(peer, route));
-    }
     // The request itself arrived over an authenticated control path, so Iroh
     // already has a route or relay identity for this peer. Refreshing an IP
     // hint is optional; one bounded request is the push attempt, and the
@@ -1390,6 +1385,9 @@ pub(crate) fn queue_admission_push(
     let client = session.node.control_client();
     let wake = session.node.control_signal();
     let task = session.runtime.spawn(async move {
+        if let Some(route) = route {
+            let _ = client.add_address_hint(peer, route).await;
+        }
         let result = client.request_control(peer, &packet).await;
         wake.notify_one();
         result
