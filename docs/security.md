@@ -12,6 +12,7 @@ Arachne Core is pre-release software. Its tests demonstrate selected behaviors;
 they are not a formal protocol verification, independent security audit,
 certification, or authorization to use in a particular environment. Do not use
 this page as a substitute for an application threat model and deployment review.
+The versioned cross-repository baseline is the [Arachne threat model](threat-model.md).
 
 ## What the layers provide
 
