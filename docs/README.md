@@ -16,6 +16,8 @@ the pre-release crates in an application.
   epoch behavior.
 - [Security](security.md) — security properties, trust boundaries, host duties,
   and known limitations.
+- [Threat model](threat-model.md) — cross-repository assets, adversaries,
+  invariants, boundary controls, evidence, owners, and residual risks.
 - [Development](development.md) — repository layout, Rust commands, test
   coverage map, and vendored dependency maintenance.
 
