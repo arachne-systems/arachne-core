@@ -65,6 +65,15 @@ Two harness failures were minimized and tracked instead of being rerun away:
   freshness anchor.
 - `ptt-60z.4.7`: restart panics by nesting a Tokio `block_on` call.
 
-The matrix remains a release blocker until those regressions, the five P0
-hardening branches, the transport regression fix, and the live qualifications
-are integrated and green together.
+Both fixes then passed together with transport regression fix `462755f` on
+integration head `73d9cd0`. Partition recovered with two real Iroh endpoints
+in 175 ms (`/tmp/arachne-adversarial-partition-fixed.json`). Restart completed
+with two real Iroh endpoints in 3,150 ms
+(`/tmp/arachne-adversarial-restart-fixed.json`). The partition fix supplies the
+persisted freshness anchor; the restart fix performs route refresh on the
+cloneable asynchronous control handle. The focused retained-admission test also
+passed with adoption running inside an active Tokio runtime.
+
+The matrix remains a release blocker until the five P0 hardening branches, the
+transport regression fix, these two fixes, and the live qualifications are
+integrated and green together.
