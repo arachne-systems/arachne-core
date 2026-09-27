@@ -26,6 +26,8 @@ the pre-release crates in an application.
   coverage map, and vendored dependency maintenance.
 - [Fuzzing](fuzzing.md) — untrusted-input targets, bounded CI smoke campaigns,
   corpus handling, and regression minimization.
+- [Vendor exit review](reviews/2026-09-27-vendor-exit-review.md) — current
+  upstream status, ownership, and removal conditions for every local fork.
 
 The [root README](../README.md) is the short project overview. Each crate also
 has a short README beside its source. Tests and source are authoritative when a

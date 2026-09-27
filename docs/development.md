@@ -279,6 +279,17 @@ types do not trigger a crate release. Review and merge the generated release PR
 to publish in dependency order and create per-crate GitHub tags/releases. Do
 not manually bump crate versions for normal releases.
 
+Each per-crate release tag also runs `release-attestation.yml`. It rebuilds the
+tagged Cargo source archive, generates an SPDX JSON SBOM for that `.crate`, and
+records separate build-provenance and SBOM attestations in GitHub. Download the
+same archive from crates.io, then verify both records with:
+
+```sh
+gh attestation verify <crate-file> -R arachne-systems/arachne-core
+gh attestation verify <crate-file> -R arachne-systems/arachne-core \
+  --predicate-type https://spdx.dev/Document/v2.3
+```
+
 Publishing uses crates.io Trusted Publishing through GitHub Actions OIDC; no
 crates.io API token is stored in GitHub. Configure each already-published
 crate's trusted publisher, including `arachne-runtime`, with owner
