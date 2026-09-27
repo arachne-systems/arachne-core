@@ -16,6 +16,8 @@ the pre-release crates in an application.
   epoch behavior.
 - [Security](security.md) — security properties, trust boundaries, host duties,
   and known limitations.
+- [Tor onion key separation ADR](reviews/adr-tor-onion-key-separation.md) —
+  proposed removal of endpoint/Tor signing-key reuse; requires external review.
 - [Development](development.md) — repository layout, Rust commands, test
   coverage map, and vendored dependency maintenance.
 
