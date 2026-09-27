@@ -1,0 +1,46 @@
+[package]
+name = "arachne-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arachne-delivery = { path = "../crates/arachne-delivery" }
+arachne-runtime = { path = "../crates/arachne-runtime" }
+arachne-security = { path = "../crates/arachne-security" }
+arachne-store = { path = "../crates/arachne-store" }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "security_decoders"
+path = "fuzz_targets/security_decoders.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "delivery_wire"
+path = "fuzz_targets/delivery_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "persistence_decoders"
+path = "fuzz_targets/persistence_decoders.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "runtime_requests"
+path = "fuzz_targets/runtime_requests.rs"
+test = false
+doc = false
+bench = false

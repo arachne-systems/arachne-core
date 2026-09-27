@@ -20,6 +20,8 @@ the pre-release crates in an application.
   invariants, boundary controls, evidence, owners, and residual risks.
 - [Development](development.md) — repository layout, Rust commands, test
   coverage map, and vendored dependency maintenance.
+- [Fuzzing](fuzzing.md) — untrusted-input targets, bounded CI smoke campaigns,
+  corpus handling, and regression minimization.
 
 The [root README](../README.md) is the short project overview. Each crate also
 has a short README beside its source. Tests and source are authoritative when a
