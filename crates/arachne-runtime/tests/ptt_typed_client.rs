@@ -120,7 +120,13 @@ fn ptt_floor_docs_mirror_only_authenticated_gossip_snapshots_from_each_member() 
                 payload,
             )
             .unwrap();
-        client.adopt_protected_publication(&candidate).unwrap();
+        if let Err(error) = client.adopt_protected_publication(&candidate) {
+            assert_eq!(error.code(), ErrorCode::TransportFailed);
+        }
+        let endpoint = client.endpoint().unwrap().endpoint_key;
+        assert!(client.floor_state().unwrap().iter().any(|record| {
+            record.endpoint == endpoint && record.payload.starts_with(b"APTF\x01\x06")
+        }));
     }
 
     let deadline = Instant::now() + Duration::from_secs(10);
