@@ -18,6 +18,8 @@ the pre-release crates in an application.
   and known limitations.
 - [Threat model](threat-model.md) — cross-repository assets, adversaries,
   invariants, boundary controls, evidence, owners, and residual risks.
+- [Protocol integration security review](reviews/2026-09-27-protocol-integration-security-review.md)
+  — MLS, Iroh, gossip, and Tor composition assumptions, evidence, and open findings.
 - [Development](development.md) — repository layout, Rust commands, test
   coverage map, and vendored dependency maintenance.
 - [Fuzzing](fuzzing.md) — untrusted-input targets, bounded CI smoke campaigns,
