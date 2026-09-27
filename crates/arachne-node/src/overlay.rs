@@ -210,13 +210,31 @@ fn open(bytes: &[u8]) -> Result<Envelope> {
     Ok(envelope)
 }
 
+fn offer_authorized_membership(
+    peers: &StdMutex<BTreeSet<PeerId>>,
+    membership: &MembershipInbox,
+    envelope: Envelope,
+) -> bool {
+    if !peers.lock().unwrap().contains(&envelope.sender) {
+        tracing::warn!(target: "data_fabric_gossip", "GOSSIP_MEMBERSHIP_AUTHOR_REJECTED");
+        return false;
+    }
+    membership.offer(
+        envelope.workspace,
+        envelope.sender,
+        envelope.revision,
+        envelope.payload,
+    );
+    true
+}
+
 pub(super) struct Overlay {
     pub(super) workspace: WorkspaceId,
     /// Current policy revision. Advanced in place when a new revision only
     /// adds members, so the swarm and its neighbors survive an epoch change.
     revision: std::sync::atomic::AtomicU64,
     /// Endpoints authorized in the current revision.
-    peers: StdMutex<BTreeSet<PeerId>>,
+    peers: Arc<StdMutex<BTreeSet<PeerId>>>,
     /// Keyed workspace tag a dialer sends first on each gossip link.
     pub(super) tag: [u8; TAG],
     pub(super) gossip: Gossip,
@@ -291,7 +309,9 @@ impl Overlay {
         let secret = endpoint.secret_key().clone();
         let local = *endpoint.id().as_bytes();
         let local_index = peers.binary_search(&local).map_err(|_| Error::Rejected)?;
-        let peers_set: BTreeSet<PeerId> = peers.iter().copied().collect();
+        let peers_set = Arc::new(StdMutex::new(
+            peers.iter().copied().collect::<BTreeSet<_>>(),
+        ));
         let digest = digest(workspace);
         let scale = connections.timer_scale();
         let config = HyparviewConfig {
@@ -352,6 +372,7 @@ impl Overlay {
         let changed = Arc::new(Notify::new());
         let observed = neighbors.clone();
         let notify = changed.clone();
+        let authorized = peers_set.clone();
         let receiver = tokio::spawn(async move {
             while let Some(event) = received.next().await {
                 match event {
@@ -376,13 +397,10 @@ impl Overlay {
                         // Crosses revisions on purpose: a member behind by an
                         // epoch must still hear the step that moves it on.
                         if envelope.topic == MEMBERSHIP_TOPIC {
-                            tracing::info!(target: "data_fabric_transport", bytes = envelope.payload.len(), from = %message.delivered_from.fmt_short(), "GOSSIP_MEMBERSHIP_RECEIVED");
-                            membership.offer(
-                                envelope.workspace,
-                                envelope.sender,
-                                envelope.revision,
-                                envelope.payload,
-                            );
+                            let bytes = envelope.payload.len();
+                            if offer_authorized_membership(&authorized, &membership, envelope) {
+                                tracing::info!(target: "data_fabric_transport", bytes, from = %message.delivered_from.fmt_short(), "GOSSIP_MEMBERSHIP_RECEIVED");
+                            }
                             continue;
                         }
                         // Only membership messages may use the frame-sized bound.
@@ -462,7 +480,7 @@ impl Overlay {
         Ok(Self {
             workspace,
             revision: std::sync::atomic::AtomicU64::new(revision),
-            peers: StdMutex::new(peers_set),
+            peers: peers_set,
             tag,
             gossip,
             sender,
@@ -920,6 +938,39 @@ fn a_flooding_member_cannot_crowd_out_another_members_step() {
             .iter()
             .any(|(_, payload)| payload == b"next-revision")
     );
+}
+
+#[test]
+fn outsider_authors_cannot_fill_the_membership_inbox() {
+    let workspace = [1; 32];
+    let member = iroh::SecretKey::from_bytes(&[201; 32]);
+    let peers = StdMutex::new(BTreeSet::from([*member.public().as_bytes()]));
+    let inbox = MembershipInbox::new(Arc::new(Notify::new()));
+    let envelope = |author: &iroh::SecretKey, payload| Envelope {
+        workspace,
+        revision: 1,
+        sender: *author.public().as_bytes(),
+        topic: MEMBERSHIP_TOPIC.into(),
+        delivery: DeliveryClass::Critical,
+        payload,
+    };
+    for seed in 1..=MAX_MEMBERSHIP_SENDERS as u8 {
+        let outsider = iroh::SecretKey::from_bytes(&[seed; 32]);
+        let signed = seal(&envelope(&outsider, vec![seed]), &outsider).unwrap();
+        assert!(!offer_authorized_membership(
+            &peers,
+            &inbox,
+            open(&signed).unwrap(),
+        ));
+    }
+    let signed = seal(&envelope(&member, b"valid".to_vec()), &member).unwrap();
+    assert!(offer_authorized_membership(
+        &peers,
+        &inbox,
+        open(&signed).unwrap(),
+    ));
+    assert_eq!(inbox.pop_for(workspace), Some(b"valid".to_vec()));
+    assert!(!inbox.has_pending());
 }
 
 /// Many authors together still hold a bounded inbox: at most 64 steps of
