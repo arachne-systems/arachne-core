@@ -170,98 +170,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arachne-iroh-blobs"
-version = "0.103.0-arachne.1"
-dependencies = [
- "anyhow",
- "arachne-bao-tree",
- "arrayvec",
- "async-compression",
- "atomic_refcell",
- "bytes",
- "cfg_aliases",
- "chrono",
- "clap",
- "concat_const",
- "constant_time_eq",
- "data-encoding",
- "derive_more",
- "genawaiter",
- "getrandom 0.4.3",
- "hex",
- "iroh",
- "iroh-base",
- "iroh-io",
- "iroh-mdns-address-lookup",
- "iroh-metrics",
- "iroh-test",
- "iroh-tickets",
- "iroh-util",
- "irpc",
- "n0-error",
- "n0-future",
- "nested_enum_utils",
- "noq",
- "postcard",
- "proptest",
- "rand 0.10.2",
- "range-collections",
- "redb",
- "ref-cast",
- "reflink-copy",
- "self_cell",
- "serde",
- "serde_json",
- "serde_test",
- "smallvec",
- "tempfile",
- "test-strategy",
- "testresult",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "tracing-test",
- "walkdir",
-]
-
-[[package]]
-name = "arachne-iroh-gossip"
-version = "0.101.0-arachne.1"
-dependencies = [
- "blake3",
- "bytes",
- "clap",
- "comfy-table",
- "data-encoding",
- "derive_more",
- "futures-concurrency",
- "hex",
- "humantime-serde",
- "indexmap 2.14.2",
- "iroh",
- "iroh-base",
- "iroh-metrics",
- "irpc",
- "n0-error",
- "n0-future",
- "n0-tracing-test",
- "noq",
- "postcard",
- "rand 0.10.2",
- "rayon",
- "serde",
- "serde-byte-array",
- "serde_json",
- "testresult",
- "tokio",
- "tokio-util",
- "toml 1.1.6+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
 name = "arachne-iroh-mdns-address-lookup"
 version = "0.5.0-arachne.1"
 dependencies = [
@@ -312,8 +220,6 @@ dependencies = [
 name = "arachne-node"
 version = "0.1.0"
 dependencies = [
- "arachne-iroh-blobs",
- "arachne-iroh-gossip",
  "arachne-iroh-mdns-address-lookup",
  "arachne-iroh-tor-transport",
  "arachne-routing",
@@ -322,6 +228,9 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "iroh",
+ "iroh-blobs",
+ "iroh-docs",
+ "iroh-gossip",
  "iroh-moq",
  "moq-net",
  "postcard",
@@ -487,6 +396,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "async-channel"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "924ed96dd52d1b75e9c1a3e6275715fd320f5f9439fb5a4a11fa51f4221158d2"
+dependencies = [
+ "concurrent-queue",
+ "event-listener-strategy",
+ "futures-core",
+ "pin-project-lite",
 ]
 
 [[package]]
@@ -1093,6 +1014,15 @@ name = "concat_const"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60c92cd5ec953d0542f48d2a90a25aa2828ab1c03217c1ca077000f3af15997d"
+
+[[package]]
+name = "concurrent-queue"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
+dependencies = [
+ "crossbeam-utils",
+]
 
 [[package]]
 name = "const-oid"
@@ -1749,6 +1679,26 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "event-listener"
+version = "5.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
+dependencies = [
+ "parking",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "event-listener-strategy"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
+dependencies = [
+ "event-listener",
+ "pin-project-lite",
 ]
 
 [[package]]
@@ -2791,6 +2741,61 @@ dependencies = [
 ]
 
 [[package]]
+name = "iroh-blobs"
+version = "0.103.0"
+dependencies = [
+ "anyhow",
+ "arachne-bao-tree",
+ "arrayvec",
+ "async-compression",
+ "atomic_refcell",
+ "bytes",
+ "cfg_aliases",
+ "chrono",
+ "clap",
+ "concat_const",
+ "constant_time_eq",
+ "data-encoding",
+ "derive_more",
+ "genawaiter",
+ "getrandom 0.4.3",
+ "hex",
+ "iroh",
+ "iroh-base",
+ "iroh-io",
+ "iroh-mdns-address-lookup",
+ "iroh-metrics",
+ "iroh-test",
+ "iroh-tickets",
+ "iroh-util",
+ "irpc",
+ "n0-error",
+ "n0-future",
+ "nested_enum_utils",
+ "noq",
+ "postcard",
+ "proptest",
+ "rand 0.10.2",
+ "range-collections",
+ "redb",
+ "ref-cast",
+ "reflink-copy",
+ "self_cell",
+ "serde",
+ "serde_json",
+ "serde_test",
+ "smallvec",
+ "tempfile",
+ "test-strategy",
+ "testresult",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tracing-test",
+ "walkdir",
+]
+
+[[package]]
 name = "iroh-dns"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2810,6 +2815,81 @@ dependencies = [
  "strum",
  "tokio",
  "tracing",
+ "url",
+]
+
+[[package]]
+name = "iroh-docs"
+version = "0.101.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8fd1bd5e39d0321a3c4a2bcef9650476c076e2df41a0e84577eca23d6de6c8ab"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "blake3",
+ "bytes",
+ "cfg_aliases",
+ "derive_more",
+ "futures-buffered",
+ "hex",
+ "iroh",
+ "iroh-blobs",
+ "iroh-gossip",
+ "iroh-metrics",
+ "iroh-tickets",
+ "irpc",
+ "n0-error",
+ "n0-future",
+ "num_enum",
+ "postcard",
+ "rand 0.10.2",
+ "redb",
+ "self_cell",
+ "serde",
+ "serde-error",
+ "strum",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "iroh-gossip"
+version = "0.101.0"
+dependencies = [
+ "blake3",
+ "bytes",
+ "clap",
+ "comfy-table",
+ "data-encoding",
+ "derive_more",
+ "futures-concurrency",
+ "hex",
+ "humantime-serde",
+ "indexmap 2.14.2",
+ "iroh",
+ "iroh-base",
+ "iroh-metrics",
+ "irpc",
+ "n0-error",
+ "n0-future",
+ "n0-tracing-test",
+ "noq",
+ "postcard",
+ "rand 0.10.2",
+ "rayon",
+ "serde",
+ "serde-byte-array",
+ "serde_json",
+ "testresult",
+ "tokio",
+ "tokio-util",
+ "toml 1.1.6+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
  "url",
 ]
 
@@ -5512,6 +5592,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-error"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "342110fb7a5d801060c885da03bf91bfa7c7ca936deafcc64bb6706375605d47"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "serde_bytes"
 version = "0.11.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7002,6 +7091,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
+ "serde",
  "wasm-bindgen",
 ]
 

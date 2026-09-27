@@ -3,6 +3,7 @@
 //! (`ops::candidate`).
 
 use arachne_api::{ApiError, ErrorCode};
+use arachne_node::Topic;
 use arachne_routing::PublicationContext;
 use serde::{Deserialize, Serialize};
 
@@ -361,8 +362,20 @@ fn stage_publication(
             )
             .map_err(delivery(ErrorCode::InvalidInput))?;
     }
+    let mirror_floor_state = !recovering
+        && recipients.is_empty()
+        && context.topic.as_str() == "streams/ptt"
+        && payload.starts_with(b"APTF")
+        && payload.get(5) == Some(&6);
     let transition = if recovering {
-        WorkspaceTransition::Republication(context, delivery_class, packet, endpoints, recipients)
+        WorkspaceTransition::Republication(
+            context,
+            delivery_class,
+            packet,
+            endpoints,
+            recipients,
+            false,
+        )
     } else {
         WorkspaceTransition::RoutedPublication(
             context,
@@ -370,6 +383,7 @@ fn stage_publication(
             packet,
             endpoints,
             recipients,
+            mirror_floor_state,
         )
     };
     let publisher = match publisher {
@@ -393,4 +407,61 @@ fn stage_publication(
             "awaiting_publication_save"
         },
     )
+}
+
+/// Latest MLS-authenticated floor gossip snapshot for the attached workspace.
+pub(crate) fn floor_state(
+    session: &mut Session,
+) -> Result<Vec<crate::client::FloorStateRecord>, ApiError> {
+    let workspace = session
+        .workspace
+        .as_ref()
+        .ok_or_else(errors::no_workspace)?;
+    let revision = workspace
+        .epoch()
+        .checked_add(1)
+        .ok_or_else(|| ApiError::internal("workspace revision overflow"))?;
+    let entries = session.runtime.block_on(async {
+        tokio::time::timeout(
+            crate::deadline::cap(session.op_deadline, std::time::Duration::from_secs(5)),
+            session
+                .node
+                .read_ptt_floor_document(workspace.id(), revision),
+        )
+        .await
+        .map_err(|_| ApiError::DeadlineExceeded)?
+        .map_err(errors::node)
+    })?;
+    let topic = Topic::new("streams/ptt").expect("static topic is valid");
+    let mut records = Vec::new();
+    for entry in entries {
+        if entry.key != b"streams/ptt" || !entry.value.starts_with(b"DFAP") {
+            continue;
+        }
+        let Ok((context, ciphertext)) =
+            PublicationContext::unpack(workspace.id(), revision, topic.clone(), &entry.value)
+        else {
+            continue;
+        };
+        let Ok(authenticated) = workspace.unprotect_object(
+            topic.namespace().as_bytes(),
+            &context.authenticated_bytes(),
+            ciphertext,
+        ) else {
+            continue;
+        };
+        if authenticated.message.endpoint != entry.author
+            || !authenticated.message.payload.starts_with(b"APTF")
+            || authenticated.message.payload.get(5) != Some(&6)
+        {
+            continue;
+        }
+        records.push(crate::client::FloorStateRecord {
+            member: authenticated.message.member,
+            endpoint: authenticated.message.endpoint,
+            payload: authenticated.message.payload,
+        });
+    }
+    records.sort_by_key(|record| (record.member, record.endpoint));
+    Ok(records)
 }

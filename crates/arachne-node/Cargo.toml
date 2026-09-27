@@ -32,11 +32,11 @@ iroh = { version = "=1.2.0", default-features = false, features = ["tls-ring", "
 # Exact pin: built on the same unstable iroh custom-transport API as above, and
 # a renamed Arachne fork (upstream 0.1.0 without the unmaintained `torut`).
 iroh-tor-transport = { package = "arachne-iroh-tor-transport", path = "../../vendor/iroh-tor-transport", version = "=0.1.0-arachne.1", optional = true }
-# Exact pins: renamed Arachne forks whose patched source must match this crate.
-# The `=` is also required because the earlier plain releases (0.103.0 and
-# 0.101.0) sort above the `-arachne.N` pre-releases; a caret would pick them.
-iroh-blobs = { package = "arachne-iroh-blobs", path = "../../vendor/iroh-blobs", version = "=0.103.0-arachne.1", default-features = false, features = ["fs-store"] }
-iroh-gossip = { package = "arachne-iroh-gossip", path = "../../vendor/iroh-gossip", version = "=0.101.0-arachne.1", default-features = false, features = ["net"] }
+# Exact pins keep the local protocol forks aligned with Iroh Docs' protocol
+# dependencies. The workspace patches crates.io to these same package IDs.
+iroh-blobs = { path = "../../vendor/iroh-blobs", version = "=0.103.0", default-features = false, features = ["fs-store"] }
+iroh-gossip = { path = "../../vendor/iroh-gossip", version = "=0.101.0", default-features = false, features = ["net"] }
+iroh-docs = { version = "=0.101.0", default-features = false, features = ["fs-store"] }
 iroh-mdns-address-lookup = { package = "arachne-iroh-mdns-address-lookup", path = "../../vendor/iroh-mdns-address-lookup", version = "=0.5.0-arachne.1", default-features = false }
 postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
 serde = { version = "1.0.229", features = ["derive"] }

@@ -18,10 +18,12 @@ use std::{
 mod budget;
 mod connections;
 mod control;
+mod documents;
 mod endpoint;
 #[cfg(test)]
 mod gossip_forwarding_test;
 mod mdns;
+pub use documents::FloorDocumentEntry;
 pub use endpoint::IrohEndpointSigner;
 mod overlay;
 pub mod resources;
@@ -181,6 +183,9 @@ impl Timeouts {
 pub struct NodeOptions {
     pub profile: NetworkProfile,
     pub timeouts: Timeouts,
+    /// Local directory for persistent Docs metadata and protected blobs.
+    /// `None` keeps the lightweight in-memory store used by tests/tools.
+    pub documents_path: Option<std::path::PathBuf>,
     /// Operator relays with their TLS trust. Replaces n0's public relays.
     pub relay: Option<RelayOptions>,
     /// Use n0's public DNS/Pkarr address lookup and publishing. The WAN
@@ -195,6 +200,7 @@ impl NodeOptions {
         Self {
             profile,
             timeouts: Timeouts::for_profile(profile),
+            documents_path: None,
             relay: None,
             public_lookup: profile.settings().1,
         }
@@ -504,6 +510,7 @@ pub struct Node {
     control_cancel: watch::Sender<bool>,
     deferred_controls: std::collections::VecDeque<ControlRequest>,
     connections: Connections,
+    documents: documents::Documents,
     routing: Arc<Mutex<RoutingTable>>,
     resources: resources::ResourceTransfers,
     events: DeliveryQueue,
@@ -704,6 +711,9 @@ impl Node {
             ALPN.to_vec(),
             control::ALPN.to_vec(),
             overlay::ALPN.to_vec(),
+            iroh_blobs::ALPN.to_vec(),
+            iroh_docs::ALPN.to_vec(),
+            iroh_gossip::ALPN.to_vec(),
         ];
         #[cfg(feature = "moq")]
         let alpns = {
@@ -719,6 +729,9 @@ impl Node {
             alpns,
         )
         .await?;
+        let documents =
+            documents::Documents::new(connections.endpoint(), options.documents_path.clone())
+                .await?;
         let routing = Arc::new(Mutex::new(RoutingTable::default()));
         let resources = resources::ResourceTransfers::new(connections.clone(), routing.clone());
         let (control_inbox, controls, control_signal) = control::ControlInbox::new(512);
@@ -737,6 +750,7 @@ impl Node {
         let overlays: Arc<Mutex<BTreeMap<WorkspaceId, Arc<overlay::Overlay>>>> =
             Arc::new(Mutex::new(BTreeMap::new()));
         let accepted_connections = connections.clone();
+        let accepted_documents = documents.clone();
         let shared = routing.clone();
         let output = events.clone();
         let accepted_overlays = overlays.clone();
@@ -763,6 +777,7 @@ impl Node {
                 let routing = shared.clone();
                 let overlays = accepted_overlays.clone();
                 let connections = accepted_connections.clone();
+                let documents = accepted_documents.clone();
                 let output = output.clone();
                 let resources = accepted_resources.clone();
                 #[cfg(feature = "moq")]
@@ -782,6 +797,32 @@ impl Node {
                         remote = Some(connection.remote_id());
                         connection_id = Some(connection.stable_id());
                         let is_control = connection.alpn() == control::ALPN;
+                        if connection.alpn() == iroh_blobs::ALPN
+                            || connection.alpn() == iroh_docs::ALPN
+                            || connection.alpn() == iroh_gossip::ALPN
+                        {
+                            let authorized = routing.lock().await.endpoints().contains(&sender);
+                            if !authorized {
+                                connection.close(403u32.into(), b"docs denied");
+                                return Err(Error::Rejected);
+                            }
+                            stage = "accept Docs protocol";
+                            let handler = async {
+                                match connection.alpn() {
+                                    iroh_blobs::ALPN => {
+                                        documents.handle_blobs(connection.clone()).await
+                                    }
+                                    iroh_docs::ALPN => {
+                                        documents.handle_docs(connection.clone()).await
+                                    }
+                                    _ => documents.handle_gossip(connection.clone()).await,
+                                }
+                            };
+                            tokio::time::timeout(connections.operation_timeout(), handler)
+                                .await
+                                .map_err(|_| Error::Timeout("accept Docs protocol"))??;
+                            return Ok(());
+                        }
                         if connection.alpn() == overlay::ALPN {
                             stage = "accept gossip";
                             let tag = read_gossip_tag(&connection, connections.operation_timeout()).await;
@@ -927,6 +968,7 @@ impl Node {
                 control_cancel,
                 deferred_controls: std::collections::VecDeque::new(),
                 connections,
+                documents,
                 routing,
                 resources,
                 events,
@@ -1051,6 +1093,7 @@ impl Node {
                 }
             }
         }
+        self.refresh_ptt_floor_document_peers().await?;
         Ok(())
     }
 
@@ -1059,12 +1102,109 @@ impl Node {
     /// narrow path so a presence reply cannot wait on peer discovery.
     pub async fn remember_observed(&self, peer: PeerId, address: SocketAddr) {
         self.connections.remember_observed(peer, address).await;
+        if let Err(error) = self.refresh_ptt_floor_document_peers().await {
+            tracing::debug!(%error, "floor Docs route refresh failed");
+        }
     }
 
     /// A cached route is only a hint. Callers must separately authorize any
     /// workspace metadata they share with it.
     pub async fn address_hint(&self, peer: PeerId) -> Option<SocketAddr> {
         self.connections.address_hint(peer).await
+    }
+
+    /// Core-only seam: install the current MLS-authorized floor document and
+    /// synchronize over every currently routable workspace member.
+    #[doc(hidden)]
+    pub async fn configure_ptt_floor_document(
+        &self,
+        workspace: WorkspaceId,
+        revision: u64,
+        namespace_key: &[u8; 32],
+        members: &[PeerId],
+    ) -> Result<()> {
+        let mut authorized = members.to_vec();
+        authorized.sort_unstable();
+        authorized.dedup();
+        if authorized.len() != members.len() || !authorized.contains(&self.id()) {
+            return Err(Error::Rejected);
+        }
+        {
+            let routing = self.routing.lock().await;
+            routing.authorizes_endpoint(workspace, revision, self.id())?;
+            for peer in &authorized {
+                routing.authorizes_endpoint(workspace, revision, *peer)?;
+            }
+        }
+        let peers = self.ptt_floor_document_peers(&authorized).await?;
+        self.documents
+            .configure(workspace, revision, namespace_key, authorized, peers)
+            .await
+    }
+
+    /// Core-only write. Callers must MLS-protect the value before storing it.
+    #[doc(hidden)]
+    pub async fn write_ptt_floor_document(
+        &self,
+        workspace: WorkspaceId,
+        revision: u64,
+        key: &[u8],
+        protected_value: &[u8],
+    ) -> Result<()> {
+        self.routing
+            .lock()
+            .await
+            .authorizes_endpoint(workspace, revision, self.id())?;
+        self.documents
+            .write(workspace, revision, key, protected_value)
+            .await
+    }
+
+    /// Core-only read. Entries remain opaque here until MLS authentication.
+    #[doc(hidden)]
+    pub async fn read_ptt_floor_document(
+        &self,
+        workspace: WorkspaceId,
+        revision: u64,
+    ) -> Result<Vec<FloorDocumentEntry>> {
+        self.routing
+            .lock()
+            .await
+            .authorizes_endpoint(workspace, revision, self.id())?;
+        self.documents.read(workspace, revision).await
+    }
+
+    async fn ptt_floor_document_peers(
+        &self,
+        members: &[PeerId],
+    ) -> Result<Vec<iroh::EndpointAddr>> {
+        let mut peers = Vec::new();
+        for peer in members.iter().copied().filter(|peer| *peer != self.id()) {
+            let key = iroh::PublicKey::from_bytes(&peer).map_err(transport)?;
+            if let Some(address) = self.connections.address_hint(peer).await {
+                peers.push(iroh::EndpointAddr::new(key).with_ip_addr(address));
+            } else if self.connections.can_dial_by_peer_id() {
+                peers.push(iroh::EndpointAddr::new(key));
+            }
+        }
+        Ok(peers)
+    }
+
+    async fn refresh_ptt_floor_document_peers(&self) -> Result<()> {
+        let Some((workspace, revision, members)) = self.documents.scope_members().await else {
+            return Ok(());
+        };
+        {
+            let routing = self.routing.lock().await;
+            if routing
+                .authorizes_endpoint(workspace, revision, self.id())
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+        let peers = self.ptt_floor_document_peers(&members).await?;
+        self.documents.sync_peers(peers).await
     }
 
     /// Whether the configured Iroh transport can resolve a destination from
@@ -1100,6 +1240,9 @@ impl Node {
             routing.install_verified_policy(workspace, revision, endpoint_permissions)?;
             self.connections.set_members(routing.endpoints());
         }
+        self.documents
+            .invalidate_if_mismatched(workspace, revision)
+            .await?;
         #[cfg(feature = "moq")]
         self.streams.policy_changed().await;
         self.resources.policy_changed();
@@ -1769,6 +1912,7 @@ impl Node {
         #[cfg(feature = "moq")]
         self.streams.close().await;
         self.resources.close().await;
+        self.documents.close().await;
         self.overlays.lock().await.clear();
         self.connections.close().await;
         self.listener.abort();

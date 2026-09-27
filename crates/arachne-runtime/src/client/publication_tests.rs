@@ -52,7 +52,9 @@ fn typed_publication_modes_reach_the_native_scheduler() {
             .call(Op::WorkspaceState, |session| {
                 let staged = session.transition.staged.as_ref().unwrap();
                 match &staged.transition {
-                    crate::WorkspaceTransition::RoutedPublication(_, class, _, _, _) => Ok(*class),
+                    crate::WorkspaceTransition::RoutedPublication(_, class, _, _, _, _) => {
+                        Ok(*class)
+                    }
                     _ => panic!("wrong publication transition"),
                 }
             })

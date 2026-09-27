@@ -12,8 +12,8 @@
 [package]
 edition = "2021"
 rust-version = "1.91"
-name = "arachne-iroh-gossip"
-version = "0.101.0-arachne.1"
+name = "iroh-gossip"
+version = "0.101.0"
 authors = ["Arachne Systems", "n0 team"]
 build = false
 autolib = false

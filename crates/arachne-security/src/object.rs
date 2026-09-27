@@ -20,6 +20,7 @@ const DOMAIN: &[u8] = b"arachne/signed-object/v2\0";
 /// MLS exporter label for the per-epoch object base secret (RFC 9420 8.5).
 const BASE_LABEL: &str = "arachne/object-base/v2";
 const NAMESPACE_INFO: &[u8] = b"arachne/object-namespace/v2\0";
+const FLOOR_DOCS_NAMESPACE_LABEL: &str = "arachne/ptt-floor-docs-namespace/v1";
 /// Longest application namespace (the first topic segment fits: topics are
 /// at most 128 bytes).
 pub const MAX_OBJECT_NAMESPACE: usize = 128;
@@ -42,6 +43,47 @@ pub struct AuthenticatedObject {
     pub epoch: u64,
     /// Scoped to the authenticated author and `epoch`.
     pub counter: u64,
+}
+
+#[test]
+fn floor_document_namespace_is_shared_and_rotates_with_membership() {
+    use super::{PendingJoin, PreparedManagementUpdate};
+
+    let admin = Workspace::create(crate::test_key(1), "Admin").unwrap();
+    let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let pending =
+        PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(2), "Member").unwrap();
+    let joined = registered
+        .workspace
+        .prepare_admission(
+            crate::test_endpoint(2),
+            pending.admission_request().unwrap(),
+        )
+        .unwrap();
+    let mut proof = pending.join_proof().unwrap();
+    proof
+        .apply_add(&joined.authorization, &joined.commit)
+        .unwrap();
+    let member = pending.prepare_workspace(&proof, &joined.welcome).unwrap();
+    let admin = joined.workspace;
+
+    let admin_namespace = admin.ptt_floor_document_namespace_key().unwrap();
+    let member_namespace = member.ptt_floor_document_namespace_key().unwrap();
+    assert_eq!(admin_namespace, member_namespace);
+    assert_ne!(admin.endpoint(), member.endpoint());
+
+    let (next, _, _) = admin.prepare_invitation(0, false, false).unwrap();
+    let member = match member
+        .prepare_step_update(&next.authorization, &next.commit)
+        .unwrap()
+    {
+        PreparedManagementUpdate::Active(workspace) => *workspace,
+        PreparedManagementUpdate::Removed(_) => panic!("member was removed"),
+    };
+    let next_namespace = next.workspace.ptt_floor_document_namespace_key().unwrap();
+    let member_namespace = member.ptt_floor_document_namespace_key().unwrap();
+    assert_eq!(next_namespace, member_namespace);
+    assert_ne!(admin_namespace, next_namespace);
 }
 
 #[test]
@@ -585,6 +627,27 @@ pub(super) fn retain_receive_epoch(
 }
 
 impl Workspace {
+    /// Derive the shared Iroh Docs write key. It rotates with the MLS epoch,
+    /// so a removed member cannot write to the current epoch's floor document.
+    /// The key must stay inside Core; Docs authors use endpoint identities.
+    pub fn ptt_floor_document_namespace_key(&self) -> Result<Zeroizing<[u8; 32]>, &'static str> {
+        let namespace = Zeroizing::new(
+            self.group
+                .export_secret(
+                    self.provider.crypto(),
+                    FLOOR_DOCS_NAMESPACE_LABEL,
+                    &self.id,
+                    32,
+                )
+                .map_err(|_| "floor document key unavailable")?,
+        );
+        let namespace: [u8; 32] = namespace
+            .as_slice()
+            .try_into()
+            .map_err(|_| "invalid floor document key")?;
+        Ok(Zeroizing::new(namespace))
+    }
+
     /// Validate the persisted receive window against the accepted epoch.
     pub(super) fn object_receive_window(&self) -> Result<Vec<(u64, [u8; 32])>, &'static str> {
         let values = self

@@ -189,6 +189,7 @@ pub(crate) fn install_workspace_policy(
                 .map_err(security(ErrorCode::Internal))?,
         )
         .await?;
+        configure_floor_document(&session.node, owner, revision).await?;
         session.interests.replace_revision(owner.id(), revision);
         Ok(PolicyInstalled {
             workspace: owner.id(),
@@ -212,6 +213,11 @@ pub(crate) fn install_member_policy(
             .workspace
             .as_ref()
             .ok_or_else(errors::no_workspace)?;
+        if workspace.epoch().checked_add(1) != Some(revision) {
+            return Err(ApiError::policy_mismatch(
+                "member policy revision must match current epoch",
+            ));
+        }
         let topics = topics(names)?;
         if topics.is_empty() {
             return Err(ApiError::invalid_input(
@@ -248,6 +254,7 @@ pub(crate) fn install_member_policy(
                 .map_err(security(ErrorCode::Internal))?,
         )
         .await?;
+        configure_floor_document(&session.node, workspace, revision).await?;
         session.interests.replace_revision(workspace.id(), revision);
         Ok(PolicyInstalled {
             workspace: workspace.id(),
@@ -255,6 +262,22 @@ pub(crate) fn install_member_policy(
             members: workspace.member_count(),
         })
     })
+}
+
+async fn configure_floor_document(
+    node: &arachne_node::Node,
+    workspace: &arachne_security::Workspace,
+    revision: u64,
+) -> Result<(), ApiError> {
+    let namespace = workspace
+        .ptt_floor_document_namespace_key()
+        .map_err(security(ErrorCode::Internal))?;
+    let members = workspace
+        .member_endpoints()
+        .map_err(security(ErrorCode::Internal))?;
+    node.configure_ptt_floor_document(workspace.id(), revision, &namespace, &members)
+        .await
+        .map_err(errors::node)
 }
 
 /// Fixture: install a caller-made policy. The guards reject it once the
