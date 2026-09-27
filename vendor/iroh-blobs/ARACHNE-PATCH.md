@@ -16,6 +16,13 @@ Small host-integration changes, with no Bao, wire, hashing or crypto changes:
   This avoids pulling in another unused heapless/atomic-polyfill dependency.
 - Export the existing `gc_run_once` function. Arachne serializes calls so changing
   the single resumable partial reclaims obsolete bytes before another download.
+- Port the ordering fix from upstream PR #240: snapshot external references
+  after marking and protect memory-store imports until the next GC cycle. This
+  closes a race that could sweep a newly committed blob. Preserve Arachne's
+  exported two-argument `gc_run_once` wrapper.
+- Always traverse a tagged HashSeq root even when its hash was already supplied
+  in the live set, closing upstream issue #256 where the root survived but its
+  children were swept.
 - Bound the file-store runtime to two workers per workspace instead of one per CPU.
 - Use fixed-size slice chunks in `HashSeq::iter` for Rust 1.98 Clippy. The
   iterator returns the same hashes and retains the existing length checks.
@@ -37,7 +44,8 @@ added to `authors`, new `description`, an `arachne` keyword, and new
 `exclude = ["Cargo.toml.orig"]` fields. `README.md` has a fork banner.
 `Cargo.toml.orig` is the unchanged upstream original. Source changes are in
 `src/lib.rs` (`ticket` module behind the `tickets` feature), `src/store/fs.rs`
-(`worker_threads(2)`), `src/store/mod.rs` (export `gc_run_once`) and
+(`worker_threads(2)`), `src/store/mod.rs` (export `gc_run_once`),
+`src/store/gc.rs` and `src/store/mem.rs` (GC correctness), and
 `src/hashseq.rs` (fixed-size hash iteration) and `examples/transfer.rs`. The other differences are whitespace normalization in
 `CHANGELOG.md`, `DESIGN.md`, `.config/nextest.toml` and `.github/workflows/`.
 

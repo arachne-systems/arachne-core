@@ -455,6 +455,9 @@ impl Actor {
             }
         };
         let hash = import_data.outboard.root().into();
+        // Match the filesystem store: imports stay protected until the next
+        // GC cycle clears this set before marking.
+        self.protected.insert(hash);
         let entry = self.get_or_create_entry(hash);
         entry
             .0
