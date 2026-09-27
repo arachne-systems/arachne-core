@@ -63,6 +63,14 @@ impl<E: HeldExchange> AdmissionWaiters<E> {
     pub(super) fn len(&self) -> usize {
         self.held.len()
     }
+
+    #[cfg(feature = "test-fixtures")]
+    pub(super) fn expired_len(&self) -> usize {
+        self.held
+            .values()
+            .filter(|(exchange, _)| exchange.expired())
+            .count()
+    }
 }
 
 #[cfg(test)]

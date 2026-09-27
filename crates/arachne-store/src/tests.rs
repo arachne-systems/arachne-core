@@ -1,5 +1,5 @@
 use super::*;
-use arachne_security::{PendingJoin, StorageKey, Workspace};
+use arachne_security::{EndpointKey, EndpointSigner, PendingJoin, StorageKey, Workspace};
 
 struct Directory(tempfile::TempDir);
 impl Directory {
@@ -33,16 +33,19 @@ fn admission_records_commit_together_and_reject_mixed_restoration() {
     let directory = Directory::new();
     let path = directory.0.path().join("workspace.db");
     let root = [7; 32]; // Isolated test fixture, never a runtime default.
-    let owner = Workspace::create([1; 32], "Storage gate admin").unwrap();
+    let owner_key = EndpointKey::generate().unwrap();
+    let member_key = EndpointKey::generate().unwrap();
+    let owner = Workspace::create(&owner_key, "Storage gate admin").unwrap();
     let scope = owner.id();
     let key = StorageKey::derive(&root).unwrap();
     let old = owner.seal(&key).unwrap();
-    let (invitation, checkpoint) = owner.issue_invitation().unwrap();
+    let (registered, invitation, checkpoint) = owner.prepare_invitation(0, false, false).unwrap();
+    let owner = registered.workspace;
     let pending =
-        PendingJoin::from_invitation(&invitation, &checkpoint, [2; 32], "Storage gate member")
+        PendingJoin::from_invitation(&invitation, &checkpoint, &member_key, "Storage gate member")
             .unwrap();
     let admitted = owner
-        .prepare_admission([2; 32], pending.admission_request().unwrap())
+        .prepare_admission(member_key.endpoint(), pending.admission_request().unwrap())
         .unwrap();
     let next = admitted.workspace.seal(&key).unwrap();
     let mut store = Store::open(&path, &root, scope).unwrap();
@@ -96,7 +99,7 @@ fn admission_records_commit_together_and_reject_mixed_restoration() {
     let store = Store::open(&path, &root, scope).unwrap();
     assert_eq!(store.revision(), 2);
     let saved = store.get(b"state").unwrap().unwrap();
-    let restored = Workspace::restore(&key, [1; 32], scope, &saved).unwrap();
+    let restored = Workspace::restore(&key, owner_key.endpoint(), scope, &saved).unwrap();
     assert_eq!(restored.member_count(), 2);
     let commit = store.get(b"history").unwrap().unwrap();
     let welcome = store.get(b"reply").unwrap().unwrap();
@@ -249,4 +252,147 @@ fn external_freshness_anchor_rejects_a_valid_rolled_back_store() {
     let rolled_back = Store::open(&path, &root, scope).unwrap();
     assert!(rolled_back.verify_freshness(current).is_err());
     assert!(rolled_back.verify_freshness(anchor).is_ok());
+}
+
+#[test]
+fn freshness_anchor_has_a_fixed_byte_encoding() {
+    let anchor = FreshnessAnchor {
+        revision: 0x0102_0304_0506_0708,
+        digest: [9; 32],
+    };
+    let bytes = anchor.to_bytes();
+    assert_eq!(bytes.len(), FreshnessAnchor::ENCODED_LEN);
+    assert_eq!(bytes[..8], [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(bytes[8..], [9; 32]);
+    assert_eq!(FreshnessAnchor::from_bytes(&bytes).unwrap(), anchor);
+    assert!(FreshnessAnchor::from_bytes(&bytes[..39]).is_err());
+    assert!(FreshnessAnchor::from_bytes(&[0; 41]).is_err());
+}
+
+fn roundtrip(provider: &dyn StorageProvider) {
+    let scope = [21; 32];
+    assert!(provider.open(scope).unwrap().is_none());
+    let mut storage = provider.create(scope).unwrap();
+    assert!(
+        provider.create(scope).is_err(),
+        "create never replaces a store"
+    );
+    assert_eq!(storage.revision(), 0);
+    storage
+        .commit(
+            0,
+            &[(b"runtime/a", Some(b"one")), (b"runtime/b", Some(b""))],
+        )
+        .unwrap();
+    let anchor = storage.freshness();
+    assert_eq!(anchor.revision, 1);
+    drop(storage);
+    let storage = provider.open(scope).unwrap().expect("store exists");
+    assert_eq!(storage.freshness(), anchor);
+    assert_eq!(
+        storage.keys(b"runtime/"),
+        vec![b"runtime/a".to_vec(), b"runtime/b".to_vec()]
+    );
+    assert_eq!(
+        storage.get(b"runtime/a").unwrap().unwrap().as_slice(),
+        b"one"
+    );
+    assert!(storage.get(b"runtime/c").unwrap().is_none());
+    assert!(provider.open([22; 32]).unwrap().is_none());
+}
+
+#[test]
+fn sqlite_and_memory_providers_keep_one_store_per_scope() {
+    let directory = Directory::new();
+    roundtrip(&SqliteProvider::new(directory.0.path(), [7; 32]));
+    roundtrip(&MemoryProvider::default());
+}
+
+#[test]
+fn memory_provider_injects_commit_and_read_faults() {
+    let provider = MemoryProvider::default();
+    let mut storage = provider.create([1; 32]).unwrap();
+    provider.fail_next_commit();
+    assert!(storage.commit(0, &[(b"k", Some(b"v"))]).is_err());
+    assert_eq!(storage.revision(), 0);
+    storage.commit(0, &[(b"k", Some(b"v"))]).unwrap();
+    provider.corrupt_reads(true);
+    assert_ne!(storage.get(b"k").unwrap().unwrap().as_slice(), b"v");
+    provider.corrupt_reads(false);
+    assert_eq!(storage.get(b"k").unwrap().unwrap().as_slice(), b"v");
+}
+
+#[test]
+fn a_crash_during_creation_leaves_no_file_and_creation_retries() {
+    let directory = Directory::new();
+    let path = directory.0.path().join("workspace.db");
+    let root = [31; 32];
+    FAIL_CREATE_AFTER_FILE.with(|fail| fail.set(true));
+    assert!(Store::create(&path, &root, [1; 32]).is_err());
+    assert!(
+        !path.exists(),
+        "a failed creation must not leave a store file"
+    );
+    let mut store = Store::create(&path, &root, [1; 32]).unwrap();
+    store.commit(0, &[(b"k", Some(b"v"))]).unwrap();
+    drop(store);
+    assert!(Store::create(&path, &root, [1; 32]).is_err());
+    assert_eq!(
+        Store::open_existing(&path, &root, [1; 32])
+            .unwrap()
+            .get(b"k")
+            .unwrap()
+            .unwrap()
+            .as_slice(),
+        b"v"
+    );
+    // No temporary file stays behind.
+    assert_eq!(std::fs::read_dir(directory.0.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn only_the_supported_store_format_opens() {
+    let directory = Directory::new();
+    let path = directory.0.path().join("workspace.db");
+    let root = [32; 32];
+    drop(Store::create(&path, &root, [2; 32]).unwrap());
+    let set_version = |version: u32| {
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(&format!("PRAGMA user_version={version};"))
+            .unwrap();
+    };
+    let refused = |expected: u32| {
+        let error = Store::open_existing(&path, &root, [2; 32])
+            .err()
+            .expect("refused");
+        let format = error
+            .downcast_ref::<FormatNotSupported>()
+            .unwrap_or_else(|| panic!("not a format error: {error}"));
+        assert_eq!(format.found, expected);
+        assert_eq!(format.supported, STORE_FORMAT);
+        assert!(error.to_string().contains("format"), "{error}");
+    };
+    set_version(STORE_FORMAT + 1);
+    refused(STORE_FORMAT + 1);
+    // A store from before format records existed: no legacy reader.
+    set_version(0);
+    refused(0);
+    set_version(STORE_FORMAT);
+    Store::open_existing(&path, &root, [2; 32]).unwrap();
+}
+
+#[test]
+fn the_format_is_bound_into_the_authenticated_head() {
+    let directory = Directory::new();
+    let path = directory.0.path().join("workspace.db");
+    let root = [33; 32];
+    drop(Store::create(&path, &root, [3; 32]).unwrap());
+    let head: Vec<u8> = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT sealed FROM head WHERE id=0", [], |row| row.get(0))
+        .unwrap();
+    let store = Store::open_existing(&path, &root, [3; 32]).unwrap();
+    let plain = store.unseal(0, b"", &head).unwrap();
+    assert_eq!(plain[..4], STORE_FORMAT.to_be_bytes());
 }

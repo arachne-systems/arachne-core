@@ -1,9 +1,13 @@
-use arachne_runtime::{close, create, describe, execute};
+use arachne_runtime::{MemoryProvider, close, describe, execute};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-// Three four-node scenarios exceed the process-wide runtime budget if overlapped.
-static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+mod common;
+
+/// A node with its own in-memory record storage.
+fn node(secret: u8) -> i64 {
+    common::stored(&[secret; 32], &MemoryProvider::default())
+}
 
 const EVENT: &str = "atak/native/v1/chat";
 const CURRENT: &str = "atak/native/v1/pli";
@@ -15,6 +19,20 @@ fn call(handle: i64, request: Value) -> Value {
 
 fn step(reply: &Value) -> Value {
     json!({"commit":reply["commit"],"authorization":reply["authorization"]})
+}
+
+/// Register a reusable link. Registration is one commit, so every policy
+/// revision below is one higher than before invitations were registered.
+fn issue_invitation(handle: i64) -> Value {
+    let staged = call(
+        handle,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    );
+    call(
+        handle,
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+    )["issued_invitation"]
+        .clone()
 }
 
 fn add(owner: i64, joiner: i64, invite: &Value, prior: Vec<Value>, name: &str) -> Value {
@@ -30,7 +48,7 @@ fn add(owner: i64, joiner: i64, invite: &Value, prior: Vec<Value>, name: &str) -
     );
     call(
         owner,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     );
     let reply = call(
         owner,
@@ -45,7 +63,7 @@ fn add(owner: i64, joiner: i64, invite: &Value, prior: Vec<Value>, name: &str) -
     );
     call(
         joiner,
-        json!({"op":"adopt_join","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
     );
     let mut reply = reply;
     reply["joined_member"] = begin["member"]["id"].clone();
@@ -104,7 +122,7 @@ fn receive_one(handle: i64) -> Value {
         if !staged.is_null() {
             call(
                 handle,
-                json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
+                json!({"op":"adopt_reception","candidate":staged["candidate"]}),
             );
             return staged;
         }
@@ -115,24 +133,21 @@ fn receive_one(handle: i64) -> Value {
 
 #[test]
 fn retained_replay_delivers_events_current_values_and_deletions() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let author = create(Some(&[121; 32])).unwrap();
-    let reader = create(Some(&[122; 32])).unwrap();
+    let author = node(121);
+    let reader = node(122);
     call(
         author,
         json!({"op":"create_workspace","display_name":"Author"}),
     );
-    let invite = call(author, json!({"op":"issue_invitation"}));
+    // +1 throughout this test: registering the invitation now costs an
+    // epoch, so the workspace settles at epoch 3 (not 2) once the reader
+    // joins. All "revision" literals below shift by the same +1.
+    let invite = issue_invitation(author);
     add(author, reader, &invite, vec![], "Reader");
     for handle in [author, reader] {
-        let staged = call(handle, json!({"op":"enable_object_delivery"}));
         call(
             handle,
-            json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
-        );
-        call(
-            handle,
-            json!({"op":"install_workspace_policy","revision":2}),
+            json!({"op":"install_workspace_policy","revision":3}),
         );
     }
     let expires_at = SystemTime::now()
@@ -141,7 +156,7 @@ fn retained_replay_delivers_events_current_values_and_deletions() {
         .as_secs()
         + 3600;
     for (id, topic, tombstone) in [(1, EVENT, false), (2, CURRENT, false), (3, CURRENT, true)] {
-        let mut request = json!({"op":"stage_network_publication","revision":2,
+        let mut request = json!({"op":"stage_network_publication","revision":3,
             "topic":topic,"id":vec![id;16],"payload":[id]});
         if topic == CURRENT {
             request["current"] = json!({"selector":vec![8;32],"replacement_key":vec![9;32],
@@ -150,13 +165,13 @@ fn retained_replay_delivers_events_current_values_and_deletions() {
         let staged = call(author, request);
         call(
             author,
-            json!({"op":"adopt_publication","snapshot":staged["snapshot"]}),
+            json!({"op":"adopt_publication","candidate":staged["candidate"]}),
         );
     }
     connect(reader, author);
     let info: Value = serde_json::from_str(&describe(author).unwrap()).unwrap();
     let query = json!({"op":"fetch_recovery_range","peer":info["endpoint_key"],
-        "revision":2,"topics":[EVENT,CURRENT],"after":0,"through":3});
+        "revision":3,"topics":[EVENT,CURRENT],"after":0,"through":3});
     call(reader, query.clone());
     assert_eq!(finish_range(&[author], reader)["packet_count"], 3);
     let staged = call(reader, json!({"op":"stage_recovery_range"}));
@@ -166,7 +181,7 @@ fn retained_replay_delivers_events_current_values_and_deletions() {
     );
     call(
         reader,
-        json!({"op":"adopt_recovery","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_recovery","candidate":staged["candidate"]}),
     );
     for id in 1..=3 {
         let pending = call(reader, json!({"op":"poll_pending_object"}));
@@ -184,7 +199,7 @@ fn retained_replay_delivers_events_current_values_and_deletions() {
         );
         call(
             reader,
-            json!({"op":"adopt_reception","snapshot":ack["snapshot"]}),
+            json!({"op":"adopt_reception","candidate":ack["candidate"]}),
         );
     }
     assert!(call(reader, json!({"op":"poll_pending_object"})).is_null());
@@ -199,17 +214,92 @@ fn retained_replay_delivers_events_current_values_and_deletions() {
 }
 
 #[test]
+fn explicit_tail_recovery_does_not_claim_evicted_history() {
+    let author = node(141);
+    let reader = node(142);
+    call(
+        author,
+        json!({"op":"create_workspace","display_name":"Author"}),
+    );
+    let invite = issue_invitation(author);
+    add(author, reader, &invite, vec![], "Reader");
+    for handle in [author, reader] {
+        call(
+            handle,
+            json!({"op":"install_workspace_policy","revision":3}),
+        );
+    }
+    connect(author, reader);
+    connect(reader, author);
+    for id in 1u8..=40 {
+        let staged = call(
+            author,
+            json!({"op":"stage_network_publication","revision":3,
+            "topic":EVENT,"id":vec![id;16],"payload":[id]}),
+        );
+        call(
+            author,
+            json!({"op":"adopt_publication","candidate":staged["candidate"]}),
+        );
+    }
+    connect(reader, author);
+    let info: Value = serde_json::from_str(&describe(author).unwrap()).unwrap();
+    let pending = call(
+        reader,
+        json!({"op":"fetch_recovery_range","peer":info["endpoint_key"],
+        "revision":3,"topics":[EVENT],"after":39}),
+    );
+    assert_eq!(pending["state"], "recovery_range_pending");
+    let ready = finish_range(&[author], reader);
+    assert_eq!(ready["after"], 39);
+    assert_eq!(ready["through"], 40);
+    assert_eq!(ready["packet_count"], 1);
+    assert_eq!(ready["automatic_source"], true);
+    let staged = call(reader, json!({"op":"stage_recovery_range"}));
+    assert_eq!(staged["publication_count"], 1);
+    assert!(
+        staged["accepted_through"].is_null(),
+        "explicit tails must not advance full-history progress"
+    );
+    call(
+        reader,
+        json!({"op":"adopt_recovery","candidate":staged["candidate"]}),
+    );
+    let object = call(reader, json!({"op":"poll_pending_object"}));
+    assert_eq!(object["id"], json!(vec![40; 16]));
+    assert_eq!(object["payload"], json!([40]));
+
+    // Continuing full history must still report the old, honestly missing prefix.
+    call(
+        reader,
+        json!({"op":"fetch_recovery_range","peer":info["endpoint_key"],
+        "revision":3,"topics":[EVENT]}),
+    );
+    let unavailable = finish_range(&[author], reader);
+    assert_eq!(unavailable["state"], "recovery_source_unavailable");
+    assert_eq!(unavailable["accepted_progress"], false);
+    assert!(
+        unavailable["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Unavailable")
+    );
+    close(reader).unwrap();
+    close(author).unwrap();
+}
+
+#[test]
 fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let author = create(Some(&[111; 32])).unwrap();
-    let stale_holder = create(Some(&[112; 32])).unwrap();
-    let fresh_holder = create(Some(&[113; 32])).unwrap();
-    let reader = create(Some(&[114; 32])).unwrap();
+    let author = node(111);
+    let stale_holder = node(112);
+    let fresh_holder = node(113);
+    let reader_storage = MemoryProvider::default();
+    let reader = common::stored(&[114; 32], &reader_storage);
     let created = call(
         author,
         json!({"op":"create_workspace","display_name":"Author"}),
     );
-    let invite = call(author, json!({"op":"issue_invitation"}));
+    let invite = issue_invitation(author);
     let stale = add(author, stale_holder, &invite, vec![], "Stale holder");
     let fresh = add(
         author,
@@ -233,19 +323,14 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
             let staged = call(handle, json!({"op":"stage_admission_update","step":update}));
             call(
                 handle,
-                json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+                json!({"op":"adopt_admission","candidate":staged["candidate"]}),
             );
         }
     }
     for handle in [author, stale_holder, fresh_holder, reader] {
-        let staged = call(handle, json!({"op":"enable_object_delivery"}));
         call(
             handle,
-            json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
-        );
-        call(
-            handle,
-            json!({"op":"install_workspace_policy","revision":4}),
+            json!({"op":"install_workspace_policy","revision":5}),
         );
     }
     connect(stale_holder, author);
@@ -261,29 +346,29 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
 
     let event = call(
         author,
-        json!({"op":"stage_network_publication","revision":4,
+        json!({"op":"stage_network_publication","revision":5,
             "topic":EVENT,"id":vec![1;16],"payload":[42]}),
     );
     call(
         author,
-        json!({"op":"adopt_publication","snapshot":event["snapshot"]}),
+        json!({"op":"adopt_publication","candidate":event["candidate"]}),
     );
     let created_state = call(
         author,
-        json!({"op":"stage_network_publication","revision":4,
+        json!({"op":"stage_network_publication","revision":5,
             "topic":CURRENT,"id":vec![2;16],"payload":[1],
             "current":{"selector":selector.clone(),"replacement_key":replacement_key.clone(),
                 "expires_at":expires_at}}),
     );
     call(
         author,
-        json!({"op":"adopt_publication","snapshot":created_state["snapshot"]}),
+        json!({"op":"adopt_publication","candidate":created_state["candidate"]}),
     );
 
     call(
         stale_holder,
         json!({"op":"fetch_recovery_range","peer":author_info["endpoint_key"],
-            "revision":4,"topics":[EVENT],"after":0,"through":1}),
+            "revision":5,"topics":[EVENT],"after":0,"through":1}),
     );
     assert_eq!(finish_range(&[author], stale_holder)["packet_count"], 1);
     let retained = call(
@@ -292,45 +377,45 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
     );
     call(
         stale_holder,
-        json!({"op":"adopt_recovery","snapshot":retained["snapshot"]}),
+        json!({"op":"adopt_recovery","candidate":retained["candidate"]}),
     );
     call(
         stale_holder,
         json!({"op":"fetch_current_view","peer":author_info["endpoint_key"],
-            "authority":created["member"]["id"],"revision":4,
+            "authority":created["member"]["id"],"revision":5,
             "topic":CURRENT,"selector":selector.clone()}),
     );
     assert_eq!(finish_current(&[author], stale_holder)["cut"], 1);
     let retained = call(stale_holder, json!({"op":"stage_current_view"}));
     call(
         stale_holder,
-        json!({"op":"adopt_current_view","snapshot":retained["snapshot"]}),
+        json!({"op":"adopt_current_view","candidate":retained["candidate"]}),
     );
 
     for (id, payload, tombstone) in [([3; 16], vec![2], false), ([4; 16], vec![0], true)] {
         let staged = call(
             author,
-            json!({"op":"stage_network_publication","revision":4,
+            json!({"op":"stage_network_publication","revision":5,
                 "topic":CURRENT,"id":id,"payload":payload,
                 "current":{"selector":selector.clone(),"replacement_key":replacement_key.clone(),
                     "expires_at":expires_at,"tombstone":tombstone}}),
         );
         call(
             author,
-            json!({"op":"adopt_publication","snapshot":staged["snapshot"]}),
+            json!({"op":"adopt_publication","candidate":staged["candidate"]}),
         );
     }
     call(
         fresh_holder,
         json!({"op":"fetch_current_view","peer":author_info["endpoint_key"],
-            "authority":created["member"]["id"],"revision":4,
+            "authority":created["member"]["id"],"revision":5,
             "topic":CURRENT,"selector":selector.clone()}),
     );
     assert_eq!(finish_current(&[author], fresh_holder)["cut"], 3);
     let retained = call(fresh_holder, json!({"op":"stage_current_view"}));
     call(
         fresh_holder,
-        json!({"op":"adopt_current_view","snapshot":retained["snapshot"]}),
+        json!({"op":"adopt_current_view","candidate":retained["candidate"]}),
     );
     close(author).unwrap();
 
@@ -341,7 +426,7 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
         let pending = call(
             reader,
             json!({"op":"fetch_current_view","authority":created["member"]["id"],
-                "revision":4,"topic":CURRENT,"selector":selector.clone()}),
+                "revision":5,"topic":CURRENT,"selector":selector.clone()}),
         );
         if pending["state"] == "current_view_pending" && pending["candidate_count"] == 2 {
             break;
@@ -367,7 +452,7 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
     let staged = call(reader, json!({"op":"stage_current_view"}));
     call(
         reader,
-        json!({"op":"adopt_current_view","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_current_view","candidate":staged["candidate"]}),
     );
     let deleted = call(reader, json!({"op":"poll_pending_object"}));
     assert_eq!(deleted["payload"], json!([0]));
@@ -379,27 +464,25 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
     );
     call(
         reader,
-        json!({"op":"adopt_reception","snapshot":acknowledged["snapshot"]}),
+        json!({"op":"adopt_reception","candidate":acknowledged["candidate"]}),
     );
-    let saved_reader = call(reader, json!({"op":"seal_workspace"}));
     close(reader).unwrap();
 
-    let reader = create(Some(&[114; 32])).unwrap();
+    let reader = common::stored(&[114; 32], &reader_storage);
     call(
         reader,
-        json!({"op":"restore_workspace","workspace":created["workspace"],
-            "snapshot":saved_reader["snapshot"]}),
+        json!({"op":"restore_workspace","workspace":created["workspace"]}),
     );
     call(
         reader,
-        json!({"op":"install_workspace_policy","revision":4}),
+        json!({"op":"install_workspace_policy","revision":5}),
     );
     connect(reader, stale_holder);
     let stale_info: Value = serde_json::from_str(&describe(stale_holder).unwrap()).unwrap();
     call(
         reader,
         json!({"op":"fetch_current_view","peer":stale_info["endpoint_key"],
-            "authority":created["member"]["id"],"revision":4,
+            "authority":created["member"]["id"],"revision":5,
             "topic":CURRENT,"selector":selector.clone()}),
     );
     assert_eq!(finish_current(&[stale_holder], reader)["cut"], 1);
@@ -415,14 +498,14 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
     call(
         reader,
         json!({"op":"fetch_recovery_range","peer":stale_info["endpoint_key"],
-            "author":created["member"]["id"],"revision":4,
+            "author":created["member"]["id"],"revision":5,
             "topics":[EVENT],"after":0,"through":1}),
     );
     assert_eq!(finish_range(&[stale_holder], reader)["packet_count"], 1);
     let recovered = call(reader, json!({"op":"stage_recovery_range"}));
     call(
         reader,
-        json!({"op":"adopt_recovery","snapshot":recovered["snapshot"]}),
+        json!({"op":"adopt_recovery","candidate":recovered["candidate"]}),
     );
     assert_eq!(
         call(reader, json!({"op":"poll_pending_object"}))["payload"],
@@ -436,16 +519,17 @@ fn newest_tombstone_beats_stale_holder_and_survives_reader_restart() {
 
 #[test]
 fn intended_recipient_recovers_private_tail_from_restarted_holder() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let author = create(Some(&[101; 32])).unwrap();
-    let holder = create(Some(&[102; 32])).unwrap();
-    let reader = create(Some(&[103; 32])).unwrap();
-    let observer = create(Some(&[104; 32])).unwrap();
+    let author = node(101);
+    let holder_storage = MemoryProvider::default();
+    let reader_storage = MemoryProvider::default();
+    let holder = common::stored(&[102; 32], &holder_storage);
+    let reader = common::stored(&[103; 32], &reader_storage);
+    let observer = node(104);
     let created = call(
         author,
         json!({"op":"create_workspace","display_name":"Author"}),
     );
-    let invite = call(author, json!({"op":"issue_invitation"}));
+    let invite = issue_invitation(author);
     let first = add(author, holder, &invite, vec![], "Holder");
     let second = add(author, reader, &invite, vec![step(&first)], "Reader");
     let third = add(
@@ -461,7 +545,7 @@ fn intended_recipient_recovers_private_tail_from_restarted_holder() {
     );
     call(
         holder,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     );
     for handle in [holder, reader] {
         let staged = call(
@@ -470,18 +554,13 @@ fn intended_recipient_recovers_private_tail_from_restarted_holder() {
         );
         call(
             handle,
-            json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
         );
     }
     for handle in [author, holder, reader, observer] {
-        let staged = call(handle, json!({"op":"enable_object_delivery"}));
         call(
             handle,
-            json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
-        );
-        call(
-            handle,
-            json!({"op":"install_workspace_policy","revision":4}),
+            json!({"op":"install_workspace_policy","revision":5}),
         );
     }
     for (from, to) in [
@@ -496,10 +575,9 @@ fn intended_recipient_recovers_private_tail_from_restarted_holder() {
         call(
             handle,
             json!({"op":"subscribe","workspace":created["workspace"],
-                "revision":4,"topic":EVENT}),
+                "revision":5,"topic":EVENT}),
         );
     }
-    let saved_reader = call(reader, json!({"op":"seal_workspace"}));
     close(reader).unwrap();
     let mut recipients = [
         serde_json::from_value::<[u8; 32]>(first["joined_member"].clone()).unwrap(),
@@ -509,43 +587,40 @@ fn intended_recipient_recovers_private_tail_from_restarted_holder() {
     let recipients = json!(recipients);
     let staged = call(
         author,
-        json!({"op":"stage_network_publication","revision":4,"topic":EVENT,
+        json!({"op":"stage_network_publication","revision":5,"topic":EVENT,
             "id":vec![1;16],"payload":[1],"recipients":recipients}),
     );
     let sent = call(
         author,
-        json!({"op":"adopt_publication","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_publication","candidate":staged["candidate"]}),
     );
     assert_eq!(sent["sequence"], 1);
     receive_one(holder);
 
-    let reader = create(Some(&[103; 32])).unwrap();
+    let reader = common::stored(&[103; 32], &reader_storage);
     call(
         reader,
-        json!({"op":"restore_workspace","workspace":created["workspace"],
-            "snapshot":saved_reader["snapshot"]}),
+        json!({"op":"restore_workspace","workspace":created["workspace"]}),
     );
     call(
         reader,
-        json!({"op":"install_workspace_policy","revision":4}),
+        json!({"op":"install_workspace_policy","revision":5}),
     );
     call(
         reader,
         json!({"op":"subscribe","workspace":created["workspace"],
-            "revision":4,"topic":EVENT}),
+            "revision":5,"topic":EVENT}),
     );
-    let saved_holder = call(holder, json!({"op":"seal_workspace"}));
     close(holder).unwrap();
     close(author).unwrap();
-    let holder = create(Some(&[102; 32])).unwrap();
+    let holder = common::stored(&[102; 32], &holder_storage);
     call(
         holder,
-        json!({"op":"restore_workspace","workspace":created["workspace"],
-            "snapshot":saved_holder["snapshot"]}),
+        json!({"op":"restore_workspace","workspace":created["workspace"]}),
     );
     call(
         holder,
-        json!({"op":"install_workspace_policy","revision":4}),
+        json!({"op":"install_workspace_policy","revision":5}),
     );
     for (from, to) in [
         (reader, holder),
@@ -559,7 +634,7 @@ fn intended_recipient_recovers_private_tail_from_restarted_holder() {
         call(
             handle,
             json!({"op":"subscribe","workspace":created["workspace"],
-                "revision":4,"topic":EVENT}),
+                "revision":5,"topic":EVENT}),
         );
         call(
             handle,
@@ -620,7 +695,7 @@ fn intended_recipient_recovers_private_tail_from_restarted_holder() {
     assert_eq!(staged["publication_count"], 1);
     call(
         reader,
-        json!({"op":"adopt_recovery","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_recovery","candidate":staged["candidate"]}),
     );
     assert!(call(reader, json!({"op":"next_direct_gap"})).is_null());
     assert_eq!(
@@ -634,16 +709,18 @@ fn intended_recipient_recovers_private_tail_from_restarted_holder() {
 
 #[test]
 fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let author = create(Some(&[91; 32])).unwrap();
-    let holder = create(Some(&[92; 32])).unwrap();
-    let reader = create(Some(&[93; 32])).unwrap();
-    let empty_holder = create(Some(&[94; 32])).unwrap();
+    let author_storage = MemoryProvider::default();
+    let holder_storage = MemoryProvider::default();
+    let reader_storage = MemoryProvider::default();
+    let author = common::stored(&[91; 32], &author_storage);
+    let holder = common::stored(&[92; 32], &holder_storage);
+    let reader = common::stored(&[93; 32], &reader_storage);
+    let empty_holder = node(94);
     let created = call(
         author,
         json!({"op":"create_workspace","display_name":"Author"}),
     );
-    let invite = call(author, json!({"op":"issue_invitation"}));
+    let invite = issue_invitation(author);
     let first = add(author, holder, &invite, vec![], "Holder");
     let second = add(author, reader, &invite, vec![step(&first)], "Reader");
     let third = add(
@@ -659,7 +736,7 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     );
     call(
         holder,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     );
     for handle in [holder, reader] {
         let staged = call(
@@ -668,29 +745,24 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
         );
         call(
             handle,
-            json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
         );
     }
     for handle in [author, holder, reader, empty_holder] {
-        let staged = call(handle, json!({"op":"enable_object_delivery"}));
         call(
             handle,
-            json!({"op":"adopt_reception","snapshot":staged["snapshot"]}),
-        );
-        call(
-            handle,
-            json!({"op":"install_workspace_policy","revision":4}),
+            json!({"op":"install_workspace_policy","revision":5}),
         );
     }
 
     let publication = call(
         author,
-        json!({"op":"stage_network_publication","revision":4,
+        json!({"op":"stage_network_publication","revision":5,
             "topic":EVENT,"id":vec![7;16],"payload":[42]}),
     );
     let publication = call(
         author,
-        json!({"op":"adopt_publication","snapshot":publication["snapshot"]}),
+        json!({"op":"adopt_publication","candidate":publication["candidate"]}),
     );
     assert_eq!(publication["sequence"], 1);
     let expires_at = SystemTime::now()
@@ -701,26 +773,27 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     let selector = vec![8; 32];
     let current = call(
         author,
-        json!({"op":"stage_network_publication","revision":4,
+        json!({"op":"stage_network_publication","revision":5,
             "topic":CURRENT,"id":vec![8;16],"payload":[43],
             "current":{"selector":selector.clone(),"replacement_key":created["member"]["id"],
                 "expires_at":expires_at}}),
     );
     let current = call(
         author,
-        json!({"op":"adopt_publication","snapshot":current["snapshot"]}),
+        json!({"op":"adopt_publication","candidate":current["candidate"]}),
     );
     assert_eq!(current["sequence"], 2);
     let holder_member = first["joined_member"].clone();
     let reader_member = second["joined_member"].clone();
-    let saved_author = call(author, json!({"op":"seal_workspace"}));
+    // Storage keeps the author's state from here; serving recovery below
+    // does not change it.
 
     connect(holder, author);
     let author_info: Value = serde_json::from_str(&describe(author).unwrap()).unwrap();
     call(
         holder,
         json!({"op":"fetch_recovery_range","peer":author_info["endpoint_key"],
-            "revision":4,"topics":[EVENT],"after":0,"through":1}),
+            "revision":5,"topics":[EVENT],"after":0,"through":1}),
     );
     assert_eq!(finish_range(&[author], holder)["packet_count"], 1);
     let retain_until = SystemTime::now()
@@ -734,12 +807,12 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     );
     call(
         holder,
-        json!({"op":"adopt_recovery","snapshot":retained["snapshot"]}),
+        json!({"op":"adopt_recovery","candidate":retained["candidate"]}),
     );
     call(
         holder,
         json!({"op":"fetch_current_view","peer":author_info["endpoint_key"],
-            "authority":created["member"]["id"],"revision":4,
+            "authority":created["member"]["id"],"revision":5,
             "topic":CURRENT,"selector":selector.clone()}),
     );
     assert_eq!(
@@ -749,26 +822,24 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     let retained = call(holder, json!({"op":"stage_current_view"}));
     call(
         holder,
-        json!({"op":"adopt_current_view","snapshot":retained["snapshot"]}),
+        json!({"op":"adopt_current_view","candidate":retained["candidate"]}),
     );
-    let saved = call(holder, json!({"op":"seal_workspace"}));
     close(holder).unwrap();
     close(author).unwrap();
 
-    let holder = create(Some(&[92; 32])).unwrap();
+    let holder = common::stored(&[92; 32], &holder_storage);
     call(
         holder,
-        json!({"op":"restore_workspace","workspace":created["workspace"],
-            "snapshot":saved["snapshot"]}),
+        json!({"op":"restore_workspace","workspace":created["workspace"]}),
     );
     call(
         holder,
-        json!({"op":"install_workspace_policy","revision":4}),
+        json!({"op":"install_workspace_policy","revision":5}),
     );
     let waiting = call(
         reader,
         json!({"op":"fetch_recovery_range","author":created["member"]["id"],
-            "revision":4,"topics":[EVENT],"after":0,"through":1}),
+            "revision":5,"topics":[EVENT],"after":0,"through":1}),
     );
     assert_eq!(waiting["state"], "recovery_source_waiting");
 
@@ -778,7 +849,7 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
         let result = call(
             reader,
             json!({"op":"fetch_recovery_range","author":created["member"]["id"],
-                "revision":4,"topics":[EVENT]}),
+                "revision":5,"topics":[EVENT]}),
         );
         if result["state"] == "recovery_range_pending" {
             assert_eq!(result["automatic_source"], true);
@@ -804,7 +875,7 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
         let result = call(
             reader,
             json!({"op":"fetch_recovery_range","author":created["member"]["id"],
-                "revision":4,"topics":[EVENT]}),
+                "revision":5,"topics":[EVENT]}),
         );
         if result["state"] == "recovery_range_pending" {
             let result = finish_range(&[holder], reader);
@@ -827,7 +898,7 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     assert_eq!(recovered["publication_count"], 1);
     call(
         reader,
-        json!({"op":"adopt_recovery","snapshot":recovered["snapshot"]}),
+        json!({"op":"adopt_recovery","candidate":recovered["candidate"]}),
     );
     let pending = call(reader, json!({"op":"poll_pending_object"}));
     assert_eq!(pending["payload"], json!([42]));
@@ -836,7 +907,7 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     call(
         reader,
         json!({"op":"fetch_recovery_range","author":created["member"]["id"],
-            "revision":4,"topics":[EVENT],"after":0,"through":1}),
+            "revision":5,"topics":[EVENT],"after":0,"through":1}),
     );
     assert_eq!(
         finish_range(&[holder], reader)["state"],
@@ -846,18 +917,16 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
         call(reader, json!({"op":"stage_recovery_range"}))["state"],
         "recovery_already_covered"
     );
-    let saved_reader = call(reader, json!({"op":"seal_workspace"}));
     close(reader).unwrap();
 
-    let reader = create(Some(&[93; 32])).unwrap();
+    let reader = common::stored(&[93; 32], &reader_storage);
     call(
         reader,
-        json!({"op":"restore_workspace","workspace":created["workspace"],
-            "snapshot":saved_reader["snapshot"]}),
+        json!({"op":"restore_workspace","workspace":created["workspace"]}),
     );
     call(
         reader,
-        json!({"op":"install_workspace_policy","revision":4}),
+        json!({"op":"install_workspace_policy","revision":5}),
     );
     connect(reader, holder);
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -865,7 +934,7 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
         let started = call(
             reader,
             json!({"op":"fetch_recovery_range","author":created["member"]["id"],
-                "revision":4,"topics":[EVENT],"after":0,"through":1}),
+                "revision":5,"topics":[EVENT],"after":0,"through":1}),
         );
         if started["state"] == "recovery_range_pending" {
             break;
@@ -891,13 +960,13 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     );
     call(
         reader,
-        json!({"op":"adopt_reception","snapshot":acknowledged["snapshot"]}),
+        json!({"op":"adopt_reception","candidate":acknowledged["candidate"]}),
     );
 
     let started = call(
         reader,
         json!({"op":"fetch_current_view","authority":created["member"]["id"],
-            "revision":4,"topic":CURRENT,"selector":selector.clone()}),
+            "revision":5,"topic":CURRENT,"selector":selector.clone()}),
     );
     assert_eq!(started["state"], "current_view_pending");
     assert_eq!(started["automatic_source"], true);
@@ -908,7 +977,7 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     assert_eq!(staged["pending"], 1);
     call(
         reader,
-        json!({"op":"adopt_current_view","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_current_view","candidate":staged["candidate"]}),
     );
     let current = call(reader, json!({"op":"poll_pending_object"}));
     assert_eq!(current["payload"], json!([43]));
@@ -920,14 +989,13 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     );
     call(
         reader,
-        json!({"op":"adopt_reception","snapshot":acknowledged["snapshot"]}),
+        json!({"op":"adopt_reception","candidate":acknowledged["candidate"]}),
     );
 
-    let author = create(Some(&[91; 32])).unwrap();
+    let author = common::stored(&[91; 32], &author_storage);
     call(
         author,
-        json!({"op":"restore_workspace","workspace":created["workspace"],
-            "snapshot":saved_author["snapshot"]}),
+        json!({"op":"restore_workspace","workspace":created["workspace"]}),
     );
     let removal = call(
         author,
@@ -935,7 +1003,7 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     );
     let removal = call(
         author,
-        json!({"op":"adopt_admission","snapshot":removal["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":removal["candidate"]}),
     );
     let accepted = call(
         reader,
@@ -943,23 +1011,18 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
     );
     call(
         reader,
-        json!({"op":"adopt_admission","snapshot":accepted["snapshot"]}),
-    );
-    let enabled = call(reader, json!({"op":"enable_object_delivery"}));
-    call(
-        reader,
-        json!({"op":"adopt_reception","snapshot":enabled["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":accepted["candidate"]}),
     );
     call(
         reader,
-        json!({"op":"install_workspace_policy","revision":5}),
+        json!({"op":"install_workspace_policy","revision":6}),
     );
     let reader_info: Value = serde_json::from_str(&describe(reader).unwrap()).unwrap();
     connect(holder, reader);
     call(
         holder,
         json!({"op":"fetch_recovery_range","peer":reader_info["endpoint_key"],
-            "author":reader_member,"revision":4,"topics":[EVENT],
+            "author":reader_member,"revision":5,"topics":[EVENT],
             "after":0,"through":1}),
     );
     let denied = finish_range(&[reader], holder);
@@ -971,30 +1034,28 @@ fn restarted_holder_repairs_offline_author_and_removal_blocks_recovery() {
         execute(
             reader,
             &serde_json::to_vec(&json!({"op":"fetch_recovery_range",
-                "peer":removed_endpoint["endpoint_key"],"revision":5,
+                "peer":removed_endpoint["endpoint_key"],"revision":6,
                 "topics":[EVENT],"after":0,"through":1}))
             .unwrap(),
         )
         .unwrap_err(),
         "recovery peer is not a current member"
     );
-    let saved_reader = call(reader, json!({"op":"seal_workspace"}));
     close(reader).unwrap();
-    let reader = create(Some(&[93; 32])).unwrap();
+    let reader = common::stored(&[93; 32], &reader_storage);
     call(
         reader,
-        json!({"op":"restore_workspace","workspace":created["workspace"],
-            "snapshot":saved_reader["snapshot"]}),
+        json!({"op":"restore_workspace","workspace":created["workspace"]}),
     );
     call(
         reader,
-        json!({"op":"install_workspace_policy","revision":5}),
+        json!({"op":"install_workspace_policy","revision":6}),
     );
     assert_eq!(
         execute(
             reader,
             &serde_json::to_vec(&json!({"op":"fetch_recovery_range",
-                "peer":removed_endpoint["endpoint_key"],"revision":5,
+                "peer":removed_endpoint["endpoint_key"],"revision":6,
                 "topics":[EVENT],"after":0,"through":1}))
             .unwrap(),
         )

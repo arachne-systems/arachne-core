@@ -17,10 +17,10 @@ use arachne_node::{
 };
 use arachne_runtime::harness::{self, Query, StateBasis};
 use arachne_runtime::{
-    create, create_relay, create_relay_with_options, create_wan, describe, enable_record_storage,
-    execute, restore_record_storage, save_candidate, wait_for_work,
+    FreshnessAnchor, StorageConfig, attach_storage, create, create_relay,
+    create_relay_with_options, create_wan, describe, execute, record_freshness, wait_for_work,
 };
-use arachne_security::{AdmissionAuthorization, Invitation, MembershipAuthorization, PendingJoin};
+use arachne_security::{Invitation, MembershipAuthorization, PendingJoin};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -37,7 +37,7 @@ use std::{
 use tempfile::TempDir;
 use tokio::task::JoinSet;
 
-const HISTORY_PAGE_PACKET: &[u8] = b"DFJP\x01";
+const HISTORY_PAGE_PACKET: &[u8] = b"DFJP\x02";
 const MAX_ENDPOINTS: usize = 1_000;
 
 #[derive(Clone, Copy, Debug)]
@@ -373,6 +373,7 @@ struct Owner {
     address: SocketAddr,
     invitation: Vec<u8>,
     checkpoint: Vec<u8>,
+    freshness: FreshnessAnchor,
     _records: TempDir,
 }
 
@@ -574,38 +575,23 @@ fn array32(value: &Value) -> Result<[u8; 32], String> {
         .map_err(|_| "expected 32 bytes".to_string())
 }
 
-fn array64(value: &Value) -> Result<[u8; 64], String> {
-    bytes(value)?
-        .try_into()
-        .map_err(|_| "expected 64 bytes".to_string())
-}
-
-fn packet(request: &[u8], name: &str, checkpoint: &[u8]) -> Vec<u8> {
-    let mut packet = b"DFJA\x02".to_vec();
+/// `DFJA\x03`; the checkpoint is not sent (B3a).
+fn packet(request: &[u8], name: &str, _checkpoint: &[u8]) -> Vec<u8> {
+    let mut packet = b"DFJA\x03".to_vec();
     packet.extend((request.len() as u32).to_be_bytes());
     packet.extend((name.len() as u16).to_be_bytes());
     packet.extend(request);
     packet.extend(name.as_bytes());
-    packet.extend(checkpoint);
     packet
 }
 
-fn history_packet(request: &[u8], checkpoint: &[u8], offset: u32) -> Vec<u8> {
+/// `DFJP\x02`; the checkpoint is not sent (B3a).
+fn history_packet(request: &[u8], _checkpoint: &[u8], offset: u32) -> Vec<u8> {
     let mut packet = HISTORY_PAGE_PACKET.to_vec();
     packet.extend((request.len() as u32).to_be_bytes());
-    packet.extend((checkpoint.len() as u32).to_be_bytes());
     packet.extend(offset.to_be_bytes());
     packet.extend(request);
-    packet.extend(checkpoint);
     packet
-}
-
-fn authorization(value: &Value) -> Result<AdmissionAuthorization, String> {
-    Ok(AdmissionAuthorization {
-        invitation_key: array32(&value["invitation_key"])?,
-        grant_signature: array64(&value["grant_signature"])?,
-        redemption_signature: array64(&value["redemption_signature"])?,
-    })
 }
 
 fn steps(value: &Value) -> Result<Vec<(MembershipAuthorization, Vec<u8>)>, String> {
@@ -614,20 +600,7 @@ fn steps(value: &Value) -> Result<Vec<(MembershipAuthorization, Vec<u8>)>, Strin
         .ok_or("admission reply has no commits".to_string())?
         .iter()
         .map(|step| {
-            let commit = bytes(&step["commit"])?;
-            let auth = if !step["authorization"].is_null() {
-                MembershipAuthorization::Admission(authorization(&step["authorization"])?)
-            } else {
-                MembershipAuthorization::AdmissionBatch(
-                    step["admission_batch"]
-                        .as_array()
-                        .ok_or("unsupported admission step".to_string())?
-                        .iter()
-                        .map(authorization)
-                        .collect::<Result<_, _>>()?,
-                )
-            };
-            Ok((auth, commit))
+            arachne_security::decode_membership_step(&bytes(&step["step"])?).map_err(str::to_owned)
         })
         .collect()
 }
@@ -666,12 +639,13 @@ async fn request_until_welcome(
 ) -> Result<Value, String> {
     loop {
         let reply = request_control(node, peer, payload, deadline).await?;
-        let value: Value = serde_json::from_slice(&reply).map_err(|e| {
-            format!(
-                "control reply JSON decode failed ({} bytes): {e}",
-                reply.len()
-            )
-        })?;
+        let value: Value =
+            arachne_runtime::harness::decode_admission_reply(&reply).map_err(|e| {
+                format!(
+                    "control reply JSON decode failed ({} bytes): {e}",
+                    reply.len()
+                )
+            })?;
         match value["state"].as_str() {
             Some("admission_queued") | Some("admission_waiting") => tokio::task::yield_now().await,
             Some("admission_replied") | None if value.get("welcome").is_some() => return Ok(value),
@@ -681,6 +655,8 @@ async fn request_until_welcome(
     }
 }
 
+// The qualification fixture keeps its transport, authority and timing inputs explicit.
+#[allow(clippy::too_many_arguments)]
 async fn full_join(
     node: Arc<Node>,
     owner: &OwnerData,
@@ -691,7 +667,7 @@ async fn full_join(
     started: Instant,
     deadline: Instant,
 ) -> Result<(u128, u128, u128, u128), String> {
-    let pending = PendingJoin::from_invitation(&invitation, &checkpoint, node.id(), &name)
+    let pending = PendingJoin::from_invitation(&invitation, &checkpoint, &*node, &name)
         .map_err(str::to_owned)?;
     full_join_with_pending(node, owner, pending, name, scenario, started, deadline).await
 }
@@ -738,7 +714,7 @@ async fn full_join_with_pending(
         )
         .await
         .map_err(|error| format!("history: {error}"))?;
-        page = serde_json::from_slice(&reply).map_err(|e| {
+        page = arachne_runtime::harness::decode_admission_reply(&reply).map_err(|e| {
             format!(
                 "history reply JSON decode failed ({} bytes): {e}",
                 reply.len()
@@ -866,12 +842,19 @@ async fn enable_gossip_profile(
             }
         }
         let node_policy = policy.clone();
+        let tag_key = match arachne_runtime::harness::gossip_tag_key(owner_handle) {
+            Ok(key) => key,
+            Err(error) => {
+                outcomes.fail(&format!("gossip key: {error}"));
+                return;
+            }
+        };
         let result = match remaining(deadline) {
             Ok(limit) => tokio::time::timeout(limit, async {
                 node.install_verified_policy(workspace, 1, node_policy)
                     .await
                     .map_err(|error| error.to_string())?;
-                node.enable_gossip(workspace, 1)
+                node.enable_gossip(workspace, 1, &tag_key)
                     .await
                     .map_err(|error| error.to_string())
             })
@@ -1035,22 +1018,22 @@ fn create_owner(
     let handle = create_endpoint_for_profile(profile, &secret, relay)?;
     let records = tempfile::tempdir().map_err(|e| e.to_string())?;
     let result = (|| {
+        attach_storage(handle, StorageConfig::sqlite(records.path(), secret))?;
         let created = call(
             handle,
             json!({"op":"create_workspace","display_name":"Qualification owner","workspace_name":"Rust qualification"}),
         )?;
         let workspace = array32(&created["workspace"])?;
-        enable_record_storage(handle, &records.path().join("owner.db"), &secret)?;
         let staged = call(
             handle,
             json!({"op":"stage_invitation","personal":false,"expires_at":0}),
         )?;
-        save_candidate(handle, &bytes(&staged["snapshot"])?)?;
         let invitation = call(
             handle,
-            json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+            json!({"op":"adopt_admission","candidate":staged["candidate"]}),
         )?["issued_invitation"]
             .clone();
+        let freshness = record_freshness(handle)?;
         let info: Value = serde_json::from_str(&describe(handle)?).map_err(|e| e.to_string())?;
         let peer = array32(&info["endpoint_key"])?;
         let port = info["bound_address"]
@@ -1068,6 +1051,7 @@ fn create_owner(
             address: ([127, 0, 0, 1], port).into(),
             invitation: bytes(&invitation["invitation"])?,
             checkpoint: bytes(&invitation["checkpoint"])?,
+            freshness,
             _records: records,
         })
     })();
@@ -1088,10 +1072,10 @@ fn restore_owner(
         workspace,
         invitation,
         checkpoint,
+        freshness,
         _records: records,
         ..
     } = owner;
-    let path = records.path().join("owner.db");
     // The partition phase closes the first endpoint before restoring its
     // records; a repeated close is expected here.
     let _ = arachne_runtime::close(handle);
@@ -1099,7 +1083,11 @@ fn restore_owner(
     secret[..8].copy_from_slice(&seed.to_be_bytes());
     let handle = create_endpoint_for_profile(profile, &secret, relay)?;
     let result = (|| {
-        restore_record_storage(handle, &path, &secret, workspace)?;
+        attach_storage(handle, StorageConfig::sqlite(records.path(), secret))?;
+        call(
+            handle,
+            json!({"op":"restore_workspace","workspace":workspace,"freshness":freshness.to_bytes().to_vec()}),
+        )?;
         let info: Value = serde_json::from_str(&describe(handle)?).map_err(|e| e.to_string())?;
         let peer = array32(&info["endpoint_key"])?;
         let port = info["bound_address"]
@@ -1117,6 +1105,7 @@ fn restore_owner(
             address: ([127, 0, 0, 1], port).into(),
             invitation,
             checkpoint,
+            freshness,
             _records: records,
         })
     })();
@@ -1141,6 +1130,8 @@ async fn bind_node(
     }
 }
 
+// The qualification fixture keeps its transport, authority and timing inputs explicit.
+#[allow(clippy::too_many_arguments)]
 async fn run_nodes(
     options: Options,
     owner: OwnerData,
@@ -1287,7 +1278,7 @@ async fn cancel_join(
     deadline: Instant,
 ) -> Result<(), String> {
     let invitation = Invitation::from_bytes(&invitation).map_err(str::to_owned)?;
-    let pending = PendingJoin::from_invitation(&invitation, &checkpoint, node.id(), "cancelled")
+    let pending = PendingJoin::from_invitation(&invitation, &checkpoint, &*node, "cancelled")
         .map_err(str::to_owned)?;
     let request = pending.admission_request().map_err(str::to_owned)?.to_vec();
     let payload = packet(&request, "cancelled", &checkpoint);
@@ -1401,7 +1392,7 @@ fn run_owner_loss(options: Options) -> Result<Value, String> {
         .map_err(|error| error.to_string())?;
         let node = Arc::new(node);
         let invitation = Invitation::from_bytes(&invitation).map_err(str::to_owned)?;
-        let pending = PendingJoin::from_invitation(&invitation, &checkpoint, node.id(), "loss")
+        let pending = PendingJoin::from_invitation(&invitation, &checkpoint, &*node, "loss")
             .map_err(str::to_owned)?;
         let request = pending.admission_request().map_err(str::to_owned)?.to_vec();
         let payload = packet(&request, "loss", &checkpoint);
@@ -1495,7 +1486,7 @@ fn run_refusal(options: Options) -> Result<Value, String> {
         .map_err(|error| error.to_string())?;
         let node = Arc::new(node);
         let invitation = Invitation::from_bytes(&invitation).map_err(str::to_owned)?;
-        let pending = PendingJoin::from_invitation(&invitation, &checkpoint, node.id(), "refusal")
+        let pending = PendingJoin::from_invitation(&invitation, &checkpoint, &*node, "refusal")
             .map_err(str::to_owned)?;
         let request = pending.admission_request().map_err(str::to_owned)?.to_vec();
         let payload = packet(&request, "refusal", &checkpoint);
@@ -1653,13 +1644,9 @@ fn run_restart(options: Options) -> Result<Value, String> {
         .map_err(|error| error.to_string())?;
         let initial = Arc::new(initial);
         let parsed_invitation = Invitation::from_bytes(&invitation).map_err(str::to_owned)?;
-        let pending = PendingJoin::from_invitation(
-            &parsed_invitation,
-            &checkpoint,
-            initial.id(),
-            "restarting",
-        )
-        .map_err(str::to_owned)?;
+        let pending =
+            PendingJoin::from_invitation(&parsed_invitation, &checkpoint, &*initial, "restarting")
+                .map_err(str::to_owned)?;
         let request = pending.admission_request().map_err(str::to_owned)?.to_vec();
         let payload = packet(&request, "restarting", &checkpoint);
         tokio::time::timeout(
@@ -1842,9 +1829,8 @@ fn run_partition(options: Options) -> Result<Value, String> {
         .map_err(|error| error.to_string())?;
         let node = Arc::new(node);
         let invitation = Invitation::from_bytes(&invitation).map_err(str::to_owned)?;
-        let pending =
-            PendingJoin::from_invitation(&invitation, &checkpoint, node.id(), "partition")
-                .map_err(str::to_owned)?;
+        let pending = PendingJoin::from_invitation(&invitation, &checkpoint, &*node, "partition")
+            .map_err(str::to_owned)?;
         let request = pending.admission_request().map_err(str::to_owned)?.to_vec();
         let payload = packet(&request, "partition", &checkpoint);
         tokio::time::timeout(
@@ -2023,7 +2009,7 @@ fn run_queue_pressure(options: Options) -> Result<Value, String> {
             let pending_join = PendingJoin::from_invitation(
                 &parsed_invitation,
                 &checkpoint,
-                node.id(),
+                &**node,
                 &format!("queue-pressure-{}", index + 1),
             )
             .map_err(str::to_owned)?;
@@ -2558,7 +2544,10 @@ mod tests {
             "\"invitation\"",
             "\"payload\"",
         ] {
-            assert!(!serialized.contains(forbidden), "receipt leaked {forbidden}");
+            assert!(
+                !serialized.contains(forbidden),
+                "receipt leaked {forbidden}"
+            );
         }
         assert!(compact["paths"]["by_route"].as_object().unwrap().len() <= 3);
     }

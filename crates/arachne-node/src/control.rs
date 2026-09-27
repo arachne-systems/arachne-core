@@ -1,10 +1,10 @@
 //! Bounded host-handled request/reply over authenticated Iroh transport.
 //! Transport identity is not workspace authorization; the host validates payloads.
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::oneshot;
 
-pub(super) const ALPN: &[u8] = b"data-fabric/control/1";
+pub(super) const ALPN: &[u8] = b"arachne/control/1";
 // Durable host control includes queueing and persistence; data/dial budgets stay short.
 pub(super) const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REQUEST: usize = 32 * 1024;
@@ -82,7 +82,18 @@ pub struct ControlRequest {
     timing: Arc<TimingCounters>,
     queued: std::time::Instant,
     taken: Option<std::time::Instant>,
+    /// Held while a stranger's request is queued or served.
+    _stranger: Option<StrangerSlot>,
 }
+
+/// One of the inbox places strangers may hold; returned on drop.
+struct StrangerSlot(Arc<AtomicUsize>);
+impl Drop for StrangerSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl ControlRequest {
     /// Observed path only. The caller must validate workspace authorization
     /// before retaining this as a dial hint.
@@ -131,6 +142,10 @@ pub(super) struct ControlInbox {
     signal: Arc<tokio::sync::Notify>,
     responder: Arc<std::sync::RwLock<Option<InquiryResponder>>>,
     timing: Arc<TimingCounters>,
+    /// Requests from strangers (no installed policy names them) queued now.
+    /// At most half the inbox, so joiners and probes never fill it for members.
+    strangers: Arc<AtomicUsize>,
+    stranger_limit: usize,
 }
 impl ControlInbox {
     pub(super) fn new(
@@ -148,6 +163,8 @@ impl ControlInbox {
                 signal: signal.clone(),
                 responder: Arc::default(),
                 timing: Arc::default(),
+                strangers: Arc::default(),
+                stranger_limit: (capacity / 2).max(1),
             },
             receiver,
             signal,
@@ -192,7 +209,15 @@ impl ControlInbox {
     }
     /// `notify_one` stores one permit when nobody waits. One permit is enough:
     /// the host drains until empty before it waits again.
-    fn offer(&self, request: ControlRequest) -> Result<()> {
+    fn offer(&self, mut request: ControlRequest, stranger: bool) -> Result<()> {
+        if stranger {
+            self.strangers
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                    (queued < self.stranger_limit).then_some(queued + 1)
+                })
+                .map_err(|_| Error::Backpressure)?;
+            request._stranger = Some(StrangerSlot(self.strangers.clone()));
+        }
         self.sender
             .try_send(request)
             .map_err(|_| Error::Backpressure)?;
@@ -244,6 +269,7 @@ pub(super) async fn receive(
     connection: &iroh::endpoint::Connection,
     inbox: &ControlInbox,
     remote_address: Option<SocketAddr>,
+    stranger: bool,
     (send, recv): (
         &mut iroh::endpoint::SendStream,
         &mut iroh::endpoint::RecvStream,
@@ -265,15 +291,19 @@ pub(super) async fn receive(
         tracing::info!(target: "data_fabric_transport", "CONTROL_INQUIRY_ANSWERED");
         bytes
     } else {
-        inbox.offer(ControlRequest {
-            peer,
-            remote_address,
-            payload,
-            reply,
-            timing: inbox.timing.clone(),
-            queued: std::time::Instant::now(),
-            taken: None,
-        })?;
+        inbox.offer(
+            ControlRequest {
+                peer,
+                remote_address,
+                payload,
+                reply,
+                timing: inbox.timing.clone(),
+                queued: std::time::Instant::now(),
+                taken: None,
+                _stranger: None,
+            },
+            stranger,
+        )?;
         tokio::select! {
             response = response => response.map_err(|_| Error::Rejected)?,
             _ = send.stopped() => return Err(Error::Rejected),
@@ -297,6 +327,10 @@ pub struct ControlClient {
 }
 
 impl ControlClient {
+    pub async fn add_address_hint(&self, peer: PeerId, address: SocketAddr) -> Result<()> {
+        self.connections.add_address_hint(peer, address).await
+    }
+
     pub fn request_control(
         self,
         peer: PeerId,
@@ -310,53 +344,55 @@ impl ControlClient {
                 return Err(Error::Cancelled);
             }
             tokio::select! {
-            _ = cancelled.changed() => Err(Error::Cancelled),
-            outcome = async {
-            let payload = payload.ok_or(Error::TooLarge)?;
-            let mut stage = "connect";
-            let mut observed = None;
-            let operation_timeout = connections.operation_timeout();
-            let outcome = tokio::time::timeout(CONTROL_TIMEOUT.max(operation_timeout), async {
-            let connection = tokio::time::timeout(operation_timeout, connections.connect(peer, ALPN))
-                .await.map_err(|_| Error::Timeout("control connect"))?
-                ?;
-            observed = Some(connection.clone());
-            settle_on_direct_path(&connection).await;
-            stage = "open stream";
-            tracing::info!(target: "data_fabric_transport", paths = ?connection.paths(), "CONTROL_CLIENT_CONNECTED");
-            let (mut send, mut recv) = connection.open_bi().await.map_err(transport)?;
-            stage = "write request";
-            send.write_all(&payload).await.map_err(transport)?;
-            send.finish().map_err(transport)?;
-            stage = "read response";
-            tracing::info!(target: "data_fabric_transport", bytes = payload.len(), "CONTROL_REQUEST_SENT");
-            let reply = recv.read_to_end(MAX_FRAME).await.map_err(transport)?;
-            tracing::info!(target: "data_fabric_transport", bytes = reply.len(), "CONTROL_REPLY_READ");
-            Ok(reply)
-        })
-        .await
-        .map_err(|_| Error::Timeout("control response")).and_then(|result| result);
-            tracing::info!(target: "data_fabric_transport", stage, success = outcome.is_ok(),
-                error = outcome.as_ref().err().map(ToString::to_string), "CONTROL_CLIENT_END");
-            if outcome.is_err()
-                && let Some(connection) = observed
-            {
-                tracing::info!(target: "data_fabric_transport", paths = ?connection.paths(), stats = ?connection.stats(), "CONTROL_CLIENT_FAILURE");
-            }
-            // Sent but no reply: do not reuse this connection for the retry.
-            if outcome.is_err() && matches!(stage, "read response" | "write request") {
-                connections.discard(peer, ALPN).await;
-            }
-            // No control bytes can have left before write_all is entered. Once
-            // writing starts, preserve uncertainty even for a partial write.
-            match outcome {
-                Err(_) if matches!(stage, "connect" | "open stream") => {
-                    Err(Error::ControlNotSent(stage))
+                _ = cancelled.changed() => Err(Error::Cancelled),
+                outcome = async {
+                let payload = payload.ok_or(Error::TooLarge)?;
+                let mut stage = "connect";
+                let mut observed = None;
+                let operation_timeout = connections.operation_timeout();
+                let outcome = tokio::time::timeout(CONTROL_TIMEOUT.max(operation_timeout), async {
+                let connection = tokio::time::timeout(operation_timeout, connections.connect(peer, ALPN))
+                    .await.map_err(|_| Error::Timeout("control connect"))?
+                    ?;
+                observed = Some(connection.clone());
+                settle_on_direct_path(&connection).await;
+                stage = "open stream";
+                tracing::info!(target: "data_fabric_transport", paths = ?connection.paths(), "CONTROL_CLIENT_CONNECTED");
+                let (mut send, mut recv) = connection.open_bi().await.map_err(transport)?;
+                stage = "write request";
+                send.write_all(&payload).await.map_err(transport)?;
+                send.finish().map_err(transport)?;
+                stage = "read response";
+                tracing::info!(target: "data_fabric_transport", bytes = payload.len(), "CONTROL_REQUEST_SENT");
+                let reply = recv.read_to_end(MAX_FRAME).await.map_err(transport)?;
+                tracing::info!(target: "data_fabric_transport", bytes = reply.len(), "CONTROL_REPLY_READ");
+                Ok(reply)
+            })
+            .await
+            .map_err(|_| Error::Timeout("control response")).and_then(|result| result);
+                tracing::info!(target: "data_fabric_transport", stage, success = outcome.is_ok(),
+                    error = outcome.as_ref().err().map(ToString::to_string), "CONTROL_CLIENT_END");
+                if outcome.is_err()
+                    && let Some(connection) = &observed
+                {
+                    tracing::info!(target: "data_fabric_transport", paths = ?connection.paths(), stats = ?connection.stats(), "CONTROL_CLIENT_FAILURE");
                 }
-                other => other,
-            }
-            } => outcome,
-            }
+                // Sent but no reply: do not reuse this connection for the retry.
+                if outcome.is_err() && matches!(stage, "read response" | "write request")
+                    && let Some(connection) = observed
+                {
+                    connections.discard(&connection).await;
+                }
+                // No control bytes can have left before write_all is entered. Once
+                // writing starts, preserve uncertainty even for a partial write.
+                match outcome {
+                    Err(_) if matches!(stage, "connect" | "open stream") => {
+                        Err(Error::ControlNotSent(stage))
+                    }
+                    other => other,
+                }
+                } => outcome,
+                }
         }
     }
 }
@@ -421,7 +457,7 @@ impl Node {
 
     /// Take the first matching request from up to `depth` newly queued ones
     /// plus those already set aside; the rest keep their order. For short
-    /// requests that must not wait behind a long queue (ADR 0009).
+    /// requests that must not wait behind a long queue.
     pub fn poll_control_first(
         &mut self,
         matches: impl Fn(&[u8]) -> bool,
@@ -461,4 +497,29 @@ impl Node {
     ) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send + 'static {
         self.control_client().request_control(peer, payload)
     }
+}
+
+#[test]
+fn strangers_hold_at_most_half_the_control_queue() {
+    let (inbox, mut queued, _) = ControlInbox::new(4);
+    let request = || ControlRequest {
+        peer: [1; 32],
+        remote_address: None,
+        payload: Vec::new(),
+        reply: oneshot::channel().0,
+        timing: inbox.timing.clone(),
+        queued: std::time::Instant::now(),
+        taken: None,
+        _stranger: None,
+    };
+    inbox.offer(request(), true).unwrap();
+    inbox.offer(request(), true).unwrap();
+    assert!(matches!(
+        inbox.offer(request(), true),
+        Err(Error::Backpressure)
+    ));
+    inbox.offer(request(), false).unwrap();
+    // A stranger's request that leaves the queue frees its place.
+    drop(queued.try_recv().unwrap());
+    inbox.offer(request(), true).unwrap();
 }

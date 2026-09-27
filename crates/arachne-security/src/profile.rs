@@ -102,8 +102,8 @@ impl Workspace {
 
 #[test]
 fn profiles_bind_names_to_current_workspace_members() {
-    let mut admin = Workspace::create([91; 32], "Alex Morgan").unwrap();
-    let outsider = Workspace::create([92; 32], "Alex Morgan").unwrap();
+    let mut admin = Workspace::create(crate::test_key(91), "Alex Morgan").unwrap();
+    let outsider = Workspace::create(crate::test_key(92), "Alex Morgan").unwrap();
     let signed = admin.sign_member_profile().unwrap();
     assert_eq!(
         admin.verify_member_profile(&signed).unwrap(),
@@ -118,15 +118,22 @@ fn profiles_bind_names_to_current_workspace_members() {
         bad[i] ^= 1;
         assert!(admin.verify_member_profile(&bad).is_err());
     }
-    let (invitation, checkpoint) = admin.issue_invitation().unwrap();
-    let pending =
-        super::PendingJoin::from_invitation(&invitation, &checkpoint, [93; 32], "Alex Morgan")
-            .unwrap();
+    let (registration, invitation, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    admin = registration.workspace;
+    let pending = super::PendingJoin::from_invitation(
+        &invitation,
+        &checkpoint,
+        crate::test_key(93),
+        "Alex Morgan",
+    )
+    .unwrap();
     let request = pending.admission_request().unwrap();
-    let prepared = admin.prepare_admission([93; 32], request).unwrap();
+    let prepared = admin
+        .prepare_admission(crate::test_endpoint(93), request)
+        .unwrap();
     admin = prepared.workspace;
     let reply = admin
-        .retained_admission([93; 32], request)
+        .retained_admission(crate::test_endpoint(93), request)
         .unwrap()
         .unwrap();
     let mut proof = pending.join_proof().unwrap();

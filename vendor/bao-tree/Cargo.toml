@@ -12,21 +12,25 @@
 [package]
 edition = "2021"
 rust-version = "1.75"
-name = "bao-tree"
-version = "0.16.1"
-authors = ["Rüdiger Klaehn <rklaehn@protonmail.com>"]
+name = "arachne-bao-tree"
+version = "0.16.1-arachne.1"
+authors = ["Arachne Systems", "Rüdiger Klaehn <rklaehn@protonmail.com>"]
 build = false
 autolib = false
 autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "BLAKE3 verfiied streaming with custom chunk groups and range set queries"
+description = "Arachne-maintained bao-tree fork (BLAKE3 verified streaming) with a reduced dependency set"
 readme = "README.md"
-keywords = ["hashing"]
+keywords = ["arachne", "hashing"]
 categories = ["data-structures"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/n0-computer/bao-tree"
+repository = "https://github.com/arachne-systems/arachne-core"
+homepage = "https://github.com/arachne-systems/arachne-core"
+documentation = "https://docs.rs/arachne-bao-tree"
+publish = ["crates-io"]
+exclude = ["Cargo.toml.orig"]
 
 [package.metadata.docs.rs]
 all-features = true

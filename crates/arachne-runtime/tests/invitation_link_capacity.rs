@@ -1,14 +1,14 @@
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use arachne_node::{ConnectionBudget, NetworkProfile, Node};
 use arachne_runtime::harness::{self, Query, StateBasis};
-use arachne_security::{AdmissionAuthorization, Invitation, MembershipAuthorization, PendingJoin};
+use arachne_security::{Invitation, MembershipAuthorization, PendingJoin};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     fs,
     net::SocketAddr,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -20,9 +20,7 @@ const PREFIX: &str = "arachne://join#";
 const INVITATION_SIZE: usize = 293;
 const COMPACT_SIZE: usize = 390;
 const BOOTSTRAP_PEERS: usize = 3;
-const CONTROL_PACKET: &[u8] = b"DFIC\x01";
-static TEST_LOCK: Mutex<()> = Mutex::new(());
-
+const CONTROL_PACKET: &[u8] = b"DFIC\x02";
 /// What a capacity run actually measured. `AdmissionOnly` is the legacy
 /// bug this harness had (issue #93): a joiner counted ready the instant it
 /// held a Welcome, with no `stage_join`, no adopted MLS state, no member
@@ -142,13 +140,14 @@ fn link(path: &str) -> Result<(Invitation, Vec<[u8; 32]>), String> {
     Ok((invitation, peers))
 }
 
-fn packet(request: &[u8], name: &str, checkpoint: &[u8]) -> Vec<u8> {
-    let mut packet = b"DFJA\x02".to_vec();
+/// `DFJA\x03`: the checkpoint is never sent; the responder resolves it from
+/// the digest the request's grant pins (B3a).
+fn packet(request: &[u8], name: &str, _checkpoint: &[u8]) -> Vec<u8> {
+    let mut packet = b"DFJA\x03".to_vec();
     packet.extend((request.len() as u32).to_be_bytes());
     packet.extend((name.len() as u16).to_be_bytes());
     packet.extend(request);
     packet.extend(name.as_bytes());
-    packet.extend(checkpoint);
     packet
 }
 
@@ -162,14 +161,43 @@ async fn fetch_checkpoint(
         let request = invitation
             .checkpoint_request(node.id(), *peer)
             .map_err(str::to_owned)?;
-        let mut payload = CONTROL_PACKET.to_vec();
-        payload.extend(request);
-        match node.request_control(*peer, &payload).await {
-            Ok(reply) => return Ok((reply, *peer)),
-            Err(error) => last = Some(error.to_string()),
+        match fetch_checkpoint_pages(node, *peer, &request).await {
+            Ok(checkpoint) => return Ok((checkpoint, *peer)),
+            Err(error) => last = Some(error),
         }
     }
     Err(last.unwrap_or_else(|| "no bootstrap peers".into()))
+}
+
+/// Mirrors the runtime's paged checkpoint fetch: `DFIC\x02 | u32 offset |
+/// proof`, answered by `DFCP\x01 | u32 total | u32 offset | chunk`.
+async fn fetch_checkpoint_pages(
+    node: &Node,
+    peer: [u8; 32],
+    proof: &[u8],
+) -> Result<Vec<u8>, String> {
+    let mut checkpoint = Vec::new();
+    loop {
+        let mut payload = CONTROL_PACKET.to_vec();
+        payload.extend((checkpoint.len() as u32).to_be_bytes());
+        payload.extend(proof);
+        let page = node
+            .request_control(peer, &payload)
+            .await
+            .map_err(|error| error.to_string())?;
+        if page.len() <= 13 || !page.starts_with(b"DFCP\x01") {
+            return Err("invalid invitation checkpoint page".into());
+        }
+        let total = u32::from_be_bytes(page[5..9].try_into().unwrap()) as usize;
+        let offset = u32::from_be_bytes(page[9..13].try_into().unwrap()) as usize;
+        if offset != checkpoint.len() || total > arachne_security::MAX_CHECKPOINT {
+            return Err("invitation checkpoint page mismatch".into());
+        }
+        checkpoint.extend(&page[13..]);
+        if checkpoint.len() >= total {
+            return Ok(checkpoint);
+        }
+    }
 }
 
 fn rss_bytes() -> u64 {
@@ -192,50 +220,22 @@ fn write_receipt(path: Option<&str>, value: &Value) {
     }
 }
 
-fn array32(value: &Value) -> Result<[u8; 32], String> {
-    let bytes: Vec<u8> = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
-    bytes.try_into().map_err(|_| "expected 32 bytes".to_string())
-}
+const ADMISSION_HISTORY_PAGE_REQUEST: &[u8; 5] = b"DFJP\x02";
 
-fn array64(value: &Value) -> Result<[u8; 64], String> {
-    let bytes: Vec<u8> = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
-    bytes.try_into().map_err(|_| "expected 64 bytes".to_string())
-}
-
-/// Build the typed admission authorization straight from the admission
-/// reply's `authorization` JSON object (`invitation_key`, `grant_signature`,
-/// `redemption_signature` -- exactly `AdmissionAuthorization`'s public
-/// fields, see `arachne_runtime::lib::RetainedAdmission`'s reply at
-/// lib.rs:1191-1193). No arachne-runtime seam needed for this leg.
-fn build_authorization(value: &Value) -> Result<AdmissionAuthorization, String> {
-    Ok(AdmissionAuthorization {
-        invitation_key: array32(&value["invitation_key"])?,
-        grant_signature: array64(&value["grant_signature"])?,
-        redemption_signature: array64(&value["redemption_signature"])?,
-    })
-}
-
-const ADMISSION_HISTORY_PAGE_REQUEST: &[u8; 5] = b"DFJP\x01";
-
-/// Mirrors `arachne_runtime::admission_history_page_packet` (lib.rs:1258),
-/// a stable, already-shipped wire request any authenticated peer may send:
-/// `"DFJP\x01" ++ request_len(u32 BE) ++ checkpoint_len(u32 BE) ++
-/// offset(u32 BE) ++ request ++ checkpoint`.
-fn history_page_packet(request: &[u8], checkpoint: &[u8], offset: u32) -> Vec<u8> {
+/// Mirrors `arachne_runtime::admission_history_page_packet`, a wire request
+/// any authenticated peer may send: `"DFJP\x02" ++ request_len(u32 BE) ++
+/// offset(u32 BE) ++ request`. No checkpoint (B3a).
+fn history_page_packet(request: &[u8], _checkpoint: &[u8], offset: u32) -> Vec<u8> {
     let mut packet = ADMISSION_HISTORY_PAGE_REQUEST.to_vec();
     packet.extend((request.len() as u32).to_be_bytes());
-    packet.extend((checkpoint.len() as u32).to_be_bytes());
     packet.extend(offset.to_be_bytes());
     packet.extend(request);
-    packet.extend(checkpoint);
     packet
 }
 
 /// Parse one reply/page's `commits` array into typed (authorization, commit)
-/// steps, matching `arachne_runtime::membership::JoinStep::authorization`
-/// (each step carries exactly one of `authorization` (single Admission) or
-/// `admission_batch` (AdmissionBatch) -- Management steps are not produced
-/// for an open invitation and are treated as an unsupported step here).
+/// steps. Each step carries the binary step codec in `step`, as
+/// `arachne_runtime::membership::JoinStep` reads it.
 fn parse_join_steps(value: &Value) -> Result<Vec<(MembershipAuthorization, Vec<u8>)>, String> {
     let commits = value
         .get("commits")
@@ -245,21 +245,9 @@ fn parse_join_steps(value: &Value) -> Result<Vec<(MembershipAuthorization, Vec<u
     commits
         .iter()
         .map(|step| {
-            let commit: Vec<u8> =
-                serde_json::from_value(step["commit"].clone()).map_err(|e| e.to_string())?;
-            let authorization = if !step["authorization"].is_null() {
-                MembershipAuthorization::Admission(build_authorization(&step["authorization"])?)
-            } else if let Some(batch) = step.get("admission_batch").and_then(Value::as_array) {
-                MembershipAuthorization::AdmissionBatch(
-                    batch
-                        .iter()
-                        .map(build_authorization)
-                        .collect::<Result<_, String>>()?,
-                )
-            } else {
-                return Err("join step is not an admission or admission batch".into());
-            };
-            Ok((authorization, commit))
+            let bytes: Vec<u8> =
+                serde_json::from_value(step["step"].clone()).map_err(|e| e.to_string())?;
+            arachne_security::decode_membership_step(&bytes).map_err(str::to_owned)
         })
         .collect()
 }
@@ -295,8 +283,8 @@ async fn collect_join_steps(
             .request_control(peer, &page_packet)
             .await
             .map_err(|error| error.to_string())?;
-        let page: Value =
-            serde_json::from_slice(&page_bytes).map_err(|error| error.to_string())?;
+        let page: Value = arachne_runtime::harness::decode_admission_reply(&page_bytes)
+            .map_err(|error| error.to_string())?;
         if page["state"] != "admission_replied" || page.get("history_page").is_none() {
             return Err("admission history page was not accepted".into());
         }
@@ -376,7 +364,7 @@ async fn full_onboard(
     // in-memory equivalent of the runtime's adopt_join op; genuine
     // disk-durable adoption is proven separately at small scale in
     // `local_full_onboarding_state_machine_rejects_a_corrupted_joiner`
-    // via enable_record_storage + save_candidate + execute_stored.
+    // via attached record storage and adopt_admission (save, read back, adopt).
     let self_id = match workspace.member() {
         Some(member) => member.id(),
         None => {
@@ -453,7 +441,6 @@ async fn full_onboard(
 #[test]
 #[ignore = "requires a real ATAK-issued link and an active ATAK owner"]
 fn one_atak_invitation_link_handles_500_synthetic_joiners() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let link_path = std::env::var("ARACHNE_INVITATION_LINK_FILE")
         .expect("set ARACHNE_INVITATION_LINK_FILE to a private link file");
     let receipt_path = std::env::var("ARACHNE_CAPACITY_RECEIPT").ok();
@@ -509,102 +496,153 @@ fn one_atak_invitation_link_handles_500_synthetic_joiners() {
 
     let invitation_bytes = invitation.export_secret_token().to_vec();
     let peers_for_thread = peers.clone();
-    let client_thread = thread::spawn(
-        move || -> Result<CapacityOutcome, String> {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(8)
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())?;
-            runtime.block_on(async move {
-                let invitation =
-                    Invitation::from_bytes(&invitation_bytes).map_err(str::to_owned)?;
-                // Fetch the authenticated checkpoint before opening the burst
-                // of independent WAN endpoints. The checkpoint is shared
-                // bootstrap state, not joiner-specific work.
-                let mut bootstrap_seed = [0; 32];
-                bootstrap_seed[..8]
-                    .copy_from_slice(&(identity_offset + 0xA600_0000).to_be_bytes());
-                let (bootstrap, _receiver) = Node::bind_with_profile(
-                    ([0, 0, 0, 0], 0).into(),
-                    Some(&bootstrap_seed),
-                    NetworkProfile::Wan,
-                    ConnectionBudget::default(),
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-                let (checkpoint, selected_peer) =
-                    fetch_checkpoint(&bootstrap, &invitation, &peers_for_thread).await?;
-                invitation.join_proof(&checkpoint).map_err(str::to_owned)?;
-                bootstrap.close().await;
-                let mut binds = JoinSet::new();
-                for index in 0..members {
-                    binds.spawn(async move {
-                        let mut seed = [0; 32];
-                        seed[..8].copy_from_slice(
-                            &(index as u64 + identity_offset + 0xA700_0000).to_be_bytes(),
-                        );
-                        Node::bind_with_profile(
-                            ([0, 0, 0, 0], 0).into(),
-                            Some(&seed),
-                            NetworkProfile::Wan,
-                            ConnectionBudget::default(),
-                        )
-                        .await
-                        .map(|(node, _receiver)| Arc::new(node))
-                        .map_err(|error| error.to_string())
-                    });
-                }
-                let mut nodes = Vec::with_capacity(members);
-                while let Some(result) = binds.join_next().await {
-                    nodes.push(result.map_err(|error| error.to_string())??);
-                }
-                if let Some(address) = owner_address {
-                    for node in &nodes {
-                        node.add_address_hint(peers_for_thread[0], address)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                    }
-                }
-                let mut packets = Vec::with_capacity(members);
-                let mut pendings: Vec<Option<PendingJoin>> = Vec::with_capacity(members);
-                for (index, node) in nodes.iter().enumerate() {
-                    let display_name = format!("ramp-{}", identity_offset + index as u64);
-                    let pending = PendingJoin::from_invitation(
-                        &invitation,
-                        &checkpoint,
-                        node.id(),
-                        &display_name,
+    let client_thread = thread::spawn(move || -> Result<CapacityOutcome, String> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(8)
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        runtime.block_on(async move {
+            let invitation = Invitation::from_bytes(&invitation_bytes).map_err(str::to_owned)?;
+            // Fetch the authenticated checkpoint before opening the burst
+            // of independent WAN endpoints. The checkpoint is shared
+            // bootstrap state, not joiner-specific work.
+            let mut bootstrap_seed = [0; 32];
+            bootstrap_seed[..8].copy_from_slice(&(identity_offset + 0xA600_0000).to_be_bytes());
+            let (bootstrap, _receiver) = Node::bind_with_profile(
+                ([0, 0, 0, 0], 0).into(),
+                Some(&bootstrap_seed),
+                NetworkProfile::Wan,
+                ConnectionBudget::default(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            let (checkpoint, selected_peer) =
+                fetch_checkpoint(&bootstrap, &invitation, &peers_for_thread).await?;
+            invitation.join_proof(&checkpoint).map_err(str::to_owned)?;
+            bootstrap.close().await;
+            let mut binds = JoinSet::new();
+            for index in 0..members {
+                binds.spawn(async move {
+                    let mut seed = [0; 32];
+                    seed[..8].copy_from_slice(
+                        &(index as u64 + identity_offset + 0xA700_0000).to_be_bytes(),
+                    );
+                    Node::bind_with_profile(
+                        ([0, 0, 0, 0], 0).into(),
+                        Some(&seed),
+                        NetworkProfile::Wan,
+                        ConnectionBudget::default(),
                     )
-                    .map_err(str::to_owned)?;
-                    let request = pending.admission_request().map_err(str::to_owned)?;
-                    packets.push(packet(request, &display_name, &checkpoint));
-                    pendings.push(Some(pending));
+                    .await
+                    .map(|(node, _receiver)| Arc::new(node))
+                    .map_err(|error| error.to_string())
+                });
+            }
+            let mut nodes = Vec::with_capacity(members);
+            while let Some(result) = binds.join_next().await {
+                nodes.push(result.map_err(|error| error.to_string())??);
+            }
+            if let Some(address) = owner_address {
+                for node in &nodes {
+                    node.add_address_hint(peers_for_thread[0], address)
+                        .await
+                        .map_err(|error| error.to_string())?;
                 }
+            }
+            let mut packets = Vec::with_capacity(members);
+            let mut pendings: Vec<Option<PendingJoin>> = Vec::with_capacity(members);
+            for (index, node) in nodes.iter().enumerate() {
+                let display_name = format!("ramp-{}", identity_offset + index as u64);
+                let pending =
+                    PendingJoin::from_invitation(&invitation, &checkpoint, &**node, &display_name)
+                        .map_err(str::to_owned)?;
+                let request = pending.admission_request().map_err(str::to_owned)?;
+                packets.push(packet(request, &display_name, &checkpoint));
+                pendings.push(Some(pending));
+            }
 
-                let mut requests = JoinSet::new();
-                for (index, (node, payload)) in nodes.iter().zip(&packets).enumerate() {
-                    let node = Arc::clone(node);
-                    let payload = payload.clone();
-                    requests.spawn(async move {
+            let mut requests = JoinSet::new();
+            for (index, (node, payload)) in nodes.iter().zip(&packets).enumerate() {
+                let node = Arc::clone(node);
+                let payload = payload.clone();
+                requests.spawn(async move {
+                    (index, node.request_control(selected_peer, &payload).await)
+                });
+            }
+            let mut pending_indices = Vec::new();
+            let mut ready_elapsed_ms = Vec::new();
+            let mut terminal_failure_elapsed_ms = Vec::new();
+            let mut resolved_terminal_failure = 0;
+            let mut retries = 0;
+            let mut ever_queued: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            let mut terminal_states = BTreeMap::new();
+            let mut welcomed: BTreeMap<usize, (Vec<u8>, Value)> = BTreeMap::new();
+            while let Some(result) = requests.join_next().await {
+                let (index, result) = result.map_err(|error| error.to_string())?;
+                match result {
+                    Ok(reply) => {
+                        let value: Value = arachne_runtime::harness::decode_admission_reply(&reply)
+                            .map_err(|e| e.to_string())?;
+                        if let Some(welcome) = value.get("welcome") {
+                            ready_elapsed_ms.push(started.elapsed().as_millis());
+                            welcomed.insert(
+                                index,
+                                (
+                                    serde_json::from_value(welcome.clone())
+                                        .map_err(|e| e.to_string())?,
+                                    value.clone(),
+                                ),
+                            );
+                        } else if value["state"] == "admission_queued" {
+                            ever_queued.insert(index);
+                            pending_indices.push(index);
+                        } else {
+                            resolved_terminal_failure += 1;
+                            terminal_failure_elapsed_ms.push(started.elapsed().as_millis());
+                            let key = format!(
+                                "{}:{}",
+                                value["state"].as_str().unwrap_or("unknown"),
+                                value["reason"].as_str().unwrap_or("")
+                            );
+                            *terminal_states.entry(key).or_insert(0) += 1;
+                        }
+                    }
+                    Err(_) => pending_indices.push(index),
+                }
+            }
+            let initial_batch_elapsed_ms = started.elapsed().as_millis();
+            // NOTE: this deadline bounds only the retry loop below. It is
+            // measured from the moment the initial request batch
+            // finished (initial_batch_elapsed_ms), not from test start,
+            // and the loop only checks it between retry rounds -- an
+            // in-flight round can finish after the deadline passes. The
+            // receipt records initial_batch_elapsed_ms, retry_loop_end_ms
+            // and elapsed_ms (final) so a reader can compute the true
+            // measured interval instead of trusting deadline_seconds as
+            // an enforced wall-clock bound.
+            let deadline = Instant::now() + Duration::from_secs(deadline_seconds);
+            while welcomed.len() < members && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let round = std::mem::take(&mut pending_indices);
+                let mut retry = JoinSet::new();
+                for index in round {
+                    let node = Arc::clone(&nodes[index]);
+                    let payload = packets[index].clone();
+                    retry.spawn(async move {
                         (index, node.request_control(selected_peer, &payload).await)
                     });
                 }
-                let mut pending_indices = Vec::new();
-                let mut ready_elapsed_ms = Vec::new();
-                let mut terminal_failure_elapsed_ms = Vec::new();
-                let mut resolved_terminal_failure = 0;
-                let mut retries = 0;
-                let mut ever_queued: std::collections::HashSet<usize> =
-                    std::collections::HashSet::new();
-                let mut terminal_states = BTreeMap::new();
-                let mut welcomed: BTreeMap<usize, (Vec<u8>, Value)> = BTreeMap::new();
-                while let Some(result) = requests.join_next().await {
+                let mut next = Vec::new();
+                while let Some(result) = retry.join_next().await {
                     let (index, result) = result.map_err(|error| error.to_string())?;
+                    retries += 1;
                     match result {
                         Ok(reply) => {
                             let value: Value =
-                                serde_json::from_slice(&reply).map_err(|e| e.to_string())?;
+                                arachne_runtime::harness::decode_admission_reply(&reply)
+                                    .map_err(|e| e.to_string())?;
                             if let Some(welcome) = value.get("welcome") {
                                 ready_elapsed_ms.push(started.elapsed().as_millis());
                                 welcomed.insert(
@@ -617,7 +655,7 @@ fn one_atak_invitation_link_handles_500_synthetic_joiners() {
                                 );
                             } else if value["state"] == "admission_queued" {
                                 ever_queued.insert(index);
-                                pending_indices.push(index);
+                                next.push(index);
                             } else {
                                 resolved_terminal_failure += 1;
                                 terminal_failure_elapsed_ms.push(started.elapsed().as_millis());
@@ -629,148 +667,90 @@ fn one_atak_invitation_link_handles_500_synthetic_joiners() {
                                 *terminal_states.entry(key).or_insert(0) += 1;
                             }
                         }
-                        Err(_) => pending_indices.push(index),
+                        Err(_) => next.push(index),
                     }
                 }
-                let initial_batch_elapsed_ms = started.elapsed().as_millis();
-                // NOTE: this deadline bounds only the retry loop below. It is
-                // measured from the moment the initial request batch
-                // finished (initial_batch_elapsed_ms), not from test start,
-                // and the loop only checks it between retry rounds -- an
-                // in-flight round can finish after the deadline passes. The
-                // receipt records initial_batch_elapsed_ms, retry_loop_end_ms
-                // and elapsed_ms (final) so a reader can compute the true
-                // measured interval instead of trusting deadline_seconds as
-                // an enforced wall-clock bound.
-                let deadline = Instant::now() + Duration::from_secs(deadline_seconds);
-                while welcomed.len() < members && Instant::now() < deadline {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    let round = std::mem::take(&mut pending_indices);
-                    let mut retry = JoinSet::new();
-                    for index in round {
-                        let node = Arc::clone(&nodes[index]);
-                        let payload = packets[index].clone();
-                        retry.spawn(async move {
-                            (index, node.request_control(selected_peer, &payload).await)
-                        });
-                    }
-                    let mut next = Vec::new();
-                    while let Some(result) = retry.join_next().await {
-                        let (index, result) = result.map_err(|error| error.to_string())?;
-                        retries += 1;
-                        match result {
-                            Ok(reply) => {
-                                let value: Value =
-                                    serde_json::from_slice(&reply).map_err(|e| e.to_string())?;
-                                if let Some(welcome) = value.get("welcome") {
-                                    ready_elapsed_ms.push(started.elapsed().as_millis());
-                                    welcomed.insert(
-                                        index,
-                                        (
-                                            serde_json::from_value(welcome.clone())
-                                                .map_err(|e| e.to_string())?,
-                                            value.clone(),
-                                        ),
-                                    );
-                                } else if value["state"] == "admission_queued" {
-                                    ever_queued.insert(index);
-                                    next.push(index);
-                                } else {
-                                    resolved_terminal_failure += 1;
-                                    terminal_failure_elapsed_ms.push(started.elapsed().as_millis());
-                                    let key = format!(
-                                        "{}:{}",
-                                        value["state"].as_str().unwrap_or("unknown"),
-                                        value["reason"].as_str().unwrap_or("")
-                                    );
-                                    *terminal_states.entry(key).or_insert(0) += 1;
-                                }
-                            }
-                            Err(_) => next.push(index),
-                        }
-                    }
-                    pending_indices = next;
-                }
-                let retry_loop_end_ms = started.elapsed().as_millis();
-                // Every remaining index falls into exactly one disjoint
-                // bucket: it was queued by the owner at least once, or it
-                // never received any explicit reply at all (every attempt
-                // was a transport-level error/timeout).
-                let unresolved_ever_queued = pending_indices
-                    .iter()
-                    .filter(|index| ever_queued.contains(index))
-                    .count();
-                let unresolved_never_replied = pending_indices.len() - unresolved_ever_queued;
+                pending_indices = next;
+            }
+            let retry_loop_end_ms = started.elapsed().as_millis();
+            // Every remaining index falls into exactly one disjoint
+            // bucket: it was queued by the owner at least once, or it
+            // never received any explicit reply at all (every attempt
+            // was a transport-level error/timeout).
+            let unresolved_ever_queued = pending_indices
+                .iter()
+                .filter(|index| ever_queued.contains(index))
+                .count();
+            let unresolved_never_replied = pending_indices.len() - unresolved_ever_queued;
 
-                let full_onboarding = if matches!(process_depth, ProcessDepth::FullOnboarding) {
-                    let mut tasks = JoinSet::new();
-                    for (index, (welcome, first_reply)) in welcomed.clone() {
-                        let node = Arc::clone(&nodes[index]);
-                        let pending = pendings[index].take().unwrap();
-                        let checkpoint = checkpoint.clone();
-                        let display_name = format!("ramp-{}", identity_offset + index as u64);
-                        tasks.spawn(async move {
-                            full_onboard(
-                                node,
-                                pending,
-                                selected_peer,
-                                checkpoint,
-                                welcome,
-                                first_reply,
-                                display_name,
-                                started,
-                            )
-                            .await
-                        });
-                    }
-                    let mut outcome = FullOnboardingOutcome {
-                        welcomed: welcomed.len(),
-                        ..Default::default()
-                    };
-                    while let Some(record) = tasks.join_next().await {
-                        let record = record.map_err(|error| error.to_string())?;
-                        if record.ready {
-                            outcome.ready += 1;
-                            outcome.stage_joined_ms.push(record.stage_joined_ms);
-                            outcome.adopted_ms.push(record.adopted_ms);
-                            outcome.profiled_ms.push(record.profiled_ms);
-                            outcome.presence_ms.push(record.presence_ms);
-                        } else if let Some(phase) = record.failed_phase {
-                            *outcome.failed_by_phase.entry(phase).or_insert(0) += 1;
-                        }
-                    }
-                    Some(outcome)
-                } else {
-                    None
+            let full_onboarding = if matches!(process_depth, ProcessDepth::FullOnboarding) {
+                let mut tasks = JoinSet::new();
+                for (index, (welcome, first_reply)) in welcomed.clone() {
+                    let node = Arc::clone(&nodes[index]);
+                    let pending = pendings[index].take().unwrap();
+                    let checkpoint = checkpoint.clone();
+                    let display_name = format!("ramp-{}", identity_offset + index as u64);
+                    tasks.spawn(async move {
+                        full_onboard(
+                            node,
+                            pending,
+                            selected_peer,
+                            checkpoint,
+                            welcome,
+                            first_reply,
+                            display_name,
+                            started,
+                        )
+                        .await
+                    });
+                }
+                let mut outcome = FullOnboardingOutcome {
+                    welcomed: welcomed.len(),
+                    ..Default::default()
                 };
-
-                let teardown_started = Instant::now();
-                for node in nodes {
-                    Arc::try_unwrap(node).ok().unwrap().close().await;
+                while let Some(record) = tasks.join_next().await {
+                    let record = record.map_err(|error| error.to_string())?;
+                    if record.ready {
+                        outcome.ready += 1;
+                        outcome.stage_joined_ms.push(record.stage_joined_ms);
+                        outcome.adopted_ms.push(record.adopted_ms);
+                        outcome.profiled_ms.push(record.profiled_ms);
+                        outcome.presence_ms.push(record.presence_ms);
+                    } else if let Some(phase) = record.failed_phase {
+                        *outcome.failed_by_phase.entry(phase).or_insert(0) += 1;
+                    }
                 }
-                let teardown_ms = teardown_started.elapsed().as_millis();
+                Some(outcome)
+            } else {
+                None
+            };
 
-                let resolved_ready = match &full_onboarding {
-                    Some(outcome) => outcome.ready,
-                    None => welcomed.len(),
-                };
-                Ok(CapacityOutcome {
-                    resolved_ready,
-                    resolved_terminal_failure,
-                    unresolved_ever_queued,
-                    unresolved_never_replied,
-                    transport_retries: retries,
-                    terminal_states,
-                    ready_elapsed_ms,
-                    terminal_failure_elapsed_ms,
-                    initial_batch_elapsed_ms,
-                    retry_loop_end_ms,
-                    teardown_ms,
-                    full_onboarding,
-                })
+            let teardown_started = Instant::now();
+            for node in nodes {
+                Arc::try_unwrap(node).ok().unwrap().close().await;
+            }
+            let teardown_ms = teardown_started.elapsed().as_millis();
+
+            let resolved_ready = match &full_onboarding {
+                Some(outcome) => outcome.ready,
+                None => welcomed.len(),
+            };
+            Ok(CapacityOutcome {
+                resolved_ready,
+                resolved_terminal_failure,
+                unresolved_ever_queued,
+                unresolved_never_replied,
+                transport_retries: retries,
+                terminal_states,
+                ready_elapsed_ms,
+                terminal_failure_elapsed_ms,
+                initial_batch_elapsed_ms,
+                retry_loop_end_ms,
+                teardown_ms,
+                full_onboarding,
             })
-        },
-    );
+        })
+    });
 
     let result = client_thread.join().unwrap().unwrap();
     let elapsed_ms = started.elapsed().as_millis();
@@ -831,7 +811,8 @@ fn one_atak_invitation_link_handles_500_synthetic_joiners() {
     );
     write_receipt(receipt_path.as_deref(), &receipt);
     assert_eq!(
-        result.resolved_ready, members,
+        result.resolved_ready,
+        members,
         "not every synthetic joiner reached ready ({})",
         process_depth.label()
     );
@@ -892,25 +873,37 @@ fn endpoint(value: &Value) -> [u8; 32] {
 
 #[test]
 fn local_full_onboarding_state_machine_rejects_a_corrupted_joiner() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     const GOOD_JOINERS: usize = 5;
     const OFFSET: u64 = 90_000;
     let started = Instant::now();
 
     let owner = arachne_runtime::create(Some(&[211; 32])).unwrap();
+    arachne_runtime::attach_storage(
+        owner,
+        arachne_runtime::StorageConfig::memory(&arachne_runtime::MemoryProvider::default()),
+    )
+    .unwrap();
     call(
         owner,
         json!({"op":"create_workspace","display_name":"Ramp Owner"}),
     )
     .unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    arachne_runtime::enable_record_storage(owner, &dir.path().join("owner.db"), &[211; 32])
-        .unwrap();
-    let invite = call(owner, json!({"op":"issue_invitation"})).unwrap();
+    let staged = call(
+        owner,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    )
+    .unwrap();
+    let invite = call(
+        owner,
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+    )
+    .unwrap()["issued_invitation"]
+        .clone();
     let invitation_bytes = bytes(&invite["invitation"]);
     let checkpoint = bytes(&invite["checkpoint"]);
     let owner_peer = endpoint(&invite["peer"]);
-    let owner_info: Value = serde_json::from_str(&arachne_runtime::describe(owner).unwrap()).unwrap();
+    let owner_info: Value =
+        serde_json::from_str(&arachne_runtime::describe(owner).unwrap()).unwrap();
     let owner_port = owner_info["bound_address"]
         .as_str()
         .unwrap()
@@ -932,12 +925,9 @@ fn local_full_onboarding_state_machine_rejects_a_corrupted_joiner() {
             if let Ok(value) = call(owner, json!({"op":"poll_admission"}))
                 && value["state"] == "awaiting_save"
             {
-                let snapshot = bytes(&value["snapshot"]);
-                arachne_runtime::save_candidate(owner, &snapshot).unwrap();
-                arachne_runtime::execute_stored(
+                call(
                     owner,
-                    br#"{"op":"adopt_admission"}"#,
-                    &snapshot,
+                    json!({"op":"adopt_admission","candidate":value["candidate"]}),
                 )
                 .unwrap();
             }
@@ -959,10 +949,9 @@ fn local_full_onboarding_state_machine_rejects_a_corrupted_joiner() {
         for index in 0..total {
             let mut seed = [0; 32];
             seed[..8].copy_from_slice(&(index as u64 + 5000).to_be_bytes());
-            let (node, _receiver) =
-                Node::bind_with_identity("127.0.0.1:0".parse().unwrap(), &seed)
-                    .await
-                    .unwrap();
+            let (node, _receiver) = Node::bind_with_identity("127.0.0.1:0".parse().unwrap(), &seed)
+                .await
+                .unwrap();
             let node = Arc::new(node);
             node.add_address_hint(owner_peer, owner_address)
                 .await
@@ -974,13 +963,9 @@ fn local_full_onboarding_state_machine_rejects_a_corrupted_joiner() {
         let mut packets = Vec::with_capacity(total);
         for (index, node) in nodes.iter().enumerate() {
             let display_name = format!("ramp-{}", OFFSET + index as u64);
-            let pending = PendingJoin::from_invitation(
-                &invitation,
-                &checkpoint,
-                node.id(),
-                &display_name,
-            )
-            .unwrap();
+            let pending =
+                PendingJoin::from_invitation(&invitation, &checkpoint, &**node, &display_name)
+                    .unwrap();
             let request = pending.admission_request().unwrap();
             packets.push(packet(request, &display_name, &checkpoint));
             pendings.push(pending);
@@ -995,7 +980,8 @@ fn local_full_onboarding_state_machine_rejects_a_corrupted_joiner() {
                 let deadline = Instant::now() + Duration::from_secs(20);
                 let mut reply = loop {
                     let reply = node.request_control(owner_peer, &packet).await.unwrap();
-                    let value: Value = serde_json::from_slice(&reply).unwrap();
+                    let value: Value =
+                        arachne_runtime::harness::decode_admission_reply(&reply).unwrap();
                     if value.get("welcome").is_some() {
                         break value;
                     }
@@ -1013,15 +999,19 @@ fn local_full_onboarding_state_machine_rejects_a_corrupted_joiner() {
                     // be counted ready.
                     let commits = reply["commits"].as_array_mut().unwrap();
                     let last = commits.last_mut().unwrap();
-                    let signature = if !last["authorization"].is_null() {
-                        &mut last["authorization"]["grant_signature"]
-                    } else {
-                        let batch = last["admission_batch"].as_array_mut().unwrap();
-                        &mut batch.last_mut().unwrap()["grant_signature"]
-                    };
-                    let mut byte = signature[0].as_u64().unwrap();
-                    byte ^= 1;
-                    signature[0] = json!(byte);
+                    let bytes: Vec<u8> = serde_json::from_value(last["step"].clone()).unwrap();
+                    let (mut authorization, commit) =
+                        arachne_security::decode_membership_step(&bytes).unwrap();
+                    match &mut authorization {
+                        MembershipAuthorization::Admission(auth) => auth.grant_signature[0] ^= 1,
+                        MembershipAuthorization::AdmissionBatch(auths) => {
+                            auths.last_mut().unwrap().grant_signature[0] ^= 1
+                        }
+                        _ => panic!("join step is not an admission"),
+                    }
+                    last["step"] = json!(
+                        arachne_security::encode_membership_step(&authorization, &commit).unwrap()
+                    );
                 }
                 let record = full_onboard(
                     node,
@@ -1062,7 +1052,10 @@ fn local_full_onboarding_state_machine_rejects_a_corrupted_joiner() {
     );
     for (index, (_, record)) in records.iter().enumerate().take(GOOD_JOINERS) {
         assert!(record.ready, "joiner {index} should have reached ready");
-        assert_eq!(record.display_name, format!("ramp-{}", OFFSET + index as u64));
+        assert_eq!(
+            record.display_name,
+            format!("ramp-{}", OFFSET + index as u64)
+        );
     }
 
     // RED: the corrupted joiner failed at stage_join specifically, and is

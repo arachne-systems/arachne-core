@@ -11,13 +11,17 @@ use std::{
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut publisher = Client::open(ClientConfig {
+    let publisher = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([41; 32]),
+        secret: Some(([41; 32]).to_vec()),
+        transport: Default::default(),
+        storage: None,
     })?;
-    let mut subscriber = Client::open(ClientConfig {
+    let subscriber = Client::open(ClientConfig {
         network: Network::Direct,
-        secret: Some([42; 32]),
+        secret: Some(([42; 32]).to_vec()),
+        transport: Default::default(),
+        storage: None,
     })?;
 
     let publisher_endpoint = publisher.endpoint()?;
@@ -49,9 +53,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             .bound_address
             .replace("0.0.0.0:", "127.0.0.1:"),
     )?;
-    publisher.install_policy(workspace, 1, &policy)?;
-    subscriber.install_policy(workspace, 1, &policy)?;
-    subscriber.set_interest(workspace, 1, topic, true)?;
+    publisher.install_policy((workspace).into(), 1, &policy)?;
+    subscriber.install_policy((workspace).into(), 1, &policy)?;
+    subscriber.set_interest((workspace).into(), 1, topic, true)?;
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -68,12 +72,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let payload = vec![0, 1, 2, 255];
-    let report = publisher.publish(workspace, 1, topic, payload.clone())?;
+    let report = publisher.publish((workspace).into(), 1, topic, payload.clone())?;
     assert_eq!(report.admitted, vec![subscriber_endpoint.endpoint_key]);
 
     loop {
         if let Some(publication) = subscriber.poll()? {
-            assert_eq!(publication.workspace, workspace);
+            assert_eq!(publication.workspace, (workspace).into());
             assert_eq!(publication.topic, topic);
             assert_eq!(publication.payload, payload);
             break;

@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.91"
 name = "arachne-iroh-blobs"
-version = "0.103.0"
+version = "0.103.0-arachne.1"
 authors = [
     "Arachne Systems",
     "dignifiedquire <me@dignifiedquire.com>",
@@ -133,8 +133,12 @@ path = "tests/tags.rs"
 [dependencies.arrayvec]
 version = "0.7.6"
 
+# Renamed Arachne fork. A direct dependency (not a root [patch]) so that the
+# fix reaches downstream consumers. Exact pin: patched source must match.
 [dependencies.bao-tree]
-version = "0.16"
+package = "arachne-bao-tree"
+path = "../bao-tree"
+version = "=0.16.1-arachne.1"
 features = [
     "experimental-mixed",
     "tokio_fsm",

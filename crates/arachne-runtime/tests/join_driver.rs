@@ -1,6 +1,4 @@
-use arachne_runtime::{
-    close, create, describe, enable_record_storage, execute, restore_record_storage, wait_for_work,
-};
+use arachne_runtime::{MemoryProvider, close, describe, execute, wait_for_work};
 use serde_json::{Value, json};
 use std::time::Instant;
 
@@ -20,32 +18,44 @@ fn bytes(value: &Value) -> Vec<u8> {
         .collect()
 }
 
+fn issue(h: i64) -> Value {
+    let staged = call(
+        h,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    )
+    .unwrap();
+    call(
+        h,
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+    )
+    .unwrap()["issued_invitation"]
+        .clone()
+}
+
 struct Owner {
     handle: i64,
     peer: Value,
     address: String,
     invitation: Value,
-    _dir: tempfile::TempDir,
+    _provider: MemoryProvider,
 }
 
 fn owner(seed: u8) -> Owner {
-    let handle = create(Some(&[seed; 32])).unwrap();
+    let provider = MemoryProvider::default();
+    let handle = common::stored(&[seed; 32], &provider);
     let _created = call(
         handle,
         json!({"op":"create_workspace","display_name":"Owner","workspace_name":"Compact join"}),
     )
     .unwrap();
-    let invitation = call(handle, json!({"op":"issue_invitation"})).unwrap();
+    let invitation = issue(handle);
     let info: Value = serde_json::from_str(&describe(handle).unwrap()).unwrap();
-    let dir = common::directory();
-    let path = dir.path().join("owner.db");
-    enable_record_storage(handle, &path, &[seed; 32]).unwrap();
     Owner {
         handle,
         peer: info["endpoint_key"].clone(),
         address: info["bound_address"].as_str().unwrap().to_owned(),
         invitation,
-        _dir: dir,
+        _provider: provider,
     }
 }
 
@@ -63,14 +73,15 @@ fn complete_join(handle: i64) -> Value {
 
 #[test]
 fn async_driver_persists_selected_peer_and_exact_pending_request() {
-    let owner = create(Some(&[231; 32])).unwrap();
-    let joiner = create(Some(&[232; 32])).unwrap();
+    let owner = common::stored(&[231; 32], &MemoryProvider::default());
+    let provider = MemoryProvider::default();
+    let joiner = common::stored(&[232; 32], &provider);
     let _created = call(
         owner,
         json!({"op":"create_workspace","display_name":"Owner","workspace_name":"Async join"}),
     )
     .unwrap();
-    let invitation = call(owner, json!({"op":"issue_invitation"})).unwrap();
+    let invitation = issue(owner);
     let owner_info: Value = serde_json::from_str(&describe(owner).unwrap()).unwrap();
     let owner_peer = bytes(&owner_info["endpoint_key"]);
     let pending = call(
@@ -87,19 +98,23 @@ fn async_driver_persists_selected_peer_and_exact_pending_request() {
     assert!(pending.get("invitation").is_none());
     let workspace: [u8; 32] = bytes(&pending["workspace"]).try_into().unwrap();
     let request = pending["admission_request"].clone();
-    let dir = common::directory();
-    let database = dir.path().join("joiner.db");
-    enable_record_storage(joiner, &database, &[232; 32]).unwrap();
 
     let started = Instant::now();
     let first = call(joiner, json!({"op":"drive_join"})).unwrap();
     assert_eq!(first["state"], "admission_pending");
     assert_eq!(first["peer"], json!(owner_peer));
-    assert!(started.elapsed().as_millis() < 500, "driver still blocks on the dial");
+    assert!(
+        started.elapsed().as_millis() < 500,
+        "driver still blocks on the dial"
+    );
 
     close(joiner).unwrap();
-    let restored_handle = create(Some(&[232; 32])).unwrap();
-    let restored = restore_record_storage(restored_handle, &database, &[232; 32], workspace).unwrap();
+    let restored_handle = common::stored(&[232; 32], &provider);
+    let restored = call(
+        restored_handle,
+        json!({"op":"restore_workspace","workspace":workspace}),
+    )
+    .unwrap();
     assert_eq!(restored["state"], "pending");
     assert_eq!(restored["admission_request"], request);
 
@@ -118,9 +133,8 @@ fn async_driver_persists_selected_peer_and_exact_pending_request() {
 #[test]
 fn compact_pending_invitation_restores_in_rust_and_joins_without_host_hydration() {
     let owner = owner(233);
-    let dir = common::directory();
-    let path = dir.path().join("compact-joiner.db");
-    let joiner = create(Some(&[234; 32])).unwrap();
+    let provider = MemoryProvider::default();
+    let joiner = common::stored(&[234; 32], &provider);
     let pending = call(
         joiner,
         json!({
@@ -133,11 +147,15 @@ fn compact_pending_invitation_restores_in_rust_and_joins_without_host_hydration(
     .unwrap();
     assert!(pending.get("invitation").is_none());
     let workspace: [u8; 32] = bytes(&pending["workspace"]).try_into().unwrap();
-    enable_record_storage(joiner, &path, &[234; 32]).unwrap();
+    assert_eq!(pending["durable"], true);
     close(joiner).unwrap();
 
-    let resumed = create(Some(&[234; 32])).unwrap();
-    let restored = restore_record_storage(resumed, &path, &[234; 32], workspace).unwrap();
+    let resumed = common::stored(&[234; 32], &provider);
+    let restored = call(
+        resumed,
+        json!({"op":"restore_workspace","workspace":workspace}),
+    )
+    .unwrap();
     assert_eq!(restored["state"], "pending");
     assert_eq!(restored["activity"]["state"], "joining");
     assert!(restored.get("invitation").is_none());

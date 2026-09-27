@@ -1,0 +1,7 @@
+[bindings.kotlin]
+package_name = "org.arachne.core.api"
+
+[bindings.swift]
+module_name = "ArachneApi"
+ffi_module_name = "ArachneApiFFI"
+ffi_module_filename = "ArachneApiFFI"

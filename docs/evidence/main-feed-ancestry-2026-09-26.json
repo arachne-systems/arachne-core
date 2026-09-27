@@ -1,0 +1,217 @@
+{
+  "main": "e410313ec750d4f6521053800361bc180bc94473",
+  "importRoot": "a694262a537e733e03089865bde5f684c3957696",
+  "integration": "3ab4486ff9321ec006fdc1c5970eff0fbf686032",
+  "feed": "2f86d887f50ce1358448d730654b9f2cac6a1d9e",
+  "mainFiles": 314,
+  "identicalAtImport": 275,
+  "changedAtImport": [
+    {
+      "file": ".gitignore",
+      "mainBlob": "c8b8dc177b6a979e74020784bfb8b6ff14de916b",
+      "importBlob": "39a83f8b1ddf8cdf50f4ddf47462f0506c2863de"
+    },
+    {
+      "file": "CORE_STATUS.md",
+      "mainBlob": "9afddacd864054a284399bfd6eae895edfde6221",
+      "importBlob": null
+    },
+    {
+      "file": "Cargo.lock",
+      "mainBlob": "599be39aea33a437aef31d075a70c2cc876e21d4",
+      "importBlob": "4672a115d577e1ef508ffbab6df4d3c01c7fda5a"
+    },
+    {
+      "file": "Cargo.toml",
+      "mainBlob": "1b458bb1f41d4074ba5636b14e5896b20be796f3",
+      "importBlob": "8c4cf8f529116c43fb4479041f4f9a49478f704a"
+    },
+    {
+      "file": "LICENSING.md",
+      "mainBlob": "260703db239419ee36c6ca3793ccd08fd253400e",
+      "importBlob": "8aa743ca0a17ca061a19f9b49b1213aeb3303d8a"
+    },
+    {
+      "file": "README.md",
+      "mainBlob": "9c6fcff6d972113be1e946f99da4335cb2feb273",
+      "importBlob": "7aae8a8fb0b164fa979661ceba9caed85e00a9bd"
+    },
+    {
+      "file": "crates/arachne-delivery/Cargo.toml",
+      "mainBlob": "ccf9b1c56dfbe82ae6a62e98a5905222c9235f4d",
+      "importBlob": "ea189767d3c471bb75b91ad4536cfea6cbe1fca7"
+    },
+    {
+      "file": "crates/arachne-delivery/README.md",
+      "mainBlob": "57265f78d6b9d73bc8fee973f273044d0e8f265a",
+      "importBlob": "067f57965e422935874ccdea8cdc97950a95ca2f"
+    },
+    {
+      "file": "crates/arachne-delivery/src/wire.rs",
+      "mainBlob": "cfa903743155150a7166074e7c93cccfa94e460b",
+      "importBlob": "20b247db9a8fb79520c27d836a4dd9bcba874a26"
+    },
+    {
+      "file": "crates/arachne-node/Cargo.toml",
+      "mainBlob": "756567f9fda898839e302bc3b7ebe573c9594e6e",
+      "importBlob": "6170c7658a585ed1400dba0440104d5b19070f78"
+    },
+    {
+      "file": "crates/arachne-node/README.md",
+      "mainBlob": "304e72f27b4644d9cc04d8794d6fad3be6abacb0",
+      "importBlob": "67923881a2789dc01f6f3a8fa18c55b20fb760c6"
+    },
+    {
+      "file": "crates/arachne-node/src/budget.rs",
+      "mainBlob": "e37aeb1ed37c2c2269db19ff76b724639b39de8e",
+      "importBlob": "b3b170c3976e01fca6d3429c2461a015f7109cd6"
+    },
+    {
+      "file": "crates/arachne-node/src/connections.rs",
+      "mainBlob": "76fd206b14ab71e9985211df7e1e4dac8d4c110b",
+      "importBlob": "d641854c1d8eb169a38825abee24f9d3bae347aa"
+    },
+    {
+      "file": "crates/arachne-node/src/lib.rs",
+      "mainBlob": "323f70b3eb0eb3e00d21f950a89e05727d42a86c",
+      "importBlob": "2de5891677d8c87798b2c3d115977409834d2682"
+    },
+    {
+      "file": "crates/arachne-routing/Cargo.toml",
+      "mainBlob": "667db92e8cc53a0bca3e6833e875c2ec4db48770",
+      "importBlob": "c29abf1bf17df416543bc66d09f3b3c0ca5d4dce"
+    },
+    {
+      "file": "crates/arachne-routing/README.md",
+      "mainBlob": "2d73ce46570189c42de4c2e77745179f6e1eeb21",
+      "importBlob": "eca6ecad1aa8a5541697ebce766bc2bb85a6019f"
+    },
+    {
+      "file": "crates/arachne-runtime/Cargo.toml",
+      "mainBlob": "120f43c766e6eb73fca7259eddf6a5b25b84cf5e",
+      "importBlob": "b97087bc680d4881faad903b724669efd9354c30"
+    },
+    {
+      "file": "crates/arachne-runtime/README.md",
+      "mainBlob": "fa97b26fdba4c5abc42b98f8cbc0db1263a641d9",
+      "importBlob": "be3bdae88ff575d64a8e7647a8a7e33627056a0c"
+    },
+    {
+      "file": "crates/arachne-runtime/examples/real-iroh-qualification.rs",
+      "mainBlob": "bb6408a34440bb291cd0f267e3db18a27c2a1749",
+      "importBlob": "8437c5eb8547f975a319a788e21c61f723f03bf4"
+    },
+    {
+      "file": "crates/arachne-runtime/src/admission_waiters.rs",
+      "mainBlob": "faf00ea2fb1dde737712b8c4dc84fbd0fd9fe60e",
+      "importBlob": "734eecd61da6f0d2e4f034baaef31757684c7c8e"
+    },
+    {
+      "file": "crates/arachne-runtime/src/client.rs",
+      "mainBlob": "e8ad51ccc12d71a09b36b1774352137adb247ec7",
+      "importBlob": "8bd626620d5203faaf75c21839c792f176cde265"
+    },
+    {
+      "file": "crates/arachne-runtime/src/lib.rs",
+      "mainBlob": "0c8a377bca2245cac4c785be23fd7a118c6bb1db",
+      "importBlob": "b1b84c42186b722f7b15586b1b428756cfd64dce"
+    },
+    {
+      "file": "crates/arachne-runtime/src/membership.rs",
+      "mainBlob": "481f2b14313f6baabc69369d39316ff3325476a1",
+      "importBlob": "0890847abe0d7da9de7f1008d642248793503ed8"
+    },
+    {
+      "file": "crates/arachne-runtime/src/persistence.rs",
+      "mainBlob": "44ab9db8cd3e8a643b29915deca2b0b72f254b4b",
+      "importBlob": "41360bbd588d02c20e63e83a690a6292c0fac55d"
+    },
+    {
+      "file": "crates/arachne-runtime/src/workspace_activity.rs",
+      "mainBlob": "b03fff95f2b9c1ef025c73de57852c27897c4b5b",
+      "importBlob": "ce0178f00fc4bf03b4c1e3ae9265fcb38c457548"
+    },
+    {
+      "file": "crates/arachne-runtime/tests/admission_event_driven.rs",
+      "mainBlob": "973ad7ae8e8ab445abdb21a66f2f50cf9d1317a4",
+      "importBlob": "fedc6f3731c8049f5a68ae0be9ff1c3623bb2b5c"
+    },
+    {
+      "file": "crates/arachne-runtime/tests/invitation_link_capacity.rs",
+      "mainBlob": "6cdd63524207e41ce3eda469052da318f67ab5e2",
+      "importBlob": "39cf86d3cba28126ca5199a90382cf7a2b0026c6"
+    },
+    {
+      "file": "crates/arachne-runtime/tests/leave.rs",
+      "mainBlob": "e2e703feeff6f35608be6da179e13aea75696565",
+      "importBlob": "777c91354a039b11d3b7623fcd835b0911f4ade2"
+    },
+    {
+      "file": "crates/arachne-runtime/tests/membership_gossip.rs",
+      "mainBlob": "fc5d50ebbc2fb2b2e13555e6fb28fe2a57a6b8ae",
+      "importBlob": "60dad3a8a470ff5e22e10efd6b8e26d0264242a6"
+    },
+    {
+      "file": "crates/arachne-runtime/tests/typed_client.rs",
+      "mainBlob": "d1f749c71eca404ec96f419801bd19b5cf294b6d",
+      "importBlob": "c602d8fa60e5dfc960d5b50f73b8317ec2ba0c71"
+    },
+    {
+      "file": "crates/arachne-security/Cargo.toml",
+      "mainBlob": "7b1ea4d08d2b463aa21a7571057695e2390334c8",
+      "importBlob": "6137c2383c722bf8016e686c079babcdb539e13e"
+    },
+    {
+      "file": "crates/arachne-security/README.md",
+      "mainBlob": "68e23c26c69dd15e29d2fdbf7ed36e94b12be653",
+      "importBlob": "160661a5ff7a305d356215dc081eb1195a8fa219"
+    },
+    {
+      "file": "crates/arachne-security/src/invitation.rs",
+      "mainBlob": "a878c60ff08f2d89c3da66e1d73f88ab004f222e",
+      "importBlob": "b1bd7689f319b241f2002d52114876be0cc4b8fc"
+    },
+    {
+      "file": "crates/arachne-store/Cargo.toml",
+      "mainBlob": "3cb5d343625b73fff275d2d03013bdb659ced318",
+      "importBlob": "e591cf25000258273f73c679cac30c1121318385"
+    },
+    {
+      "file": "crates/arachne-store/README.md",
+      "mainBlob": "ca45204a8c8b774e6aebf3fc17f63ea7d52c9791",
+      "importBlob": "d5835137fcde41cc625707a6dc04852d903746c7"
+    },
+    {
+      "file": "docs/architecture.md",
+      "mainBlob": "96a76eda4615597dc413098b20ce2d75e0a10ad7",
+      "importBlob": "a069c2e55c41c6501533762a025c94312bcaa951"
+    },
+    {
+      "file": "docs/development-guidance.md",
+      "mainBlob": "9619c56289a28304b3b5bb40afcd61b1f459ad95",
+      "importBlob": null
+    },
+    {
+      "file": "docs/domain-model.md",
+      "mainBlob": "3e493d1b15def46b77a95ca2d6fd8667d62e8fa4",
+      "importBlob": null
+    },
+    {
+      "file": "docs/security-and-groups.md",
+      "mainBlob": "4ce2e592d79e4f2e9707a6c4bf1997fe45736fbc",
+      "importBlob": null
+    }
+  ],
+  "mainFilesAbsentNow": [
+    "CORE_STATUS.md",
+    "crates/arachne-delivery/src/receive.rs",
+    "crates/arachne-node/tests/gossip_forwarding.rs",
+    "crates/arachne-runtime/src/protected.rs",
+    "crates/arachne-security/tests/data/openmls-0.8.1.fixture",
+    "crates/arachne-security/tests/upgrade.rs",
+    "docs/development-guidance.md",
+    "docs/domain-model.md",
+    "docs/security-and-groups.md"
+  ],
+  "importAncestor": true
+}

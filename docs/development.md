@@ -1,5 +1,9 @@
 # Core development guide
 
+**BLUF:** Use the pinned toolchain and the default test thread count. Dependencies
+use optimization level 2; workspace crates stay unoptimized. Disable incremental
+compilation and debug information when a small local build cache is required.
+
 ## Repository layout
 
 ```text
@@ -18,7 +22,7 @@ Each crate has a short README. The root workspace pins direct dependency
 versions where interoperability or protocol behavior requires it and uses
 `Cargo.lock` to capture the resolved graph. Shared package metadata and
 registry-compatible versions for normal internal dependencies are configured.
-The six first-party packages and two Arachne-maintained Iroh forks are
+The six first-party packages and three Arachne-maintained Iroh forks are
 publishable workspace members. Check crates.io for current publication status;
 new crate names require a one-time manual first publish before Trusted
 Publishing can be enabled.
@@ -29,16 +33,18 @@ Use the Rust 1.98.0 toolchain recorded in the root README:
 
 ```sh
 cargo +1.98.0 check --locked --workspace
-cargo +1.98.0 test --locked --workspace -- --test-threads=1
+cargo +1.98.0 test --locked --workspace
 ```
 
 Published manifests declare Rust 1.91 as the MSRV. Verify that claim with
 `cargo +1.91.0 check --locked --workspace` before changing the dependency lock.
 
-Run from the repository root. Tests are serialized within each test binary
-because runtime tests share process-wide session state and capacity. The
-workspace build and tests are Rust checks; they do not build the Android plugin,
-load the library through JNI, or validate an ATAK host/device deployment.
+Run from the repository root with the default test thread count. Each runtime
+session belongs to a `Context` with its own limits, connection budget and
+runtime (the default context allows 64 sessions). Tests in
+`tests/nearby_invitation.rs` protect their shared LAN discovery fixture locally.
+The workspace build and tests are Rust checks; they do not build the Android
+plugin, load the library through JNI, or validate an ATAK host/device deployment.
 
 Useful focused checks while iterating:
 
@@ -47,14 +53,126 @@ cargo +1.98.0 test --locked -p arachne-security
 cargo +1.98.0 test --locked -p arachne-routing
 cargo +1.98.0 test --locked -p arachne-delivery
 cargo +1.98.0 test --locked -p arachne-store
-cargo +1.98.0 test --locked -p arachne-node -- --test-threads=1
-cargo +1.98.0 test --locked -p arachne-runtime -- --test-threads=1
+cargo +1.98.0 test --locked -p arachne-node
+cargo +1.98.0 test --locked -p arachne-runtime
 ```
+
+### Test speed and build cache size
+
+The development profile builds dependencies at optimization level 2. Workspace
+crates stay at level 0. The test profile inherits this setting. Debug assertions
+and overflow checks remain enabled. No release profile is needed for tests.
+
+For a small local build cache, set these variables before the commands above:
+
+```sh
+export CARGO_BUILD_JOBS=4 CARGO_INCREMENTAL=0
+export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+```
+
+Keep a separate target directory for each worktree. After its last check,
+`cargo +1.98.0 clean --profile dev` removes rebuildable development and test
+artifacts. Do not clean a target while its build or test process is active.
+
+The H3 comparison on 2026-09-26 used the same source based on `7ab2ec6`, Rust
+1.98.0, and an AMD Ryzen 9 9950X. The baseline removed all package profile
+overrides. The second build used only `[profile.dev.package."*"] opt-level = 2`.
+Both clean builds used four Cargo jobs, no incremental compilation, and no debug
+information. Each test case ran directly from its compiled binary, outside the
+shared build lock, with `nice -n 19 taskset -c 8-11` and the default test thread
+count. No other test from this lane ran at the same time.
+
+| Measurement | No package optimization | Dependencies at level 2 |
+| --- | ---: | ---: |
+| Membership join wave | 860.546 s | 56.068 s |
+| `record_storage` (two tests) | 931.209 s | 101.361 s |
+| Native persistence with 100 members | 1862.810 s | 273.523 s |
+| Total test time | 3654.565 s | 430.952 s |
+| Clean build for these binaries | 55.04 s | 146.84 s |
+| Target directory after that build (`du -sb`) | 1,511,738,651 bytes | 1,279,393,248 bytes |
+
+All four tests passed in both runs. The test cases were 6.81 to 15.35 times
+faster. This gain does not require optimization of workspace crates. Cargo's
+build records confirmed optimization level 2 for OpenMLS, level 0 for Arachne
+security, delivery, store, and runtime, and enabled debug assertions and overflow
+checks. These are single runs on a shared machine, not a statistical benchmark.
+
+Build the same test binaries with:
+
+```sh
+cargo +1.98.0 test --locked -p arachne-runtime --lib \
+  --test record_storage --test native_persistence --no-run
+```
+
+For test-only timings, run the executable paths that Cargo prints. Use the exact
+lib filter `membership::gossiped_names_from_a_join_wave_survive_until_their_steps_land`,
+run both `record_storage` tests, and use the exact `native_persistence` filter
+`hundred_member_runtime_commits_tokens_and_reopens_without_legacy_snapshots`.
+Keep the CPU set and cache settings the same for each comparison.
+
+The initial lower-crate check compiled and ran all 27 unit and integration test binaries
+for `arachne-node`, `arachne-security`, `arachne-delivery`, and `arachne-store`
+with the default test thread count on CPUs 8–11: **204 passed, 1 failed, 7
+ignored**. All four crate unit-test binaries passed. No check showed a need to
+serialize tests across a binary.
+
+The red integration test was
+`gossip_forwarding::workspace_publication_crosses_an_intermediate_without_a_direct_route`.
+It also failed when its binary ran with `--test-threads=1`. At line 52, it assumes
+that C cannot have A as a neighbor after the fixture seeds A↔B↔C addresses.
+Gossip can learn addresses and create the A↔C path. The fixture must enforce
+its intended chain before its forwarding assertions can give valid evidence.
+At this checkpoint, the full workspace suite was not green.
+
+The follow-up fixture uses Iroh endpoint hooks under `cfg(test)` to block the
+A–C link until the route-refresh step. The scenario now runs in the node unit
+test binary, so no production option or routing rule is needed. Once the only
+neighbor closes, the fixture waits for neighbor loss and checks the existing
+`MissingPeer` result. It preserves forwarding through B, original authorship,
+duplicate suppression, queue pressure, outsider rejection, reconnection, and
+removed-member rejection. The exact scenario passed with serial and default
+test threads (7.391 s and 7.384 s).
+
+The complete follow-up for the same four lower crates passed **205 tests, with
+0 failures and 7 ignored**, across 26 unit and integration test binaries. It
+used default features and the default test thread count on CPUs 8–11. The
+forwarding scenario also passed alongside the other node unit tests.
+
+### Dependency checks
+
+The `.github/workflows/supply-chain.yml` workflow runs these checks on each PR,
+on `main`, and weekly:
+
+```sh
+cargo +1.98.0 check --locked --workspace --all-targets --all-features
+cargo deny --all-features check   # policy in deny.toml
+```
+
+The CI job `minimal-versions` also runs `cargo update -Z direct-minimal-versions`
+on a pinned nightly. It proves that the lower bounds in the Arachne crates build.
+To keep that true, published crates use caret ranges whose lower bound is a
+version that builds (normally the locked version). Use `=` only where an exact
+match is required, and put a comment next to it: today that is `iroh` and
+the renamed forks, including `arachne-iroh-tor-transport` (unstable
+custom-transport API).
+That job takes the vendored Iroh forks out of `members`, because their upstream
+manifests have loose lower bounds that do not build at their minimums.
+
+`deny.toml` fails on any vulnerability advisory, on unmaintained crates, on a
+license outside the allowlist, on an unlisted source, and on a second
+version of a directly used crypto crate (for example `aes-gcm`, `openmls`,
+`sha2`). Existing duplicates and accepted advisories are listed there with a
+reason; review them when you change dependencies. The two existing MoQ Git sources are
+listed by exact repository URL and must use a `rev` pin. Their committed revisions remain
+in the manifests and lockfile. The Arachne crates and Tor fork use SHA-2 0.11 and
+HKDF/HMAC 0.13. Older copies remain only for upstream elliptic curve dependencies.
+AES-GCM stays at 0.10 with OpenMLS and Iroh. SFrame 2.0 uses `ring`; enabling its
+`rust-crypto` backend would add AES-GCM 0.11.
 
 For the simple transport example:
 
 ```sh
-cargo +1.98.0 run --locked -p arachne-runtime --example typed_pubsub
+cargo +1.98.0 run --locked -p arachne-runtime --features test-fixtures --example typed_pubsub
 ```
 
 That example exercises basic routing and transport only; it is not a secure MLS
@@ -77,17 +195,44 @@ certification.
 
 ## Vendored dependency patches
 
-`vendor/` contains two Arachne-maintained, publishable forks of Iroh packages:
-`arachne-iroh-gossip` and `arachne-iroh-blobs`. Their Rust import names stay
-`iroh_gossip` and `iroh_blobs`; each retains upstream provenance, notices, and
-MIT/Apache-2.0 terms. They are not official Iroh releases.
+`vendor/` contains five Arachne-maintained, publishable renamed forks:
+`arachne-iroh-gossip`, `arachne-iroh-blobs`, `arachne-iroh-tor-transport` and
+`arachne-bao-tree`, plus the local `arachne-iroh-mdns-address-lookup` fork.
+The mDNS fork keeps a changed peer address for later lookups (see its
+[patch record](../vendor/iroh-mdns-address-lookup/ARACHNE-PATCH.md)). It is not
+published. Their Rust import names stay `iroh_gossip`, `iroh_blobs`,
+`iroh_tor_transport`, `bao_tree` and `iroh_mdns_address_lookup`; each retains
+upstream provenance, notices, and MIT/Apache-2.0 terms. They are not official
+upstream releases. Because Arachne crates depend on them directly (with
+`package = "arachne-..."`), their fixes reach every downstream consumer.
 
-The root `[patch.crates-io]` still selects local copies of `bao-tree`,
-`netlink-packet-core`, and `hax-lib-macros` for this workspace. Those patches
-are not part of the Arachne crate dependencies; the clean-consumer check must
-therefore build without them. Keep their upstream copyright, license, and
-notice files intact, and do not imply that the Arachne MPL license replaces
-their terms.
+Fork versions use `<upstream version>-arachne.<N>` (for example
+`0.103.0-arachne.1`). Dependents pin them with `=`, because the patched source
+must match. Note: `arachne-iroh-blobs` 0.103.0 and `arachne-iroh-gossip` 0.101.0
+were published earlier with the plain upstream numbers. Under semver, a
+pre-release such as `0.103.0-arachne.1` sorts *below* `0.103.0`. Thus a caret
+requirement or `cargo add` picks the old release. Always use the exact `=` pin.
+
+The root also selects `vendor/iroh` 1.2.0 with a connection restart fix.
+QUIC Initial packets must try updated addresses even while an old selected
+path remains alive. Established traffic keeps Iroh's path selection. See the
+[patch record](../vendor/iroh/ARACHNE-PATCH.md) and the process-kill regression
+in `crates/arachne-node/tests/moq_restart.rs`.
+
+**Every consuming workspace must repeat the Iroh patch** with its local Core
+path. This includes the SDK and app native build roots. Cargo ignores patches
+inside dependencies. A registry-only build without this patch does not have
+this restart fix. The release gate must keep that limit explicit until an
+upstream release carries it or the dependency is published under an approved
+fork policy. No release is authorized by this local integration.
+
+The registry graph currently includes two transitive "unmaintained" notices:
+`paste` RUSTSEC-2024-0436 through Iroh's netlink 0.8 stack, and
+`proc-macro-error2` RUSTSEC-2026-0173 through OpenMLS's HPKE/hax stack. Neither
+advisory reports a vulnerability; the latter is only a `cfg(hax)` dependency
+and is not compiled in normal builds. `deny.toml` records these exact temporary
+exceptions. Remove them when the parent dependency chains can upgrade. Do not
+carry source forks whose only effect is hiding these notices.
 
 When updating a patched dependency:
 
@@ -107,9 +252,21 @@ notices when bundling Core into a binary distribution.
 
 ## Crates.io releases
 
-`arachne-node` depends on the two named Arachne Iroh forks so their required
-APIs are ordinary registry dependencies, not workspace-only patches. The
-other three vendor patches are deliberately excluded from publishing. A clean
+`arachne-node` depends on the two named Arachne Iroh forks, and
+`arachne-iroh-blobs` depends on `arachne-bao-tree`, so their required APIs and
+fixes are ordinary registry dependencies. The Iroh restart fix above is still
+a root patch and must be resolved before a registry-only release.
+
+`arachne-bao-tree` is in the workspace `exclude` list (to keep its upstream
+dev-dependencies out of `Cargo.lock`), so release-plz does not publish it.
+Publish order for a fork change: `arachne-bao-tree` (by hand, `cargo publish
+--manifest-path vendor/bao-tree/Cargo.toml`), then `arachne-iroh-blobs`,
+`arachne-iroh-gossip`, `arachne-iroh-tor-transport`,
+`arachne-iroh-mdns-address-lookup`, `arachne-node`,
+`arachne-runtime`. Until
+`arachne-bao-tree` is on crates.io, `cargo package`/`cargo publish --dry-run`
+verification of `arachne-iroh-blobs`, `arachne-node` and `arachne-runtime`
+fails; use `cargo package --list` or `--no-verify` for a local check. A clean
 consumer build outside this workspace must resolve registry-compatible
 package names and dependencies without inheriting this root manifest's
 `[patch.crates-io]` entries.
@@ -121,6 +278,17 @@ append `!` for a breaking change (for example, `feat(api)!:`). Other commit
 types do not trigger a crate release. Review and merge the generated release PR
 to publish in dependency order and create per-crate GitHub tags/releases. Do
 not manually bump crate versions for normal releases.
+
+Each per-crate release tag also runs `release-attestation.yml`. It rebuilds the
+tagged Cargo source archive, generates an SPDX JSON SBOM for that `.crate`, and
+records separate build-provenance and SBOM attestations in GitHub. Download the
+same archive from crates.io, then verify both records with:
+
+```sh
+gh attestation verify <crate-file> -R arachne-systems/arachne-core
+gh attestation verify <crate-file> -R arachne-systems/arachne-core \
+  --predicate-type https://spdx.dev/Document/v2.3
+```
 
 Publishing uses crates.io Trusted Publishing through GitHub Actions OIDC; no
 crates.io API token is stored in GitHub. Configure each already-published

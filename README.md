@@ -1,6 +1,11 @@
 # Arachne Core
 
-**The portable Rust foundation for Arachne’s secure, peer-to-peer workspaces.**
+## BLUF
+
+Arachne Core is the portable Rust foundation for secure peer-to-peer workspaces.
+Applications consume the Arachne SDK; the SDK consumes Core's typed contract.
+Core owns membership, transport and durable state transitions. Applications own
+UI, payload meaning and decisions about delivery to their users.
 
 Arachne Core provides the shared membership, security, connectivity, and data-
 delivery layer used by Arachne applications. It lets admitted participants
@@ -25,6 +30,7 @@ payloads as opaque bytes.
 
 | Crate | Responsibility |
 | --- | --- |
+| `arachne-api` | Versioned IDs, errors, events and shared contract types |
 | `arachne-runtime` | Typed application-facing lifecycle and workspace API |
 | `arachne-security` | MLS workspace state, membership, invitations, and profiles |
 | `arachne-node` | Authenticated peer connections and resource transfer |
@@ -40,16 +46,25 @@ the ATAK host, the TAK SDK, Android UI, a relay service, or ATAK-specific data
 translation such as CoT/PLI. Build the plugin only with an authorized TAK SDK
 obtained separately.
 
-Applications own their local storage and must follow the client API’s save,
-read-back, and adopt steps when accepting state changes. The core does not
-silently persist application state on the host’s behalf.
+Open a `Client` in an owned `Context`, with a storage configuration and a
+protected storage root key. Core saves each opaque candidate, reads it back,
+and then adopts it. Applications protect the keys and storage directory and
+acknowledge received content through the durable inbox API.
+
+API version 6 supplies typed errors, events, deadlines and suspend/resume.
+Core owns the UniFFI metadata. The SDK generates and packages Kotlin, Swift,
+Python and Go bindings from those types. Rust hosts can use the same `Client`
+directly. See the [integration guide](docs/integration.md).
 
 ## Status
 
 Pre-release software under active development. APIs and persisted formats may
-change. All eight crates have an initial release on crates.io.
-Direct, local, and selected relay paths have Rust test coverage, but that is not
-a guarantee of reachability or capacity on every network or deployment.
+change. Existing installations need an authenticated state upgrade before they
+adopt a new stored format. The [work tracker](docs/reviews/2026-09-24-work-tracker.md)
+records implementation evidence and open release decisions.
+
+Direct, local and selected relay paths have Rust test coverage. Deployment
+qualification must measure the networks and capacities that the application uses.
 
 ## Build and test
 
@@ -57,12 +72,15 @@ Install Rust 1.98.0, then run from the repository root:
 
 ```sh
 cargo +1.98.0 check --locked --workspace
-cargo +1.98.0 test --locked --workspace -- --test-threads=1
+cargo +1.98.0 test --locked --workspace
 ```
 
-Tests run serially because some runtime tests share a process-wide session-
-capacity limit. These commands build the portable Rust workspace; they do not
-require Android, ATAK, or a device.
+Use the default test thread count. Runtime tests own their sessions through
+a `Context`; LAN discovery tests protect their shared fixture locally.
+Dependencies use optimization level 2 in development and test builds. Workspace
+crates stay unoptimized. See the [development guide](docs/development.md) for
+measurements and settings that keep build caches small. These commands build
+the portable Rust workspace; they do not require Android, ATAK, or a device.
 
 ## Documentation
 

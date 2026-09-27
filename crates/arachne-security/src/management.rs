@@ -1,18 +1,29 @@
-//! Exact administrator actions, verified against the receiver's accepted state.
-//! Verification alone does not adopt, persist, disseminate or finalize a change.
-use super::{AUTHORITY, JoinProof, Workspace, bootstrap, storage};
-use openmls::prelude::tls_codec::{Deserialize, Serialize};
+//! Exact membership and invitation management, verified against the
+//! receiver's accepted state. Verification alone does not adopt, persist,
+//! disseminate or finalize a change.
+//!
+//! Class 2 actions (Promote, invitation create / approve / decline) are
+//! committed by an administrator. Class 0 and 1 actions (Remove, Leave,
+//! Demote, DisableInvitation) are signed revocation orders that any member
+//! may commit (ADR A2 step 4, `order.rs`).
+use super::{
+    AUTHORITY, MembershipAuthorization, OrderStep, RevocationKind, RevocationOrder, Workspace,
+    bootstrap, storage,
+};
+use openmls::prelude::tls_codec::Deserialize;
 use openmls::prelude::*;
-use openmls_traits::{OpenMlsProvider, crypto::OpenMlsCrypto, signatures::Signer};
+use openmls_traits::OpenMlsProvider;
 
-/// One authenticated membership or invitation-management intent.
+/// One management intent. Remove, Demote and DisableInvitation are intents
+/// for [`Workspace::prepare_management`], which signs an order and commits
+/// it; their history authorization is always a
+/// [`MembershipAuthorization::Revocation`]. A departure is a
+/// [`Workspace::leave_order`] that another member commits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManagementAction {
     Promote([u8; 32]),
     Demote([u8; 32]),
     Remove([u8; 32]),
-    /// A member's signature authorizes only their own departure from this branch.
-    Leave([u8; 32], [u8; 64]),
     CreateInvitation([u8; 32], u64, bool),
     CreateAutomaticInvitation([u8; 32], u64),
     CreateRequestInvitation([u8; 32], u64),
@@ -27,7 +38,6 @@ impl ManagementAction {
             Self::Promote(id)
             | Self::Demote(id)
             | Self::Remove(id)
-            | Self::Leave(id, _)
             | Self::CreateInvitation(id, ..)
             | Self::CreateRequestInvitation(id, ..)
             | Self::DeclineInvitationRequest(id, _)
@@ -36,39 +46,15 @@ impl ManagementAction {
             | Self::ApproveInvitation(id, _) => id,
         }
     }
-    fn removes(self) -> bool {
-        matches!(self, Self::Remove(_) | Self::Leave(..))
+    /// The revocation kind of a class 0 or 1 intent.
+    pub fn revocation(self) -> Option<RevocationKind> {
+        match self {
+            Self::Remove(_) => Some(RevocationKind::Remove),
+            Self::Demote(_) => Some(RevocationKind::Demote),
+            Self::DisableInvitation(_) => Some(RevocationKind::DisableInvitation),
+            _ => None,
+        }
     }
-}
-
-fn leave_payload(context: &GroupContext, member: [u8; 32]) -> Result<Vec<u8>, &'static str> {
-    let mut bytes = b"data-fabric/leave/v1\0".to_vec();
-    bytes.extend(
-        context
-            .tls_serialize_detached()
-            .map_err(|_| "leave context encoding failed")?,
-    );
-    bytes.extend(member);
-    Ok(bytes)
-}
-
-fn verify_leave(
-    crypto: &impl OpenMlsCrypto,
-    context: &GroupContext,
-    key: &[u8],
-    action: ManagementAction,
-) -> Result<(), &'static str> {
-    if let ManagementAction::Leave(id, signature) = action {
-        crypto
-            .verify_signature(
-                super::SUITE.signature_algorithm(),
-                &leave_payload(context, id)?,
-                key,
-                &signature,
-            )
-            .map_err(|_| "invalid leave signature or membership branch")?;
-    }
-    Ok(())
 }
 
 /// Provisional local change. Save the returned workspace before adopting it or
@@ -76,6 +62,8 @@ fn verify_leave(
 pub struct PreparedManagement {
     pub workspace: Workspace,
     pub action: ManagementAction,
+    /// The history authorization receivers verify with the commit.
+    pub authorization: MembershipAuthorization,
     pub commit: Vec<u8>,
 }
 
@@ -86,10 +74,18 @@ pub enum PreparedManagementUpdate {
     Removed(super::RemovedMembership),
 }
 
+/// A member-set or role change inside one management commit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Change {
+    Promote,
+    Demote,
+    Remove,
+}
+
 impl Workspace {
-    /// Sign a departure from this exact membership branch. Another admitted
-    /// member must commit it; signing alone neither leaves nor changes keys.
-    pub fn leave_action(&self) -> Result<ManagementAction, &'static str> {
+    /// Sign a departure, anchored at this state. Another member must commit
+    /// it; signing alone neither leaves nor changes keys.
+    pub fn leave_order(&self) -> Result<RevocationOrder, &'static str> {
         let member = self.member().ok_or("member identity required")?;
         let roster = self.member_roster()?;
         if roster
@@ -99,18 +95,39 @@ impl Workspace {
         {
             return Err("Make another member an administrator before leaving.");
         }
-        let signature = self
-            ._signer
-            .sign(&leave_payload(
-                super::MembershipVerifier::from_workspace(self)?
-                    .group
-                    .group_context(),
-                member.id(),
-            )?)
-            .map_err(|_| "leave signing failed")?
-            .try_into()
-            .map_err(|_| "invalid leave signature length")?;
-        Ok(ManagementAction::Leave(member.id(), signature))
+        self.issue_revocation(RevocationKind::Leave, member.id())
+    }
+
+    /// Sign a revocation order anchored at this state. Remove, Demote and
+    /// DisableInvitation need an administrator; Leave targets only this member.
+    pub fn issue_revocation(
+        &self,
+        kind: RevocationKind,
+        target: [u8; 32],
+    ) -> Result<RevocationOrder, &'static str> {
+        if kind == RevocationKind::Leave {
+            if self.member().map(|m| m.id()) != Some(target) {
+                return Err("a member may sign only its own departure");
+            }
+        } else if !bootstrap::authority(self.group.extensions())?
+            .iter()
+            .any(|key| key == self._signer.public())
+        {
+            return Err("management actor is not an administrator");
+        }
+        RevocationOrder::sign(
+            kind,
+            target,
+            self.group.public_group().group_context(),
+            &self._signer,
+        )
+    }
+
+    /// Public checkpoint of this state, for an [`super::AnchorProof`]. Any
+    /// member can produce it. It carries roster metadata: share it only with
+    /// members.
+    pub fn public_checkpoint(&self) -> Result<Vec<u8>, &'static str> {
+        bootstrap::public_checkpoint(self)
     }
 
     /// A one-member workspace has no peer to notify or remaining keys to rotate.
@@ -120,19 +137,13 @@ impl Workspace {
             return Err("another member must accept the departure");
         }
         let member = self.member().ok_or("member identity required")?;
-        use sha2::Digest;
+        let order = self.issue_revocation(RevocationKind::Leave, member.id())?;
         Ok(super::RemovedMembership::verified(
             self.id,
             self.endpoint,
             member.clone(),
             self.epoch(),
-            sha2::Sha256::digest(leave_payload(
-                super::MembershipVerifier::from_workspace(self)?
-                    .group
-                    .group_context(),
-                member.id(),
-            )?)
-            .into(),
+            order.digest(),
         )
         .for_solo_leave())
     }
@@ -167,63 +178,96 @@ impl Workspace {
         })
     }
 
+    /// Prepare one administrator action. Remove, Demote and DisableInvitation
+    /// sign an order at this state and commit it.
     pub fn prepare_management(
         &self,
         action: ManagementAction,
     ) -> Result<PreparedManagement, &'static str> {
-        let mut admins = bootstrap::authority(self.group.extensions())?;
-        if !matches!(action, ManagementAction::Leave(..))
-            && !admins.iter().any(|key| key == self._signer.public())
+        if let Some(kind) = action.revocation() {
+            let order = self.issue_revocation(kind, action.target())?;
+            let mut prepared = self.prepare_revocation(&OrderStep::new(order))?;
+            prepared.action = action;
+            return Ok(prepared);
+        }
+        if !bootstrap::authority(self.group.extensions())?
+            .iter()
+            .any(|key| key == self._signer.public())
         {
             return Err("management actor is not an administrator");
         }
-        if matches!(
-            action,
-            ManagementAction::CreateInvitation(..)
-                | ManagementAction::CreateRequestInvitation(..)
-                | ManagementAction::DeclineInvitationRequest(..)
-                | ManagementAction::CreateAutomaticInvitation(..)
-                | ManagementAction::DisableInvitation(_)
-                | ManagementAction::ApproveInvitation(..)
-        ) {
-            return super::invitation_controls::prepare(self, action);
+        let authorization = MembershipAuthorization::Management(action);
+        if !matches!(action, ManagementAction::Promote(_)) {
+            let extensions = super::invitation_controls::changed(self.group.extensions(), action)?;
+            return self.commit_change(action, authorization, None, Some(extensions), Vec::new());
         }
-        let id = action.target();
+        self.prepare_change(
+            action,
+            authorization,
+            Change::Promote,
+            action.target(),
+            Vec::new(),
+        )
+    }
+
+    /// Commit a revocation order. Any member may do this; the order carries
+    /// the authority. The last-administrator guard applies at this state.
+    pub fn prepare_revocation(&self, step: &OrderStep) -> Result<PreparedManagement, &'static str> {
+        let order = &step.order;
+        let authorization = MembershipAuthorization::Revocation(step.clone());
+        let aad = super::order::commit_aad(order);
+        let action = match order.kind {
+            RevocationKind::Remove | RevocationKind::Leave => {
+                ManagementAction::Remove(order.target)
+            }
+            RevocationKind::Demote => ManagementAction::Demote(order.target),
+            RevocationKind::DisableInvitation => ManagementAction::DisableInvitation(order.target),
+        };
+        match order.kind {
+            RevocationKind::DisableInvitation => {
+                let extensions =
+                    super::invitation_controls::changed(self.group.extensions(), action)?;
+                self.commit_change(action, authorization, None, Some(extensions), aad)
+            }
+            RevocationKind::Demote => {
+                self.prepare_change(action, authorization, Change::Demote, order.target, aad)
+            }
+            RevocationKind::Remove | RevocationKind::Leave => {
+                self.prepare_change(action, authorization, Change::Remove, order.target, aad)
+            }
+        }
+    }
+
+    fn prepare_change(
+        &self,
+        action: ManagementAction,
+        authorization: MembershipAuthorization,
+        change: Change,
+        id: [u8; 32],
+        aad: Vec<u8>,
+    ) -> Result<PreparedManagement, &'static str> {
+        let mut admins = bootstrap::authority(self.group.extensions())?;
         let target = self
             .group
             .members()
             .find(|m| bootstrap::binding(&m.credential).is_ok_and(|b| b.0 == id))
             .ok_or("management target is not a current member")?;
-        verify_leave(
-            self.provider.crypto(),
-            super::MembershipVerifier::from_workspace(self)?
-                .group
-                .group_context(),
-            &target.signature_key,
-            action,
-        )?;
         let had_role = admins.contains(&target.signature_key);
-        match action {
-            ManagementAction::CreateInvitation(..)
-            | ManagementAction::CreateRequestInvitation(..)
-            | ManagementAction::DeclineInvitationRequest(..)
-            | ManagementAction::CreateAutomaticInvitation(..)
-            | ManagementAction::DisableInvitation(_)
-            | ManagementAction::ApproveInvitation(..) => unreachable!(),
-            ManagementAction::Promote(_) => {
+        match change {
+            Change::Promote => {
                 if had_role {
                     return Err("member is already an administrator");
                 }
                 admins.push(target.signature_key.clone());
                 admins.sort();
             }
-            ManagementAction::Demote(_) => {
+            Change::Demote => {
                 if !had_role {
                     return Err("member is not an administrator");
                 }
                 admins.retain(|key| key != &target.signature_key);
             }
-            ManagementAction::Remove(_) | ManagementAction::Leave(..) => {
+            Change::Remove => {
                 if target.index == self.group.own_leaf_index() {
                     return Err("self removal requires a separate leave operation");
                 }
@@ -233,29 +277,49 @@ impl Workspace {
         if admins.is_empty() {
             return Err("cannot remove the last administrator");
         }
-        let mut candidate = self.provisional_copy()?;
-        let role_change = !action.removes() || had_role;
-        let mut builder = candidate.group.commit_builder();
-        if action.removes() {
-            builder = builder.propose_removals([target.index]);
-        }
-        if role_change {
+        let role_change = change != Change::Remove || had_role;
+        let extensions = if role_change {
             let bytes =
                 super::invitation_controls::replace_admins(self.group.extensions(), &admins)?;
-            let extensions = Extensions::from_vec(
-                self.group
-                    .extensions()
-                    .iter()
-                    .map(|e| {
-                        if e.extension_type() == ExtensionType::Unknown(AUTHORITY) {
-                            Extension::Unknown(AUTHORITY, UnknownExtension(bytes.clone()))
-                        } else {
-                            e.clone()
-                        }
-                    })
-                    .collect(),
+            Some(
+                Extensions::from_vec(
+                    self.group
+                        .extensions()
+                        .iter()
+                        .map(|e| {
+                            if e.extension_type() == ExtensionType::Unknown(AUTHORITY) {
+                                Extension::Unknown(AUTHORITY, UnknownExtension(bytes.clone()))
+                            } else {
+                                e.clone()
+                            }
+                        })
+                        .collect(),
+                )
+                .map_err(|_| "invalid management extensions")?,
             )
-            .map_err(|_| "invalid management extensions")?;
+        } else {
+            None
+        };
+        let removal = (change == Change::Remove).then_some(target.index);
+        self.commit_change(action, authorization, removal, extensions, aad)
+    }
+
+    /// Build, verify and stage one management commit.
+    fn commit_change(
+        &self,
+        action: ManagementAction,
+        authorization: MembershipAuthorization,
+        removal: Option<LeafNodeIndex>,
+        extensions: Option<Extensions<GroupContext>>,
+        aad: Vec<u8>,
+    ) -> Result<PreparedManagement, &'static str> {
+        let mut candidate = self.provisional_copy()?;
+        candidate.group.set_aad(aad);
+        let mut builder = candidate.group.commit_builder();
+        if let Some(index) = removal {
+            builder = builder.propose_removals([index]);
+        }
+        if let Some(extensions) = extensions {
             builder = builder
                 .propose_group_context_extensions(extensions)
                 .map_err(|_| "management proposal failed")?;
@@ -277,34 +341,54 @@ impl Workspace {
             .to_bytes()
             .map_err(|_| "management encoding failed")?;
         let mut proof = super::MembershipVerifier::from_workspace(self)?;
-        proof.apply_transition(&super::MembershipAuthorization::Management(action), &commit)?;
+        proof.apply_transition(&authorization, &commit)?;
+        super::object::retain_receive_epoch(&candidate.provider, &candidate.group)?;
         candidate
             .group
             .merge_pending_commit(&candidate.provider)
             .map_err(|_| "management merge failed")?;
-        candidate.join_history =
-            Some(self.append_history(super::MembershipAuthorization::Management(action), &commit)?);
+        candidate.join_history = Some(self.append_history(authorization.clone(), &commit)?);
+        candidate.prune_invitation_checkpoints()?;
         if !proof.matches_workspace(&candidate)? {
             return Err("management branch mismatch");
         }
         Ok(PreparedManagement {
             workspace: candidate,
             action,
+            authorization,
             commit,
         })
     }
 
-    /// Stage verified management without changing this owner. Removal returns
-    /// metadata without group keys, for replacement of the active saved record.
+    /// Stage a verified class 2 management step. Revocations need their
+    /// order: use [`Workspace::prepare_step_update`].
     pub fn prepare_management_update(
         &self,
         action: ManagementAction,
         commit: &[u8],
     ) -> Result<PreparedManagementUpdate, &'static str> {
-        self.verify_management(action, commit)?;
+        self.prepare_step_update(&MembershipAuthorization::Management(action), commit)
+    }
+
+    /// Stage one verified management, revocation or self-update step without
+    /// changing this owner. Removal of this member returns metadata without
+    /// group keys, for replacement of the active saved record.
+    pub fn prepare_step_update(
+        &self,
+        authorization: &MembershipAuthorization,
+        commit: &[u8],
+    ) -> Result<PreparedManagementUpdate, &'static str> {
+        if matches!(
+            authorization,
+            MembershipAuthorization::Admission(_) | MembershipAuthorization::AdmissionBatch(_)
+        ) {
+            return Err("use prepare_admission_update for admissions");
+        }
         let mut proof = super::MembershipVerifier::from_workspace(self)?;
-        proof.apply_transition(&super::MembershipAuthorization::Management(action), commit)?;
+        proof.apply_transition(authorization, commit)?;
         let mut candidate = self.provisional_copy()?;
+        // The private group also checks the membership tag, which public
+        // verification cannot.
         let processed = candidate
             .group
             .process_message(
@@ -318,13 +402,14 @@ impl Workspace {
         let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
             return Err("not a management commit");
         };
+        super::object::retain_receive_epoch(&candidate.provider, &candidate.group)?;
         candidate
             .group
             .merge_staged_commit(&candidate.provider, *staged)
             .map_err(|_| "management merge failed")?;
         if !candidate.group.is_active() {
             let member = self.member().ok_or("removed owner lacks member identity")?;
-            if !action.removes() || action.target() != member.id() {
+            if authorization.removed_member() != Some(member.id()) {
                 return Err("removal does not match local member");
             }
             use sha2::Digest;
@@ -338,8 +423,7 @@ impl Workspace {
                 ),
             ));
         }
-        candidate.join_history =
-            Some(self.append_history(super::MembershipAuthorization::Management(action), commit)?);
+        candidate.join_history = Some(self.append_history(authorization.clone(), commit)?);
         candidate.prune_invitation_checkpoints()?;
         if !proof.matches_workspace(&candidate)? {
             return Err("management branch mismatch");
@@ -347,15 +431,26 @@ impl Workspace {
         Ok(PreparedManagementUpdate::Active(Box::new(candidate)))
     }
 
-    /// Authenticate an exact public MLS management commit without changing this
-    /// owner. The expected action is untrusted until it matches the signed commit.
-    /// This checks one branch; it cannot establish global finality across partitions.
+    /// Authenticate an exact public MLS class 2 management commit without
+    /// changing this owner. The expected action is untrusted until it matches
+    /// the signed commit. Revocations: [`Workspace::verify_step`].
     pub fn verify_management(
         &self,
         action: ManagementAction,
         commit: &[u8],
     ) -> Result<(), &'static str> {
-        JoinProof::from_workspace(self)?.verify_management(action, commit)?;
+        self.verify_step(&MembershipAuthorization::Management(action), commit)
+    }
+
+    /// Authenticate one exact step against this state without changing it.
+    /// This checks one branch; it cannot establish finality across partitions.
+    pub fn verify_step(
+        &self,
+        authorization: &MembershipAuthorization,
+        commit: &[u8],
+    ) -> Result<(), &'static str> {
+        // Own local state: the local bound, not the joiner's inline wire bound.
+        super::MembershipVerifier::from_workspace(self)?.apply_transition(authorization, commit)?;
         // PublicGroup checks signatures/policy but cannot check membership tags.
         // Use a disposable private owner as well; never consume the live state.
         let provider = storage::copy_provider(&self.provider)?;
@@ -379,37 +474,81 @@ impl Workspace {
     }
 }
 
+/// Verify a class 2 management commit: the committer must be an administrator.
 pub(super) fn verify(
-    crypto: &impl OpenMlsCrypto,
     group: &PublicGroup,
     sender: &Sender,
     staged: &StagedCommit,
     action: ManagementAction,
 ) -> Result<(), &'static str> {
+    let actor = actor(group, sender)?;
+    let before = bootstrap::authority(group.group_context().extensions())?;
+    if !before.contains(&actor.signature_key) {
+        return Err("management actor is not an administrator");
+    }
+    match action {
+        ManagementAction::Promote(id) => {
+            verify_change(group, sender, &actor, staged, Change::Promote, id)
+        }
+        ManagementAction::CreateInvitation(..)
+        | ManagementAction::CreateRequestInvitation(..)
+        | ManagementAction::DeclineInvitationRequest(..)
+        | ManagementAction::CreateAutomaticInvitation(..)
+        | ManagementAction::ApproveInvitation(..) => {
+            super::invitation_controls::verify(group, sender, &actor, staged, action)
+        }
+        ManagementAction::Remove(_)
+        | ManagementAction::Demote(_)
+        | ManagementAction::DisableInvitation(_) => Err("revocation requires a signed order"),
+    }
+}
+
+/// Verify the commit of an already verified revocation order. Any member may
+/// be the sender; the order carries the authority.
+pub(super) fn verify_revocation(
+    group: &PublicGroup,
+    sender: &Sender,
+    staged: &StagedCommit,
+    order: &RevocationOrder,
+) -> Result<(), &'static str> {
+    let actor = actor(group, sender)?;
+    match order.kind {
+        RevocationKind::Remove | RevocationKind::Leave => {
+            verify_change(group, sender, &actor, staged, Change::Remove, order.target)
+        }
+        RevocationKind::Demote => {
+            verify_change(group, sender, &actor, staged, Change::Demote, order.target)
+        }
+        RevocationKind::DisableInvitation => super::invitation_controls::verify(
+            group,
+            sender,
+            &actor,
+            staged,
+            ManagementAction::DisableInvitation(order.target),
+        ),
+    }
+}
+
+fn actor(group: &PublicGroup, sender: &Sender) -> Result<Member, &'static str> {
     let Sender::Member(actor_index) = sender else {
         return Err("management actor is not a member");
     };
-    let members: Vec<_> = group.members().collect();
-    let actor = members
-        .iter()
+    group
+        .members()
         .find(|m| m.index == *actor_index)
-        .ok_or("unknown management actor")?;
+        .ok_or("unknown management actor")
+}
+
+fn verify_change(
+    group: &PublicGroup,
+    sender: &Sender,
+    actor: &Member,
+    staged: &StagedCommit,
+    change: Change,
+    id: [u8; 32],
+) -> Result<(), &'static str> {
+    let members: Vec<_> = group.members().collect();
     let before = bootstrap::authority(group.group_context().extensions())?;
-    if !matches!(action, ManagementAction::Leave(..)) && !before.contains(&actor.signature_key) {
-        return Err("management actor is not an administrator");
-    }
-    if matches!(
-        action,
-        ManagementAction::CreateInvitation(..)
-            | ManagementAction::CreateRequestInvitation(..)
-            | ManagementAction::DeclineInvitationRequest(..)
-            | ManagementAction::CreateAutomaticInvitation(..)
-            | ManagementAction::DisableInvitation(_)
-            | ManagementAction::ApproveInvitation(..)
-    ) {
-        return super::invitation_controls::verify(group, sender, actor, staged, action);
-    }
-    let id = action.target();
     let mut target = None;
     for member in &members {
         if bootstrap::binding(&member.credential)?.0 == id {
@@ -420,7 +559,6 @@ pub(super) fn verify(
         }
     }
     let target = target.ok_or("management target is not a current member")?;
-    verify_leave(crypto, group.group_context(), &target.signature_key, action)?;
     if before
         .iter()
         .any(|key| members.iter().filter(|m| &m.signature_key == key).count() != 1)
@@ -429,14 +567,8 @@ pub(super) fn verify(
     }
     let was_admin = before.contains(&target.signature_key);
     let mut expected = before.clone();
-    match action {
-        ManagementAction::CreateInvitation(..)
-        | ManagementAction::CreateRequestInvitation(..)
-        | ManagementAction::DeclineInvitationRequest(..)
-        | ManagementAction::CreateAutomaticInvitation(..)
-        | ManagementAction::DisableInvitation(_)
-        | ManagementAction::ApproveInvitation(..) => unreachable!(),
-        ManagementAction::Promote(_) => {
+    match change {
+        Change::Promote => {
             if was_admin {
                 return Err("member is already an administrator");
             }
@@ -451,13 +583,13 @@ pub(super) fn verify(
             expected.push(target.signature_key.clone());
             expected.sort();
         }
-        ManagementAction::Demote(_) => {
+        Change::Demote => {
             if !was_admin {
                 return Err("member is not an administrator");
             }
             expected.retain(|key| key != &target.signature_key);
         }
-        ManagementAction::Remove(_) | ManagementAction::Leave(..) => {
+        Change::Remove => {
             if target.index == actor.index {
                 return Err("self removal requires a separate leave operation");
             }
@@ -487,12 +619,11 @@ pub(super) fn verify(
     {
         return Err("management cannot change unrelated group policy");
     }
-    if let Some(leaf) = staged.update_path_leaf_node()
-        && (leaf.credential() != &actor.credential
-            || leaf.signature_key().as_slice() != actor.signature_key)
-    {
-        return Err("management cannot replace committer identity");
+    if let Some(leaf) = staged.update_path_leaf_node() {
+        bootstrap::check_path_leaf(group, actor.index, leaf)
+            .map_err(|_| "management cannot replace committer identity")?;
     }
+    let removes = change == Change::Remove;
     let mut removals = 0;
     let mut roles = 0;
     for proposal in staged.queued_proposals() {
@@ -502,14 +633,14 @@ pub(super) fn verify(
             return Err("management requires inline actor-authored proposals");
         }
         match proposal.proposal() {
-            Proposal::Remove(remove) if action.removes() && remove.removed() == target.index => {
+            Proposal::Remove(remove) if removes && remove.removed() == target.index => {
                 removals += 1
             }
             Proposal::GroupContextExtensions(_) => roles += 1,
             _ => return Err("management includes an unrelated proposal"),
         }
     }
-    if removals != usize::from(action.removes()) || roles != usize::from(before != expected) {
+    if removals != usize::from(removes) || roles != usize::from(before != expected) {
         return Err("management proposal count does not match intent");
     }
     Ok(())
@@ -518,17 +649,29 @@ pub(super) fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PendingJoin, StorageKey};
+    use crate::{JoinProof, PendingJoin, StorageKey};
     use openmls::prelude::tls_codec::Deserialize;
     use openmls_traits::OpenMlsProvider;
 
-    fn add(admin: Workspace, endpoint: u8) -> (Workspace, Workspace, crate::PreparedAdmission) {
-        let (invite, checkpoint) = admin.issue_invitation().unwrap();
-        let pending =
-            PendingJoin::from_invitation(&invite, &checkpoint, [endpoint; 32], "Field member")
-                .unwrap();
+    /// Returns the invitation registration other members must also apply.
+    fn add(
+        admin: Workspace,
+        endpoint: u8,
+    ) -> (PreparedManagement, Workspace, crate::PreparedAdmission) {
+        let (registration, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+        let admin = &registration.workspace;
+        let pending = PendingJoin::from_invitation(
+            &invite,
+            &checkpoint,
+            crate::test_key(u64::from(endpoint)),
+            "Field member",
+        )
+        .unwrap();
         let prepared = admin
-            .prepare_admission([endpoint; 32], pending.admission_request().unwrap())
+            .prepare_admission(
+                crate::test_endpoint(u64::from(endpoint)),
+                pending.admission_request().unwrap(),
+            )
             .unwrap();
         let mut proof = pending.join_proof().unwrap();
         proof
@@ -537,10 +680,13 @@ mod tests {
         let member = pending
             .prepare_workspace(&proof, &prepared.welcome)
             .unwrap();
-        (admin, member, prepared)
+        (registration, member, prepared)
     }
     fn pair() -> (Workspace, Workspace) {
-        let (_, member, prepared) = add(Workspace::create([1; 32], "Coordinator").unwrap(), 2);
+        let (_, member, prepared) = add(
+            Workspace::create(crate::test_key(1), "Coordinator").unwrap(),
+            2,
+        );
         (prepared.workspace, member)
     }
 
@@ -548,10 +694,9 @@ mod tests {
     fn incremental_verification_has_no_workspace_lifetime_counter() {
         let (mut admin, member) = pair();
         let checkpoint = admin.join_checkpoint().unwrap();
-        use sha2::{Digest, Sha256};
         let mut verifier = crate::MembershipVerifier::from_trusted_checkpoint(
             admin.id(),
-            Sha256::digest(&checkpoint).into(),
+            crate::checkpoint_digest(&checkpoint).unwrap(),
             &checkpoint,
         )
         .unwrap();
@@ -562,36 +707,35 @@ mod tests {
             let mut keys = vec![admin._signer.public().to_vec()];
             let (action, wrong) = if sequence % 2 == 0 {
                 keys.push(member._signer.public().to_vec());
-                (ManagementAction::Promote(id), ManagementAction::Demote(id))
+                (
+                    m(ManagementAction::Promote(id)),
+                    m(ManagementAction::Demote(id)),
+                )
             } else {
-                (ManagementAction::Demote(id), ManagementAction::Promote(id))
+                (
+                    order(&mut admin, RevocationKind::Demote, id),
+                    m(ManagementAction::Promote(id)),
+                )
             };
             let commit = role_commit(&mut admin, keys);
             let epoch = verifier.epoch();
-            assert!(
-                verifier
-                    .apply_transition(&crate::MembershipAuthorization::Management(wrong), &commit,)
-                    .is_err()
-            );
+            assert!(verifier.apply_transition(&wrong, &commit).is_err());
             assert_eq!(verifier.epoch(), epoch);
             verifier
-                .apply_transition(&crate::MembershipAuthorization::Management(action), &commit)
+                .apply_transition(&action, &commit)
                 .unwrap_or_else(|error| panic!("transition {}: {error}", sequence + 1));
-            assert!(
-                verifier
-                    .apply_transition(&crate::MembershipAuthorization::Management(action), &commit)
-                    .is_err()
-            );
+            assert!(verifier.apply_transition(&action, &commit).is_err());
             assert_eq!(verifier.epoch(), epoch + 1);
             admin.group.merge_pending_commit(&admin.provider).unwrap();
             assert!(verifier.matches_workspace(&admin).unwrap());
         }
-        assert_eq!(verifier.epoch(), 129);
+        assert_eq!(verifier.epoch(), 130); // Registration, admission, 128 actions.
     }
     fn extensions(owner: &Workspace, mut keys: Vec<Vec<u8>>) -> Extensions<GroupContext> {
         keys.sort();
-        let mut encoded = vec![1, keys.len() as u8];
+        let mut encoded = vec![2, keys.len() as u8];
         encoded.extend(keys.into_iter().flatten());
+        encoded.extend(crate::invitation_controls::policy_bytes(owner.group.extensions()).unwrap());
         Extensions::from_vec(
             owner
                 .group
@@ -621,10 +765,30 @@ mod tests {
             .to_bytes()
             .unwrap()
     }
+    fn m(action: ManagementAction) -> MembershipAuthorization {
+        MembershipAuthorization::Management(action)
+    }
+    /// Sign an order with `owner`'s key at its current state, past the
+    /// issuing guard, and make `owner`'s next raw commit carry it.
+    fn order(
+        owner: &mut Workspace,
+        kind: RevocationKind,
+        target: [u8; 32],
+    ) -> MembershipAuthorization {
+        let order = RevocationOrder::sign(
+            kind,
+            target,
+            owner.group.public_group().group_context(),
+            &owner._signer,
+        )
+        .unwrap();
+        owner.group.set_aad(crate::order::commit_aad(&order));
+        MembershipAuthorization::Revocation(OrderStep::new(order))
+    }
     // Test-only merge after the production receiver guard succeeds. No product
     // management save/adopt/history support is implied by this helper.
-    fn accept(owner: &mut Workspace, action: ManagementAction, commit: &[u8]) {
-        owner.verify_management(action, commit).unwrap();
+    fn accept(owner: &mut Workspace, authorization: &MembershipAuthorization, commit: &[u8]) {
+        owner.verify_step(authorization, commit).unwrap();
         let message = MlsMessageIn::tls_deserialize_exact(commit)
             .unwrap()
             .try_into_protocol_message()
@@ -665,7 +829,7 @@ mod tests {
                 .verify_management(ManagementAction::Promote([99; 32]), &commit)
                 .is_err()
         );
-        let unrelated = Workspace::create([9; 32], "Other workspace").unwrap();
+        let unrelated = Workspace::create(crate::test_key(9), "Other workspace").unwrap();
         assert!(
             unrelated
                 .verify_management(ManagementAction::Promote(member_id), &commit)
@@ -678,8 +842,24 @@ mod tests {
                 .verify_management(ManagementAction::Promote(member_id), &tampered)
                 .is_err()
         );
-        accept(&mut member, ManagementAction::Promote(member_id), &commit);
+        accept(
+            &mut member,
+            &m(ManagementAction::Promote(member_id)),
+            &commit,
+        );
         admin.group.merge_pending_commit(&admin.provider).unwrap();
+        // The invitation registration gave the creator saved history; keep it
+        // matching the raw merge so the snapshot below still restores.
+        admin.join_history = Some(
+            admin
+                .append_history(
+                    crate::MembershipAuthorization::Management(ManagementAction::Promote(
+                        member_id,
+                    )),
+                    &commit,
+                )
+                .unwrap(),
+        );
         assert!(
             member
                 .verify_management(ManagementAction::Promote(member_id), &commit)
@@ -694,13 +874,11 @@ mod tests {
         let workspace = admin.id();
         drop(admin);
         let next_keys = vec![member._signer.to_public_vec()];
+        let authorization = order(&mut member, RevocationKind::Demote, admin_id);
         let demotion = role_commit(&mut member, next_keys);
-        let mut returning = Workspace::restore(&key, [1; 32], workspace, &snapshot).unwrap();
-        accept(
-            &mut returning,
-            ManagementAction::Demote(admin_id),
-            &demotion,
-        );
+        let mut returning =
+            Workspace::restore(&key, crate::test_endpoint(1), workspace, &snapshot).unwrap();
+        accept(&mut returning, &authorization, &demotion);
         assert!(returning.issue_invitation().is_err());
         assert_eq!(returning.member_count(), 2);
     }
@@ -727,6 +905,11 @@ mod tests {
             .find(|m| m.signature_key == admin._signer.public())
             .unwrap()
             .index;
+        let forged = order(
+            &mut member,
+            RevocationKind::Remove,
+            admin.member().unwrap().id(),
+        );
         let attack = member
             .group
             .remove_members(&member.provider, &member._signer, &[index])
@@ -735,11 +918,15 @@ mod tests {
             .to_bytes()
             .unwrap();
         assert_eq!(
+            admin.verify_step(&forged, &attack),
+            Err("order issuer was not an administrator at the anchor")
+        );
+        assert_eq!(
             admin.verify_management(
                 ManagementAction::Remove(admin.member().unwrap().id()),
                 &attack
             ),
-            Err("management actor is not an administrator")
+            Err("revocation requires a signed order")
         );
     }
     #[test]
@@ -752,6 +939,7 @@ mod tests {
             .find(|m| m.signature_key == member._signer.public())
             .unwrap()
             .index;
+        let authorization = order(&mut admin, RevocationKind::Remove, id);
         let removal = admin
             .group
             .remove_members(&admin.provider, &admin._signer, &[index])
@@ -759,35 +947,41 @@ mod tests {
             .0
             .to_bytes()
             .unwrap();
-        member
-            .verify_management(ManagementAction::Remove(id), &removal)
+        member.verify_step(&authorization, &removal).unwrap();
+        let admin_id = admin.member().unwrap().id();
+        let wrong = admin
+            .issue_revocation(RevocationKind::Remove, admin_id)
             .unwrap();
         assert!(
             member
-                .verify_management(
-                    ManagementAction::Remove(admin.member().unwrap().id()),
+                .verify_step(
+                    &MembershipAuthorization::Revocation(OrderStep::new(wrong)),
                     &removal
                 )
                 .is_err()
         );
-        accept(&mut member, ManagementAction::Remove(id), &removal);
+        accept(&mut member, &authorization, &removal);
         assert!(!member.group.is_active());
         admin
             .group
             .clear_pending_commit(admin.provider.storage())
             .unwrap();
+        let authorization = order(&mut admin, RevocationKind::Demote, admin_id);
         let last = role_commit(&mut admin, vec![]);
         assert_eq!(
-            admin.verify_management(
-                ManagementAction::Demote(admin.member().unwrap().id()),
-                &last
-            ),
+            admin.verify_step(&authorization, &last),
             Err("cannot remove the last administrator")
         );
     }
     fn trio() -> (Workspace, Workspace, Workspace) {
         let (admin, second) = pair();
-        let (_, third, prepared) = add(admin, 3);
+        let (registration, third, prepared) = add(admin, 3);
+        let PreparedManagementUpdate::Active(second) = second
+            .prepare_step_update(&registration.authorization, &registration.commit)
+            .unwrap()
+        else {
+            panic!("invitation registration removed member")
+        };
         let second = second
             .prepare_admission_update(&prepared.authorization, &prepared.commit)
             .unwrap();
@@ -801,18 +995,31 @@ mod tests {
             second._signer.to_public_vec(),
         ];
         let commit = role_commit(&mut admin, keys);
-        accept(&mut second, ManagementAction::Promote(id), &commit);
-        accept(&mut third, ManagementAction::Promote(id), &commit);
+        accept(&mut second, &m(ManagementAction::Promote(id)), &commit);
+        accept(&mut third, &m(ManagementAction::Promote(id)), &commit);
         admin.group.merge_pending_commit(&admin.provider).unwrap();
         (admin, second, third)
     }
     #[test]
     fn administrator_removal_excludes_keys_and_old_invites() {
-        let (mut admin, mut removed, mut survivor) = two_admins();
+        let (mut admin, removed, mut survivor) = two_admins();
         let removed_id = removed.member().unwrap().id();
-        let (invite, checkpoint) = removed.issue_invitation().unwrap();
+        let (registration, invite, checkpoint) =
+            removed.prepare_invitation(0, false, false).unwrap();
+        accept(
+            &mut admin,
+            &registration.authorization,
+            &registration.commit,
+        );
+        accept(
+            &mut survivor,
+            &registration.authorization,
+            &registration.commit,
+        );
+        let mut removed = registration.workspace;
         let pending =
-            PendingJoin::from_invitation(&invite, &checkpoint, [4; 32], "Late arrival").unwrap();
+            PendingJoin::from_invitation(&invite, &checkpoint, crate::test_key(4), "Late arrival")
+                .unwrap();
         let ext = extensions(&admin, vec![admin._signer.to_public_vec()]);
         let index = admin
             .group
@@ -820,6 +1027,7 @@ mod tests {
             .find(|m| m.signature_key == removed._signer.public())
             .unwrap()
             .index;
+        let authorization = order(&mut admin, RevocationKind::Remove, removed_id);
         let commit = admin
             .group
             .commit_builder()
@@ -841,7 +1049,7 @@ mod tests {
             .0
             .to_bytes()
             .unwrap();
-        accept(&mut survivor, ManagementAction::Remove(removed_id), &commit);
+        accept(&mut survivor, &authorization, &commit);
         admin.group.merge_pending_commit(&admin.provider).unwrap();
         assert_eq!(survivor.member_count(), 2);
         assert!(
@@ -851,24 +1059,27 @@ mod tests {
                 .contains(&removed.endpoint())
         );
         let fresh = admin
-            .protect_object(b"test", b"current members only")
+            .protect_object(b"app", b"test", b"current members only")
             .unwrap();
         assert_eq!(
             survivor
-                .unprotect_object(b"test", &fresh)
+                .unprotect_object(b"app", b"test", &fresh)
                 .unwrap()
                 .message
                 .payload,
             b"current members only"
         );
-        assert!(removed.unprotect_object(b"test", &fresh).is_err());
+        assert!(removed.unprotect_object(b"app", b"test", &fresh).is_err());
         let stale = removed
-            .protect_object(b"test", b"old admin publication")
+            .protect_object(b"app", b"test", b"old admin publication")
             .unwrap();
-        assert!(survivor.unprotect_object(b"test", &stale).is_err());
+        assert!(survivor.unprotect_object(b"app", b"test", &stale).is_err());
         assert_eq!(
             admin
-                .prepare_admission([4; 32], pending.admission_request().unwrap())
+                .prepare_admission(
+                    crate::test_endpoint(4),
+                    pending.admission_request().unwrap()
+                )
                 .err(),
             Some("invitation issuer is no longer an administrator")
         );
@@ -880,21 +1091,15 @@ mod tests {
         let second_id = second.member().unwrap().id();
         let first_keys = vec![admin._signer.to_public_vec()];
         let other_keys = vec![second._signer.to_public_vec()];
+        let first_order = order(&mut admin, RevocationKind::Demote, second_id);
         let first = role_commit(&mut admin, first_keys);
+        let other_order = order(&mut second, RevocationKind::Demote, admin_id);
         let other = role_commit(&mut second, other_keys);
-        observer
-            .verify_management(ManagementAction::Demote(second_id), &first)
-            .unwrap();
-        observer
-            .verify_management(ManagementAction::Demote(admin_id), &other)
-            .unwrap();
-        accept(&mut observer, ManagementAction::Demote(second_id), &first);
+        observer.verify_step(&first_order, &first).unwrap();
+        observer.verify_step(&other_order, &other).unwrap();
+        accept(&mut observer, &first_order, &first);
         let epoch = observer.epoch();
-        assert!(
-            observer
-                .verify_management(ManagementAction::Demote(admin_id), &other)
-                .is_err()
-        );
+        assert!(observer.verify_step(&other_order, &other).is_err());
         assert_eq!(observer.epoch(), epoch);
         // Explicit rejection is evidence of no overwrite, not branch convergence.
     }
@@ -951,10 +1156,32 @@ mod tests {
     }
     #[test]
     fn staged_role_change_restores_and_old_invitation_crosses_mixed_history() {
-        let admin = Workspace::create([1; 32], "Coordinator").unwrap();
-        let (old_invitation, old_checkpoint) = admin.issue_invitation().unwrap();
+        let admin = Workspace::create(crate::test_key(1), "Coordinator").unwrap();
+        let (registration, old_invitation, old_checkpoint) =
+            admin.prepare_invitation(0, false, false).unwrap();
+        let admin = registration.workspace;
+        // The helper joins through the same link, so both owners anchor at its checkpoint.
         let (mut admin, helper) = {
-            let (_, helper, prepared) = add(admin, 2);
+            let pending = PendingJoin::from_invitation(
+                &old_invitation,
+                &old_checkpoint,
+                crate::test_key(2),
+                "Field member",
+            )
+            .unwrap();
+            let prepared = admin
+                .prepare_admission(
+                    crate::test_endpoint(2),
+                    pending.admission_request().unwrap(),
+                )
+                .unwrap();
+            let mut proof = pending.join_proof().unwrap();
+            proof
+                .apply_add(&prepared.authorization, &prepared.commit)
+                .unwrap();
+            let helper = pending
+                .prepare_workspace(&proof, &prepared.welcome)
+                .unwrap();
             (prepared.workspace, helper)
         };
         let key = StorageKey::derive(&[7; 32]).unwrap();
@@ -965,7 +1192,7 @@ mod tests {
         let prepared = admin.prepare_management(action).unwrap();
         assert_eq!(admin.epoch(), before);
         let PreparedManagementUpdate::Active(promoted) = helper
-            .prepare_management_update(action, &prepared.commit)
+            .prepare_step_update(&prepared.authorization, &prepared.commit)
             .unwrap()
         else {
             panic!("promotion removed member")
@@ -979,12 +1206,14 @@ mod tests {
                 .unwrap()
                 .inline(promoted.id())
                 .unwrap()[..5],
-            b"DFJH\x02"
+            b"DFJH\x03"
         );
         let snapshot = promoted.seal(&key).unwrap();
-        let promoted = Workspace::restore(&key, [2; 32], helper.id(), &snapshot).unwrap();
+        let promoted =
+            Workspace::restore(&key, crate::test_endpoint(2), helper.id(), &snapshot).unwrap();
         let mut records = promoted.export_records().unwrap();
-        let promoted = Workspace::restore_records([2; 32], helper.id(), &records).unwrap();
+        let promoted =
+            Workspace::restore_records(crate::test_endpoint(2), helper.id(), &records).unwrap();
         let history_key = records
             .keys()
             .find(|name| name.starts_with(b"security/history/step/"))
@@ -992,19 +1221,26 @@ mod tests {
             .clone();
         let bytes = records.get_mut(&history_key).unwrap();
         assert_eq!(bytes[0], 0); // Admission authorization record.
-        bytes[33] ^= 1; // Administrator grant signature; publicly verifiable.
-        assert!(Workspace::restore_records([2; 32], helper.id(), &records).is_err());
+        bytes[34] ^= 1; // Administrator grant signature; publicly verifiable.
+        assert!(
+            Workspace::restore_records(crate::test_endpoint(2), helper.id(), &records).is_err()
+        );
         assert!(promoted.issue_invitation().is_ok());
         admin = prepared.workspace;
         let saved_admin = admin.seal(&key).unwrap();
-        admin = Workspace::restore(&key, [1; 32], admin.id(), &saved_admin).unwrap();
-        let late =
-            PendingJoin::from_invitation(&old_invitation, &old_checkpoint, [3; 32], "Late member")
-                .unwrap();
+        admin =
+            Workspace::restore(&key, crate::test_endpoint(1), admin.id(), &saved_admin).unwrap();
+        let late = PendingJoin::from_invitation(
+            &old_invitation,
+            &old_checkpoint,
+            crate::test_key(3),
+            "Late member",
+        )
+        .unwrap();
         let request = late.admission_request().unwrap();
         for owner in [&admin, &promoted] {
             let steps = owner
-                .membership_history([3; 32], request, &old_checkpoint)
+                .membership_history(crate::test_endpoint(3), request, &old_checkpoint)
                 .unwrap();
             assert_eq!(steps.len(), 2);
             let mut proof = late.join_proof().unwrap();
@@ -1014,27 +1250,34 @@ mod tests {
             assert!(proof.matches_workspace(owner).unwrap());
             assert_eq!(
                 owner
-                    .admission_history([3; 32], request, &old_checkpoint)
+                    .admission_history(crate::test_endpoint(3), request, &old_checkpoint)
                     .err(),
                 Some("membership history requires management support")
             );
         }
         drop(admin);
         drop(helper);
-        let admitted = promoted.prepare_admission([3; 32], request).unwrap();
+        let admitted = promoted
+            .prepare_admission(crate::test_endpoint(3), request)
+            .unwrap();
         let steps = admitted
             .workspace
-            .membership_history([3; 32], request, &old_checkpoint)
+            .membership_history(crate::test_endpoint(3), request, &old_checkpoint)
             .unwrap();
         let mut proof = late.join_proof().unwrap();
         for (auth, commit) in &steps {
             proof.apply_transition(auth, commit).unwrap();
         }
         let joined = late.prepare_workspace(&proof, &admitted.welcome).unwrap();
-        let restored =
-            Workspace::restore(&key, [3; 32], joined.id(), &joined.seal(&key).unwrap()).unwrap();
+        let restored = Workspace::restore(
+            &key,
+            crate::test_endpoint(3),
+            joined.id(),
+            &joined.seal(&key).unwrap(),
+        )
+        .unwrap();
         assert_eq!(restored.member_count(), 3);
-        assert_eq!(restored.epoch(), 3);
+        assert_eq!(restored.epoch(), 4); // Registration, admission, promotion, admission.
         let encoded = proof.history();
         assert!(
             JoinProof::from_history(joined.id(), old_invitation.checkpoint_digest(), encoded)
@@ -1077,20 +1320,21 @@ mod tests {
         let action = ManagementAction::Remove(removed.member().unwrap().id());
         let prepared = admin.prepare_management(action).unwrap();
         let PreparedManagementUpdate::Active(updated) = survivor
-            .prepare_management_update(action, &prepared.commit)
+            .prepare_step_update(&prepared.authorization, &prepared.commit)
             .unwrap()
         else {
             panic!("survivor removed")
         };
-        assert_eq!(admin.epoch(), 2);
-        assert_eq!(survivor.epoch(), 2);
+        // Two invitation registrations and two admissions.
+        assert_eq!(admin.epoch(), 4);
+        assert_eq!(survivor.epoch(), 4);
         let PreparedManagementUpdate::Removed(record) = removed
-            .prepare_management_update(action, &prepared.commit)
+            .prepare_step_update(&prepared.authorization, &prepared.commit)
             .unwrap()
         else {
             panic!("removed recipient returned active state")
         };
-        assert_eq!(record.epoch(), 3);
+        assert_eq!(record.epoch(), 5);
         let key = StorageKey::derive(&[9; 32]).unwrap();
         let sealed_removal = record.seal(&key).unwrap();
         let restored_removal = crate::RemovedMembership::restore(
@@ -1104,7 +1348,7 @@ mod tests {
         assert!(
             Workspace::restore(&key, removed.endpoint(), removed.id(), &sealed_removal).is_err()
         );
-        assert_eq!(removed.epoch(), 2);
+        assert_eq!(removed.epoch(), 4);
         let key = StorageKey::derive(&[9; 32]).unwrap();
         let restored = Workspace::restore(
             &key,
@@ -1114,22 +1358,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restored.member_count(), 2);
-        assert_eq!(restored.epoch(), 3);
+        assert_eq!(restored.epoch(), 5);
         let mut sender = prepared.workspace;
         let payload = sender
-            .protect_object(b"removal", b"surviving members")
+            .protect_object(b"app", b"removal", b"surviving members")
             .unwrap();
         assert_eq!(
             restored
-                .unprotect_object(b"removal", &payload)
+                .unprotect_object(b"app", b"removal", &payload)
                 .unwrap()
                 .message
                 .payload,
             b"surviving members"
         );
-        assert!(removed.unprotect_object(b"removal", &payload).is_err());
-        let stale = removed.protect_object(b"removal", b"old member").unwrap();
-        assert!(restored.unprotect_object(b"removal", &stale).is_err());
+        assert!(
+            removed
+                .unprotect_object(b"app", b"removal", &payload)
+                .is_err()
+        );
+        let stale = removed
+            .protect_object(b"app", b"removal", b"old member")
+            .unwrap();
+        assert!(
+            restored
+                .unprotect_object(b"app", b"removal", &stale)
+                .is_err()
+        );
     }
     #[test]
     fn removed_record_is_context_bound_and_cannot_restore_active_keys() {
@@ -1142,7 +1396,7 @@ mod tests {
         *bad_commit.last_mut().unwrap() ^= 1;
         assert!(
             removed
-                .prepare_management_update(action, &bad_commit)
+                .prepare_step_update(&prepared.authorization, &bad_commit)
                 .is_err()
         );
         assert!(
@@ -1154,7 +1408,7 @@ mod tests {
                 .is_err()
         );
         let PreparedManagementUpdate::Removed(record) = removed
-            .prepare_management_update(action, &prepared.commit)
+            .prepare_step_update(&prepared.authorization, &prepared.commit)
             .unwrap()
         else {
             panic!("removed recipient returned keys")
@@ -1189,8 +1443,12 @@ mod tests {
             )
             .is_err()
         );
-        assert!(RemovedMembership::restore(&key, [9; 32], workspace, &sealed).is_err());
-        assert!(RemovedMembership::restore(&key, endpoint, [9; 32], &sealed).is_err());
+        assert!(
+            RemovedMembership::restore(&key, crate::test_endpoint(9), workspace, &sealed).is_err()
+        );
+        assert!(
+            RemovedMembership::restore(&key, endpoint, crate::test_endpoint(9), &sealed).is_err()
+        );
         for length in 0..sealed.len() {
             assert!(
                 RemovedMembership::restore(&key, endpoint, workspace, &sealed[..length]).is_err()
@@ -1242,7 +1500,7 @@ mod tests {
 
 #[test]
 fn provisional_copy_exceeds_legacy_size_and_isolates_sender_state() {
-    let owner = Workspace::create([1; 32], "Publisher").unwrap();
+    let owner = Workspace::create(crate::test_key(1), "Publisher").unwrap();
     // An opaque provider record crosses the old serialization size boundary.
     owner.provider.storage().values.write().unwrap().insert(
         b"test/large-native-record".to_vec(),
@@ -1254,7 +1512,7 @@ fn provisional_copy_exceeds_legacy_size_and_isolates_sender_state() {
     let mut candidate = owner.provisional_copy().unwrap();
     assert_eq!(candidate.export_records().unwrap(), before);
     candidate
-        .protect_object(b"stream", b"provisional output")
+        .protect_object(b"app", b"stream", b"provisional output")
         .unwrap();
     assert_eq!(candidate.object_counter().unwrap(), 1);
     assert_eq!(owner.object_counter().unwrap(), 0);

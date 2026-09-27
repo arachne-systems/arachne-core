@@ -1,0 +1,54 @@
+name: Release attestation
+
+on:
+  push:
+    # release-plz creates one `<package>-v<version>` tag per published crate.
+    tags: ["*-v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  attest:
+    if: github.repository == 'arachne-systems/arachne-core'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: 1.98.0
+      - id: package
+        name: Rebuild tagged crate archive
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          package="${TAG%-v*}"
+          version="${TAG##*-v}"
+          test -n "$package" && test -n "$version" && test "$TAG" = "$package-v$version"
+          cargo package --locked --no-verify -p "$package"
+          artifact="$GITHUB_WORKSPACE/target/package/$package-$version.crate"
+          test -f "$artifact"
+          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          file: ${{ steps.package.outputs.artifact }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ steps.package.outputs.artifact }}
+      - name: Attest SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ steps.package.outputs.artifact }}
+          sbom-path: sbom.spdx.json

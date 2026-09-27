@@ -1,9 +1,11 @@
+use arachne_api::ApiError;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 
 /// Durable lifecycle phases projected to every adapter.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum Phase {
     Empty,
     Creating,
@@ -21,7 +23,16 @@ pub enum Phase {
 /// details remain separate projections; this value only answers where the
 /// workspace operation is and why it stopped.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Activity {
+    pub phase: Phase,
+    pub reason: Option<String>,
+}
+
+/// The phase as adapters see it: `{"state": phase, "reason": ...}`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct ActivityView {
+    #[serde(rename = "state")]
     pub phase: Phase,
     pub reason: Option<String>,
 }
@@ -36,12 +47,12 @@ impl Default for Activity {
 }
 
 impl Activity {
-    pub(super) fn transition(&mut self, next: Phase, reason: Option<&str>) -> Result<(), String> {
+    pub(super) fn transition(&mut self, next: Phase, reason: Option<&str>) -> Result<(), ApiError> {
         if self.phase != next && !legal(self.phase, next) {
-            return Err(format!(
+            return Err(ApiError::wrong_state(format!(
                 "invalid workspace activity transition: {:?} -> {:?}",
                 self.phase, next
-            ));
+            )));
         }
         let reason = reason.map(str::to_owned);
         if let Some(value) = &reason
@@ -51,15 +62,20 @@ impl Activity {
                     .bytes()
                     .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'))
         {
-            return Err("workspace activity reason is not a stable code".into());
+            return Err(ApiError::internal(
+                "workspace activity reason is not a stable code",
+            ));
         }
         self.reason = reason;
         self.phase = next;
         Ok(())
     }
 
-    pub(super) fn projection(&self) -> Value {
-        json!({"state": self.phase, "reason": self.reason})
+    pub(super) fn view(&self) -> ActivityView {
+        ActivityView {
+            phase: self.phase,
+            reason: self.reason.clone(),
+        }
     }
 }
 
@@ -104,6 +120,7 @@ fn legal(from: Phase, to: Phase) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn legal_transitions_are_strict_and_idempotent() {
@@ -119,7 +136,13 @@ mod tests {
         activity
             .transition(Phase::Failed, Some("join_timeout"))
             .unwrap();
-        assert_eq!(activity.projection()["state"], json!("failed"));
-        assert_eq!(activity.projection()["reason"], json!("join_timeout"));
+        assert_eq!(
+            serde_json::to_value(activity.view()).unwrap()["state"],
+            json!("failed")
+        );
+        assert_eq!(
+            serde_json::to_value(activity.view()).unwrap()["reason"],
+            json!("join_timeout")
+        );
     }
 }

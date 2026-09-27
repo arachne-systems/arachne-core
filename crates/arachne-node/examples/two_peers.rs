@@ -23,10 +23,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .skip(1)
         .map(|arg| arg.into_string().map_err(|_| "arguments must be UTF-8"))
         .collect::<Result<_, _>>()?;
-    let address: SocketAddr = args
-        .first()
-        .ok_or("provide bind IP:PORT")?
-        .parse()?;
+    let address: SocketAddr = args.first().ok_or("provide bind IP:PORT")?.parse()?;
     let lan_lookup = args.iter().any(|arg| arg == "--lan-lookup");
     let wan_lookup = args.iter().any(|arg| arg == "--wan-lookup");
     if lan_lookup && wan_lookup {

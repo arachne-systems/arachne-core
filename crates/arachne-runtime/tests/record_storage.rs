@@ -42,41 +42,72 @@ fn restore(store: &Store, endpoint: [u8; 32], workspace: [u8; 32]) -> Workspace 
     Workspace::restore_records(endpoint, workspace, &records).unwrap()
 }
 
+/// Pre-release rule: no legacy formats. A version-one record set is
+/// refused with the one "create the workspace again" error.
 #[test]
 fn restores_version_one_security_records() {
-    let owner = Workspace::create([17; 32], "Legacy record owner").unwrap();
+    let key = arachne_security::EndpointKey::generate().unwrap();
+    let owner = Workspace::create(&key, "Legacy record owner").unwrap();
     let mut records = owner.export_records().unwrap();
     let meta = records.get_mut(b"security/meta".as_slice()).unwrap();
     meta[..5].copy_from_slice(b"DFWR\x01");
     let legacy_length = meta.len() - 8;
     meta.truncate(legacy_length);
-    let restored = Workspace::restore_records([17; 32], owner.id(), &records).unwrap();
-    assert_eq!(restored.member_count(), 1);
+    assert_eq!(
+        Workspace::restore_records(owner.endpoint(), owner.id(), &records).err(),
+        Some(arachne_security::FORMAT_NOT_SUPPORTED)
+    );
 }
 
 #[test]
 fn hundred_members_save_as_records_and_follower_crosses_old_history_ceiling() {
     let directory = common::directory();
-    let mut admin = Workspace::create([200; 32], "Record-store administrator").unwrap();
+    let admin_key = arachne_security::EndpointKey::generate().unwrap();
+    let mut admin = Workspace::create(&admin_key, "Record-store administrator").unwrap();
     let id = admin.id();
+    let admin_endpoint = admin.endpoint();
     let old_key = StorageKey::derive(&[201; 32]).unwrap();
     let old_file = admin.seal(&old_key).unwrap();
-    admin = Workspace::restore(&old_key, [200; 32], id, &old_file).unwrap();
-    let (old_invitation, old_checkpoint) = admin.issue_invitation().unwrap();
+    admin = Workspace::restore(&old_key, admin_endpoint, id, &old_file).unwrap();
+    let member_keys: Vec<_> = (0..100)
+        .map(|_| arachne_security::EndpointKey::generate().unwrap())
+        .collect();
+    let late_key = arachne_security::EndpointKey::generate().unwrap();
+    let late_endpoint = arachne_security::EndpointSigner::endpoint(&late_key);
+    let first_member = arachne_security::EndpointSigner::endpoint(&member_keys[1]);
+    let (registered, old_invitation, old_checkpoint) =
+        admin.prepare_invitation(0, false, false).unwrap();
+    admin = registered.workspace;
     let admin_path = directory.path().join("admin.db");
     let follower_path = directory.path().join("follower.db");
     let mut admin_store = Store::open(&admin_path, &[202; 32], id).unwrap();
     let mut follower_store = Store::open(&follower_path, &[203; 32], id).unwrap();
     save(&mut admin_store, &admin);
-    let mut follower = None;
+    let mut follower: Option<Workspace> = None;
     let mut latest = None;
     for member in 1u8..100 {
-        let (invite, checkpoint) = admin.issue_invitation().unwrap();
+        let (registered, invite, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+        admin = registered.workspace;
+        if let Some(owner) = &follower {
+            // The follower is already a member once one exists, so it must
+            // apply the registration commit too or it forks from admin.
+            let updated = owner
+                .prepare_management_update(registered.action, &registered.commit)
+                .unwrap();
+            let arachne_security::PreparedManagementUpdate::Active(boxed) = updated else {
+                panic!("expected active update")
+            };
+            follower = Some(*boxed);
+        }
+        let member_key = &member_keys[member as usize];
         let pending =
-            PendingJoin::from_invitation(&invite, &checkpoint, [member; 32], "Workspace member")
+            PendingJoin::from_invitation(&invite, &checkpoint, member_key, "Workspace member")
                 .unwrap();
         let prepared = admin
-            .prepare_admission([member; 32], pending.admission_request().unwrap())
+            .prepare_admission(
+                arachne_security::EndpointSigner::endpoint(member_key),
+                pending.admission_request().unwrap(),
+            )
             .unwrap();
         let mut proof = pending.join_proof().unwrap();
         proof
@@ -107,8 +138,8 @@ fn hundred_members_save_as_records_and_follower_crosses_old_history_ceiling() {
             drop(follower_store);
             admin_store = Store::open(&admin_path, &[202; 32], id).unwrap();
             follower_store = Store::open(&follower_path, &[203; 32], id).unwrap();
-            admin = restore(&admin_store, [200; 32], id);
-            follower = Some(restore(&follower_store, [1; 32], id));
+            admin = restore(&admin_store, admin_endpoint, id);
+            follower = Some(restore(&follower_store, first_member, id));
             println!(
                 "reopened members={} admin_records={} follower_records={}",
                 admin.member_count(),
@@ -126,16 +157,19 @@ fn hundred_members_save_as_records_and_follower_crosses_old_history_ceiling() {
     assert!(proof.matches_workspace(&admin).unwrap());
     // An invitation from the founding epoch still has verifiable retained history.
     let late =
-        PendingJoin::from_invitation(&old_invitation, &old_checkpoint, [150; 32], "Later joiner")
+        PendingJoin::from_invitation(&old_invitation, &old_checkpoint, &late_key, "Later joiner")
             .unwrap();
     let steps = admin
         .membership_history(
-            [150; 32],
+            late_endpoint,
             late.admission_request().unwrap(),
             &old_checkpoint,
         )
         .unwrap();
-    assert_eq!(steps.len(), 99);
+    // 99 -> 198: each of the 99 loop iterations now also registers its
+    // invitation via prepare_invitation before admitting, costing one extra
+    // epoch per member on top of the admission commit itself.
+    assert_eq!(steps.len(), 198);
     let mut verifier = MembershipVerifier::from_trusted_checkpoint(
         id,
         old_invitation.checkpoint_digest(),
@@ -147,11 +181,15 @@ fn hundred_members_save_as_records_and_follower_crosses_old_history_ceiling() {
     }
     assert!(verifier.matches_workspace(&admin).unwrap());
     let sample = admin
-        .protect_object(b"streams/opaque", b"one hundred members")
+        .protect_object(b"streams", b"streams/opaque", b"one hundred members")
         .unwrap();
     save(&mut admin_store, &admin); // Persist the sender counter before delivery.
     for reader in [follower.as_ref().unwrap(), &joined] {
-        assert!(reader.unprotect_object(b"streams/opaque", &sample).is_ok());
+        assert!(
+            reader
+                .unprotect_object(b"streams", b"streams/opaque", &sample)
+                .is_ok()
+        );
     }
     // Native storage metadata is scope-bound; missing provider state fails closed.
     let mut records = admin.export_records().unwrap();
@@ -162,7 +200,7 @@ fn hundred_members_save_as_records_and_follower_crosses_old_history_ceiling() {
         .unwrap()
         .clone();
     records.remove(&provider_key);
-    assert!(Workspace::restore_records([200; 32], id, &records).is_err());
+    assert!(Workspace::restore_records(admin_endpoint, id, &records).is_err());
     drop(admin_store);
     drop(follower_store);
     directory.close().unwrap();

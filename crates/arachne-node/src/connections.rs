@@ -5,16 +5,15 @@ use std::{
     time::Instant,
 };
 
-use futures_util::StreamExt;
+use super::mdns::PausableMdns;
 use iroh::{
     Endpoint, EndpointAddr, PublicKey,
     address_lookup::memory::MemoryLookup,
     endpoint::{AfterHandshakeOutcome, BeforeConnectOutcome, EndpointHooks, presets},
 };
-use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use tokio::sync::{Mutex, OnceCell};
 
-use super::{ConnectionBudget, Error, NetworkProfile, PeerId, RelayOptions, Result, transport};
+use super::{ConnectionBudget, Error, NodeOptions, PeerId, Result, Timeouts, transport};
 
 const MAX_ADDRESS_HINTS: usize = 4096;
 const MAX_CACHED_CONNECTIONS: usize = 32;
@@ -22,8 +21,6 @@ const MAX_CONTROL_CONNECTIONS: usize = 32;
 /// First wait after a failed dial; doubles per consecutive failure.
 const UNREACHABLE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_UNREACHABLE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(120);
-const TOR_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
-const TOR_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 // The owning Connections instance supplies the local endpoint identity.
 // A peer path/address is deliberately absent from this key.
@@ -48,10 +45,7 @@ impl EndpointHooks for ConnectionObserver {
         &'a self,
         connection: &'a iroh::endpoint::Connection,
     ) -> AfterHandshakeOutcome {
-        if connection
-            .alpn()
-            .starts_with(super::overlay::ALPN_PREFIX)
-        {
+        if connection.alpn() == super::overlay::ALPN {
             tracing::info!(
                 target: "data_fabric_transport",
                 peer = %connection.remote_id().fmt_short(),
@@ -73,16 +67,27 @@ impl EndpointHooks for ConnectionObserver {
     }
 }
 
+/// Gossip endpoints per workspace overlay tag. One ALPN serves every overlay,
+/// so the handshake admits a member of any overlay; the listener checks the
+/// overlay named by the tag.
 #[derive(Clone, Debug, Default)]
-struct GossipAuthorization(Arc<RwLock<BTreeMap<Vec<u8>, BTreeSet<PeerId>>>>);
+struct GossipAuthorization(Arc<RwLock<BTreeMap<[u8; super::overlay::TAG], BTreeSet<PeerId>>>>);
 
 impl GossipAuthorization {
-    fn allows(&self, alpn: &[u8], peer: PeerId) -> bool {
+    fn allows(&self, tag: &[u8; super::overlay::TAG], peer: PeerId) -> bool {
         self.0
             .read()
             .unwrap()
-            .get(alpn)
+            .get(tag)
             .is_some_and(|allowed| allowed.contains(&peer))
+    }
+
+    fn allows_any(&self, peer: PeerId) -> bool {
+        self.0
+            .read()
+            .unwrap()
+            .values()
+            .any(|allowed| allowed.contains(&peer))
     }
 }
 
@@ -92,8 +97,7 @@ impl EndpointHooks for GossipAuthorization {
         remote: &'a EndpointAddr,
         alpn: &'a [u8],
     ) -> BeforeConnectOutcome {
-        let allowed = !alpn.starts_with(super::overlay::ALPN_PREFIX)
-            || self.allows(alpn, *remote.id.as_bytes());
+        let allowed = alpn != super::overlay::ALPN || self.allows_any(*remote.id.as_bytes());
         if allowed {
             BeforeConnectOutcome::Accept
         } else {
@@ -110,10 +114,8 @@ impl EndpointHooks for GossipAuthorization {
         &'a self,
         connection: &'a iroh::endpoint::Connection,
     ) -> AfterHandshakeOutcome {
-        let allowed = !connection
-            .alpn()
-            .starts_with(super::overlay::ALPN_PREFIX)
-            || self.allows(connection.alpn(), *connection.remote_id().as_bytes());
+        let allowed = connection.alpn() != super::overlay::ALPN
+            || self.allows_any(*connection.remote_id().as_bytes());
         if allowed {
             AfterHandshakeOutcome::Accept
         } else {
@@ -126,6 +128,49 @@ impl EndpointHooks for GossipAuthorization {
                 error_code: 403u32.into(),
                 reason: b"workspace endpoint denied".to_vec(),
             }
+        }
+    }
+}
+
+/// Which relays an endpoint uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Relays {
+    None,
+    /// n0's public relay network.
+    Public,
+    /// The operator's relays from `NodeOptions::relay`.
+    Operator,
+}
+
+/// Public address lookup and relays, from the profile and the options.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TransportPlan {
+    /// n0's DNS/Pkarr address lookup and publishing.
+    public_lookup: bool,
+    relays: Relays,
+}
+
+impl TransportPlan {
+    fn new(options: &NodeOptions) -> Self {
+        Self {
+            public_lookup: options.public_lookup,
+            relays: match (&options.relay, options.public_lookup) {
+                (Some(_), _) => Relays::Operator,
+                (None, true) => Relays::Public,
+                (None, false) => Relays::None,
+            },
+        }
+    }
+
+    /// A builder with only the services this plan names. Operator relays are
+    /// set on it later; direct transports follow the profile.
+    fn builder(self) -> iroh::endpoint::Builder {
+        match (self.public_lookup, self.relays) {
+            (true, _) => Endpoint::builder(presets::N0),
+            (false, Relays::None) => Endpoint::builder(presets::Minimal)
+                .clear_relay_transports()
+                .clear_ip_transports(),
+            (false, _) => Endpoint::builder(presets::Minimal).clear_ip_transports(),
         }
     }
 }
@@ -143,21 +188,26 @@ fn unreachable_backoff(failures: u32) -> std::time::Duration {
 #[derive(Clone)]
 pub(super) struct Connections {
     endpoint: Endpoint,
+    #[cfg(test)]
+    pub(super) blocked_peer: super::gossip_forwarding_test::BlockedPeer,
     budget: ConnectionBudget,
+    members: super::budget::Members,
     bound_address: SocketAddr,
     addresses: Arc<Mutex<BTreeMap<PeerId, SocketAddr>>>,
     memory: MemoryLookup,
-    alpns: Arc<Mutex<BTreeSet<Vec<u8>>>>,
     gossip_authorization: GossipAuthorization,
     observer: ConnectionObserver,
     outgoing: Arc<Mutex<BTreeMap<PeerProtocol, CachedConnection>>>,
     nearby: Arc<Mutex<BTreeSet<PeerId>>>,
-    nearby_listener: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    mdns: Option<PausableMdns>,
+    /// Background timer multiplier: 1 normally, more in low power.
+    timer_scale: Arc<std::sync::atomic::AtomicU32>,
     /// Peers whose last dial failed: retry time and consecutive failures.
     /// Dials to offline members must not hold the few control dial slots.
     unreachable: Arc<Mutex<BTreeMap<PeerId, (Instant, u32)>>>,
     address_lookup: bool,
     use_ip_hints: bool,
+    timeouts: Timeouts,
     tor: bool,
     #[cfg(feature = "tor")]
     _tor_transport: Option<Arc<iroh_tor_transport::TorCustomTransport>>,
@@ -166,13 +216,15 @@ pub(super) struct Connections {
 impl Connections {
     pub(super) async fn bind(
         address: SocketAddr,
-        profile: NetworkProfile,
+        options: &NodeOptions,
         secret: Option<iroh::SecretKey>,
         budget: ConnectionBudget,
         alpns: Vec<Vec<u8>>,
-        relay: Option<RelayOptions>,
     ) -> Result<Self> {
-        let (mdns_service, wan_lookup, relay_only, use_ip_hints) = profile.settings();
+        let profile = options.profile;
+        let (mdns_service, _, relay_only, use_ip_hints) = profile.settings();
+        let plan = TransportPlan::new(options);
+        let relay = options.relay.clone();
         #[cfg(feature = "tor")]
         let tor_transport = if profile.uses_tor() {
             if relay.is_some() {
@@ -194,40 +246,40 @@ impl Connections {
         };
         let gossip_authorization = GossipAuthorization::default();
         let observer = ConnectionObserver::default();
+        let members = super::budget::Members::default();
         #[cfg(feature = "tor")]
         let builder = if let Some(tor_transport) = tor_transport.as_ref() {
             Endpoint::builder(tor_transport.preset())
-        } else if wan_lookup {
-            Endpoint::builder(presets::N0)
         } else {
-            Endpoint::builder(presets::Minimal)
-                .clear_relay_transports()
-                .clear_ip_transports()
+            plan.builder()
         };
         #[cfg(not(feature = "tor"))]
-        let builder = if wan_lookup {
-            Endpoint::builder(presets::N0)
-        } else {
-            Endpoint::builder(presets::Minimal)
-                .clear_relay_transports()
-                .clear_ip_transports()
-        };
+        let builder = plan.builder();
         let memory = MemoryLookup::new();
         let mut builder = if relay_only {
             builder.clear_ip_transports()
         } else {
             builder.bind_addr(address).map_err(transport)?
         }
-        .alpns(alpns.clone())
+        .alpns(alpns)
         .hooks(gossip_authorization.clone())
-        .hooks(budget.clone())
+        .hooks(super::budget::Admission {
+            budget: budget.clone(),
+            members: members.clone(),
+        })
         .hooks(observer.clone());
+        #[cfg(test)]
+        let blocked_peer = super::gossip_forwarding_test::BlockedPeer::default();
+        #[cfg(test)]
+        {
+            builder = builder.hooks(blocked_peer.clone());
+        }
         if !profile.uses_tor() {
             builder = builder.address_lookup(memory.clone());
         }
-        // Disable GSO on Android x86_64: multi-packet replies fail on the tested
-        // emulator path.
-        #[cfg(all(target_os = "android", target_arch = "x86_64"))]
+        // Use individual UDP sends on Android. This setting passed the tablet
+        // restart comparison and the tested emulator path.
+        #[cfg(target_os = "android")]
         {
             builder = builder.transport_config(
                 iroh::endpoint::QuicTransportConfig::builder()
@@ -244,61 +296,38 @@ impl Connections {
                 .ca_tls_config(relay.tls);
         }
         let endpoint = builder.bind().await.map_err(transport)?;
+        let nearby = Arc::new(Mutex::new(BTreeSet::new()));
         let mdns = if let Some(service_name) = mdns_service {
-            let lookup = MdnsAddressLookup::builder()
-                .service_name(service_name)
-                .build(endpoint.id())
+            let mdns = PausableMdns::start_new(service_name.into(), endpoint.id(), nearby.clone())
                 .map_err(transport)?;
             endpoint
                 .address_lookup()
                 .map_err(transport)?
-                .add(lookup.clone());
-            Some(lookup)
+                .add(mdns.clone());
+            Some(mdns)
         } else {
             None
         };
-        let nearby = Arc::new(Mutex::new(BTreeSet::new()));
-        let nearby_listener = mdns.as_ref().map(|lookup| {
-            let lookup = lookup.clone();
-            let nearby = nearby.clone();
-            let own = endpoint.id();
-            tokio::spawn(async move {
-                let mut events = lookup.subscribe().await;
-                while let Some(event) = events.next().await {
-                    match event {
-                        DiscoveryEvent::Discovered { endpoint_info, .. } => {
-                            let endpoint = endpoint_info.endpoint_id;
-                            if endpoint != own {
-                                let mut discovered = nearby.lock().await;
-                                if discovered.len() < 16 {
-                                    discovered.insert(*endpoint.as_bytes());
-                                }
-                            }
-                        }
-                        DiscoveryEvent::Expired { endpoint_id } => {
-                            nearby.lock().await.remove(endpoint_id.as_bytes());
-                        }
-                        _ => {}
-                    }
-                }
-            })
-        });
         let bound_address = endpoint.bound_sockets().first().copied().unwrap_or(address);
         Ok(Self {
             endpoint,
+            #[cfg(test)]
+            blocked_peer,
             budget,
+            members,
             bound_address,
             addresses: Arc::new(Mutex::new(BTreeMap::new())),
             memory,
-            alpns: Arc::new(Mutex::new(alpns.into_iter().collect())),
             gossip_authorization,
             observer,
             outgoing: Arc::new(Mutex::new(BTreeMap::new())),
             nearby,
-            nearby_listener: Arc::new(Mutex::new(nearby_listener)),
+            mdns,
+            timer_scale: Arc::new(std::sync::atomic::AtomicU32::new(1)),
             unreachable: Arc::new(Mutex::new(BTreeMap::new())),
-            address_lookup: mdns_service.is_some() || wan_lookup || profile.uses_tor(),
+            address_lookup: mdns_service.is_some() || plan.public_lookup || profile.uses_tor(),
             use_ip_hints,
+            timeouts: options.timeouts,
             tor: profile.uses_tor(),
             #[cfg(feature = "tor")]
             _tor_transport: tor_transport,
@@ -318,15 +347,54 @@ impl Connections {
     }
 
     pub(super) fn operation_timeout(&self) -> std::time::Duration {
-        if self.tor {
-            TOR_OPERATION_TIMEOUT
-        } else {
-            super::TIMEOUT
-        }
+        self.timeouts.operation
+    }
+
+    pub(super) fn timeouts(&self) -> Timeouts {
+        self.timeouts
+    }
+
+    /// Protocols of the open connections this endpoint observed.
+    pub(super) fn live_alpns(&self) -> Vec<Vec<u8>> {
+        self.observer
+            .0
+            .read()
+            .unwrap()
+            .live
+            .iter()
+            .filter_map(|weak| weak.upgrade())
+            .filter(|connection| connection.close_reason().is_none())
+            .map(|connection| connection.alpn().to_vec())
+            .collect()
+    }
+
+    /// Remote endpoints and protocols of the open observed connections.
+    #[cfg(test)]
+    pub(super) fn live_links(&self) -> Vec<(PeerId, Vec<u8>)> {
+        self.observer
+            .0
+            .read()
+            .unwrap()
+            .live
+            .iter()
+            .filter_map(|weak| weak.upgrade())
+            .filter(|connection| connection.close_reason().is_none())
+            .map(|connection| {
+                (
+                    *connection.remote_id().as_bytes(),
+                    connection.alpn().to_vec(),
+                )
+            })
+            .collect()
     }
 
     pub(super) fn endpoint(&self) -> Endpoint {
         self.endpoint.clone()
+    }
+
+    #[cfg(feature = "moq")]
+    pub(super) fn dial_capacity(&self, alpn: &[u8]) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        self.budget.dial(alpn)
     }
 
     pub(super) async fn wait_online(&self) {
@@ -335,6 +403,15 @@ impl Connections {
 
     pub(super) fn capacity_counts(&self) -> super::budget::CapacityCounts {
         self.budget.capacity_counts()
+    }
+
+    /// Replace the endpoints the installed policies name.
+    pub(super) fn set_members(&self, members: BTreeSet<PeerId>) {
+        self.members.replace(members);
+    }
+
+    pub(super) fn is_member(&self, peer: &PeerId) -> bool {
+        self.members.contains(peer)
     }
 
     pub(super) fn mark_evictable(&self, id: usize) {
@@ -392,20 +469,18 @@ impl Connections {
         }
     }
 
-    pub(super) async fn add_alpn(&self, alpn: Vec<u8>) {
-        let mut alpns = self.alpns.lock().await;
-        if alpns.insert(alpn) {
-            self.endpoint.set_alpns(alpns.iter().cloned().collect());
+    /// Replace the endpoints allowed on the overlay named by `tag`.
+    pub(super) fn authorize_gossip(&self, tag: [u8; super::overlay::TAG], peers: Vec<PeerId>) {
+        let mut authorized = self.gossip_authorization.0.write().unwrap();
+        if peers.is_empty() {
+            authorized.remove(&tag);
+        } else {
+            authorized.insert(tag, peers.into_iter().collect());
         }
     }
 
-    pub(super) async fn authorize_gossip(&self, alpn: Vec<u8>, peers: Vec<PeerId>) {
-        self.gossip_authorization
-            .0
-            .write()
-            .unwrap()
-            .insert(alpn.clone(), peers.into_iter().collect());
-        self.add_alpn(alpn).await;
+    pub(super) fn gossip_allows(&self, tag: &[u8; super::overlay::TAG], peer: PeerId) -> bool {
+        self.gossip_authorization.allows(tag, peer)
     }
 
     pub(super) async fn network_change(&self) {
@@ -426,7 +501,7 @@ impl Connections {
         addresses.insert(peer, address);
         self.unreachable.lock().await.remove(&peer);
         self.memory
-            .add_endpoint_info(EndpointAddr::new(key).with_ip_addr(address));
+            .set_endpoint_info(EndpointAddr::new(key).with_ip_addr(address));
         Ok(())
     }
 
@@ -436,6 +511,13 @@ impl Connections {
 
     pub(super) fn can_dial_by_peer_id(&self) -> bool {
         self.address_lookup
+    }
+
+    /// A fresh authenticated transport reached us. Clear only that peer's
+    /// failed-dial schedule; retain its address and all authorization state.
+    #[cfg(feature = "moq")]
+    pub(super) async fn remember_reachable(&self, peer: PeerId) {
+        self.unreachable.lock().await.remove(&peer);
     }
 
     pub(super) async fn remember_observed(&self, peer: PeerId, address: SocketAddr) {
@@ -449,7 +531,7 @@ impl Connections {
             addresses.insert(peer, address);
             if let Ok(key) = PublicKey::from_bytes(&peer) {
                 self.memory
-                    .add_endpoint_info(EndpointAddr::new(key).with_ip_addr(address));
+                    .set_endpoint_info(EndpointAddr::new(key).with_ip_addr(address));
             }
         }
     }
@@ -550,7 +632,7 @@ impl Connections {
         let outcome = if self.tor {
             // Tor hidden-service descriptors can take up to two minutes to
             // propagate. Retry failed SOCKS connects within a bounded window.
-            let deadline = Instant::now() + TOR_DIAL_TIMEOUT;
+            let deadline = Instant::now() + self.timeouts.dial;
             let mut delay = std::time::Duration::from_secs(3);
             loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -577,7 +659,7 @@ impl Connections {
                 }
             }
         } else {
-            attempt(destination, super::TIMEOUT).await
+            attempt(destination, self.timeouts.dial).await
         };
         let mut unreachable = self.unreachable.lock().await;
         match &outcome {
@@ -611,16 +693,84 @@ impl Connections {
         outcome
     }
 
-    /// Close and forget the cached connection to `peer` for `alpn`. A request
-    /// was sent on it and no reply came: on tablets such a connection stayed
-    /// broken (iroh dropped the reply's packets on a path the other side did
-    /// not know) and every retry on it waited out the full deadline again. The
-    /// next dial gets a fresh connection.
-    pub(super) async fn discard(&self, peer: PeerId, alpn: &[u8]) {
-        let cached = self.outgoing.lock().await.remove(&(peer, alpn.to_vec()));
-        if let Some(connection) = cached.and_then(|cached| cached.connection.get().cloned()) {
-            connection.close(0u8.into(), b"stalled");
+    /// A new authenticated session may belong to a restarted peer. Let existing
+    /// exchanges keep their handles, but make the next exchange open a fresh one.
+    #[cfg(any(feature = "moq", test))]
+    pub(super) async fn forget(&self, peer: PeerId, alpn: &[u8]) {
+        self.outgoing.lock().await.remove(&(peer, alpn.to_vec()));
+    }
+
+    /// Close the failed connection. A late failure must not evict a newer
+    /// connection that another exchange has already put in the cache.
+    pub(super) async fn discard(&self, connection: &iroh::endpoint::Connection) {
+        let key = (
+            *connection.remote_id().as_bytes(),
+            connection.alpn().to_vec(),
+        );
+        let mut outgoing = self.outgoing.lock().await;
+        if outgoing
+            .get(&key)
+            .and_then(|cached| cached.connection.get())
+            .is_some_and(|cached| cached.stable_id() == connection.stable_id())
+        {
+            outgoing.remove(&key);
         }
+        connection.close(0u8.into(), b"stalled");
+    }
+
+    /// Close every connection with no exchange in progress (suspend). The
+    /// endpoint stays bound; later dials open new connections. Returns the
+    /// number closed.
+    pub(super) async fn close_idle(&self) -> usize {
+        self.outgoing.lock().await.clear();
+        let live: Vec<_> = self
+            .observer
+            .0
+            .read()
+            .unwrap()
+            .live
+            .iter()
+            .filter_map(|weak| weak.upgrade())
+            .filter(|connection| connection.close_reason().is_none())
+            .collect();
+        let mut closed = 0;
+        for connection in live {
+            if !self.budget.is_busy(connection.stable_id()) {
+                connection.close(0u32.into(), b"suspended");
+                closed += 1;
+            }
+        }
+        closed
+    }
+
+    pub(super) fn timer_scale(&self) -> u32 {
+        self.timer_scale.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(super) fn set_timer_scale(&self, scale: u32) {
+        self.timer_scale
+            .store(scale.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Stop the mDNS service (suspend). Local lookups and announcements end.
+    pub(super) async fn pause_mdns(&self) {
+        if let Some(mdns) = &self.mdns {
+            mdns.pause().await;
+        }
+    }
+
+    /// Start the mDNS service again with the current addresses.
+    pub(super) fn resume_mdns(&self) {
+        if let Some(mdns) = &self.mdns
+            && let Err(error) = mdns.start()
+        {
+            tracing::warn!(target: "data_fabric_transport", %error, "MDNS_RESUME_FAILED");
+        }
+    }
+
+    /// (running mDNS services, address sets announced): a test hook.
+    pub(super) fn mdns_state(&self) -> (usize, u64) {
+        self.mdns.as_ref().map_or((0, 0), PausableMdns::state)
     }
 
     pub(super) async fn nearby_peers(&self, _first_result: bool) -> Vec<PeerId> {
@@ -628,11 +778,26 @@ impl Connections {
     }
 
     pub(super) async fn close(&self) {
-        if let Some(listener) = self.nearby_listener.lock().await.take() {
-            listener.abort();
-            let _ = listener.await;
+        if let Some(mdns) = &self.mdns {
+            mdns.pause().await;
         }
-        self.endpoint.close().await;
+        // The drain waits for peers to acknowledge the close, up to three
+        // probe timeouts of the slowest open connection. A probe timeout grows
+        // with the measured round trip time, so a slow link (Tor) or a starved
+        // host can make the drain outlast any fixed deadline. The drain is best
+        // effort: a peer that misses the close frame learns of it by its own
+        // idle timeout. The caller blocks on close (a JNI thread on Android),
+        // so bound the drain by the short close drain deadline, not by the
+        // operation deadline (300 s on Tor), and finish the local teardown.
+        // The drain runs on its own task, so an overrun leaves it to finish
+        // the endpoint's shutdown in the background instead of dropping it
+        // halfway.
+        let drain = self.timeouts.close_drain;
+        let endpoint = self.endpoint.clone();
+        let draining = tokio::spawn(async move { endpoint.close().await });
+        if tokio::time::timeout(drain, draining).await.is_err() {
+            tracing::warn!(target: "data_fabric_transport", ?drain, "TRANSPORT_CLOSE_DRAIN_TIMEOUT");
+        }
         self.outgoing.lock().await.clear();
     }
 }
@@ -640,13 +805,143 @@ impl Connections {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{NetworkProfile, RelayOptions};
 
     #[cfg(feature = "tor")]
     #[test]
     fn tor_profile_uses_endpoint_id_resolution_without_ip_hints() {
         let (mdns, wan_lookup, relay_only, use_ip_hints) = NetworkProfile::Tor.settings();
-        assert_eq!((mdns, wan_lookup, relay_only, use_ip_hints), (None, false, true, false));
+        assert_eq!(
+            (mdns, wan_lookup, relay_only, use_ip_hints),
+            (None, false, true, false)
+        );
         assert!(NetworkProfile::Tor.uses_tor());
+    }
+
+    fn operator_relay() -> RelayOptions {
+        RelayOptions::new(
+            iroh::RelayMap::from(
+                "https://relay.example.invalid"
+                    .parse::<iroh::RelayUrl>()
+                    .unwrap(),
+            ),
+            iroh::tls::CaTlsConfig::embedded(),
+        )
+    }
+
+    /// A WAN deployment can use its operator's relays and leave n0's public
+    /// lookup out; the defaults keep n0 for WAN and nothing for local profiles.
+    #[test]
+    fn transport_plan_follows_profile_and_options() {
+        let plan = |options: &NodeOptions| TransportPlan::new(options);
+        let wan = NodeOptions::new(NetworkProfile::Wan);
+        assert_eq!(
+            plan(&wan),
+            TransportPlan {
+                public_lookup: true,
+                relays: Relays::Public
+            }
+        );
+        let operator = NodeOptions {
+            relay: Some(operator_relay()),
+            public_lookup: false,
+            ..wan.clone()
+        };
+        assert_eq!(
+            plan(&operator),
+            TransportPlan {
+                public_lookup: false,
+                relays: Relays::Operator
+            }
+        );
+        let isolated = NodeOptions {
+            public_lookup: false,
+            ..wan
+        };
+        assert_eq!(plan(&isolated).relays, Relays::None);
+        for profile in [
+            NetworkProfile::Direct,
+            NetworkProfile::Lan,
+            NetworkProfile::Nearby,
+        ] {
+            assert_eq!(
+                plan(&NodeOptions::new(profile)),
+                TransportPlan {
+                    public_lookup: false,
+                    relays: Relays::None
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wan_binds_with_operator_relays_and_no_public_lookup() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let options = NodeOptions {
+                relay: Some(operator_relay()),
+                public_lookup: false,
+                ..NodeOptions::new(NetworkProfile::Wan)
+            };
+            let node = Connections::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                &options,
+                None,
+                ConnectionBudget::default(),
+                vec![],
+            )
+            .await
+            .unwrap();
+            // LAN lookup remains, so peers still resolve by endpoint ID nearby.
+            assert!(node.can_dial_by_peer_id());
+            node.close().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn refreshing_an_address_hint_replaces_the_stale_port() {
+        let peer = Endpoint::builder(presets::Minimal)
+            .clear_relay_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let cache = Connections::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            &NodeOptions::new(NetworkProfile::Direct),
+            None,
+            ConnectionBudget::default(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        let stale = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let current = peer.bound_sockets()[0];
+        cache
+            .add_address_hint(*peer.id().as_bytes(), stale)
+            .await
+            .unwrap();
+        cache
+            .add_address_hint(*peer.id().as_bytes(), current)
+            .await
+            .unwrap();
+
+        let known = cache
+            .memory
+            .get_endpoint_info(peer.id())
+            .unwrap()
+            .ip_addrs()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(known, [current]);
+
+        cache.close().await;
+        peer.close().await;
     }
 
     #[tokio::test]
@@ -681,11 +976,10 @@ mod tests {
             });
             let cache = Connections::bind(
                 "127.0.0.1:0".parse().unwrap(),
-                NetworkProfile::Direct,
+                &NodeOptions::new(NetworkProfile::Direct),
                 None,
                 ConnectionBudget::default(),
                 vec![],
-                None,
             )
             .await
             .unwrap();
@@ -762,11 +1056,10 @@ mod tests {
             let alpn = super::super::control::ALPN.to_vec();
             let cache = Connections::bind(
                 "127.0.0.1:0".parse().unwrap(),
-                NetworkProfile::Direct,
+                &NodeOptions::new(NetworkProfile::Direct),
                 None,
                 ConnectionBudget::default(),
                 vec![],
-                None,
             )
             .await
             .unwrap();
@@ -797,6 +1090,172 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(feature = "moq")]
+    #[tokio::test]
+    async fn authenticated_incoming_moq_ends_only_its_peers_backoff() {
+        use crate::{Node, Permissions, Topic};
+        use iroh_moq::{Moq, MoqSession};
+        use std::time::Duration;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (receiver, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let (sender, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let workspace = [56; 32];
+            let topic = Topic::new("shared/stream").unwrap();
+            let policy = BTreeMap::from([
+                (receiver.id(), Permissions::AllTopics),
+                (sender.id(), Permissions::AllTopics),
+            ]);
+            for node in [&receiver, &sender] {
+                node.install_verified_policy(workspace, 1, policy.clone())
+                    .await
+                    .unwrap();
+            }
+            receiver
+                .subscribe(workspace, 1, topic.clone())
+                .await
+                .unwrap();
+            receiver
+                .add_address_hint(sender.id(), sender.address())
+                .await
+                .unwrap();
+            receiver
+                .enable_moq_delivery(workspace, 1, sender.id(), topic)
+                .await
+                .unwrap();
+            let unrelated = *iroh::SecretKey::generate().public().as_bytes();
+            let until = Instant::now() + Duration::from_secs(120);
+            receiver
+                .connections
+                .unreachable
+                .lock()
+                .await
+                .extend([(sender.id(), (until, 6)), (unrelated, (until, 6))]);
+            let error = receiver
+                .connections
+                .connect(sender.id(), super::super::ALPN)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("recently unreachable"));
+
+            // A fresh incoming QUIC/MoQ handshake is authenticated by Iroh and
+            // admitted by the receiver's existing route/topic policy. It does
+            // not send a direct-frame message that could clear the backoff.
+            let moq = Moq::new(sender.connections.endpoint());
+            let (session, driver) = MoqSession::connect(
+                &sender.connections.endpoint(),
+                EndpointAddr::new(PublicKey::from_bytes(&receiver.id()).unwrap())
+                    .with_ip_addr(receiver.address()),
+                moq.origin(),
+            )
+            .await
+            .unwrap();
+            let driver = tokio::spawn(driver.run());
+            let observed = tokio::time::timeout(Duration::from_secs(1), async {
+                while receiver
+                    .connections
+                    .unreachable
+                    .lock()
+                    .await
+                    .contains_key(&sender.id())
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            let data = receiver
+                .connections
+                .connect(sender.id(), super::super::ALPN)
+                .await;
+            let unrelated_kept = receiver
+                .connections
+                .unreachable
+                .lock()
+                .await
+                .contains_key(&unrelated);
+            session.close(moq_net::Error::Cancel);
+            driver.abort();
+            let _ = driver.await;
+            sender.close().await;
+            receiver.close().await;
+            assert!(
+                observed.is_ok(),
+                "authenticated incoming MoQ left stale backoff: {data:?}"
+            );
+            assert!(
+                data.is_ok(),
+                "fresh reachable peer could not use the data ALPN: {data:?}"
+            );
+            assert!(
+                unrelated_kept,
+                "one peer cleared another peer's failure state"
+            );
+        })
+        .await
+        .expect("authenticated reachability fixture timed out");
+    }
+
+    #[cfg(feature = "moq")]
+    #[tokio::test]
+    async fn rejected_incoming_moq_does_not_clear_backoff() {
+        use crate::{Node, Permissions};
+        use iroh_moq::{Moq, MoqSession};
+        use std::time::Duration;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (receiver, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let (sender, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            receiver
+                .install_verified_policy(
+                    [57; 32],
+                    1,
+                    BTreeMap::from([
+                        (receiver.id(), Permissions::AllTopics),
+                        (sender.id(), Permissions::AllTopics),
+                    ]),
+                )
+                .await
+                .unwrap();
+            // Membership alone does not authorize an enabled streaming route.
+            receiver
+                .connections
+                .unreachable
+                .lock()
+                .await
+                .insert(sender.id(), (Instant::now() + Duration::from_secs(120), 6));
+            let moq = Moq::new(sender.connections.endpoint());
+            let attempt = MoqSession::connect(
+                &sender.connections.endpoint(),
+                EndpointAddr::new(PublicKey::from_bytes(&receiver.id()).unwrap())
+                    .with_ip_addr(receiver.address()),
+                moq.origin(),
+            )
+            .await;
+            let running = attempt
+                .ok()
+                .map(|(session, driver)| (session, tokio::spawn(driver.run())));
+            while receiver.moq_metrics().rejected_sessions == 0 {
+                tokio::task::yield_now().await;
+            }
+            let kept = receiver
+                .connections
+                .unreachable
+                .lock()
+                .await
+                .contains_key(&sender.id());
+            if let Some((session, driver)) = running {
+                session.close(moq_net::Error::Cancel);
+                driver.abort();
+                let _ = driver.await;
+            }
+            sender.close().await;
+            receiver.close().await;
+            assert!(kept, "rejected MoQ arrival cleared its peer's backoff");
+        })
+        .await
+        .expect("rejected reachability fixture timed out");
+    }
+
     #[test]
     fn unreachable_backoff_doubles_from_five_seconds_to_a_two_minute_cap() {
         let seconds = |failures| unreachable_backoff(failures).as_secs();
@@ -817,11 +1276,10 @@ mod tests {
             let alpn = super::super::control::ALPN.to_vec();
             let cache = Connections::bind(
                 "127.0.0.1:0".parse().unwrap(),
-                NetworkProfile::Direct,
+                &NodeOptions::new(NetworkProfile::Direct),
                 None,
                 ConnectionBudget::default(),
                 vec![],
-                None,
             )
             .await
             .unwrap();
@@ -878,11 +1336,10 @@ mod tests {
             });
             let cache = Connections::bind(
                 "127.0.0.1:0".parse().unwrap(),
-                NetworkProfile::Direct,
+                &NodeOptions::new(NetworkProfile::Direct),
                 None,
                 ConnectionBudget::default(),
                 vec![],
-                None,
             )
             .await
             .unwrap();
@@ -898,7 +1355,7 @@ mod tests {
                 first.stable_id(),
                 "a healthy connection is reused"
             );
-            cache.discard(id, &alpn).await;
+            cache.discard(&first).await;
             assert!(
                 first.close_reason().is_some(),
                 "the discarded connection is closed"
@@ -908,6 +1365,22 @@ mod tests {
                 fresh.stable_id(),
                 first.stable_id(),
                 "the next dial is a new connection"
+            );
+            cache.forget(id, &alpn).await;
+            assert!(
+                fresh.close_reason().is_none(),
+                "refresh cancelled an existing exchange"
+            );
+            let replacement = cache.connect(id, &alpn).await.unwrap();
+            // A late failure on the old handle must not discard its replacement.
+            cache.discard(&fresh).await;
+            assert!(
+                replacement.close_reason().is_none(),
+                "old failure closed the new connection"
+            );
+            assert_eq!(
+                cache.connect(id, &alpn).await.unwrap().stable_id(),
+                replacement.stable_id()
             );
             cache.close().await;
             peer.close().await;
@@ -952,11 +1425,10 @@ mod tests {
                 .unwrap();
             let mut cache = Connections::bind(
                 "127.0.0.1:0".parse().unwrap(),
-                NetworkProfile::Direct,
+                &NodeOptions::new(NetworkProfile::Direct),
                 None,
                 ConnectionBudget::default(),
                 vec![],
-                None,
             )
             .await
             .unwrap();

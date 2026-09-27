@@ -1,6 +1,4 @@
-use arachne_runtime::{
-    close, create, describe, enable_record_storage, execute, restore_record_storage, save_candidate,
-};
+use arachne_runtime::{MemoryProvider, close, describe, execute};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
@@ -48,7 +46,7 @@ fn join(owner: i64, joiner: i64, invite: &Value, display_name: &str) {
     .unwrap();
     call(
         owner,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap();
     let reply = call(
@@ -63,7 +61,7 @@ fn join(owner: i64, joiner: i64, invite: &Value, display_name: &str) {
     .unwrap();
     call(
         joiner,
-        json!({"op":"adopt_join","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_join","candidate":staged["candidate"]}),
     )
     .unwrap();
 }
@@ -75,7 +73,10 @@ fn wait_for_offer(owner: i64) -> Value {
         if !value.is_null() {
             return value;
         }
-        assert!(Instant::now() < until, "membership handoff acknowledgement timed out");
+        assert!(
+            Instant::now() < until,
+            "membership handoff acknowledgement timed out"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -85,7 +86,10 @@ fn wait_for_offer_result(owner: i64) -> Result<Value, String> {
     loop {
         match call(owner, json!({"op":"poll_membership_offer"})) {
             Ok(value) if value.is_null() => {
-                assert!(Instant::now() < until, "membership offer response timed out");
+                assert!(
+                    Instant::now() < until,
+                    "membership offer response timed out"
+                );
                 std::thread::sleep(Duration::from_millis(10));
             }
             result => return result,
@@ -97,12 +101,35 @@ fn drive_until_work(handle: i64) -> Value {
     let until = Instant::now() + Duration::from_secs(10);
     loop {
         let value = call(handle, json!({"op":"drive_workspace"})).unwrap();
-        if value.get("state").is_some() {
+        // Presence replies can precede the membership exchange under test.
+        if value.get("state").is_some() && value["state"] != "presence_replied" {
             return value;
         }
-        assert!(Instant::now() < until, "workspace driver did not observe work");
+        assert!(
+            Instant::now() < until,
+            "workspace driver did not observe work"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Complete a self-update through an explicit authenticated offer while the
+/// fixture has suspended automatic gossip and presence.
+fn settle_self_update_by_offer(member: i64, admin: i64) {
+    let before = call(member, json!({"op":"member_roster"})).unwrap()["epoch"]
+        .as_u64()
+        .unwrap();
+    let updated = drive_until_work(member);
+    assert_eq!(updated["state"], "self_update_committed");
+    assert_eq!(
+        call(member, json!({"op":"member_roster"})).unwrap()["epoch"],
+        before + 1
+    );
+    offer_and_drive(member, admin, before);
+    assert_eq!(
+        call(admin, json!({"op":"member_roster"})).unwrap()["epoch"],
+        before + 1
+    );
 }
 
 fn self_member_id(handle: i64) -> [u8; 32] {
@@ -129,36 +156,64 @@ fn offer_and_drive(owner: i64, peer: i64, after: u64) {
         json!({"op":"offer_membership_update","peer":peer_info["endpoint_key"],"after":after}),
     )
     .unwrap();
-    assert_eq!(pending["state"], "membership_offer_pending", "offer owner={owner} peer={peer} after={after}: {pending}; owner_roster={owner_roster}; peer_info={peer_info}");
+    assert_eq!(
+        pending["state"], "membership_offer_pending",
+        "offer owner={owner} peer={peer} after={after}: {pending}; owner_roster={owner_roster}; peer_info={peer_info}"
+    );
     assert_eq!(drive_until_work(peer)["state"], "workspace_committed");
     assert_eq!(wait_for_offer(owner)["state"], "membership_offer_finished");
 }
 
+fn issue_invitation(handle: i64) -> Value {
+    let staged = call(
+        handle,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    )
+    .unwrap();
+    call(
+        handle,
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+    )
+    .unwrap()["issued_invitation"]
+        .clone()
+}
+
 fn adopt_candidate(handle: i64, staged: &Value) -> Value {
-    let snapshot = serde_json::from_value::<Vec<u8>>(staged["snapshot"].clone()).unwrap();
-    save_candidate(handle, &snapshot).unwrap();
-    call(handle, json!({"op":"adopt_admission","snapshot":staged["snapshot"]})).unwrap()
+    call(
+        handle,
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+    )
+    .unwrap()
 }
 
 #[test]
 fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave() {
-    let admin = create(Some(&[73; 32])).unwrap();
-    let successor = create(Some(&[74; 32])).unwrap();
+    // This fixture checks one staged offer and its save/adopt acknowledgement.
+    // Keep automatic presence requests out of that controlled exchange.
+    let context = arachne_runtime::Context::new(Default::default()).unwrap();
+    context.suspend().unwrap();
+    let make_node = |secret: u8| {
+        let handle = context
+            .create_with_options(
+                Some(&[secret; 32]),
+                arachne_node::NodeOptions::new(arachne_node::NetworkProfile::Direct),
+            )
+            .unwrap();
+        common::attach(handle, &MemoryProvider::default());
+        handle
+    };
+    let admin = make_node(73);
+    let successor = make_node(74);
     call(
         admin,
         json!({"op":"create_workspace","display_name":"Original admin"}),
     )
     .unwrap();
-    let invite = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let invite = issue_invitation(admin);
     join(admin, successor, &invite, "Successor");
-    let dir = common::directory();
-    enable_record_storage(
-        successor,
-        &dir.path().join("successor.db"),
-        &[74; 32],
-    )
-    .unwrap();
     route(admin, successor);
+    route(successor, admin);
+    settle_self_update_by_offer(successor, admin);
 
     let before_promotion = call(admin, json!({"op":"member_roster"})).unwrap();
     let successor_id = before_promotion["members"]
@@ -184,7 +239,10 @@ fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave()
         call(admin, json!({"op":"discard_workspace_candidate"})).unwrap()["discarded"],
         true
     );
-    assert_eq!(call(admin, json!({"op":"member_roster"})).unwrap()["epoch"], old_epoch);
+    assert_eq!(
+        call(admin, json!({"op":"member_roster"})).unwrap()["epoch"],
+        old_epoch
+    );
     assert_eq!(abandoned["state"], "awaiting_save");
 
     let promotion = call(
@@ -201,21 +259,20 @@ fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave()
     assert_eq!(pending["state"], "membership_offer_pending");
     // The acknowledgement is deliberately not available until the successor
     // has received, saved, and adopted the promoted membership.
-    assert!(call(admin, json!({"op":"poll_membership_offer"}))
-        .unwrap()
-        .is_null());
+    assert!(
+        call(admin, json!({"op":"poll_membership_offer"}))
+            .unwrap()
+            .is_null()
+    );
 
     let offered = drive_until_work(successor);
     assert_eq!(offered["state"], "workspace_committed");
     assert_eq!(offered["epoch"], old_epoch + 1);
     assert_eq!(offered["reply_queued"], true);
-    assert_eq!(
-        wait_for_offer(admin)["state"],
-        "membership_offer_finished"
-    );
+    assert_eq!(wait_for_offer(admin)["state"], "membership_offer_finished");
     let promoted = call(
         admin,
-        json!({"op":"adopt_admission","snapshot":promotion["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":promotion["candidate"]}),
     )
     .unwrap();
     assert_eq!(promoted["epoch"], old_epoch + 1);
@@ -228,12 +285,13 @@ fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave()
     });
     let staged = incoming(successor);
     assert_eq!(staged["state"], "awaiting_save");
-    assert!(!leaving.is_finished(), "departure completed before the peer adopted it");
-    let snapshot = serde_json::from_value::<Vec<u8>>(staged["snapshot"].clone()).unwrap();
-    save_candidate(successor, &snapshot).unwrap();
+    assert!(
+        !leaving.is_finished(),
+        "departure completed before the peer adopted it"
+    );
     call(
         successor,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap();
     assert_eq!(
@@ -252,41 +310,84 @@ fn administrator_handoff_acknowledges_after_successor_adopts_then_allows_leave()
     assert_eq!(
         call(
             admin,
-            json!({"op":"adopt_admission","snapshot":removed["snapshot"]}),
+            json!({"op":"adopt_admission","candidate":removed["candidate"]}),
         )
         .unwrap()["state"],
         "removed"
     );
 
     close(successor).unwrap();
-    dir.close().unwrap();
 }
 
 #[test]
 fn three_member_leave_converges_through_successive_administrator_handoffs() {
-    let admin = create(Some(&[101; 32])).unwrap();
-    let successor = create(Some(&[102; 32])).unwrap();
-    let third = create(Some(&[103; 32])).unwrap();
+    // This scenario controls each membership exchange. Suspend background
+    // gossip and presence so they cannot repair the deliberately stale member
+    // before the negative handoff check. Authenticated control still works.
+    let context = arachne_runtime::Context::new(Default::default()).unwrap();
+    context.suspend().unwrap();
+    let make_node = |secret: u8| {
+        let handle = context
+            .create_with_options(
+                Some(&[secret; 32]),
+                arachne_node::NodeOptions::new(arachne_node::NetworkProfile::Direct),
+            )
+            .unwrap();
+        common::attach(handle, &MemoryProvider::default());
+        handle
+    };
+    let admin = make_node(101);
+    let successor = make_node(102);
+    let third = make_node(103);
     call(
         admin,
         json!({"op":"create_workspace","display_name":"Alpha"}),
     )
     .unwrap();
-    let invite = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let invite = issue_invitation(admin);
     join(admin, successor, &invite, "Bravo");
-    let invite = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    route(admin, successor);
+    route(successor, admin);
+    settle_self_update_by_offer(successor, admin);
+    // Registering the second invitation costs admin an epoch that successor
+    // (already a member) does not automatically have. Apply that management
+    // step to successor directly so it doesn't fork before the third join.
+    let staged = call(
+        admin,
+        json!({"op":"stage_invitation","personal":false,"expires_at":0}),
+    )
+    .unwrap();
+    let adopted = call(
+        admin,
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
+    )
+    .unwrap();
+    let invite = adopted["issued_invitation"].clone();
+    let synced = call(
+        successor,
+        json!({"op":"stage_admission_update","step":adopted["step"]}),
+    )
+    .unwrap();
+    call(
+        successor,
+        json!({"op":"adopt_admission","candidate":synced["candidate"]}),
+    )
+    .unwrap();
+    assert_eq!(
+        call(successor, json!({"op":"member_roster"})).unwrap()["epoch"],
+        4
+    );
     join(admin, third, &invite, "Charlie");
 
-    let dir = common::directory();
-    enable_record_storage(admin, &dir.path().join("alpha.db"), &[101; 32]).unwrap();
-    enable_record_storage(successor, &dir.path().join("bravo.db"), &[102; 32]).unwrap();
-    enable_record_storage(third, &dir.path().join("charlie.db"), &[103; 32]).unwrap();
     route(admin, successor);
     route(successor, admin);
     route(admin, third);
     route(third, admin);
     route(successor, third);
     route(third, successor);
+    // The third member saves and offers its self-update (epoch 5 -> 6).
+    // The successor stays at epoch 4 until the explicit handoff below.
+    settle_self_update_by_offer(third, admin);
 
     let successor_id = self_member_id(successor);
     let third_id = self_member_id(third);
@@ -304,18 +405,28 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
     let poll = std::thread::spawn(move || wait_for_offer_result(admin));
     assert_eq!(drive_until_work(successor)["state"], "membership_replied");
     let rejected = poll.join().unwrap();
-    assert!(rejected.is_err(), "stale peer unexpectedly accepted handoff: {rejected:?}");
+    assert!(
+        rejected.is_err(),
+        "stale peer unexpectedly accepted handoff: {rejected:?}"
+    );
     assert_eq!(
         call(admin, json!({"op":"discard_workspace_candidate"})).unwrap()["discarded"],
         true
     );
     assert_eq!(failed_promotion["state"], "awaiting_save");
+    let stale_roster = call(successor, json!({"op":"member_roster"})).unwrap();
+    assert_eq!(stale_roster["epoch"], 4);
+    assert_eq!(stale_roster["members"].as_array().unwrap().len(), 2);
 
     // The second join advances the creator while the first member still has
     // the previous accepted view. Reconcile that view before any management.
-    offer_and_drive(admin, successor, 1);
+    // Bravo already self-updated at epoch 3 and received the second
+    // invitation registration at epoch 4. It is missing Charlie's join
+    // (epoch 4 -> 5) and self-update (epoch 5 -> 6).
+    offer_and_drive(admin, successor, 4);
+    offer_and_drive(admin, successor, 5);
     let before_promotion = call(admin, json!({"op":"member_roster"})).unwrap();
-    assert_eq!(before_promotion["epoch"], 2);
+    assert_eq!(before_promotion["epoch"], 6);
     let before_promotion_epoch = before_promotion["epoch"].as_u64().unwrap();
 
     let promotion = call(
@@ -344,11 +455,13 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
     let after_admin_leave = call(successor, json!({"op":"member_roster"})).unwrap();
     assert_eq!(after_admin_leave["epoch"], before_promotion_epoch + 2);
     assert_eq!(after_admin_leave["members"].as_array().unwrap().len(), 2);
-    assert!(after_admin_leave["members"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|member| member["self"] == true && member["administrator"] == true));
+    assert!(
+        after_admin_leave["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|member| member["self"] == true && member["administrator"] == true)
+    );
 
     let promotion = call(
         successor,
@@ -387,19 +500,20 @@ fn three_member_leave_converges_through_successive_administrator_handoffs() {
     assert_eq!(final_roster["members"][0]["administrator"], true);
 
     close(third).unwrap();
-    dir.close().unwrap();
 }
 
 #[test]
 fn leave_over_iroh_retries_saved_outcome_then_restores_only_terminal_state() {
-    let mut admin = create(Some(&[71; 32])).unwrap();
-    let member = create(Some(&[72; 32])).unwrap();
+    let admin_storage = MemoryProvider::default();
+    let member_storage = MemoryProvider::default();
+    let mut admin = common::stored(&[71; 32], &admin_storage);
+    let member = common::stored(&[72; 32], &member_storage);
     let created = call(
         admin,
         json!({"op":"create_workspace","display_name":"Admin"}),
     )
     .unwrap();
-    let invite = call(admin, json!({"op":"issue_invitation"})).unwrap();
+    let invite = issue_invitation(admin);
     let join = call(
         member,
         json!({"op":"begin_join","display_name":"Departing member",
@@ -409,21 +523,16 @@ fn leave_over_iroh_retries_saved_outcome_then_restores_only_terminal_state() {
     let admission = call(admin, json!({"op":"stage_admission","authenticated_endpoint":join["endpoint"],"request":join["admission_request"]})).unwrap();
     call(
         admin,
-        json!({"op":"adopt_admission","snapshot":admission["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":admission["candidate"]}),
     )
     .unwrap();
     let reply = call(admin, json!({"op":"retained_admission","authenticated_endpoint":join["endpoint"],"request":join["admission_request"]})).unwrap();
     let joined = call(member, json!({"op":"stage_join","welcome":reply["welcome"],"commits":[{"commit":reply["commit"],"authorization":reply["authorization"]}]})).unwrap();
     call(
         member,
-        json!({"op":"adopt_join","snapshot":joined["snapshot"]}),
+        json!({"op":"adopt_join","candidate":joined["candidate"]}),
     )
     .unwrap();
-    let dir = common::directory();
-    let a = dir.path().join("admin.db");
-    let b = dir.path().join("member.db");
-    enable_record_storage(admin, &a, &[71; 32]).unwrap();
-    enable_record_storage(member, &b, &[72; 32]).unwrap();
     assert!(call(admin, json!({"op":"stage_solo_leave"})).is_err());
     route(member, admin);
     let peer = info(admin)["endpoint_key"].clone();
@@ -432,25 +541,18 @@ fn leave_over_iroh_retries_saved_outcome_then_restores_only_terminal_state() {
     let staged = incoming(admin);
     assert_eq!(staged["leaving"], true);
     assert!(call(admin, json!({"op":"send_admission_reply"})).is_err());
-    save_candidate(
-        admin,
-        &serde_json::from_value::<Vec<u8>>(staged["snapshot"].clone()).unwrap(),
-    )
-    .unwrap();
     let adopted = call(
         admin,
-        json!({"op":"adopt_admission","snapshot":staged["snapshot"]}),
+        json!({"op":"adopt_admission","candidate":staged["candidate"]}),
     )
     .unwrap();
     assert_eq!(adopted["members"], 1);
     close(admin).unwrap(); // Saved departure, lost reply.
     assert!(first.join().unwrap().is_err());
-    admin = create(Some(&[71; 32])).unwrap();
-    let restored = restore_record_storage(
+    admin = common::stored(&[71; 32], &admin_storage);
+    let restored = call(
         admin,
-        &a,
-        &[71; 32],
-        serde_json::from_value(created["workspace"].clone()).unwrap(),
+        json!({"op":"restore_workspace","workspace":created["workspace"]}),
     )
     .unwrap();
     assert_eq!(restored["members"], 1);
@@ -462,35 +564,21 @@ fn leave_over_iroh_retries_saved_outcome_then_restores_only_terminal_state() {
     call(admin, json!({"op":"send_admission_reply"})).unwrap();
     let departed = retry.join().unwrap().unwrap();
     assert_eq!(departed["removed"], true);
-    assert!(
-        call(
-            member,
-            json!({"op":"adopt_admission","snapshot":departed["snapshot"]})
-        )
-        .is_err()
-    );
-    save_candidate(
-        member,
-        &serde_json::from_value::<Vec<u8>>(departed["snapshot"].clone()).unwrap(),
-    )
-    .unwrap();
     assert_eq!(
         call(
             member,
-            json!({"op":"adopt_admission","snapshot":departed["snapshot"]})
+            json!({"op":"adopt_admission","candidate":departed["candidate"]})
         )
         .unwrap()["state"],
         "removed"
     );
     assert!(call(member, json!({"op":"member_roster"})).is_err());
     close(member).unwrap();
-    let member = create(Some(&[72; 32])).unwrap();
+    let member = common::stored(&[72; 32], &member_storage);
     assert_eq!(
-        restore_record_storage(
+        call(
             member,
-            &b,
-            &[72; 32],
-            serde_json::from_value(created["workspace"].clone()).unwrap()
+            json!({"op":"restore_workspace","workspace":created["workspace"]}),
         )
         .unwrap()["state"],
         "removed"
@@ -504,5 +592,4 @@ fn leave_over_iroh_retries_saved_outcome_then_restores_only_terminal_state() {
     );
     close(member).unwrap();
     close(admin).unwrap();
-    dir.close().unwrap();
 }

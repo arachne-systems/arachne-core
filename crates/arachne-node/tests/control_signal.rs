@@ -29,12 +29,18 @@ async fn closing_a_session_cancels_an_unanswered_control_exchange() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let (client, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let (server, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
-        client.add_address_hint(server.id(), server.address()).await.unwrap();
+        client
+            .add_address_hint(server.id(), server.address())
+            .await
+            .unwrap();
         let cancel = client.control_cancellation();
         let pending = tokio::spawn(client.request_control(server.id(), b"hold"));
         server.control_signal().notified().await;
         cancel.send_replace(true);
-        assert!(matches!(pending.await.unwrap(), Err(arachne_node::Error::Cancelled)));
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(arachne_node::Error::Cancelled)
+        ));
     })
     .await
     .unwrap();
@@ -71,7 +77,10 @@ async fn set_aside_requests_are_reported_and_rearm_wakes_the_host() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let (client, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let (mut server, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
-        client.add_address_hint(server.id(), server.address()).await.unwrap();
+        client
+            .add_address_hint(server.id(), server.address())
+            .await
+            .unwrap();
         let signal = server.control_signal();
         let other = tokio::spawn(client.request_control(server.id(), b"other"));
         signal.notified().await;
@@ -82,16 +91,25 @@ async fn set_aside_requests_are_reported_and_rearm_wakes_the_host() {
             .poll_control_matching(|payload| payload == b"wanted")
             .expect("the matching request is taken");
         assert_eq!(taken.payload(), b"wanted");
-        assert!(server.has_deferred_controls(), "the other request must be reported as set aside");
+        assert!(
+            server.has_deferred_controls(),
+            "the other request must be reported as set aside"
+        );
         taken.respond(vec![1]).unwrap();
         wanted.await.unwrap().unwrap();
         // Both arrival permits are spent: nothing wakes the host but a rearm.
-        assert!(tokio::time::timeout(Duration::from_millis(100), signal.notified()).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), signal.notified())
+                .await
+                .is_err()
+        );
         server.rearm_control_signal();
         tokio::time::timeout(Duration::from_secs(1), signal.notified())
             .await
             .expect("rearm did not wake the host");
-        let request = server.poll_control().expect("the set-aside request is still there");
+        let request = server
+            .poll_control()
+            .expect("the set-aside request is still there");
         assert_eq!(request.payload(), b"other");
         assert!(!server.has_deferred_controls());
         request.respond(vec![2]).unwrap();
@@ -110,11 +128,16 @@ async fn an_urgent_request_is_found_behind_a_long_queue_in_one_scan() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let (client, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let (mut server, _) = Node::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
-        client.add_address_hint(server.id(), server.address()).await.unwrap();
+        client
+            .add_address_hint(server.id(), server.address())
+            .await
+            .unwrap();
         let signal = server.control_signal();
         let mut queued = Vec::new();
         for index in 0..20u8 {
-            queued.push(tokio::spawn(client.request_control(server.id(), &[b'q', index])));
+            queued.push(tokio::spawn(
+                client.request_control(server.id(), &[b'q', index]),
+            ));
             signal.notified().await;
         }
         let urgent = tokio::spawn(client.request_control(server.id(), b"urgent"));
@@ -127,7 +150,11 @@ async fn an_urgent_request_is_found_behind_a_long_queue_in_one_scan() {
         urgent.await.unwrap().unwrap();
         for index in 0..20u8 {
             let request = server.poll_control().expect("a set-aside request");
-            assert_eq!(request.payload(), &[b'q', index], "the other requests keep their order");
+            assert_eq!(
+                request.payload(),
+                &[b'q', index],
+                "the other requests keep their order"
+            );
             request.respond(vec![0]).unwrap();
         }
         for request in queued {

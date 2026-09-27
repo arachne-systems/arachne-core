@@ -22,8 +22,7 @@ impl CatalogEntry {
         if self.tombstone && !self.payload.is_empty() {
             return Err("catalog tombstone has payload");
         }
-        if !self.tombstone
-            && (self.payload.is_empty() || self.payload.len() > MAX_CATALOG_PAYLOAD)
+        if !self.tombstone && (self.payload.is_empty() || self.payload.len() > MAX_CATALOG_PAYLOAD)
         {
             return Err("catalog entry payload is out of bounds");
         }

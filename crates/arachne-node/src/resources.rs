@@ -13,8 +13,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::Bytes;
 use arachne_routing::RoutingTable;
+use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh_blobs::{
@@ -36,7 +36,8 @@ use tokio::sync::{Mutex, OnceCell, Semaphore, watch};
 use crate::{ALPN, Error, PeerId, Result, WorkspaceId, connections::Connections, transport};
 
 pub(crate) const STREAM_KIND: u8 = 1;
-const ADMISSION_LIFETIME: Duration = Duration::from_secs(120);
+/// Shortest read-grant lifetime; slow transports extend it (`Timeouts`).
+pub(crate) const ADMISSION_LIFETIME: Duration = Duration::from_secs(120);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Transmitted only inside an authenticated, recipient-scoped application
@@ -176,7 +177,7 @@ impl ResourceTransfers {
                     revision,
                     peer,
                     path: path.to_owned(),
-                    expires: Instant::now() + ADMISSION_LIFETIME,
+                    expires: Instant::now() + self.0.connections.timeouts().resource_grant(),
                     tag,
                 }),
             );
@@ -228,10 +229,13 @@ impl ResourceTransfers {
             .map_err(|_| Error::Backpressure)?;
         let mut changes = self.0.changed.subscribe();
         let mut token = [0; 32];
-        tokio::time::timeout(crate::TIMEOUT, recv.read_exact(&mut token))
-            .await
-            .map_err(|_| Error::Timeout("resource admission"))?
-            .map_err(transport)?;
+        tokio::time::timeout(
+            self.0.connections.operation_timeout(),
+            recv.read_exact(&mut token),
+        )
+        .await
+        .map_err(|_| Error::Timeout("resource admission"))?
+        .map_err(transport)?;
         let grant = self
             .0
             .grants
@@ -256,10 +260,11 @@ impl ResourceTransfers {
             IdleWriter(send),
             EventSender::default(),
         );
-        let request = tokio::time::timeout(crate::TIMEOUT, pair.read_request())
-            .await
-            .map_err(|_| Error::Timeout("blob request"))?
-            .map_err(transport)?;
+        let request =
+            tokio::time::timeout(self.0.connections.operation_timeout(), pair.read_request())
+                .await
+                .map_err(|_| Error::Timeout("blob request"))?
+                .map_err(transport)?;
         let Request::Get(request) = request else {
             return Err(Error::Rejected);
         };

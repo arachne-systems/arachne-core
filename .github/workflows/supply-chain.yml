@@ -1,0 +1,77 @@
+name: Supply chain
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so new RustSec advisories fail even without a code change.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supply-chain-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  locked:
+    name: Locked build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: 1.98.0
+      # --locked fails if Cargo.toml and the committed Cargo.lock disagree.
+      - run: cargo check --locked --workspace --all-targets --all-features
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      # Policy: deny.toml (advisories, licenses, crypto duplicate bans, sources).
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1 (cargo-deny 0.20.2)
+        with:
+          command: check
+          arguments: --all-features
+          # Resolve metadata with the same toolchain as the other jobs, not
+          # the action image's default (1.85).
+          rust-version: "1.98.0"
+
+  minimal-versions:
+    name: Direct minimal versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: nightly-2026-07-29
+      # The vendored Iroh forks keep their upstream manifests, whose loose
+      # lower bounds (for example `bytes = "1"` with the `serde` feature) do
+      # not build at their minimums. Take them out of `members` for this job
+      # only, so the check covers the direct dependencies of the Arachne crates.
+      # They stay path dependencies and resolve to normal (maximal) versions.
+      - name: Exclude vendored forks from workspace members
+        run: |
+          python3 - <<'EOF'
+          import pathlib
+          p = pathlib.Path("Cargo.toml")
+          s = p.read_text()
+          s = s.replace('    "vendor/iroh-gossip",\n    "vendor/iroh-blobs",\n    "vendor/iroh-tor-transport",\n    "vendor/iroh-mdns-address-lookup",\n', "")
+          s = s.replace('exclude = ["vendor/bao-tree"', 'exclude = ["vendor/iroh-gossip", "vendor/iroh-blobs", "vendor/iroh-tor-transport", "vendor/iroh-mdns-address-lookup", "vendor/bao-tree"')
+          assert '"vendor/iroh-tor-transport", "vendor/iroh-mdns-address-lookup", "vendor/bao-tree"' in s, "workspace layout changed; update this step"
+          assert '    "vendor/' not in s, "a vendored fork is still a workspace member; update this step"
+          p.write_text(s)
+          EOF
+      - run: cargo update -Z direct-minimal-versions
+      - run: cargo check --workspace --all-targets --all-features

@@ -1,0 +1,10 @@
+[bindings.kotlin]
+package_name = "org.arachne.core.runtime"
+
+[bindings.kotlin.rename]
+"Client.close" = "shutdown"
+
+[bindings.swift]
+module_name = "ArachneRuntime"
+ffi_module_name = "ArachneRuntimeFFI"
+ffi_module_filename = "ArachneRuntimeFFI"

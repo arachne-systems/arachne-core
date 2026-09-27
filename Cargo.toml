@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/arachne-api",
     "crates/arachne-store",
     "crates/arachne-security",
     "crates/arachne-delivery",
@@ -8,20 +9,31 @@ members = [
     "crates/arachne-runtime",
     "vendor/iroh-gossip",
     "vendor/iroh-blobs",
+    "vendor/iroh-tor-transport",
+    "vendor/iroh-mdns-address-lookup",
 ]
 resolver = "3"
-exclude = ["vendor/bao-tree", "vendor/netlink-packet-core", "vendor/hax-lib-macros"]
+exclude = ["fuzz", "vendor/iroh", "vendor/bao-tree"]
 
 [workspace.package]
 version = "0.1.0"
 authors = ["Arachne Systems"]
 edition = "2024"
-license-file = "LICENSE"
+# SPDX expression. Each crate directory carries a `LICENSE` symlink to the root
+# MPL-2.0 text so `cargo package` still ships the full license with the crate.
+license = "MPL-2.0"
 rust-version = "1.91"
 repository = "https://github.com/arachne-systems/arachne-core"
 homepage = "https://github.com/arachne-systems"
 
+# Cargo ignores dependency-owned patches. Consumers must repeat the Iroh
+# restart fix so every protocol uses one corrected Iroh package identity.
+# See docs/development.md for provenance and downstream build requirements.
 [patch.crates-io]
-bao-tree = { path = "vendor/bao-tree" }
-netlink-packet-core = { path = "vendor/netlink-packet-core" }
-hax-lib-macros = { path = "vendor/hax-lib-macros" }
+iroh = { path = "vendor/iroh" }
+moq-net = { git = "https://github.com/moq-dev/moq", rev = "6ab7d1a223e1949a5c2e10b68e29db2e8ab9bdd1" }
+moq-tokio = { git = "https://github.com/moq-dev/moq", rev = "6ab7d1a223e1949a5c2e10b68e29db2e8ab9bdd1" }
+
+# Optimize dependencies for crypto-heavy tests; workspace crates stay unoptimized.
+[profile.dev.package."*"]
+opt-level = 2

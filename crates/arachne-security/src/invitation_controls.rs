@@ -1,8 +1,9 @@
 //! Invitation controls in the existing authority extension. A disabled grant
 //! cannot authorize a later Add on this branch. Wall-clock expiry is checked
 //! when handling a new request, independently of replaying accepted history.
-use super::{AUTHORITY, ManagementAction, PreparedManagement, Workspace, bootstrap};
+use super::{AUTHORITY, ManagementAction, Workspace, bootstrap};
 use openmls::prelude::*;
+#[cfg(test)]
 use openmls_traits::OpenMlsProvider;
 
 pub const INVITATION_DISABLED: &str =
@@ -13,6 +14,10 @@ pub const INVITATION_APPROVAL_REQUIRED: &str =
     "This personal invitation needs administrator approval for your join request.";
 pub const INVITATION_AUTOMATIC_APPROVAL_REQUIRED: &str =
     "This personal invitation is waiting for an administrator to bind its first join request.";
+pub const INVITATION_CONTROLS_FULL: &str =
+    "Too many active invitations. Disable an invitation you no longer need, then try again.";
+/// The 16 KiB policy bound holds a 2-byte count and 74-byte rows.
+const MAX_CONTROLS: usize = (16 * 1024 - 2) / 74;
 const AUTOMATIC_APPROVAL: [u8; 32] = [0xff; 32];
 const REQUEST_ACCESS: [u8; 32] = [0xfe; 32];
 
@@ -58,6 +63,22 @@ fn decision_key(invitation: [u8; 32], package: [u8; 32]) -> [u8; 32] {
     hash.finalize().into()
 }
 
+/// Make space for one more row. A disabled row (revoked, declined or used)
+/// never admits, and neither does an unregistered key, so disabled rows and
+/// the decisions of a disabled request link are dropped when the policy is
+/// full. Every member recomputes the same result from the accepted policy.
+fn make_room(controls: &mut Vec<InvitationControl>) -> Result<(), &'static str> {
+    if controls.len() < MAX_CONTROLS {
+        return Ok(());
+    }
+    let disabled: Vec<_> = controls.iter().filter(|c| !c.enabled).cloned().collect();
+    controls.retain(|c| c.enabled && !c.is_request_decision(&disabled));
+    if controls.len() >= MAX_CONTROLS {
+        return Err(INVITATION_CONTROLS_FULL);
+    }
+    Ok(())
+}
+
 fn decide(
     controls: &mut Vec<InvitationControl>,
     parent: &InvitationControl,
@@ -71,6 +92,7 @@ fn decide(
     if controls.iter().any(|c| c.key == key) {
         return Err("join request already decided");
     }
+    make_room(controls)?;
     controls.push(InvitationControl {
         key,
         expires_at: parent.expires_at,
@@ -81,16 +103,16 @@ fn decide(
     Ok(())
 }
 
-pub(super) fn decode(bytes: &[u8]) -> Result<(bool, Vec<InvitationControl>), &'static str> {
-    if bytes.len() < 3 || bytes.len() > 16 * 1024 || bytes[0] > 1 {
+pub(super) fn decode(bytes: &[u8]) -> Result<Vec<InvitationControl>, &'static str> {
+    if bytes.len() < 2 || bytes.len() > 16 * 1024 {
         return Err("invalid invitation controls");
     }
-    let count = u16::from_be_bytes(bytes[1..3].try_into().unwrap()) as usize;
-    if bytes.len() != 3 + count * 74 {
+    let count = u16::from_be_bytes(bytes[..2].try_into().unwrap()) as usize;
+    if bytes.len() != 2 + count * 74 {
         return Err("invalid invitation control length");
     }
     let mut controls = Vec::with_capacity(count);
-    for row in bytes[3..].as_chunks::<74>().0 {
+    for row in bytes[2..].as_chunks::<74>().0 {
         let key: [u8; 32] = row[..32].try_into().unwrap();
         if row[40] > 1
             || row[41] > 1
@@ -107,17 +129,13 @@ pub(super) fn decode(bytes: &[u8]) -> Result<(bool, Vec<InvitationControl>), &'s
             approved_package: row[42..74].try_into().unwrap(),
         });
     }
-    Ok((bytes[0] == 1, controls))
+    Ok(controls)
 }
 
 pub(super) fn policy_bytes(extensions: &Extensions<GroupContext>) -> Result<Vec<u8>, &'static str> {
     let keys = bootstrap::authority(extensions)?;
     let bytes = &extensions.unknown(AUTHORITY).ok_or("missing authority")?.0;
-    Ok(if bytes[0] == 1 {
-        vec![1, 0, 0]
-    } else {
-        bytes[2 + keys.len() * 32..].to_vec()
-    })
+    Ok(bytes[2 + keys.len() * 32..].to_vec())
 }
 
 pub(super) fn replace_admins(
@@ -127,9 +145,7 @@ pub(super) fn replace_admins(
     let old = &extensions.unknown(AUTHORITY).ok_or("missing authority")?.0;
     let mut bytes = vec![old[0], admins.len() as u8];
     bytes.extend(admins.iter().flatten());
-    if old[0] == 2 {
-        bytes.extend(policy_bytes(extensions)?);
-    }
+    bytes.extend(policy_bytes(extensions)?);
     Ok(bytes)
 }
 
@@ -139,7 +155,7 @@ pub(super) fn check(
     now: Option<u64>,
     package: &KeyPackage,
 ) -> Result<(), &'static str> {
-    let (legacy, controls) = decode(&policy_bytes(extensions)?)?;
+    let controls = decode(&policy_bytes(extensions)?)?;
     match controls.iter().find(|c| c.key == key) {
         Some(c) if !c.enabled => Err(INVITATION_DISABLED),
         Some(c) if c.expires_at != 0 && now.is_some_and(|n| n >= c.expires_at) => {
@@ -164,7 +180,6 @@ pub(super) fn check(
             Err(INVITATION_APPROVAL_REQUIRED)
         }
         Some(_) => Ok(()),
-        None if legacy => Ok(()),
         None => Err(INVITATION_DISABLED),
     }
 }
@@ -187,16 +202,17 @@ pub(super) fn now() -> Result<u64, &'static str> {
         .map_err(|_| "device clock is invalid")
 }
 
-fn changed(
+pub(super) fn changed(
     extensions: &Extensions<GroupContext>,
     action: ManagementAction,
 ) -> Result<Extensions<GroupContext>, &'static str> {
-    let (mut legacy, mut controls) = decode(&policy_bytes(extensions)?)?;
+    let mut controls = decode(&policy_bytes(extensions)?)?;
     match action {
         ManagementAction::CreateInvitation(key, expires_at, personal) => {
             if key == [0; 32] || controls.iter().any(|c| c.key == key) {
                 return Err("invitation already registered or invalid");
             }
+            make_room(&mut controls)?;
             controls.push(InvitationControl {
                 key,
                 expires_at,
@@ -210,6 +226,7 @@ fn changed(
             if key == [0; 32] || controls.iter().any(|c| c.key == key) {
                 return Err("invitation already registered or invalid");
             }
+            make_room(&mut controls)?;
             controls.push(InvitationControl {
                 key,
                 expires_at,
@@ -260,29 +277,59 @@ fn changed(
             decide(&mut controls, &parent, package, false)?;
         }
         ManagementAction::DisableInvitation(key) => {
-            if key == [0; 32] {
-                if !legacy {
-                    return Err("older invitations already disabled");
-                }
-                legacy = false;
-            } else {
-                let control = controls
-                    .iter_mut()
-                    .find(|c| c.key == key)
-                    .ok_or("unknown invitation")?;
-                if !control.enabled {
-                    return Err("invitation already disabled");
-                }
-                control.enabled = false;
+            let control = controls
+                .iter_mut()
+                .find(|c| c.key == key)
+                .ok_or("unknown invitation")?;
+            if !control.enabled {
+                return Err("invitation already disabled");
             }
+            control.enabled = false;
         }
         _ => return Err("expected invitation control action"),
     }
+    with_controls(extensions, controls)
+}
+
+/// An approval bound to one join request admits once. The admission commit
+/// carries this exact policy change, so every member disables the used
+/// approval and a removed member cannot replay the same request.
+pub(super) fn consumed(
+    extensions: &Extensions<GroupContext>,
+    admitted: &[([u8; 32], &KeyPackage)],
+) -> Result<Option<Extensions<GroupContext>>, &'static str> {
+    let mut controls = decode(&policy_bytes(extensions)?)?;
+    let mut used = false;
+    for (key, package) in admitted {
+        let Some(control) = controls.iter().find(|c| c.key == *key).cloned() else {
+            continue;
+        };
+        let target = if control.request_access() {
+            decision_key(control.key, package_digest(package)?)
+        } else if control.approved() {
+            control.key
+        } else {
+            continue;
+        };
+        if let Some(row) = controls.iter_mut().find(|c| c.key == target && c.enabled) {
+            row.enabled = false;
+            used = true;
+        }
+    }
+    if !used {
+        return Ok(None);
+    }
+    with_controls(extensions, controls).map(Some)
+}
+
+fn with_controls(
+    extensions: &Extensions<GroupContext>,
+    controls: Vec<InvitationControl>,
+) -> Result<Extensions<GroupContext>, &'static str> {
     let admins = bootstrap::authority(extensions)?;
     let mut bytes = vec![2, admins.len() as u8];
     bytes.extend(admins.into_iter().flatten());
-    let mut policy = vec![u8::from(legacy)];
-    policy.extend((controls.len() as u16).to_be_bytes());
+    let mut policy = (controls.len() as u16).to_be_bytes().to_vec();
     for c in controls {
         policy.extend(c.key);
         policy.extend(c.expires_at.to_be_bytes());
@@ -308,54 +355,9 @@ fn changed(
 }
 
 impl Workspace {
-    pub fn invitation_controls(&self) -> Result<(bool, Vec<InvitationControl>), &'static str> {
+    pub fn invitation_controls(&self) -> Result<Vec<InvitationControl>, &'static str> {
         decode(&policy_bytes(self.group.extensions())?)
     }
-}
-
-pub(super) fn prepare(
-    owner: &Workspace,
-    action: ManagementAction,
-) -> Result<PreparedManagement, &'static str> {
-    let extensions = changed(owner.group.extensions(), action)?;
-    let mut candidate = owner.provisional_copy()?;
-    let commit = candidate
-        .group
-        .commit_builder()
-        .propose_group_context_extensions(extensions)
-        .map_err(|_| "invitation control proposal failed")?
-        .load_psks(candidate.provider.storage())
-        .map_err(|_| "invitation control state failed")?
-        .build(
-            candidate.provider.rand(),
-            candidate.provider.crypto(),
-            &candidate._signer,
-            |_| true,
-        )
-        .map_err(|_| "invitation control preparation failed")?
-        .stage_commit(&candidate.provider)
-        .map_err(|_| "invitation control staging failed")?
-        .into_contents()
-        .0
-        .to_bytes()
-        .map_err(|_| "invitation control encoding failed")?;
-    let mut proof = super::MembershipVerifier::from_workspace(owner)?;
-    proof.apply_transition(&super::MembershipAuthorization::Management(action), &commit)?;
-    candidate
-        .group
-        .merge_pending_commit(&candidate.provider)
-        .map_err(|_| "invitation control merge failed")?;
-    candidate.join_history =
-        Some(owner.append_history(super::MembershipAuthorization::Management(action), &commit)?);
-    candidate.prune_invitation_checkpoints()?;
-    if !proof.matches_workspace(&candidate)? {
-        return Err("invitation control branch mismatch");
-    }
-    Ok(PreparedManagement {
-        workspace: candidate,
-        action,
-        commit,
-    })
 }
 
 pub(super) fn verify(
@@ -369,11 +371,9 @@ pub(super) fn verify(
     {
         return Err("invitation action changed unrelated policy");
     }
-    if let Some(leaf) = staged.update_path_leaf_node()
-        && (leaf.credential() != &actor.credential
-            || leaf.signature_key().as_slice() != actor.signature_key)
-    {
-        return Err("invitation action replaced actor identity");
+    if let Some(leaf) = staged.update_path_leaf_node() {
+        bootstrap::check_path_leaf(group, actor.index, leaf)
+            .map_err(|_| "invitation action replaced actor identity")?;
     }
     if staged.queued_proposals().count() != 1
         || !staged.queued_proposals().all(|p| {
@@ -385,4 +385,122 @@ pub(super) fn verify(
         return Err("invitation action requires exactly its inline policy proposal");
     }
     Ok(())
+}
+
+#[test]
+fn new_workspace_rejects_unregistered_admin_signed_invitation() {
+    let admin = Workspace::create(crate::test_key(1), "Coordinator").unwrap();
+    let (invitation, checkpoint) = admin.issue_invitation().unwrap();
+    let pending =
+        super::PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(2), "Member")
+            .unwrap();
+    assert_eq!(
+        admin
+            .prepare_admission(
+                crate::test_endpoint(2),
+                pending.admission_request().unwrap()
+            )
+            .err(),
+        Some(INVITATION_DISABLED)
+    );
+}
+
+#[test]
+fn full_invitation_controls_reuse_disabled_rows() {
+    let key = |n: u16| {
+        let mut key = [7; 32];
+        key[..2].copy_from_slice(&n.to_be_bytes());
+        key
+    };
+    let create = |n| ManagementAction::CreateInvitation(key(n), 0, false);
+    // The first link is real, so the owner retains its checkpoint.
+    let (registration, first, _) = Workspace::create(crate::test_key(1), "Coordinator")
+        .unwrap()
+        .prepare_invitation(0, false, false)
+        .unwrap();
+    let mut admin = registration.workspace;
+    // 16 KiB holds 221 rows of 74 bytes.
+    for n in 1..221 {
+        admin = admin.prepare_management(create(n)).unwrap().workspace;
+    }
+    assert_eq!(
+        admin.prepare_management(create(221)).err(),
+        Some(INVITATION_CONTROLS_FULL)
+    );
+    // Disabling one link frees its row for the next link.
+    admin = admin
+        .prepare_management(ManagementAction::DisableInvitation(first.key()))
+        .unwrap()
+        .workspace;
+    admin = admin.prepare_management(create(221)).unwrap().workspace;
+    let controls = admin.invitation_controls().unwrap();
+    assert_eq!(controls.len(), 221);
+    // The pruned link is unregistered, so admission refuses it (see the test above).
+    assert!(controls.iter().all(|c| c.key != first.key() && c.enabled));
+    // Its retained checkpoint went with it, so the owner still restores.
+    let restored = Workspace::restore_records(
+        crate::test_endpoint(1),
+        admin.id(),
+        &admin.export_records().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(restored.invitation_controls().unwrap(), controls);
+}
+
+#[test]
+fn admission_cannot_carry_a_policy_change_it_does_not_consume() {
+    use openmls::prelude::tls_codec::Deserialize;
+    let admin = Workspace::create(crate::test_key(1), "Coordinator").unwrap();
+    let (registration, invitation, checkpoint) = admin.prepare_invitation(0, false, false).unwrap();
+    let mut admin = registration.workspace;
+    let pending =
+        super::PendingJoin::from_invitation(&invitation, &checkpoint, crate::test_key(2), "Member")
+            .unwrap();
+    let prepared = admin
+        .prepare_admission(
+            crate::test_endpoint(2),
+            pending.admission_request().unwrap(),
+        )
+        .unwrap();
+    let package = KeyPackageIn::tls_deserialize_exact(pending.key_package().unwrap())
+        .unwrap()
+        .validate(admin.provider.crypto(), ProtocolVersion::Mls10)
+        .unwrap();
+    // A reusable link consumes nothing, so an Add that also disables it is forged.
+    let policy = changed(
+        admin.group.extensions(),
+        ManagementAction::DisableInvitation(invitation.key()),
+    )
+    .unwrap();
+    admin
+        .group
+        .set_aad(bootstrap::asserted_time_aad(now().unwrap()));
+    let forged = admin
+        .group
+        .commit_builder()
+        .propose_adds([package])
+        .propose_group_context_extensions(policy)
+        .unwrap()
+        .load_psks(admin.provider.storage())
+        .unwrap()
+        .build(
+            admin.provider.rand(),
+            admin.provider.crypto(),
+            &admin._signer,
+            |_| true,
+        )
+        .unwrap()
+        .stage_commit(&admin.provider)
+        .unwrap()
+        .into_commit()
+        .to_bytes()
+        .unwrap();
+    let mut proof = pending.join_proof().unwrap();
+    assert_eq!(
+        proof.apply_add(&prepared.authorization, &forged),
+        Err("invitation authorizes only Adds without policy changes")
+    );
+    proof
+        .apply_add(&prepared.authorization, &prepared.commit)
+        .unwrap();
 }
