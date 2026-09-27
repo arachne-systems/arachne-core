@@ -13,7 +13,7 @@ members = [
     "vendor/iroh-mdns-address-lookup",
 ]
 resolver = "3"
-exclude = ["vendor/iroh", "vendor/bao-tree"]
+exclude = ["fuzz", "vendor/iroh", "vendor/bao-tree"]
 
 [workspace.package]
 version = "0.1.0"
