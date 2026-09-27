@@ -18,6 +18,8 @@ the pre-release crates in an application.
   and known limitations.
 - [Development](development.md) — repository layout, Rust commands, test
   coverage map, and vendored dependency maintenance.
+- [Vendor exit review](reviews/2026-09-27-vendor-exit-review.md) — current
+  upstream status, ownership, and removal conditions for every local fork.
 
 The [root README](../README.md) is the short project overview. Each crate also
 has a short README beside its source. Tests and source are authoritative when a
