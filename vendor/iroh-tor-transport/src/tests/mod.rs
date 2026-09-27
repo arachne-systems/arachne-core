@@ -20,8 +20,8 @@ use tokio::{
 };
 
 use crate::{
-    TorPacket, TorPacketSender, TorPacketService, TorStreamIo, iroh_to_tor_secret_key,
-    read_tor_packet, write_tor_packet,
+    MAX_PACKET_SIZE, TorPacket, TorPacketSender, TorPacketService, TorStreamIo,
+    iroh_to_tor_secret_key, read_tor_packet, write_tor_packet,
 };
 
 /// Get the onion address for an iroh SecretKey (test helper).
@@ -63,6 +63,34 @@ async fn test_packet_service_roundtrip() -> Result<()> {
     drop(client);
 
     server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn packet_length_is_bounded_before_body_allocation() -> Result<()> {
+    let from = SecretKey::generate().public();
+    let mut oversized_header = Vec::new();
+    oversized_header.push(0);
+    oversized_header.extend_from_slice(from.as_bytes());
+    oversized_header.extend_from_slice(&((MAX_PACKET_SIZE + 1) as u32).to_be_bytes());
+
+    let err = read_tor_packet(&mut oversized_header.as_slice())
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+    let packet = TorPacket {
+        from,
+        data: Bytes::from(vec![0x5a; MAX_PACKET_SIZE]),
+        segment_size: None,
+    };
+    let mut encoded = Vec::new();
+    write_tor_packet(&mut encoded, &packet).await?;
+    assert_eq!(
+        read_tor_packet(&mut encoded.as_slice()).await?,
+        Some(packet)
+    );
+
     Ok(())
 }
 

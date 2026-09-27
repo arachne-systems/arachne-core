@@ -103,6 +103,9 @@ pub(crate) struct TorPacket {
 }
 
 const FLAG_SEGMENT_SIZE: u8 = 0x01;
+// noq-proto's maximum UDP payload. The Tor framing layer must reject larger
+// lengths before allocation because it runs before Iroh authenticates a peer.
+const MAX_PACKET_SIZE: usize = 65_527;
 /// Transport id for the Tor user transport.
 const TOR_USER_TRANSPORT_ID: u64 = 0x544f52;
 
@@ -176,6 +179,12 @@ pub(crate) async fn read_tor_packet<R: AsyncRead + Unpin>(
     let mut len_bytes = [0u8; 4];
     reader.read_exact(&mut len_bytes).await?;
     let len = u32::from_be_bytes(len_bytes) as usize;
+    if len > MAX_PACKET_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Tor packet exceeds Iroh datagram limit",
+        ));
+    }
 
     let mut data = vec![0u8; len];
     reader.read_exact(&mut data).await?;
@@ -192,6 +201,12 @@ pub(crate) async fn write_tor_packet<W: AsyncWrite + Unpin>(
     writer: &mut W,
     packet: &TorPacket,
 ) -> io::Result<()> {
+    if packet.data.len() > MAX_PACKET_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Tor packet exceeds Iroh datagram limit",
+        ));
+    }
     let mut flags = 0u8;
     if packet.segment_size.is_some() {
         flags |= FLAG_SEGMENT_SIZE;

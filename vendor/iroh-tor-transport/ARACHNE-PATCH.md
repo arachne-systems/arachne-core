@@ -94,6 +94,8 @@ iroh `SecretKey`, and the Tor key blob is only a SHA-512 expansion.
 - The SOCKS connect path formats the address with `Display` (same string).
 - The outbound stream cache is capped at 64 peers. A new peer evicts an idle
   stream; if all cached streams are active, the send fails with backpressure.
+- Tor packet frames are capped at noq-proto's 65,527-byte maximum UDP payload
+  before allocation. The writer applies the same limit.
 - In-file change notice on line 1.
 
 ### Tests
@@ -101,7 +103,8 @@ iroh `SecretKey`, and the Tor key blob is only a SHA-512 expansion.
 - `src/tests/mod.rs`: the helper derives the onion address from the public
   key. `test_key_conversion` compared torut's public key with iroh's; it now
   checks the RFC 8032 TEST 1 key blob and onion address pinned to torut's
-  output. In-file change notice on line 1.
+  output. The packet framing test rejects an oversized length with no body and
+  round-trips the exact maximum. In-file change notice on line 1.
 - `src/onion.rs` and `src/control.rs` unit tests: RFC 8032 TEST 1/2 vectors
   (public keys from the RFC; key blobs, addresses and wire bytes captured from
   torut 0.2.1), torut's own onion-address test vector, checksum/version
