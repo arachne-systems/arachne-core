@@ -24,6 +24,8 @@ the pre-release crates in an application.
   proposed removal of endpoint/Tor signing-key reuse; requires external review.
 - [Security release gates](security-release-gates.md) — disclosure, evidence,
   signing, fuzzing, dependency, and incident-response checks for a release.
+- [Adversarial testing](adversarial-testing.md) — deterministic fault and
+  resource-exhaustion matrix, availability limits, and receipt rules.
 - [Development](development.md) — repository layout, Rust commands, test
   coverage map, and vendored dependency maintenance.
 - [Fuzzing](fuzzing.md) — untrusted-input targets, bounded CI smoke campaigns,
