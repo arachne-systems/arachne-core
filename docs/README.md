@@ -22,6 +22,8 @@ the pre-release crates in an application.
   — MLS, Iroh, gossip, and Tor composition assumptions, evidence, and open findings.
 - [Tor onion key separation ADR](reviews/adr-tor-onion-key-separation.md) —
   proposed removal of endpoint/Tor signing-key reuse; requires external review.
+- [Security release gates](security-release-gates.md) — disclosure, evidence,
+  signing, fuzzing, dependency, and incident-response checks for a release.
 - [Development](development.md) — repository layout, Rust commands, test
   coverage map, and vendored dependency maintenance.
 - [Fuzzing](fuzzing.md) — untrusted-input targets, bounded CI smoke campaigns,
