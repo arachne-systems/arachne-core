@@ -95,21 +95,27 @@ fn expand(records: &SecurityRecords) -> Result<SecurityRecords, ApiError> {
 }
 
 /// The records of a store as the runtime wrote them: parts joined, tags removed.
-struct Logical<'a>(&'a dyn Storage);
+struct Logical<'a> {
+    store: &'a dyn Storage,
+    legacy: bool,
+}
 
 impl Logical<'_> {
     fn keys(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
-        self.0
+        self.store
             .keys(prefix)
             .into_iter()
-            .filter(|name| !is_part(name))
+            .filter(|name| self.legacy || !is_part(name))
             .collect()
     }
 
     fn get(&self, name: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>, ApiError> {
-        let Some(stored) = self.0.get(name).map_err(errors::store)? else {
+        let Some(stored) = self.store.get(name).map_err(errors::store)? else {
             return Ok(None);
         };
+        if self.legacy {
+            return Ok(Some(stored));
+        }
         let corrupt = || ApiError::storage_corrupt("invalid stored record encoding");
         match stored.split_first() {
             Some((&WHOLE, value)) => Ok(Some(Zeroizing::new(value.to_vec()))),
@@ -118,7 +124,7 @@ impl Logical<'_> {
                 let mut value = Zeroizing::new(Vec::new());
                 for number in 0..count {
                     let part = self
-                        .0
+                        .store
                         .get(&part_name(name, number))
                         .map_err(errors::store)?
                         .ok_or_else(corrupt)?;
@@ -127,6 +133,22 @@ impl Logical<'_> {
                 Ok(Some(value))
             }
             _ => Err(corrupt()),
+        }
+    }
+}
+
+impl<'a> Logical<'a> {
+    fn current(store: &'a dyn Storage) -> Self {
+        Self {
+            store,
+            legacy: false,
+        }
+    }
+
+    fn legacy(store: &'a dyn Storage) -> Self {
+        Self {
+            store,
+            legacy: true,
         }
     }
 }
@@ -321,18 +343,15 @@ impl NativeStore {
     }
 
     fn terminal(&self) -> Result<bool, ApiError> {
-        let view = Logical(self.store.as_ref());
+        let view = Logical::current(self.store.as_ref());
         Ok(view.get(RESET)?.is_some() || view.get(REMOVED)?.is_some())
     }
 }
 
-/// The format of stored runtime records. Unknown, newer and pre-format
-/// stores fail with `FormatNotSupported`; there is no legacy reader.
+/// Unknown and newer runtime formats fail with `FormatNotSupported`.
 fn stored_format(bytes: Option<&[u8]>) -> Result<u32, ApiError> {
     let bytes = bytes.ok_or_else(|| {
-        ApiError::format_not_supported(
-            "record store has no runtime format record; it predates format 1 and has no reader",
-        )
+        ApiError::format_not_supported("record store has no runtime format record")
     })?;
     let found = u32::from_be_bytes(bytes.try_into().map_err(|_| {
         ApiError::format_not_supported("record store has an invalid runtime format record")
@@ -757,29 +776,50 @@ pub(crate) fn restore(
                 .map_err(errors::store)?;
         }
     }
-    let get = |name: &[u8]| Logical(store.as_ref()).get(name);
+    let format_record = store
+        .get(FORMAT)
+        .map_err(errors::store)?
+        .map(|bytes| bytes.to_vec());
+    let raw_token = store.get(TOKEN).map_err(errors::store)?;
+    let legacy = format_record.is_none()
+        && raw_token
+            .as_deref()
+            .is_some_and(|token| token.first() != Some(&WHOLE));
     let corrupt = |detail: &str| ApiError::storage_corrupt(detail);
-    let committed = get(TOKEN)?
+    let view = if legacy {
+        Logical::legacy(store.as_ref())
+    } else {
+        Logical::current(store.as_ref())
+    };
+    let committed = view
+        .get(TOKEN)?
         .ok_or_else(|| corrupt("missing native commit token"))?
         .to_vec();
     if committed.len() != 37 || !committed.starts_with(b"DFRC\x01") {
         return Err(corrupt("invalid native commit token"));
     }
-    if get(RESET)?.is_some() {
+    if view.get(RESET)?.is_some() {
         return Err(ApiError::wrong_state("native record store was reset"));
     }
-    let format = stored_format(get(FORMAT)?.as_deref().map(|bytes| bytes.as_slice()))?;
+    let format = if legacy {
+        0
+    } else {
+        stored_format(view.get(FORMAT)?.as_deref().map(|bytes| bytes.as_slice()))?
+    };
     let endpoint = session.node.id();
-    if get(ENDPOINT)?.as_deref().map(|bytes| bytes.as_slice()) != Some(endpoint.as_slice()) {
+    if !legacy
+        && view.get(ENDPOINT)?.as_deref().map(|bytes| bytes.as_slice()) != Some(endpoint.as_slice())
+    {
         return Err(ApiError::wrong_state(
             "the stored workspace belongs to a different endpoint key; restore it with that endpoint identity",
         ));
     }
+    drop(view);
     let mut store = NativeStore::new(store, workspace, &config, endpoint, committed);
-    if format != RUNTIME_FORMAT {
+    if format != 0 && format != RUNTIME_FORMAT {
         // The migration hook: upgrade every record, then save them as one
         // commit before any is used.
-        let view = Logical(store.store.as_ref());
+        let view = Logical::current(store.store.as_ref());
         let mut records: SecurityRecords = view
             .keys(b"")
             .into_iter()
@@ -788,14 +828,24 @@ pub(crate) fn restore(
                 Ok((name, value.ok_or_else(|| corrupt("missing record"))?))
             })
             .collect::<Result<_, ApiError>>()?;
+        drop(view);
         if migrate(&mut records, format, MIGRATIONS)? {
             let token = store.committed.clone();
             store.commit(records, &token)?;
         }
     }
-    let (store, committed) = (store.store, store.committed);
-    let get = |name: &[u8]| Logical(store.as_ref()).get(name);
-    let keys = Logical(store.as_ref()).keys(b"");
+    let get = |name: &[u8]| {
+        Logical {
+            store: store.store.as_ref(),
+            legacy,
+        }
+        .get(name)
+    };
+    let keys = if legacy {
+        Logical::legacy(store.store.as_ref()).keys(b"")
+    } else {
+        Logical::current(store.store.as_ref()).keys(b"")
+    };
     if let Some(bytes) = get(PENDING)? {
         if keys.iter().any(|name| {
             ![PENDING, TOKEN, ENDPOINT, FORMAT, JOIN_LIFECYCLE, ACTIVITY].contains(&name.as_slice())
@@ -830,13 +880,23 @@ pub(crate) fn restore(
         session.activity = activity;
         session.join.lifecycle = lifecycle;
         session.join.pending = Some(pending);
-        session.records = Some(NativeStore::new(
-            store, workspace, &config, endpoint, committed,
-        ));
+        if legacy {
+            let records = pending_records(
+                session,
+                session
+                    .join
+                    .pending
+                    .as_ref()
+                    .ok_or_else(errors::no_pending_join)?,
+            )?;
+            let token = store.committed.clone();
+            store.commit(records, &token)?;
+        }
+        session.records = Some(store);
         return Ok(Restored::Pending(value));
     }
     if let Some(bytes) = get(REMOVED)? {
-        if keys.len() != 4 {
+        if keys.len() != if legacy { 2 } else { 4 } {
             return Err(corrupt("removed store contains active state"));
         }
         let removed = arachne_security::RemovedMembership::restore(
@@ -846,7 +906,12 @@ pub(crate) fn restore(
             &bytes,
         )
         .map_err(security(ErrorCode::StorageCorrupt))?;
-        let mut value = Removed::of(&removed, store.freshness());
+        if legacy {
+            let records = BTreeMap::from([(REMOVED.to_vec(), Zeroizing::new(bytes.to_vec()))]);
+            let token = store.committed.clone();
+            store.commit(records, &token)?;
+        }
+        let mut value = Removed::of(&removed, store.store.freshness());
         value.workspace = workspace;
         session.ending = true;
         return Ok(Restored::Removed(RemovedDurably {
@@ -914,9 +979,21 @@ pub(crate) fn restore(
     session.delivery.inbox = inbox;
     commit_workspace(session, owner);
     value.activity = session.activity.view();
-    session.records = Some(NativeStore::new(
-        store, workspace, &config, endpoint, committed,
-    ));
+    if legacy {
+        let workspace = session
+            .workspace
+            .as_ref()
+            .ok_or_else(|| ApiError::internal("restored workspace was not committed"))?;
+        let records = active_records(
+            workspace,
+            session.delivery.publisher.as_ref(),
+            session.delivery.inbox.as_ref(),
+            &session.activity,
+        )?;
+        let token = store.committed.clone();
+        store.commit(records, &token)?;
+    }
+    session.records = Some(store);
     Ok(Restored::Opened(value))
 }
 
@@ -1012,7 +1089,7 @@ mod tests {
             (b"security/small".to_vec(), Zeroizing::new(vec![1, 2, 3])),
         ]);
         store.commit(records, &candidate_token().unwrap()).unwrap();
-        let view = Logical(store.store.as_ref());
+        let view = Logical::current(store.store.as_ref());
         assert_eq!(
             view.get(b"security/large").unwrap().unwrap().as_slice(),
             large
@@ -1034,7 +1111,7 @@ mod tests {
     }
 
     fn view_get(store: &NativeStore, name: &[u8]) -> Vec<u8> {
-        Logical(store.store.as_ref())
+        Logical::current(store.store.as_ref())
             .get(name)
             .unwrap()
             .unwrap()
