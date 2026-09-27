@@ -61,8 +61,10 @@ pub(super) async fn gc_mark_task(
         roots.insert(tt);
     }
     for HashAndFormat { hash, format } in roots {
-        // we need to do this for all formats except raw
-        if live.insert(hash) && !format.is_raw() {
+        live.insert(hash);
+        // A root may already be in `live` through an external reference. Its
+        // children still need marking when a tag identifies it as a hashseq.
+        if !format.is_raw() {
             let mut stream = store.export_bao(hash, ChunkRanges::all()).hashes();
             while let Some(hash) = stream.next().await {
                 match hash {
@@ -140,9 +142,9 @@ pub struct GcConfig {
     pub interval: Duration,
     /// Optional callback to manually add protected blobs.
     ///
-    /// The callback is called before each garbage collection run. It gets a `&mut HashSet<Hash>`
-    /// and returns a future that returns [`ProtectOutcome`]. All hashes that are added to the
-    /// [`HashSet`] will be protected from garbage collection during this run.
+    /// The callback is called after marking, immediately before each sweep. It gets a
+    /// `&mut HashSet<Hash>` and returns a future that returns [`ProtectOutcome`]. All hashes that
+    /// are added to the [`HashSet`] will be protected from garbage collection during this run.
     ///
     /// In normal operation, return [`ProtectOutcome::Continue`] from the callback. If you return
     /// [`ProtectOutcome::Abort`], the garbage collection run will be aborted.Use this if your
@@ -176,7 +178,16 @@ pub type ProtectCb = Arc<
         + 'static,
 >;
 
+/// Run one mark-and-sweep cycle with hashes already known to be live.
 pub async fn gc_run_once(store: &Store, live: &mut HashSet<Hash>) -> crate::api::Result<()> {
+    gc_run_once_with_protect(store, live, None).await
+}
+
+async fn gc_run_once_with_protect(
+    store: &Store,
+    live: &mut HashSet<Hash>,
+    protect: Option<&ProtectCb>,
+) -> crate::api::Result<()> {
     debug!(externally_protected = live.len(), "gc: start");
     {
         store.clear_protected().await?;
@@ -193,6 +204,18 @@ pub async fn gc_run_once(store: &Store, live: &mut HashSet<Hash>) -> crate::api:
                     error!("error during gc mark: {:?}", err);
                     return Err(err);
                 }
+            }
+        }
+    }
+    // Snapshot external references after marking, immediately before sweep.
+    // Imports committed after this snapshot remain in the store's protected
+    // set, so no write can fall between all three protections.
+    if let Some(protect) = protect {
+        match protect(live).await {
+            ProtectOutcome::Continue => {}
+            ProtectOutcome::Abort => {
+                info!("abort gc run: protect callback indicated abort");
+                return Ok(());
             }
         }
     }
@@ -225,16 +248,9 @@ pub async fn run_gc(store: Store, config: GcConfig) {
     loop {
         live.clear();
         n0_future::time::sleep(config.interval).await;
-        if let Some(ref cb) = config.add_protected {
-            match (cb)(&mut live).await {
-                ProtectOutcome::Continue => {}
-                ProtectOutcome::Abort => {
-                    info!("abort gc run: protect callback indicated abort");
-                    continue;
-                }
-            }
-        }
-        if let Err(e) = gc_run_once(&store, &mut live).await {
+        if let Err(e) =
+            gc_run_once_with_protect(&store, &mut live, config.add_protected.as_ref()).await
+        {
             error!("error during gc run: {e}");
             break;
         }
@@ -409,6 +425,109 @@ mod tests {
         tracing_subscriber::fmt::try_init().ok();
         let store = crate::store::mem::MemStore::default();
         gc_check_deletion(&store).await
+    }
+
+    async fn already_live_hashseq_marks_children(store: &Store) -> TestResult {
+        let child_tag = store
+            .blobs()
+            .add_slice(b"collection child")
+            .temp_tag()
+            .await?;
+        let child = child_tag.hash();
+        drop(child_tag);
+
+        let sequence: HashSeq = [child].into_iter().collect();
+        let root_tag = store
+            .blobs()
+            .add_bytes_with_opts(AddBytesOptions {
+                data: sequence.into(),
+                format: BlobFormat::HashSeq,
+            })
+            .temp_tag()
+            .await?;
+        let root = root_tag.hash();
+        store
+            .tags()
+            .set("live-collection", HashAndFormat::hash_seq(root))
+            .await?;
+        drop(root_tag);
+
+        let mut live = HashSet::from([root]);
+        gc_run_once(store, &mut live).await?;
+        assert!(store.has(root).await?);
+        assert!(store.has(child).await?, "live hashseq child was swept");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn already_live_hashseq_marks_children_mem() -> TestResult {
+        already_live_hashseq_marks_children(&crate::store::mem::MemStore::new()).await
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "fs-store")]
+    async fn already_live_hashseq_marks_children_fs() -> TestResult {
+        let testdir = tempfile::tempdir()?;
+        let store = crate::store::fs::FsStore::load(testdir.path().join("db")).await?;
+        already_live_hashseq_marks_children(&store).await
+    }
+
+    async fn committed_during_gc_survives(store: &Store) -> TestResult {
+        use tokio::sync::{mpsc, oneshot};
+
+        let existing = {
+            let tag = store.blobs().add_slice("existing").temp_tag().await?;
+            let hash = tag.hash();
+            drop(tag);
+            hash
+        };
+        let (trigger, mut requests) = mpsc::channel::<oneshot::Sender<()>>(1);
+        let writer_store = store.clone();
+        let writer = tokio::spawn(async move {
+            while let Some(done) = requests.recv().await {
+                let tag = writer_store
+                    .blobs()
+                    .add_slice("committed during gc")
+                    .temp_tag()
+                    .await
+                    .unwrap();
+                drop(tag);
+                let _ = done.send(());
+            }
+        });
+        let protect: ProtectCb = Arc::new(move |live| {
+            let trigger = trigger.clone();
+            Box::pin(async move {
+                live.insert(existing);
+                let (done, completed) = oneshot::channel();
+                trigger.send(done).await.unwrap();
+                completed.await.unwrap();
+                ProtectOutcome::Continue
+            })
+        });
+
+        let mut live = HashSet::new();
+        gc_run_once_with_protect(store, &mut live, Some(&protect)).await?;
+        assert!(store.has(existing).await?);
+        assert!(
+            store.has(Hash::new("committed during gc")).await?,
+            "blob committed during GC was swept"
+        );
+        writer.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn committed_during_gc_survives_mem() -> TestResult {
+        committed_during_gc_survives(&crate::store::mem::MemStore::new()).await
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "fs-store")]
+    async fn committed_during_gc_survives_fs() -> TestResult {
+        let testdir = tempfile::tempdir()?;
+        let store = crate::store::fs::FsStore::load(testdir.path().join("db")).await?;
+        committed_during_gc_survives(&store).await
     }
 
     async fn gc_check_deletion(store: &Store) -> TestResult {
