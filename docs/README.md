@@ -16,6 +16,8 @@ the pre-release crates in an application.
   epoch behavior.
 - [Security](security.md) — security properties, trust boundaries, host duties,
   and known limitations.
+- [Adversarial testing](adversarial-testing.md) — deterministic fault and
+  resource-exhaustion matrix, availability limits, and receipt rules.
 - [Development](development.md) — repository layout, Rust commands, test
   coverage map, and vendored dependency maintenance.
 
