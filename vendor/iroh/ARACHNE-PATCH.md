@@ -6,7 +6,7 @@ Source: crates.io `iroh` 1.2.0, upstream commit `17c0612f80f78f5288e97b818b1360a
 Archive SHA-256: `b2f8d1cfffc83efe39a1031aab423ce09cb8048071baba550508931e9a81ce46`.
 License: MIT OR Apache-2.0, with the upstream BSD-3-Clause notices retained.
 
-Only `src/socket/remote_map/remote_state.rs` changes upstream source. `State::handle_msg_send_datagram` uses the existing fanout over known addresses for QUIC Initial packets even when a path is selected. The actor drains those sends into at most 16 concurrent tasks with a three-second deadline, matching current upstream's bounded send pattern, so a slow transport cannot block address and connection updates. Established traffic keeps Iroh's normal path selection. Encryption, endpoint identity, ALPN negotiation, and access checks do not change.
+Only `src/socket/remote_map/remote_state.rs` changes upstream source. `State::handle_msg_send_datagram` uses the existing fanout over known addresses for QUIC Initial packets even when a path is selected. The actor runs at most 16 timed fanouts and waits for capacity instead of silently dropping a handshake datagram when that set is full. Established traffic keeps Iroh's normal path selection. Encryption, endpoint identity, ALPN negotiation, and access checks do not change.
 
 The unpatched path sends new handshakes only to the selected path. A stopped process leaves that path selected until its old connections expire. An incoming connection from the restarted process can work while a new outgoing connection to its fresh address stalls.
 

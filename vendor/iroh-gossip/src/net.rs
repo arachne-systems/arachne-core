@@ -478,9 +478,9 @@ impl Actor {
                         let peer_state = self.peers.get(&peer_id);
                         let is_active = matches!(peer_state, Some(PeerState::Active { .. }));
                         if !is_active {
+                            self.peers.remove(&peer_id);
                             self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
                                 .await;
-                            self.peers.remove(&peer_id);
                         }
                     }
                     None => {
@@ -567,15 +567,38 @@ impl Actor {
     }
 
     fn handle_connection(&mut self, peer_id: EndpointId, origin: ConnOrigin, conn: Connection) {
-        let (send_tx, send_rx) = mpsc::channel(SEND_QUEUE_CAP);
         let conn_id = conn.stable_id();
+        if let Some(PeerState::Active {
+            active_conn_id,
+            active_origin,
+            ..
+        }) = self.peers.get(&peer_id)
+        {
+            if *active_conn_id == conn_id {
+                debug!("connection already active");
+                return;
+            }
+            // Simultaneous dials create two valid connections. Both endpoints
+            // must retain the same one or each closes the other's active link.
+            let preferred = if self.endpoint.id().as_bytes() < peer_id.as_bytes() {
+                ConnOrigin::Dial
+            } else {
+                ConnOrigin::Accept
+            };
+            if *active_origin == preferred && origin != preferred {
+                conn.close(0u32.into(), b"redundant gossip connection");
+                return;
+            }
+        }
+        let (send_tx, send_rx) = mpsc::channel(SEND_QUEUE_CAP);
 
         let queue = match self.peers.entry(peer_id) {
-            Entry::Occupied(mut entry) => entry.get_mut().accept_conn(send_tx, conn_id),
+            Entry::Occupied(mut entry) => entry.get_mut().accept_conn(send_tx, conn_id, origin),
             Entry::Vacant(entry) => {
                 entry.insert(PeerState::Active {
                     active_send_tx: send_tx,
                     active_conn_id: conn_id,
+                    active_origin: origin,
                     other_conns: Vec::new(),
                 });
                 Vec::new()
@@ -617,22 +640,18 @@ impl Actor {
         let reason = conn.close_reason().expect("just closed");
         let error = task_result.err();
         debug!(%reason, ?error, "connection closed");
-        if let Some(PeerState::Active {
-            active_conn_id,
-            other_conns,
-            ..
-        }) = self.peers.get_mut(&peer_id)
-        {
-            if conn.stable_id() == *active_conn_id {
-                debug!("active send connection closed, mark peer as disconnected");
-                self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
-                    .await;
-                // Discard peer descriptor from tracking map upon connection closure to prevent connection descriptor leak
-                self.peers.remove(&peer_id);
-            } else {
-                other_conns.retain(|x| *x != conn.stable_id());
-                debug!("remaining {} other connections", other_conns.len() + 1);
-            }
+        let active_closed = matches!(
+            self.peers.get(&peer_id),
+            Some(PeerState::Active { active_conn_id, .. }) if conn.stable_id() == *active_conn_id
+        );
+        if active_closed {
+            debug!("active send connection closed, mark peer as disconnected");
+            self.peers.remove(&peer_id);
+            self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
+                .await;
+        } else if let Some(PeerState::Active { other_conns, .. }) = self.peers.get_mut(&peer_id) {
+            other_conns.retain(|x| *x != conn.stable_id());
+            debug!("remaining {} other connections", other_conns.len() + 1);
         } else {
             debug!("peer already marked as disconnected");
         }
@@ -812,6 +831,7 @@ enum PeerState {
     Active {
         active_send_tx: mpsc::Sender<ProtoMessage>,
         active_conn_id: ConnId,
+        active_origin: ConnOrigin,
         other_conns: Vec<ConnId>,
     },
 }
@@ -821,6 +841,7 @@ impl PeerState {
         &mut self,
         send_tx: mpsc::Sender<ProtoMessage>,
         conn_id: ConnId,
+        origin: ConnOrigin,
     ) -> Vec<ProtoMessage> {
         match self {
             PeerState::Pending { queue, .. } => {
@@ -828,6 +849,7 @@ impl PeerState {
                 *self = PeerState::Active {
                     active_send_tx: send_tx,
                     active_conn_id: conn_id,
+                    active_origin: origin,
                     other_conns: Vec::new(),
                 };
                 queue
@@ -835,6 +857,7 @@ impl PeerState {
             PeerState::Active {
                 active_send_tx,
                 active_conn_id,
+                active_origin,
                 other_conns,
             } => {
                 // We already have an active connection. We keep the old connection intact,
@@ -845,6 +868,7 @@ impl PeerState {
                 other_conns.push(*active_conn_id);
                 *active_send_tx = send_tx;
                 *active_conn_id = conn_id;
+                *active_origin = origin;
                 Vec::new()
             }
         }
@@ -945,15 +969,9 @@ async fn connection_loop(
     let send_fut = send_loop.run(queue).instrument(error_span!("send"));
     let recv_fut = recv_loop.run().instrument(error_span!("recv"));
 
-    tokio::select! {
-        biased;
-        res = send_fut => {
-            res?;
-        }
-        res = recv_fut => {
-            res?;
-        }
-    }
+    let (send_res, recv_res) = tokio::join!(send_fut, recv_fut);
+    send_res?;
+    recv_res?;
     Ok(())
 }
 
@@ -1639,20 +1657,8 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// Regression test: a [`SendLoop`] must terminate once its send channel is
-    /// closed (all senders dropped), which is how a superseded or disconnected
-    /// connection is signalled — [`PeerState::accept_conn`] drops the old
-    /// connection's `send_tx`, and [`Actor::handle_in_event`] drops it on
-    /// `DisconnectPeer`.
-    ///
-    /// Previously the send loop's `select!` used `Some(msg) = recv()` plus an
-    /// `else => break`. That `else` was dead code: the biased `closed` branch
-    /// stayed enabled-and-pending, so the loop blocked on `closed` forever
-    /// instead of breaking when the channel closed. The connection (and its
-    /// `connection_loop`) then lived until the *peer* closed it — which under
-    /// keep-alive never happened — leaking one connection per churned link.
-    ///
-    /// [`SendLoop`]: util::SendLoop
+    /// A closed send channel must end its loop and close the superseded
+    /// connection so the paired receive loop can also be reaped.
     #[tokio::test]
     #[traced_test]
     async fn send_loop_terminates_when_send_channel_closed() -> Result {
@@ -1661,14 +1667,11 @@ pub(crate) mod tests {
         let ep1 = create_endpoint(rng, relay_map.clone(), None).await?;
         let ep2 = create_endpoint(rng, relay_map.clone(), None).await?;
 
-        // Let ep1 resolve ep2's address.
         let memory_lookup = MemoryLookup::new();
         memory_lookup.add_endpoint_info(EndpointAddr::new(ep2.id()).with_relay_url(relay_url));
         ep1.address_lookup()?.add(memory_lookup);
 
         let ep2_id = ep2.id();
-        // ep2 accepts the connection and holds it open (so the only thing that can
-        // make the send loop exit is the closed send channel, not the peer).
         let accept_task = task::spawn(async move {
             if let Some(incoming) = ep2.accept().await {
                 if let Ok(conn) = incoming.await {
@@ -1676,27 +1679,17 @@ pub(crate) mod tests {
                 }
             }
         });
-
         let conn = ep1
             .connect(ep2_id, GOSSIP_ALPN)
             .await
             .std_context("connect")?;
-
-        // A send channel whose only sender is immediately dropped models a
-        // just-superseded connection.
         let (send_tx, send_rx) = mpsc::channel::<ProtoMessage>(1);
         drop(send_tx);
 
-        // With the fix this returns promptly; with the bug it blocks on
-        // `conn.closed()` forever and the timeout fires.
         let mut send_loop = util::SendLoop::new(conn, send_rx, 1024);
-        let res = timeout(Duration::from_secs(5), send_loop.run(vec![])).await;
-        assert!(
-            res.is_ok(),
-            "SendLoop must terminate when its send channel closes (superseded connection)"
-        );
-        res.expect("send loop returned")
-            .std_context("send loop run")?;
+        timeout(Duration::from_secs(5), send_loop.run(vec![]))
+            .await
+            .std_context("send loop did not terminate")??;
 
         accept_task.abort();
         Ok(())
