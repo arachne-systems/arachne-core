@@ -23,6 +23,11 @@ use super::{
     PeerIdentity, IO,
 };
 
+const MAX_RECEIVED_MESSAGES: usize = 4096;
+const MAX_CACHED_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_MISSING_MESSAGES: usize = 4096;
+const MAX_IHAVES_PER_MESSAGE: usize = 64;
+
 /// A message identifier, which is the message content's blake3 hash.
 #[derive(Serialize, Deserialize, Clone, Hash, Copy, PartialEq, Eq, MaxSize)]
 pub struct MessageId([u8; 32]);
@@ -428,6 +433,14 @@ impl<PI: PeerIdentity> State<PI> {
         &self.stats
     }
 
+    fn payload_cache_capacity(&self) -> usize {
+        (MAX_CACHED_PAYLOAD_BYTES / self.max_message_size.max(1)).max(1)
+    }
+
+    fn lazy_queue_capacity(&self) -> usize {
+        (self.max_message_size.saturating_sub(3) / IHave::POSTCARD_MAX_SIZE).max(1)
+    }
+
     /// Handle receiving a [`Message`].
     fn handle_message(&mut self, sender: PI, message: Message, now: Instant, io: &mut impl IO<PI>) {
         if matches!(message, Message::Gossip(_)) {
@@ -473,12 +486,20 @@ impl<PI: PeerIdentity> State<PI> {
         let message = Gossip { id, content, scope };
         let me = self.me;
         if let DeliveryScope::Swarm(_) = scope {
-            self.received_messages
-                .insert(id, (), now + self.config.message_id_retention);
-            self.cache.insert(
+            if !self.received_messages.insert_bounded(
+                id,
+                (),
+                now + self.config.message_id_retention,
+                MAX_RECEIVED_MESSAGES,
+            ) {
+                warn!("dropping gossip broadcast: received-message capacity exhausted");
+                return;
+            }
+            self.cache.insert_bounded(
                 id,
                 message.clone(),
                 now + self.config.message_cache_retention,
+                self.payload_cache_capacity(),
             );
             self.lazy_push(message.clone(), &me, io);
         }
@@ -508,20 +529,25 @@ impl<PI: PeerIdentity> State<PI> {
         } else {
             if let DeliveryScope::Swarm(prev_round) = message.scope {
                 // insert the message in the list of received messages
-                self.received_messages.insert(
+                if !self.received_messages.insert_bounded(
                     message.id,
                     (),
                     now + self.config.message_id_retention,
-                );
+                    MAX_RECEIVED_MESSAGES,
+                ) {
+                    warn!("dropping gossip message: received-message capacity exhausted");
+                    return;
+                }
                 // increase the round for forwarding the message, and add to cache
                 // to reply to Graft messages later
                 // TODO: add callback/event to application to get missing messages that were received before?
                 let message = message.next_round().expect("just checked");
 
-                self.cache.insert(
+                self.cache.insert_bounded(
                     message.id,
                     message.clone(),
                     now + self.config.message_cache_retention,
+                    self.payload_cache_capacity(),
                 );
                 // push the message to our peers
                 self.eager_push(message.clone(), &sender, io);
@@ -597,10 +623,17 @@ impl<PI: PeerIdentity> State<PI> {
     fn on_ihave(&mut self, sender: PI, ihaves: Vec<IHave>, io: &mut impl IO<PI>) {
         for ihave in ihaves {
             if !self.received_messages.contains_key(&ihave.id) {
-                self.missing_messages
-                    .entry(ihave.id)
-                    .or_default()
-                    .push_back((sender, ihave.round));
+                if !self.missing_messages.contains_key(&ihave.id)
+                    && self.missing_messages.len() >= MAX_MISSING_MESSAGES
+                {
+                    warn!("dropping IHave: missing-message capacity exhausted");
+                    continue;
+                }
+                let peers = self.missing_messages.entry(ihave.id).or_default();
+                if peers.len() >= MAX_IHAVES_PER_MESSAGE {
+                    continue;
+                }
+                peers.push_back((sender, ihave.round));
 
                 if !self.graft_timer_scheduled.contains(&ihave.id) {
                     self.graft_timer_scheduled.insert(ihave.id);
@@ -626,6 +659,13 @@ impl<PI: PeerIdentity> State<PI> {
             .missing_messages
             .get_mut(&id)
             .and_then(|entries| entries.pop_front());
+        if self
+            .missing_messages
+            .get(&id)
+            .is_some_and(VecDeque::is_empty)
+        {
+            self.missing_messages.remove(&id);
+        }
         if let Some((peer, round)) = entry {
             self.add_eager(peer);
             let message = Message::Graft(Graft {
@@ -721,11 +761,15 @@ impl<PI: PeerIdentity> State<PI> {
         let Some(round) = gossip.round() else {
             return;
         };
+        let capacity = self.lazy_queue_capacity();
         for peer in self.lazy_push_peers.iter().filter(|x| *x != sender) {
-            self.lazy_push_queue.entry(*peer).or_default().push(IHave {
-                id: gossip.id,
-                round,
-            });
+            let queue = self.lazy_push_queue.entry(*peer).or_default();
+            if queue.len() < capacity {
+                queue.push(IHave {
+                    id: gossip.id,
+                    round,
+                });
+            }
         }
         if !self.dispatch_timer_scheduled {
             io.push(OutEvent::ScheduleTimer(
@@ -740,6 +784,84 @@ impl<PI: PeerIdentity> State<PI> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn unique_gossip_and_ihave_floods_stay_bounded() {
+        let mut state = State::new(1u32, Config::default(), 128 * 1024);
+        let now = Instant::now();
+        let mut io = VecDeque::new();
+
+        for sequence in 0..MAX_RECEIVED_MESSAGES + 100 {
+            let content = Bytes::copy_from_slice(&sequence.to_be_bytes());
+            state.handle(
+                InEvent::RecvMessage(
+                    2,
+                    Message::Gossip(Gossip {
+                        id: MessageId::from_content(&content),
+                        content,
+                        scope: DeliveryScope::Swarm(Round(1)),
+                    }),
+                ),
+                now,
+                &mut io,
+            );
+            io.clear();
+        }
+        assert_eq!(state.received_messages.len(), MAX_RECEIVED_MESSAGES);
+        assert_eq!(state.cache.len(), state.payload_cache_capacity());
+
+        for sequence in 0..MAX_MISSING_MESSAGES + 100 {
+            let mut content = vec![b'm'];
+            content.extend_from_slice(&sequence.to_be_bytes());
+            let id = MessageId::from_content(&content);
+            state.handle(
+                InEvent::RecvMessage(
+                    2,
+                    Message::IHave(vec![IHave {
+                        id,
+                        round: Round(1),
+                    }]),
+                ),
+                now,
+                &mut io,
+            );
+            io.clear();
+        }
+        assert_eq!(state.missing_messages.len(), MAX_MISSING_MESSAGES);
+        assert_eq!(state.graft_timer_scheduled.len(), MAX_MISSING_MESSAGES);
+
+        let repeated = *state.missing_messages.keys().next().unwrap();
+        for peer in 3..200 {
+            state.on_ihave(
+                peer,
+                vec![IHave {
+                    id: repeated,
+                    round: Round(1),
+                }],
+                &mut io,
+            );
+        }
+        assert_eq!(
+            state.missing_messages[&repeated].len(),
+            MAX_IHAVES_PER_MESSAGE
+        );
+
+        state.lazy_push_peers.insert(2);
+        let capacity = state.lazy_queue_capacity();
+        for sequence in 0..capacity + 100 {
+            let content = Bytes::copy_from_slice(&sequence.to_be_bytes());
+            state.lazy_push(
+                Gossip {
+                    id: MessageId::from_content(&content),
+                    content,
+                    scope: DeliveryScope::Swarm(Round(1)),
+                },
+                &1,
+                &mut io,
+            );
+        }
+        assert_eq!(state.lazy_push_queue[&2].len(), capacity);
+    }
 
     /// Regression for n0-computer/iroh-gossip#146: a downed neighbor must be
     /// dropped from `lazy_push_queue`, not just from the eager/lazy peer sets.

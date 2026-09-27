@@ -76,6 +76,13 @@ state machine.
   per-peer state after disconnect, timeout, or eviction. These changes do not
   alter the wire protocol.
 
+- `src/proto/plumtree.rs` and `src/proto/util.rs`: bound protocol state to
+  4,096 received message IDs, 16 MiB of worst-case payload cache entries,
+  4,096 missing message IDs, 64 advertising peers per missing message, and one
+  encoded IHave frame per lazy peer. New work is dropped at capacity until
+  normal expiry or recovery frees space. Replacement entries no longer leave
+  duplicate expiry-heap nodes. Adversarial unit coverage floods each bound.
+
 - `src/bin/sim.rs`: remove a redundant borrow in a formatting argument for
   Rust 1.98 Clippy. This diagnostic binary keeps the same behavior.
 
