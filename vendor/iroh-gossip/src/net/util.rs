@@ -239,7 +239,13 @@ impl SendLoop {
                     // branch while `closed` stayed pending forever — SendLoop hung,
                     // send_fut never resolved, connection_loop's select! never fired,
                     // and the Connection + ConnectionDriver leaked (1 per removed peer).
-                    None => break,
+                    None => {
+                        // A superseded or removed peer has no sender left.
+                        // Close the connection so its receive half also exits;
+                        // connection_loop can then reap both halves together.
+                        self.conn.close(0u32.into(), b"gossip sender closed");
+                        break;
+                    }
                 },
                 _ = self.finishing.join_next(), if !self.finishing.is_empty() => {}
                 else => break,

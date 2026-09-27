@@ -60,9 +60,11 @@ Found with `diff -ru` against the crates.io archive
    never sees it.
 7. **Connection churn cleanup.** Adapt the fixes and regression checks from
    upstream pull request #154 (commit `90a1af0`): stop a send loop when its
-   channel closes, stop the connection task when either half ends, and remove
-   closed or failed peers from the actor map. Failed dial cleanup is limited
-   to inactive peers so a concurrently accepted connection remains live.
+   channel closes, close that superseded connection so its paired receive loop
+   also ends, and remove closed or failed peers from the actor map. Simultaneous
+   dials choose the same physical connection at both endpoints before closing
+   the redundant link. Failed dial cleanup is limited to inactive peers so a
+   concurrently accepted connection remains live.
 
 No protocol version, crypto or dependency version changes. Item 6 adds bytes
 before the gossip streams on dialed connections.
