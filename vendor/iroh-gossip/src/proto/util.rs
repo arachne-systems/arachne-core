@@ -267,6 +267,13 @@ impl<T> TimerMap<T> {
         self.heap.peek().map(|x| &x.time)
     }
 
+    fn remove(&mut self, item: &T)
+    where
+        T: PartialEq,
+    {
+        self.heap.retain(|entry| &entry.item != item);
+    }
+
     #[cfg(test)]
     fn to_vec(&self) -> Vec<(Instant, T)>
     where
@@ -331,8 +338,27 @@ impl<K, V> Default for TimeBoundCache<K, V> {
 impl<K: Hash + Eq + Clone, V> TimeBoundCache<K, V> {
     /// Insert an item into the cache, marked with an expiration time.
     pub fn insert(&mut self, key: K, value: V, expires: Instant) {
+        if self.map.contains_key(&key) {
+            self.expiry.remove(&key);
+        }
         self.map.insert(key.clone(), (expires, value));
         self.expiry.insert(expires, key);
+    }
+
+    /// Insert an item while keeping both the value map and expiry heap bounded.
+    /// Returns false when a new key would exceed `max_entries`.
+    pub fn insert_bounded(
+        &mut self,
+        key: K,
+        value: V,
+        expires: Instant,
+        max_entries: usize,
+    ) -> bool {
+        if !self.map.contains_key(&key) && self.map.len() >= max_entries {
+            return false;
+        }
+        self.insert(key, value, expires);
+        true
     }
 
     /// Returns `true` if the map contains a value for the specified key.
@@ -528,5 +554,15 @@ mod test {
         cache.expire_until(t2);
         assert_eq!(cache.get(&4), None);
         assert_eq!(cache.get(&5), Some(&50));
+
+        for value in 0..100 {
+            assert!(cache.insert_bounded(5, value, t3, 2));
+        }
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.expiry.heap.len(), 1);
+        assert!(cache.insert_bounded(6, 60, t3, 2));
+        assert!(!cache.insert_bounded(7, 70, t3, 2));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.expiry.heap.len(), 2);
     }
 }
