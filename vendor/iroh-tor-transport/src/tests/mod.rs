@@ -67,6 +67,38 @@ async fn test_packet_service_roundtrip() -> Result<()> {
 }
 
 #[tokio::test]
+async fn full_packet_queue_drops_without_stalling_stream() -> Result<()> {
+    let (tx, mut rx) = mpsc::channel::<TorPacket>(1);
+    let service = TorPacketService::new(tx);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        service.handle_stream(stream).await
+    });
+
+    let from = SecretKey::generate().public();
+    let mut client = TcpStream::connect(addr).await?;
+    for data in [b"kept".as_slice(), b"dropped".as_slice()] {
+        write_tor_packet(
+            &mut client,
+            &TorPacket {
+                from,
+                data: Bytes::copy_from_slice(data),
+                segment_size: None,
+            },
+        )
+        .await?;
+    }
+    drop(client);
+
+    tokio::time::timeout(Duration::from_secs(1), server).await???;
+    assert_eq!(rx.recv().await.unwrap().data, Bytes::from_static(b"kept"));
+    assert!(rx.try_recv().is_err());
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_sender_reuses_connection() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;

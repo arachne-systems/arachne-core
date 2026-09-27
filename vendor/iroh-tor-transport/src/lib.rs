@@ -224,7 +224,7 @@ impl TorPacketService {
     /// Handle packets on a single stream until EOF.
     pub(crate) async fn handle_stream(&self, mut stream: TcpStream) -> io::Result<()> {
         while let Some(packet) = read_tor_packet(&mut stream).await? {
-            let _ = self.sender.send(packet).await;
+            let _ = self.sender.try_send(packet);
         }
         Ok(())
     }
@@ -351,7 +351,9 @@ impl TorPacketSender {
     }
 }
 
-const DEFAULT_RECV_CAPACITY: usize = 64 * 1024;
+// With the 65,527-byte Iroh datagram ceiling this retains at most about 4 MiB
+// of packet bodies. Queue saturation drops datagrams, matching UDP semantics.
+const DEFAULT_RECV_CAPACITY: usize = 64;
 const DEFAULT_SOCKS_PORT: u16 = 9050;
 const DEFAULT_CONTROL_PORT: u16 = 9051;
 const DEFAULT_ONION_PORT: u16 = 9999;

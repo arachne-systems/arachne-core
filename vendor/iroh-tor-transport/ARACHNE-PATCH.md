@@ -94,6 +94,9 @@ iroh `SecretKey`, and the Tor key blob is only a SHA-512 expansion.
 - The SOCKS connect path formats the address with `Display` (same string).
 - The outbound stream cache is capped at 64 peers. A new peer evicts an idle
   stream; if all cached streams are active, the send fails with backpressure.
+- The inbound endpoint queue is capped at 64 packets (about 4 MiB of bodies at
+  Iroh's maximum datagram size). Saturation drops a datagram instead of
+  blocking its raw stream task, matching UDP transport behavior.
 - In-file change notice on line 1.
 
 ### Tests
@@ -102,6 +105,8 @@ iroh `SecretKey`, and the Tor key blob is only a SHA-512 expansion.
   key. `test_key_conversion` compared torut's public key with iroh's; it now
   checks the RFC 8032 TEST 1 key blob and onion address pinned to torut's
   output. In-file change notice on line 1.
+- `full_packet_queue_drops_without_stalling_stream` proves that saturation is
+  bounded and that EOF still releases the raw stream task.
 - `src/onion.rs` and `src/control.rs` unit tests: RFC 8032 TEST 1/2 vectors
   (public keys from the RFC; key blobs, addresses and wire bytes captured from
   torut 0.2.1), torut's own onion-address test vector, checksum/version
