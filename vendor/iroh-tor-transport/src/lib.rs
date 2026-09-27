@@ -414,9 +414,11 @@ impl TorPacketSender {
     }
 }
 
-const DEFAULT_RECV_CAPACITY: usize = 64 * 1024;
 const MAX_INBOUND_STREAMS: usize = 64;
 const INBOUND_READ_TIMEOUT: Duration = Duration::from_secs(30);
+// With the 65,527-byte Iroh datagram ceiling this retains at most about 4 MiB
+// of packet bodies. Queue saturation drops datagrams, matching UDP semantics.
+const DEFAULT_RECV_CAPACITY: usize = 64;
 const DEFAULT_SOCKS_PORT: u16 = 9050;
 const DEFAULT_CONTROL_PORT: u16 = 9051;
 const DEFAULT_ONION_PORT: u16 = 9999;

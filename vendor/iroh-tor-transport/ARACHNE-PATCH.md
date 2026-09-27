@@ -99,6 +99,9 @@ iroh `SecretKey`, and the Tor key blob is only a SHA-512 expansion.
 - The raw inbound Tor accept loop reserves one of 64 permits before accepting
   a stream. Each packet read has a 30-second deadline, and a full endpoint
   packet queue drops the datagram instead of retaining the stream task.
+- The inbound endpoint queue is capped at 64 packets (about 4 MiB of bodies at
+  Iroh's maximum datagram size). Saturation drops a datagram instead of
+  blocking its raw stream task, matching UDP transport behavior.
 - In-file change notice on line 1.
 
 ### Tests
@@ -111,6 +114,8 @@ iroh `SecretKey`, and the Tor key blob is only a SHA-512 expansion.
 - `idle_inbound_streams_are_bounded_and_release_capacity` proves that the
   accept loop stops at its permit count and that an idle framing deadline
   releases capacity for the next stream.
+- `full_packet_queue_drops_without_stalling_stream` proves that saturation is
+  bounded and that EOF still releases the raw stream task.
 - `src/onion.rs` and `src/control.rs` unit tests: RFC 8032 TEST 1/2 vectors
   (public keys from the RFC; key blobs, addresses and wire bytes captured from
   torut 0.2.1), torut's own onion-address test vector, checksum/version
