@@ -245,7 +245,7 @@ impl RemoteStateActor {
         trace!("actor started");
         let mut send_tasks = FuturesUnorderedBounded::new(MAX_DATAGRAM_SEND_TASKS);
         for msg in initial_msgs {
-            self.handle_message(msg, &mut send_tasks);
+            self.handle_message(msg, &mut send_tasks).await;
         }
         let idle_timeout = time::sleep(ACTOR_MAX_IDLE_TIMEOUT);
         n0_future::pin!(idle_timeout);
@@ -280,7 +280,7 @@ impl RemoteStateActor {
                 Some(()) = send_tasks.next(), if !send_tasks.is_empty() => {}
                 msg = inbox.recv() => {
                     match msg {
-                        Some(msg) => self.handle_message(msg, &mut send_tasks),
+                        Some(msg) => self.handle_message(msg, &mut send_tasks).await,
                         None => break,
                     }
                 }
@@ -355,7 +355,7 @@ impl RemoteStateActor {
     ///
     /// Error returns are fatal and kill the actor.
     #[instrument(skip(self))]
-    fn handle_message(
+    async fn handle_message(
         &mut self,
         msg: RemoteStateMessage,
         send_tasks: &mut FuturesUnorderedBounded<Boxed<()>>,
@@ -364,7 +364,8 @@ impl RemoteStateActor {
         match msg {
             RemoteStateMessage::SendDatagram(sender, transmit) => {
                 self.state
-                    .handle_msg_send_datagram(sender, transmit, send_tasks);
+                    .handle_msg_send_datagram(sender, transmit, send_tasks)
+                    .await;
             }
             RemoteStateMessage::AddConnection(handle, tx) => {
                 self.handle_msg_add_connection(handle, tx);
@@ -795,7 +796,7 @@ impl RemoteStateActor {
 
 impl State {
     /// Handles [`RemoteStateMessage::SendDatagram`].
-    fn handle_msg_send_datagram(
+    async fn handle_msg_send_datagram(
         &mut self,
         sender: Box<TransportsSender>,
         transmit: OwnedTransmit,
@@ -840,7 +841,7 @@ impl State {
         if targets.is_empty() {
             return;
         }
-        let send = Box::pin(
+        let mut send: Boxed<()> = Box::pin(
             async move {
                 let send = async move {
                     let mut sender = sender;
@@ -858,8 +859,16 @@ impl State {
             }
             .instrument(Span::current()),
         );
-        if send_tasks.try_push(send).is_err() {
-            debug!("dropping datagram: send task limit reached");
+        loop {
+            match send_tasks.try_push(send) {
+                Ok(()) => break,
+                Err(pending) => {
+                    send = pending;
+                    // Preserve backpressure instead of silently losing the
+                    // handshake datagram that discovered the current address.
+                    let _ = send_tasks.next().await;
+                }
+            }
         }
         // This message is received *before* a connection is added.  So we do
         // not yet have a connection to holepunch.  Instead we trigger
