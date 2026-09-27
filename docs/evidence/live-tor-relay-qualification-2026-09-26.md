@@ -69,6 +69,11 @@ payload delivery, reconnect, traffic-analysis resistance, or behavior under a
 malicious Tor relay. The 45-second pub/sub timeout is an environment or Tor
 reachability failure; it does not isolate a Core defect.
 
+The operator confirmed that the home LAN filters plain Tor while obfs4 works.
+This qualification intentionally stops here: Arachne's current Tor profile has
+no pluggable-transport configuration surface, so an obfs4 run would test an
+external bootstrap path that Core cannot select or reproduce today.
+
 ## Metadata observed
 
 - The Tor daemon observed local control connections, onion-service creation,
@@ -96,4 +101,3 @@ reachability failure; it does not isolate a Core defect.
 4. Repeat relay loss/restart and Tor recovery across separate hosts and an
    impaired network. This run is single-host evidence and exposes route
    metadata, not WAN behavior.
-
