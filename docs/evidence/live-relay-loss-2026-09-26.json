@@ -1,0 +1,119 @@
+{
+  "cancellation": {
+    "completed": 0
+  },
+  "classification": "passed",
+  "deadline_ms": 120000,
+  "elapsed_ms": 32737,
+  "evidence_ceiling": "real Rust/Iroh endpoints on this host; not tablet, WAN, relay, or impaired-network evidence unless the selected profile and external network setup provide it",
+  "failures": {},
+  "gossip": {
+    "messages_received": 0,
+    "messages_sent": 0,
+    "neighbors": 0,
+    "nodes_with_neighbors": 0
+  },
+  "harness": "real_iroh_workspace_qualification",
+  "joiners": 1,
+  "owner_loss": {
+    "observed": 0
+  },
+  "owner_metrics": {
+    "admission_in_flight": 0,
+    "admission_queue": 0,
+    "admission_queue_bytes": 0,
+    "admission_waiters": 0,
+    "approval_pending": 0,
+    "connection_capacity": {
+      "evicted": 0,
+      "refused": 0
+    },
+    "control_timing": {
+      "host_service": {
+        "count": 1,
+        "max_us": 31199,
+        "total_us": 31199
+      },
+      "host_wait": {
+        "count": 1,
+        "max_us": 471,
+        "total_us": 471
+      },
+      "inquiry": {
+        "count": 0,
+        "max_us": 0,
+        "total_us": 0
+      }
+    },
+    "gossip_neighbors": 0,
+    "membership_gossip": {
+      "failed": 0,
+      "no_overlay": 2,
+      "range_failed": 0,
+      "range_pulled": 0,
+      "received": 0,
+      "rejected": 0,
+      "sent": 0,
+      "staged": 0
+    },
+    "paths": {
+      "by_route": {
+        "relay": 2
+      },
+      "limited": false,
+      "total": 2
+    },
+    "pending_objects": 0,
+    "receive_queue": 0,
+    "received_bytes": 18608,
+    "repair_jobs": 0,
+    "sent_bytes": 19555
+  },
+  "partition": {
+    "recovered": 0
+  },
+  "passed": true,
+  "peak_joiner_endpoints": 1,
+  "phases": {
+    "presence": {
+      "completed": 0,
+      "max_ms": null,
+      "p50_ms": null,
+      "p95_ms": null
+    },
+    "profile": {
+      "completed": 0,
+      "max_ms": null,
+      "p50_ms": null,
+      "p95_ms": null
+    },
+    "stage_join": {
+      "completed": 0,
+      "max_ms": null,
+      "p50_ms": null,
+      "p95_ms": null
+    },
+    "welcome": {
+      "completed": 0,
+      "max_ms": null,
+      "p50_ms": null,
+      "p95_ms": null
+    }
+  },
+  "profile": "relay",
+  "queue_pressure": {
+    "peak": 0
+  },
+  "real_iroh_endpoints": 2,
+  "refusal": {
+    "observed": 0
+  },
+  "relay_infrastructure": "arachne_local_relay",
+  "relay_loss": {
+    "observed": 1,
+    "outcome": "explicit_failure",
+    "reconnected": 0
+  },
+  "scenario": "relay-loss",
+  "seed": 2730557440
+}
